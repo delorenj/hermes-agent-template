@@ -78,7 +78,8 @@ agent_id:
 
 display_name:
   type: str
-  default: "{{ target_repo|title }} {{ role|title }}"
+  # Short roles (pm, dev, ops, qa, ci) get uppercased; longer ones get title-cased.
+  default: "{{ target_repo|title }} {% if role|length <= 3 %}{{ role|upper }}{% else %}{{ role|title }}{% endif %}"
   when: false
 
 bot_handle:
