@@ -97,11 +97,10 @@ UNIT
 
 mkdir -p "$RUNTIME/logs"
 
-if command -v systemctl >/dev/null && systemctl --user is-system-running >/dev/null 2>&1; then
+if systemd_user_available; then
   systemctl --user daemon-reload
   for u in "$GW_UNIT" "$CSM_UNIT" "$CKPT_TIMER"; do
-    systemctl --user enable "$u" >/dev/null
-    log "    enabled: $u"
+    systemctl --user enable "$u" >/dev/null 2>&1 && log "    enabled: $u" || warn "    failed to enable: $u"
   done
 else
   warn "    systemd --user not available; units installed at $SYS_DIR but not enabled"

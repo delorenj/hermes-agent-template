@@ -14,10 +14,9 @@ RAW=$(printf '%s%s' "${REPO:0:3}" "${ROLE:0:2}" | tr -cd '[:alnum:]' | tr '[:low
 while (( ${#RAW} < 3 )); do RAW="${RAW}X"; done
 IDENT="${RAW:0:5}"
 
-# Project name (no hyphens, spaces OK)
-NAME=$(printf '%s %s' \
-  "$(tr '[:lower:]' '[:upper:]' <<<${REPO:0:1})${REPO:1}" \
-  "$(tr '[:lower:]' '[:upper:]' <<<${ROLE:0:1})${ROLE:1}")
+# Project name = display_name (already smart-cased: "Bloodbank PM", "Hermes-Agent Dev").
+# Plane forbids hyphens in names — substitute spaces.
+NAME="${DISPLAY_NAME//-/ }"
 
 log "[40] creating plane project '$NAME' [$IDENT]"
 
