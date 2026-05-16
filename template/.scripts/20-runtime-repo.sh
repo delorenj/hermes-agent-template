@@ -72,7 +72,9 @@ cp "$ROLE_DIR/SOUL.md" "$TMP/SOUL.md"
 
 # 5. Submodule-add into the role dir (REMOVES the scratch dir first)
 PROJECT_PATH="$(project_repo_path)" || die "no project git root"
-REL_SUBMODULE_PATH="$(realpath --relative-to="$PROJECT_PATH" "$RUNTIME_LOCAL")"
+# Compute relative path from the ROLE dir (which exists), then append /runtime
+REL_ROLE_PATH="$(realpath --relative-to="$PROJECT_PATH" "$ROLE_DIR")"
+REL_SUBMODULE_PATH="${REL_ROLE_PATH}/runtime"
 log "    adding submodule at $REL_SUBMODULE_PATH"
 rm -rf "$RUNTIME_LOCAL"
 (
