@@ -27,10 +27,14 @@ else
   warn "    bring up:  cd ~/code/33GOD/bloodbank && docker compose -f compose/docker-compose.yml up -d"
 fi
 
-# Ensure nats-py is available
-if ! python3 -c "import nats" 2>/dev/null; then
-  warn "    python nats-py not installed; installing into the hermes venv"
-  "$HERMES_AGENT_REPO/.venv/bin/pip" install nats-py 2>&1 | tail -3 || true
+# Ensure nats-py is available in the hermes venv (uv-managed, no pip binary)
+if ! "$HERMES_AGENT_REPO/.venv/bin/python" -c "import nats" 2>/dev/null; then
+  warn "    python nats-py not installed in hermes venv; installing via uv"
+  if command -v uv >/dev/null 2>&1; then
+    (cd "$HERMES_AGENT_REPO" && uv pip install --quiet --python .venv/bin/python nats-py 2>&1 | tail -3) || true
+  else
+    warn "    uv not available either — install nats-py manually: cd $HERMES_AGENT_REPO && uv pip install nats-py"
+  fi
 fi
 
 mark_done 60-bloodbank
