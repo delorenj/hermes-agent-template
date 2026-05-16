@@ -5,6 +5,7 @@ source "$(dirname "$0")/_lib.sh"
 load_role_env
 
 already_done 20-runtime-repo && { log "[20] runtime repo already set up — skipping"; exit 0; }
+[[ "${SKIP_RUNTIME_REPO:-0}" == "1" ]] && { log "[20] runtime repo — SKIPPED (SKIP_RUNTIME_REPO=1)"; mark_done 20-runtime-repo; exit 0; }
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 RUNTIME_LOCAL="$ROLE_DIR/runtime"

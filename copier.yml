@@ -31,6 +31,13 @@ _envops:
 
 # ─── Questions (only what we can't derive) ───────────────────────────────
 
+target_repo:
+  type: str
+  help: "Name of the project repo this agent belongs to (e.g. bloodbank, hermes-agent)"
+  validator: "{% if not target_repo %}Required{% endif %}"
+  # No default — must be provided explicitly via --data or interactively.
+  # Path-based auto-derivation is unreliable across relative/absolute dst_path.
+
 role:
   type: str
   help: "Role for this agent (pm | dev | review | ops | qa | …)"
@@ -63,11 +70,6 @@ soul_tone:
     - terse
 
 # ─── Derived (never asked) ───────────────────────────────────────────────
-
-target_repo:
-  type: str
-  default: "{{ _copier_conf.dst_path | string | regex_replace('/agents/hermes/[^/]+/?$', '') | regex_replace('.*/', '') }}"
-  when: false
 
 agent_id:
   type: str
