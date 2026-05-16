@@ -111,6 +111,14 @@ export HERMES_BIN HERMES_AGENT_REPO RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \
        PLANE_BASE PLANE_API_KEY \
        CF_API CF_ZONE_DELO_SH CF_ACCOUNT_ID
 
+# systemd --user health check. Accept running/degraded/starting — only one
+# broken unit shouldn't disqualify the rest of the user manager.
+systemd_user_available() {
+  command -v systemctl >/dev/null || return 1
+  local state; state=$(systemctl --user is-system-running 2>&1)
+  [[ "$state" =~ ^(running|degraded|starting|maintenance)$ ]]
+}
+
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
 # Walk up from $ROLE_DIR until we find a git root that isn't us.
 project_repo_path() {
