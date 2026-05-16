@@ -1,0 +1,51 @@
+# Hermes agent role manifest.  Tracked in the PROJECT repository.
+# The agent's actual state (memory, sessions, evolving SOUL) lives in the
+# runtime submodule.  This file is the immutable contract for this role.
+
+repo: {{ target_repo }}
+role: {{ role }}
+agent_id: {{ agent_id }}
+display_name: "{{ display_name }}"
+purpose: "{{ agent_purpose }}"
+
+# Inference target (empty = inherit from global ~/.hermes/config.yaml)
+model:
+  provider: "{{ model_provider }}"
+  name: "{{ model_name }}"
+
+# Hermes profile name. Profile dir is symlinked into ./runtime/.
+profile: {{ agent_id }}
+
+# Telegram bot identity (one bot per agent — see docs/architecture.md).
+telegram:
+  bot_username: "{{ bot_handle }}"
+
+# Email address (Cloudflare Email Routing on delo.sh).
+email:
+  address: "{{ email_address }}"
+  forward_to: "{{ forward_to }}"
+
+# Plane project (1:1 with this agent).
+plane:
+  workspace: "{{ plane_workspace }}"
+  # identifier is set by .scripts/40-plane.sh after creation
+  identifier: ""
+
+# Bloodbank wiring (consumed + produced subjects).
+bloodbank:
+  subscribe:
+    - "bloodbank.evt.v1.repo.{{ target_repo }}.>"
+    - "bloodbank.cmd.v1.agent.{{ agent_id }}.>"
+  producer: "hermes-agent:{{ agent_id }}"
+
+# Runtime repo (git-tracked HERMES_HOME, auto-checkpointed).
+runtime:
+  github_repo: "{{ runtime_repo_owner }}/{{ runtime_repo }}"
+  submodule_path: "./runtime"
+  checkpoint:
+    cadence: "hourly"
+    on_session_end: true
+
+# Provenance — managed by the template, do not hand-edit.
+provisioned_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime }}"
+provisioned_by: hermes-agent-template

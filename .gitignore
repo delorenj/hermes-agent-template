@@ -1,0 +1,6 @@
+# Bash compile cache
+__pycache__/
+*.pyc
+
+# Local provisioning state (per-developer)
+.scratch/

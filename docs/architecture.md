@@ -1,0 +1,100 @@
+# Architecture
+
+## Two-artifact split
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                                                                          │
+│   gh:delorenj/hermes-agent-template       ← Copier template (this repo)  │
+│   ─────────────────────────────────       used once per role            │
+│                                                                          │
+│        copier copy ... ./agents/hermes/<role>                           │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+                  ┌────────────────────────────────┐
+                  │  your-project/                  │
+                  │   agents/hermes/<role>/         │  ← in YOUR project git
+                  │     ├── role.yaml               │
+                  │     ├── SOUL.md                 │
+                  │     ├── hermes (launcher)       │
+                  │     ├── .scripts/               │
+                  │     └── runtime/    ────────────┼─── git submodule
+                  └────────────────────────────────┘     │
+                                                          ▼
+                  ┌────────────────────────────────────────┐
+                  │  gh:delorenj/agent-hm-<project>-<role> │ ← NEW repo per agent
+                  │  ───────────────────────────────────── │   private
+                  │     ├── config.yaml                    │
+                  │     ├── SOUL.md (evolving)             │
+                  │     ├── memories/                      │   auto-checkpointed
+                  │     ├── sessions/sessions.db  (LFS)    │   hourly + on
+                  │     ├── decisions/                     │   session end
+                  │     └── bloodbank-consumer.py          │
+                  └────────────────────────────────────────┘
+```
+
+## Why two artifacts, not one
+
+The **template** is the contract / the bootstrap recipe — it doesn't change
+when an agent learns something. The **runtime** is the agent's accumulating
+state — it changes every conversation. Bundling them would mean every memory
+update churns the template's commit log; separating them means:
+
+- The template repo is small, stable, easy to update fleet-wide
+- The runtime repo is per-agent, fast-moving, auditable in isolation
+- You can fork an agent (branch the runtime repo) without touching others
+- You can wipe an agent (delete the runtime repo) without affecting the template
+
+## Why git-tracked runtime
+
+The runtime is the agent's "subjective experience" — its memory of every
+conversation, the SOUL refinements it has absorbed, the decisions it has
+emitted. Putting it in git gives:
+
+- **Durability**: nothing lost when the host dies. `git clone` restores it.
+- **Auditability**: `git log` is a full trace of how the agent evolved.
+- **Reversibility**: if the agent develops bad habits, `git revert` rolls back.
+- **Forkability**: experiment with a copy on a branch, merge if it works out.
+- **Cross-machine**: same agent state on big-chungus and on the laptop.
+
+## Checkpoint cadence
+
+A systemd `--user` timer runs `.scripts/checkpoint.sh` every hour. The script:
+
+1. `cd` into the runtime submodule
+2. `git add -A`
+3. Commits only if dirty (exits clean otherwise)
+4. Pushes to `origin`
+
+On session end, a hermes hook (TBD path) does the same thing immediately so
+nothing in-flight is lost between hourly ticks.
+
+Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters git.
+They're in `.gitignore` and live only on the host machine.
+
+## One bot per agent (Telegram)
+
+Each agent gets its own BotFather bot and runs its own gateway daemon.
+Hermes' `gateway/status.py:acquire_scoped_lock(scope="telegram", identity=<token>)`
+already enforces "one token per gateway process" — so even if two profiles
+happen to share a token, the second one's startup fails fast. The N×M cost
+(N BotFather sessions per fleet) is the price we accept for zero custom
+routing code.
+
+## One Plane project per agent
+
+A Plane "project" is the natural unit of work isolation. Mixing agents into a
+shared project would conflate decisions and break filters. 1:1 also makes
+archive-on-retire clean.
+
+## Bloodbank wiring
+
+Each consumer subscribes to two lanes:
+- `bloodbank.evt.v1.repo.<repo>.>`   — events affecting this repo
+- `bloodbank.cmd.v1.agent.<agent_id>.>` — commands targeting THIS agent specifically
+
+Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
+`producer = hermes-agent:<id>`, `source = hermes://agent/<id>`. The naming
+spec is owned by Holyfields (`~/code/33GOD/bloodbank/docs/event-naming.md`).
