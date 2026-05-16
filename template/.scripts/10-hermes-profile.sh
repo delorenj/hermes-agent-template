@@ -12,12 +12,31 @@ PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 if [[ -d "$PROFILE_HOME" ]]; then
   log "    profile dir already exists; reusing"
 else
-  "$HERMES_BIN" profile create "$PROFILE_NAME" --clone-all --no-alias
+  # --clone (NOT --clone-all): copies config.yaml, .env, SOUL.md only.
+  # --clone-all has a recursion bug — it copies the entire ~/.hermes tree,
+  #   including profiles/ itself, producing nested profiles/<name>/profiles/<name>/...
+  # We do explicit skill + plugin + hooks copies below to avoid that.
+  "$HERMES_BIN" profile create "$PROFILE_NAME" --clone --no-alias
 fi
 
-# Strip any inherited gateway state so this profile boots clean.
+# Manually copy the inheritable bits that --clone doesn't get.
+# These are content-only dirs; safe to mirror without recursion risk.
+log "    mirroring skills, plugins, hooks from default profile"
+for sub in skills plugins hooks cron skins; do
+  src="$HOME/.hermes/$sub"
+  dst="$PROFILE_HOME/$sub"
+  if [[ -d "$src" && "$src" != "$PROFILE_HOME"* ]]; then
+    mkdir -p "$dst"
+    # cp -R, dereferencing symlinks; -u to preserve newer if dst exists
+    cp -RLu "$src/." "$dst/" 2>/dev/null || cp -RL "$src/." "$dst/" 2>/dev/null || true
+  fi
+done
+
+# Strip any inherited gateway/runtime state so this profile boots clean.
 rm -f "$PROFILE_HOME/gateway.pid" "$PROFILE_HOME/gateway_state.json" \
-      "$PROFILE_HOME/processes.json" 2>/dev/null || true
+      "$PROFILE_HOME/processes.json" "$PROFILE_HOME/state.db" 2>/dev/null || true
+# Belt-and-suspenders: if a profiles/ dir somehow exists, remove it
+[[ -d "$PROFILE_HOME/profiles" ]] && rm -rf "$PROFILE_HOME/profiles"
 
 # Apply role-specific config overrides.
 REPO_PATH="$(project_repo_path)" || die "couldn't locate project repo root"
