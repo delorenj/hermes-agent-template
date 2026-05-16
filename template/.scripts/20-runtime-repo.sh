@@ -26,7 +26,16 @@ fi
 
 REMOTE_URL=$(gh repo view "$RUNTIME_REPO" --json sshUrl -q .sshUrl)
 
-# 2. Stage the runtime scaffold into a tmp dir, push to the empty GH repo
+# 2. Check if remote already has commits — if so, skip the scaffold push.
+#    This makes the step idempotent across failed-run retries.
+if git ls-remote --heads "$REMOTE_URL" 2>/dev/null | grep -q refs/heads; then
+  log "    remote already has commits — skipping scaffold push"
+  REMOTE_HAS_CONTENT=1
+else
+  REMOTE_HAS_CONTENT=0
+fi
+
+# 2a. Stage the runtime scaffold into a tmp dir (only if remote is empty)
 TMP=$(mktemp -d)
 log "    populating scaffold in $TMP"
 cp -a "$RUNTIME_SCAFFOLD_DIR/." "$TMP/"
@@ -57,18 +66,20 @@ fi
 # Copy the project's SOUL.md as the canonical starting personality.
 cp "$ROLE_DIR/SOUL.md" "$TMP/SOUL.md"
 
-# 4. Git init + LFS + initial commit + push
-(
-  cd "$TMP"
-  git init -b main >/dev/null
-  git lfs install --local >/dev/null 2>&1 || warn "git-lfs not installed; sessions.db will commit as raw binary"
-  git lfs track "*.db" >/dev/null 2>&1 || true
-  git lfs track "*.sqlite" >/dev/null 2>&1 || true
-  git add -A
-  git -c commit.gpgsign=false commit -m "Initial scaffold for $AGENT_ID" >/dev/null
-  git remote add origin "$REMOTE_URL"
-  git push -u origin main 2>&1 | tail -3
-)
+# 4. Git init + LFS + initial commit + push (skip if remote already has content)
+if [[ "$REMOTE_HAS_CONTENT" == "0" ]]; then
+  (
+    cd "$TMP"
+    git init -b main >/dev/null
+    git lfs install --local >/dev/null 2>&1 || warn "git-lfs not installed; sessions.db will commit as raw binary"
+    git lfs track "*.db" >/dev/null 2>&1 || true
+    git lfs track "*.sqlite" >/dev/null 2>&1 || true
+    git add -A
+    git -c commit.gpgsign=false commit -m "Initial scaffold for $AGENT_ID" >/dev/null
+    git remote add origin "$REMOTE_URL"
+    git push -u origin main 2>&1 | tail -3
+  )
+fi
 
 # 5. Submodule-add into the role dir (REMOVES the scratch dir first)
 PROJECT_PATH="$(project_repo_path)" || die "no project git root"
