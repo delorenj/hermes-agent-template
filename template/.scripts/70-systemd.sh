@@ -36,7 +36,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HERMES_HOME=$RUNTIME
-ExecStart=$HERMES_BIN gateway run --foreground
+ExecStart=$HERMES_BIN gateway run --replace
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:$RUNTIME/logs/gateway.systemd.log
