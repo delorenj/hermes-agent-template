@@ -38,6 +38,39 @@ rm -f "$PROFILE_HOME/gateway.pid" "$PROFILE_HOME/gateway_state.json" \
 # Belt-and-suspenders: if a profiles/ dir somehow exists, remove it
 [[ -d "$PROFILE_HOME/profiles" ]] && rm -rf "$PROFILE_HOME/profiles"
 
+# Strip inherited messaging-platform credentials from the cloned .env.
+# `profile create --clone` copies the DEFAULT profile's .env verbatim — and the
+# default profile is an operator's own agent (e.g. Condaleeza on Slack). Without
+# this, every sub-agent inherits the parent's bot token and would (a) hijack the
+# parent's Slack/Telegram socket if it ever connects, and (b) crash-loop: the
+# gateway treats an inherited-but-unusable platform as "configured", fails to
+# connect it, and exits non-fatal only when ZERO platforms are configured. A
+# sub-agent must establish its OWN identity via the Wire steps (30-telegram etc),
+# never borrow the parent's.
+PROFILE_ENV="$PROFILE_HOME/.env"
+if [[ -f "$PROFILE_ENV" ]]; then
+  log "    stripping inherited platform credentials from profile .env"
+  python3 - "$PROFILE_ENV" <<'PYEOF'
+import re, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+# Identity-bearing platform creds that must be per-agent, not inherited.
+keys = (
+    "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS",
+    "SLACK_SIGNING_SECRET", "SLACK_HOME_CHANNEL",
+    "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS",
+    "DISCORD_BOT_TOKEN", "DISCORD_ALLOWED_USERS", "DISCORD_HOME_CHANNEL",
+    "DISCORD_HOME_CHANNEL_NAME",
+)
+# Only touch *uncommented* assignments (leave the template's `# KEY=` examples).
+pat = re.compile(r"^\s*(?:%s)=" % "|".join(keys))
+lines = p.read_text().splitlines(keepends=True)
+kept = [ln for ln in lines if not pat.match(ln)]
+if len(kept) != len(lines):
+    p.write_text("".join(kept))
+PYEOF
+  chmod 600 "$PROFILE_ENV"
+fi
+
 # Apply role-specific config overrides.
 REPO_PATH="$(project_repo_path)" || die "couldn't locate project repo root"
 log "    setting terminal.cwd = $REPO_PATH"
