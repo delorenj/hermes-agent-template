@@ -24,7 +24,7 @@ invocations).
 | Step | What happens | Skippable via |
 | --- | --- | --- |
 | 00 banner | Print identity | n/a |
-| 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default | n/a |
+| 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills` | n/a |
 | 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from runtime-scaffold/, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
