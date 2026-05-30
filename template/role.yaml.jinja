@@ -20,13 +20,9 @@ profile: {{ agent_id }}
 telegram:
   bot_username: "{{ bot_handle }}"
 
-# Email address (Cloudflare Email Routing on delo.sh).
-email:
-  address: "{{ email_address }}"
-  forward_to: "{{ forward_to }}"
-
 # Plane project (1:1 with this agent).
 plane:
+  # Empty -> resolved from ~/.config/hermes-agent-template/config.toml [plane].workspace
   workspace: "{{ plane_workspace }}"
   # identifier is set by .scripts/40-plane.sh after creation
   identifier: ""
@@ -40,7 +36,9 @@ bloodbank:
 
 # Runtime repo (git-tracked HERMES_HOME, auto-checkpointed).
 runtime:
-  github_repo: "{{ runtime_repo_owner }}/{{ runtime_repo }}"
+  # Empty owner -> resolved from config.toml [github].runtime_repo_owner.
+  github_owner: "{{ runtime_repo_owner }}"
+  github_repo: "{{ runtime_repo }}"
   submodule_path: "./runtime"
   checkpoint:
     cadence: "hourly"

@@ -13,10 +13,14 @@
 #   2. Creates a per-agent runtime repo gh:delorenj/agent-hm-<repo>-<role>
 #   3. Submodules it at agents/hermes/<role>/runtime/  (this is HERMES_HOME)
 #   4. Creates a Plane project in 33god workspace
-#   5. Wires Cloudflare Email Routing for <repo>-<role>@delo.sh
 #   6. Prompts for a BotFather Telegram token, stores in runtime/.env
 #   7. Installs a Bloodbank consumer + hourly checkpoint timer
 #   8. Appends to ~/.hermes/agents-registry.yaml
+#
+# Environment-specific defaults (Hermes binary path, runtime repo owner, Plane
+# workspace/URL, NATS endpoint, skills dir, …) are NOT hardcoded — they live in
+# ~/.config/hermes-agent-template/config.toml, seeded from config.example.toml on
+# first run. Edit that file to retarget the template for a different machine/user.
 
 _min_copier_version: "9.0.0"
 _subdirectory: template
@@ -33,7 +37,7 @@ _envops:
 
 target_repo:
   type: str
-  help: "Name of the project repo this agent belongs to (e.g. bloodbank, hermes-agent)"
+  help: "Name of the project repo this agent belongs to"
   validator: "{% if not target_repo %}Required{% endif %}"
   # No default — must be provided explicitly via --data or interactively.
   # Path-based auto-derivation is unreliable across relative/absolute dst_path.
@@ -87,11 +91,6 @@ bot_handle:
   default: "{{ target_repo|lower|replace('-','_') }}_{{ role|lower }}_bot"
   when: false
 
-email_address:
-  type: str
-  default: "{{ target_repo|lower }}-{{ role|lower }}@delo.sh"
-  when: false
-
 runtime_repo:
   type: str
   default: "agent-hm-{{ target_repo|lower }}-{{ role|lower }}"
@@ -99,17 +98,17 @@ runtime_repo:
 
 runtime_repo_owner:
   type: str
-  default: "delorenj"
+  # Empty by default — resolved at provision time from
+  # ~/.config/hermes-agent-template/config.toml [github].runtime_repo_owner.
+  # Pass --data runtime_repo_owner=<owner> to override per-run.
+  default: ""
   when: false
 
 plane_workspace:
   type: str
-  default: "33god"
-  when: false
-
-forward_to:
-  type: str
-  default: "jaradd@gmail.com"
+  # Empty by default — resolved at provision time from
+  # ~/.config/hermes-agent-template/config.toml [plane].workspace.
+  default: ""
   when: false
 
 # ─── Post-generation tasks ───────────────────────────────────────────────
@@ -119,11 +118,12 @@ forward_to:
 _tasks:
   - "chmod +x .scripts/*.sh hermes 2>/dev/null || true"
   - "./.scripts/00-banner.sh"
+  - "./.scripts/01-config.sh"
+  - "./.scripts/05-fleet-env.sh"
   - "./.scripts/10-hermes-profile.sh"
   - "./.scripts/20-runtime-repo.sh"
   - "./.scripts/30-telegram.sh"
   - "./.scripts/40-plane.sh"
-  - "./.scripts/50-email.sh"
   - "./.scripts/60-bloodbank.sh"
   - "./.scripts/70-systemd.sh"
   - "./.scripts/80-registry.sh"

@@ -24,11 +24,12 @@ invocations).
 | Step | What happens | Skippable via |
 | --- | --- | --- |
 | 00 banner | Print identity | n/a |
+| 01 config | Seed `~/.config/hermes-agent-template/config.toml` from the shipped example if absent (see [Configuration](#configuration)) | n/a |
+| 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
 | 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills` | n/a |
-| 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from runtime-scaffold/, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime | `SKIP_RUNTIME_REPO=1` |
+| 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from role-local `.runtime-scaffold/`, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
-| 50 email | CF Email Routing rule <repo>-<role>@delo.sh → jaradd@gmail.com | `SKIP_EMAIL=1` |
 | 60 bloodbank | Install consumer (renders from scaffold w/ agent values), health-check NATS, install nats-py via uv if missing | `SKIP_BLOODBANK=1` |
 | 70 systemd | Install user units: gateway, consumer, hourly checkpoint timer | `SKIP_SYSTEMD=1` |
 | 80 registry | Append entry to ~/.hermes/agents-registry.yaml | n/a |
@@ -36,6 +37,59 @@ invocations).
 
 Every step is idempotent — re-running the entire provisioning is safe. Each
 step writes a `.done-NN-*` marker; delete that marker to force a re-run.
+
+## Configuration
+
+Environment-specific defaults are NOT hardcoded — they live in
+`~/.config/hermes-agent-template/config.toml` (override the path with
+`$HERMES_TEMPLATE_CONFIG`). Step `01 config` seeds it from the shipped
+`config.example.toml` on first run. Every provisioning script and the generated
+`hermes` launcher read it.
+
+Resolution precedence for each value: **explicit env var → `~/.hermes/fleet.env`
+→ `config.toml` → built-in fallback**. To retarget the whole template for a
+different machine/user, edit this one file:
+
+```toml
+[fleet]
+hermes_bin = "/path/to/hermes-agent/.venv/bin/hermes"
+hermes_repo = "/path/to/hermes-agent"
+canonical_skills_dir = "/path/to/.agents/skills"
+
+[github]
+runtime_repo_owner = "your-gh-owner"
+
+[plane]
+base = "https://plane.example.com"
+workspace = "your-workspace"
+
+[bloodbank]
+nats_host = "127.0.0.1"
+nats_port = 4222
+```
+
+`role.yaml` stores an empty `runtime.github_owner` and `plane.workspace` for
+freshly provisioned agents; the shell layer fills them from `config.toml` at
+runtime (older manifests that baked `owner/name` into `runtime.github_repo`
+still work unchanged).
+
+## Fleet source-of-truth
+
+`~/.hermes/fleet.env` is the single shared pointer every generated launcher reads:
+
+- `HERMES_FLEET_BIN` (the exact Hermes executable all agents use)
+- `HERMES_FLEET_REPO` (the upstream/fork checkout you keep on the edge)
+- `HERMES_FLEET_REGISTRY_FILE` (defaults to `~/.hermes/agents-registry.yaml`)
+
+If you `git pull`/sync the repo at `HERMES_FLEET_REPO` and rebuild/update that
+same binary path, every wrapper benefits immediately with no per-agent edits.
+
+To retrofit older provisioned agents onto this model, run:
+
+```bash
+cd /home/delorenj/code/hermes-agent-template
+./scripts/backfill-fleet-sot.sh
+```
 
 ## Start the daemons for an agent
 
@@ -55,7 +109,6 @@ systemctl --user start hermes-${AGENT}-gateway.service
 | --- | --- |
 | Telegram | DM `@<repo>_<role>_bot` (once Telegram is wired) |
 | Local CLI | `./agents/hermes/<role>/hermes chat "..."` |
-| Email | Send to `<repo>-<role>@delo.sh` (once CF email rule exists) |
 | Bloodbank | Publish to subject `bloodbank.cmd.v1.agent.<agent_id>.<verb>.requested` |
 
 ## Inspect fleet state
@@ -91,25 +144,6 @@ journalctl --user -fu hermes-<agent-id>-consumer.service
    SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
    systemctl --user restart hermes-<agent-id>-gateway.service
    ```
-
-### Cloudflare Email Routing token
-
-Create a Cloudflare API token (one-time, used by every agent's email setup):
-
-| Resource | Permission |
-| --- | --- |
-| Zone (delo.sh) | Email Routing Rules — **Edit** |
-| Zone (delo.sh) | Email Routing Settings — **Read** |
-| Account (delonet) | Email Routing Addresses — **Read** |
-
-Store at `op://DeLoSecrets/Cloudflare-EmailRouting/token`, or
-`export CF_EMAIL_ROUTING_TOKEN=...`. Then per agent:
-
-```bash
-cd <project>/agents/hermes/<role>
-rm .scripts/.done-50-email
-./.scripts/50-email.sh
-```
 
 ## Restore an agent on a new machine
 
@@ -149,21 +183,16 @@ PROJECT_ID=$(python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.
 curl -X POST "https://plane.delo.sh/api/v1/workspaces/33god/projects/${PROJECT_ID}/archive/" \
   -H "X-API-Key: ${PLANE_33GOD_API_KEY}"
 
-# 4. Delete CF email rule
-RULE=$(python3 -c "...agents-registry.yaml...['email']['rule_id']")
-curl -X DELETE "https://api.cloudflare.com/client/v4/zones/eabc163cde3e31680f10fc313aecdda3/email/routing/rules/${RULE}" \
-  -H "Authorization: Bearer ${CF_EMAIL_ROUTING_TOKEN}"
-
-# 5. BotFather: /deletebot @<repo>_<role>_bot
-# 6. Archive runtime repo (GitHub UI; we don't have delete_repo scope by default)
-# 7. Remove registry entry
+# 4. BotFather: /deletebot @<repo>_<role>_bot
+# 5. Archive runtime repo (GitHub UI; we don't have delete_repo scope by default)
+# 6. Remove registry entry
 python3 -c "
 import yaml, pathlib
 p = pathlib.Path.home() / '.hermes' / 'agents-registry.yaml'
 d = yaml.safe_load(p.read_text()); d['agents'].pop('${AGENT}', None)
 p.write_text(yaml.safe_dump(d))"
 
-# 8. In the project repo, remove the submodule
+# 7. In the project repo, remove the submodule
 cd /path/to/project
 git submodule deinit -f agents/hermes/<role>/runtime
 git rm -f agents/hermes/<role>/runtime

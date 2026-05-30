@@ -24,7 +24,7 @@ if (echo > /dev/tcp/$BLOODBANK_NATS_HOST/$BLOODBANK_NATS_PORT) 2>/dev/null; then
   log "    NATS reachable at $BLOODBANK_NATS_HOST:$BLOODBANK_NATS_PORT"
 else
   warn "    NATS not reachable; consumer will retry on start"
-  warn "    bring up:  cd ~/code/33GOD/bloodbank && docker compose -f compose/docker-compose.yml up -d"
+  warn "    bring up:  cd $BLOODBANK_COMPOSE_DIR && docker compose -f compose/docker-compose.yml up -d"
 fi
 
 # Ensure nats-py is available in the hermes venv (uv-managed, no pip binary)

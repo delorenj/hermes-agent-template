@@ -9,6 +9,9 @@ already_done 10-hermes-profile && { log "[10] profile already created — skippi
 log "[10] creating hermes profile: $PROFILE_NAME"
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 
+# Set repo path to directory where .git is
+REPO_PATH="$(cd "$ROLE_DIR" && git rev-parse --show-toplevel 2>/dev/null || echo "$ROLE_DIR")"
+
 if [[ -d "$PROFILE_HOME" ]]; then
   log "    profile dir already exists; reusing"
 else
@@ -72,12 +75,11 @@ PYEOF
 fi
 
 # Apply role-specific config overrides.
-REPO_PATH="$(project_repo_path)" || die "couldn't locate project repo root"
 log "    setting terminal.cwd = $REPO_PATH"
 env HERMES_HOME="$PROFILE_HOME" "$HERMES_BIN" config set terminal.cwd "$REPO_PATH"
 
 # Canonical shared-skill source of truth + local PM fallback sync.
-CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-/home/delorenj/.agents/skills}"
+CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir '/home/delorenj/.agents/skills')}"
 CANONICAL_PM_SKILL_SRC="$CANONICAL_SKILLS_DIR/subagent-driven-development"
 LOCAL_PM_SKILL_DST="$PROFILE_HOME/skills/software-development/subagent-driven-development"
 
@@ -87,7 +89,7 @@ if [[ -d "$CANONICAL_SKILLS_DIR" ]]; then
 
   # Ensure key PM/local-ops skills are symlinked into runtime/profile skills root.
   # This preserves canonical ownership and keeps updates instant across agents.
-  read -r -a SYMLINKED_RUNTIME_SKILLS <<< "${SYMLINKED_RUNTIME_SKILLS:-delonet-conventions delonet-dotenv hermes-pm-template-maintenance hindsight subagent-driven-development}"
+  read -r -a SYMLINKED_RUNTIME_SKILLS <<< "${SYMLINKED_RUNTIME_SKILLS:-$(config_get fleet.symlinked_runtime_skills 'delonet-conventions delonet-dotenv hermes-pm-template-maintenance hindsight subagent-driven-development')}"
   mkdir -p "$PROFILE_HOME/skills"
 
   for skill_name in "${SYMLINKED_RUNTIME_SKILLS[@]}"; do

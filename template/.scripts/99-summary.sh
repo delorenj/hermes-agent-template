@@ -15,8 +15,9 @@ cat >&2 <<EOF
 │  Talk:        @$BOT_HANDLE  (Telegram DM)
 │  Shell:       $ROLE_DIR/hermes chat "status"
 │  Board:       $PLANE_BASE/$PLANE_WORKSPACE/projects/$(cat "$ROLE_DIR/.scripts/.plane-project-id" 2>/dev/null || echo "(skipped)")
-│  Mail:        $EMAIL_ADDR  →  $FORWARD_TO
 │  Runtime:     gh:$RUNTIME_REPO   (auto-checkpointed hourly)
+│  Hermes bin:  $HERMES_BIN
+│  Fleet env:   $FLEET_ENV
 │
 │  Start fleet daemons:
 │    systemctl --user start $GW_UNIT

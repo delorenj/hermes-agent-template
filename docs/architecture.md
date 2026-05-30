@@ -47,6 +47,10 @@ update churns the template's commit log; separating them means:
 - You can fork an agent (branch the runtime repo) without touching others
 - You can wipe an agent (delete the runtime repo) without affecting the template
 
+A third file ties the fleet together: `~/.hermes/fleet.env`.
+It is the single source-of-truth pointer for the shared Hermes executable/repo
+that every generated launcher uses.
+
 ## Why git-tracked runtime
 
 The runtime is the agent's "subjective experience" — its memory of every
