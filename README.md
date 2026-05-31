@@ -16,6 +16,15 @@ memory/state checkpointing.
 CommonProject runs first to create the umbrella project. hermes-agent-template
 runs second (for each agent role you want) to drop agents into it.
 
+## Roles
+
+The template provisions several roles. The `pm` role handles project management
+and triage. The `scrum-master` role runs a provider-agnostic ticket sentinel
+(Linear, Plane, or Trello) with an autonomous delegated-review escape hatch.
+
+To work on or extend the Scrum Master, start with the [Scrum Master handoff
+guide](docs/scrum-master/README.md).
+
 ## Quickstart
 
 ```bash
