@@ -36,7 +36,8 @@ PY
 # gql QUERY [VARS_JSON] — POST a GraphQL request, print data JSON, fail on errors.
 gql() {
   need_key
-  python3 - "$1" "${2:-{}}" <<'PY'
+  _vars="${2:-}"; [ -n "$_vars" ] || _vars='{}'
+  python3 - "$1" "$_vars" <<'PY'
 import json, os, sys, urllib.request, urllib.error
 q, variables = sys.argv[1], json.loads(sys.argv[2])
 req = urllib.request.Request(
