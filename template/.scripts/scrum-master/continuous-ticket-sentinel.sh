@@ -58,9 +58,25 @@ REPO_ROOT="$(repo_root)"
 cd "$REPO_ROOT"
 mkdir -p "$RUNTIME/logs"
 
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  printf '[sentinel] another heartbeat/full run is active; skipping\n'; exit 0
+# Single-run lock. Prefer flock (Linux); fall back to an atomic mkdir lock so
+# this also works on macOS, which doesn't ship flock.
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$LOCK_FILE"
+  if ! flock -n 9; then
+    printf '[sentinel] another heartbeat/full run is active; skipping\n'; exit 0
+  fi
+else
+  LOCK_DIR="$LOCK_FILE.d"
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    # Steal a stale lock older than 60 minutes (a crashed run left it behind).
+    if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
+      rmdir "$LOCK_DIR" 2>/dev/null && mkdir "$LOCK_DIR" 2>/dev/null \
+        || { printf '[sentinel] another run active; skipping\n'; exit 0; }
+    else
+      printf '[sentinel] another heartbeat/full run is active; skipping\n'; exit 0
+    fi
+  fi
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 fi
 
 decision="$(

@@ -102,33 +102,44 @@ print(json.dumps({"id":m.get("id",""),"name":m.get("name",""),"state":"active" i
 
   list_issues)
     [ -n "$PROJ" ] || die "project not set"
-    api GET "projects/$PROJ/issues/" | BASE="$BASE" WS="$WS" PROJ="$PROJ" python3 -c 'import sys,json,os
-d=json.load(sys.stdin); rows=d.get("results", d if isinstance(d,list) else [])
+    # Plane v1 returns issue.state as a bare UUID, so join against the states map.
+    STATES="$(api GET "projects/$PROJ/states/")"
+    ISSUES="$(api GET "projects/$PROJ/issues/")"
+    printf '%s\n%s\n' "$STATES" "$ISSUES" | BASE="$BASE" WS="$WS" PROJ="$PROJ" python3 -c 'import sys,json,os
+parts=sys.stdin.read().split("\n",1)
+srows=json.loads(parts[0] or "{}"); srows=srows.get("results", srows if isinstance(srows,list) else [])
+smap={s.get("id"):(s.get("name",""),s.get("group","")) for s in srows}
+d=json.loads(parts[1] or "{}"); rows=d.get("results", d if isinstance(d,list) else [])
 base,ws,proj=os.environ["BASE"],os.environ["WS"],os.environ["PROJ"]
 out=[]
 for n in rows:
-    st=n.get("state_detail") or {}
     iid=n.get("id","")
+    name,group=smap.get(n.get("state",""),("",""))
     out.append({"id":iid,"key":n.get("sequence_id",iid),
-                "title":n.get("name",""),"state":st.get("name",""),
-                "state_type":st.get("group",""),"updated_at":n.get("updated_at",""),
-                "assignee":"","url":base+"/"+ws+"/projects/"+proj+"/issues/"+str(iid)})
+                "title":n.get("name",""),"state":name,"state_type":group,
+                "updated_at":n.get("updated_at",""),"assignee":"",
+                "url":base+"/"+ws+"/projects/"+proj+"/issues/"+str(iid)})
 print(json.dumps(out))'
     ;;
 
   get_issue)
     ID="${1:?usage: get_issue <id>}"
-    DESC="$(api GET "projects/$PROJ/issues/$ID/")"
+    STATES="$(api GET "projects/$PROJ/states/")"
+    ISSUE="$(api GET "projects/$PROJ/issues/$ID/")"
     COMM="$(api GET "projects/$PROJ/issues/$ID/comments/" 2>/dev/null || echo '[]')"
-    printf '%s\n%s\n' "$DESC" "$COMM" | python3 -c 'import sys,json
-parts=sys.stdin.read().split("\n",1)
-i=json.loads(parts[0] or "{}"); c=json.loads(parts[1] or "[]")
+    printf '%s\n%s\n%s\n' "$STATES" "$ISSUE" "$COMM" | python3 -c 'import sys,json,re
+parts=sys.stdin.read().split("\n",2)
+srows=json.loads(parts[0] or "{}"); srows=srows.get("results", srows if isinstance(srows,list) else [])
+smap={s.get("id"):(s.get("name",""),s.get("group","")) for s in srows}
+i=json.loads(parts[1] or "{}"); c=json.loads(parts[2] or "[]")
 rows=c.get("results", c if isinstance(c,list) else [])
-st=i.get("state_detail") or {}
-cs=[{"id":x.get("id",""),"body":x.get("comment_stripped",x.get("comment_html","")),"author":""} for x in rows]
+def strip(h): return re.sub(r"<[^>]+>","",h or "").strip()
+name,group=smap.get(i.get("state",""),("",""))
+desc=strip(i.get("description_html",""))
+cs=[{"id":x.get("id",""),"body":strip(x.get("comment_html","")),"author":""} for x in rows]
 print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.get("name",""),
-                  "description":i.get("description_stripped",""),"acceptance":i.get("description_stripped",""),
-                  "state":st.get("name",""),"state_type":st.get("group",""),"comments":cs}))'
+                  "description":desc,"acceptance":desc,
+                  "state":name,"state_type":group,"comments":cs}))'
     ;;
 
   comment)

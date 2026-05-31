@@ -1,0 +1,214 @@
+#!/usr/bin/env sh
+# Least-friction local install of Hermes PM + Scrum Master roles into a project.
+#
+# Local-only: no GitHub runtime repo, no Telegram, no NATS/BloodBank, no Plane
+# project creation. It binds the Scrum Master to a ticket board you already have.
+# Works on macOS (launchd) and Linux (systemd).
+#
+# One-liner (from anywhere inside the target project):
+#   curl -fsSL https://raw.githubusercontent.com/delorenj/hermes-agent-template/main/install-local.sh | sh
+#
+# Or from a checkout:
+#   sh /path/to/hermes-agent-template/install-local.sh
+#
+# Environment overrides (skip the prompts):
+#   HAT_REPO=<name>            project/repo name (default: basename of CWD)
+#   HAT_PROVIDER=linear|plane|trello   (default: plane)
+#   HAT_ROLES="pm scrum-master"        roles to install (default: both)
+#   HAT_DRY_RUN=1              print actions, change nothing
+#   Provider creds: LINEAR_API_KEY | PLANE_API_KEY+PLANE_BASE | TRELLO_KEY+TRELLO_TOKEN
+set -eu
+
+say()  { printf '\033[36m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
+run()  { if [ "${HAT_DRY_RUN:-0}" = "1" ]; then printf '  [dry-run] %s\n' "$*"; else eval "$*"; fi; }
+ask()  { # ask VAR "prompt" "default"
+  eval "_cur=\${$1:-}"; [ -n "${_cur:-}" ] && return 0
+  printf '%s [%s]: ' "$2" "${3:-}" >&2; read -r _ans || _ans=""
+  eval "$1=\"\${_ans:-$3}\""
+}
+
+OS="$(uname -s)"
+PROJECT_DIR="$(pwd)"
+[ -d "$PROJECT_DIR/.git" ] || warn "Note: $PROJECT_DIR is not a git repo root; the role will install here anyway."
+
+# --- Resolve the template source (local checkout wins, else GitHub) ----------
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd || echo "")"
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/copier.yml" ]; then
+  TEMPLATE_SRC="$SCRIPT_DIR"
+else
+  TEMPLATE_SRC="${HAT_TEMPLATE:-gh:delorenj/hermes-agent-template}"
+fi
+
+say "== Hermes local install =="
+say "   project:  $PROJECT_DIR"
+say "   template: $TEMPLATE_SRC"
+say "   os:       $OS"
+
+# --- 1. Ensure the hermes CLI ------------------------------------------------
+if command -v hermes >/dev/null 2>&1; then
+  say "1. hermes: found ($(command -v hermes))"
+else
+  say "1. hermes: not found — installing"
+  run "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+  command -v hermes >/dev/null 2>&1 || die "hermes install did not put 'hermes' on PATH. Open a new shell and re-run."
+fi
+HERMES_BIN="$(command -v hermes)"
+
+# --- 2. Ensure copier --------------------------------------------------------
+if command -v copier >/dev/null 2>&1; then
+  say "2. copier: found"
+else
+  say "2. copier: not found — installing"
+  if command -v uv >/dev/null 2>&1; then run "uv tool install copier"
+  else run "python3 -m pip install --user copier"; fi
+  command -v copier >/dev/null 2>&1 || die "copier install failed. Install it (uv tool install copier) and re-run."
+fi
+
+# --- 3. Host-correct, local config.toml (so 01-config doesn't seed delo defaults)
+CFG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hermes-agent-template"
+CFG="$CFG_DIR/config.toml"
+if [ -f "$CFG" ]; then
+  say "3. config: exists ($CFG) — leaving it"
+else
+  say "3. config: writing local defaults to $CFG"
+  if [ "${HAT_DRY_RUN:-0}" != "1" ]; then
+    mkdir -p "$CFG_DIR"
+    cat > "$CFG" <<TOML
+# Local install — cloud fields intentionally blank.
+[fleet]
+hermes_bin = "$HERMES_BIN"
+hermes_repo = "$HOME/.hermes/hermes-agent"
+fleet_env = "~/.hermes/fleet.env"
+registry_file = "~/.hermes/agents-registry.yaml"
+
+[github]
+runtime_repo_owner = ""
+
+[plane]
+base = "${PLANE_BASE:-}"
+workspace = ""
+
+[bloodbank]
+nats_host = "127.0.0.1"
+nats_port = 4222
+TOML
+  fi
+fi
+
+# --- 4. Provider credentials + board binding ---------------------------------
+ask HAT_PROVIDER "Ticket provider (linear|plane|trello)" "plane"
+PROVIDER="$HAT_PROVIDER"
+ask HAT_REPO "Project/repo name" "$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]')"
+REPO="$HAT_REPO"
+SM_ENV="$HOME/.hermes/${REPO}-scrum-master.env"
+
+# These get written into the scrum-master role.yaml binding after render.
+# Pre-seed from optional env knobs so the install can run non-interactively.
+TP_WORKSPACE="${HAT_PLANE_WORKSPACE:-}"; TP_PROJECT="${HAT_PLANE_PROJECT:-}"
+TP_TEAM="${HAT_LINEAR_TEAM:-}"; TP_BOARD="${HAT_TRELLO_BOARD:-}"
+case "$PROVIDER" in
+  plane)
+    ask PLANE_BASE "Plane base URL" "https://app.plane.so"
+    : "${PLANE_API_KEY:?Set PLANE_API_KEY in your environment, then re-run}"
+    ask TP_WORKSPACE "Plane workspace slug" ""
+    [ -n "$TP_WORKSPACE" ] || die "workspace is required"
+    say "   Plane projects in '$TP_WORKSPACE':"
+    _pj="$(mktemp)"
+    curl -fsS "$PLANE_BASE/api/v1/workspaces/$TP_WORKSPACE/projects/?per_page=100" \
+      -H "X-API-Key: $PLANE_API_KEY" > "$_pj" 2>/dev/null || true
+    python3 - "$_pj" <<'PY' 2>/dev/null || warn "   (could not list projects; check PLANE_API_KEY/base/workspace)"
+import sys, json
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+rows = d.get("results", d if isinstance(d, list) else [])
+for p in rows:
+    print(f"     {p.get('id')}  {(p.get('identifier') or ''):8} {p.get('name')}")
+PY
+    rm -f "$_pj"
+    ask TP_PROJECT "Plane project UUID to manage" ""
+    [ -n "$TP_PROJECT" ] || die "project UUID is required"
+    CRED_LINES="PLANE_API_KEY=$PLANE_API_KEY
+PLANE_BASE=$PLANE_BASE"
+    ;;
+  linear)
+    : "${LINEAR_API_KEY:?Set LINEAR_API_KEY in your environment, then re-run}"
+    ask TP_TEAM "Linear team key (for example DEL)" ""
+    [ -n "$TP_TEAM" ] || die "team key is required"
+    CRED_LINES="LINEAR_API_KEY=$LINEAR_API_KEY"
+    ;;
+  trello)
+    : "${TRELLO_KEY:?Set TRELLO_KEY in your environment, then re-run}"
+    : "${TRELLO_TOKEN:?Set TRELLO_TOKEN in your environment, then re-run}"
+    ask TP_BOARD "Trello board id" ""
+    [ -n "$TP_BOARD" ] || die "board id is required"
+    CRED_LINES="TRELLO_KEY=$TRELLO_KEY
+TRELLO_TOKEN=$TRELLO_TOKEN"
+    ;;
+  *) die "unknown provider: $PROVIDER" ;;
+esac
+
+say "4. writing provider credentials to $SM_ENV"
+if [ "${HAT_DRY_RUN:-0}" != "1" ]; then
+  mkdir -p "$HOME/.hermes"; umask 077
+  printf '%s\n' "$CRED_LINES" > "$SM_ENV"
+fi
+
+# --- 5. Provision each role with copier (cloud + Telegram + systemd skipped) --
+# No provider key in copier's env, so 42-ticket-provider skips board creation;
+# we bind to the existing board below.
+export SKIP_TELEGRAM=1 SKIP_EMAIL=1 SKIP_RUNTIME_REPO=1 SKIP_PLANE=1 \
+       SKIP_BLOODBANK=1 SKIP_SYSTEMD=1
+ROLES="${HAT_ROLES:-pm scrum-master}"
+for ROLE in $ROLES; do
+  say "5. provisioning role: $ROLE"
+  DEST="$PROJECT_DIR/agents/hermes/$ROLE"
+  # Scrub provider creds from copier's environment so 42-ticket-provider skips
+  # board CREATION; we bind to the existing board in step 6 instead.
+  run "env -u PLANE_API_KEY -u PLANE_33GOD_API_KEY -u LINEAR_API_KEY \
+        -u TRELLO_KEY -u TRELLO_TOKEN \
+        copier copy '$TEMPLATE_SRC' '$DEST' --trust --defaults --overwrite \
+        --data target_repo='$REPO' --data role='$ROLE' --data ticket_provider='$PROVIDER'"
+done
+
+# --- 6. Bind the Scrum Master to the existing board --------------------------
+SM_ROLE="$PROJECT_DIR/agents/hermes/scrum-master/role.yaml"
+if [ -f "$SM_ROLE" ] && [ "${HAT_DRY_RUN:-0}" != "1" ]; then
+  say "6. binding scrum-master to your $PROVIDER board"
+  TP_WORKSPACE="$TP_WORKSPACE" TP_PROJECT="$TP_PROJECT" TP_TEAM="$TP_TEAM" \
+  TP_BOARD="$TP_BOARD" PROVIDER="$PROVIDER" python3 - "$SM_ROLE" <<'PY'
+import os, re, sys, pathlib
+p = pathlib.Path(sys.argv[1]); t = p.read_text()
+def setleaf(text, key, val):
+    if not val: return text
+    new, n = re.subn(rf'(?m)^(\s*{re.escape(key)}:\s*)"?[^"\n]*"?\s*$', rf'\g<1>"{val}"', text, count=1)
+    return new if n else text
+t = setleaf(t, "workspace", os.environ.get("TP_WORKSPACE",""))
+t = setleaf(t, "project",   os.environ.get("TP_PROJECT",""))
+t = setleaf(t, "team",      os.environ.get("TP_TEAM",""))
+t = setleaf(t, "board",     os.environ.get("TP_BOARD",""))
+p.write_text(t)
+print("   bound:", {k:v for k,v in os.environ.items() if k.startswith("TP_") and v})
+PY
+fi
+
+# --- 7. Smoke test the board connection --------------------------------------
+if [ "${HAT_DRY_RUN:-0}" != "1" ] && [ -f "$SM_ROLE" ]; then
+  say "7. smoke test: reading your board through the adapter"
+  LIB="$PROJECT_DIR/agents/hermes/scrum-master/.scripts/lib/ticket-provider.sh"
+  ( set -a; . "$SM_ENV" 2>/dev/null; set +a
+    bash -c '. "$1"; tp resolve && echo "   issues: $(tp list_issues | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")"' _ "$LIB" ) \
+    || warn "   smoke test failed — check the binding in $SM_ROLE and creds in $SM_ENV"
+fi
+
+say ""
+say "Done. Talk to the PM:   agents/hermes/pm/hermes chat \"status\""
+if [ "$OS" = "Darwin" ]; then
+  say "Sentinel (launchd):     launchctl list | grep $REPO-scrum-master"
+else
+  say "Sentinel (systemd):     systemctl --user status hermes-$REPO-scrum-master-continuous-ticket-sentinel.timer"
+fi
+say "Provider creds live in: $SM_ENV"
