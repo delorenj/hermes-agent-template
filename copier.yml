@@ -44,14 +44,36 @@ target_repo:
 
 role:
   type: str
-  help: "Role for this agent (pm | dev | review | ops | qa | …)"
+  help: "Role for this agent"
   default: pm
+  choices:
+    "Project Manager (pm)": pm
+    "Scrum Master — continuous ticket sentinel (scrum-master)": scrum-master
+    "Developer (dev)": dev
+    "Reviewer (review)": review
+    "Ops (ops)": ops
+    "QA (qa)": qa
   validator: "{% if not role %}Required{% endif %}"
+
+ticket_provider:
+  type: str
+  help: "Ticket system this agent's board lives in"
+  default: plane
+  choices:
+    "Linear": linear
+    "Plane": plane
+    "Trello": trello
+
+with_scrum_master:
+  type: bool
+  help: "Also provision a paired Scrum Master (continuous ticket sentinel) for this repo?"
+  default: false
+  when: "{{ role == 'pm' }}"
 
 agent_purpose:
   type: str
   help: "One-line description of what this agent does in this repo"
-  default: "Project management and triage"
+  default: "{% if role == 'scrum-master' %}Continuous ticket sentinel and delegated review{% else %}Project management and triage{% endif %}"
 
 model_provider:
   type: str
@@ -123,11 +145,15 @@ _tasks:
   - "./.scripts/10-hermes-profile.sh"
   - "./.scripts/20-runtime-repo.sh"
   - "./.scripts/30-telegram.sh"
-  - "./.scripts/40-plane.sh"
+  - "./.scripts/42-ticket-provider.sh"
   - "./.scripts/60-bloodbank.sh"
   - "./.scripts/70-systemd.sh"
+  - command: "./.scripts/75-scrum-master.sh"
+    when: "{{ role == 'scrum-master' }}"
   - "./.scripts/80-registry.sh"
   - "./.scripts/99-summary.sh"
+  - command: "./.scripts/90-chain-scrum-master.sh"
+    when: "{{ role == 'pm' and with_scrum_master }}"
 
 _skip_if_exists:
   - hermes

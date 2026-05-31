@@ -20,11 +20,37 @@ profile: {{ agent_id }}
 telegram:
   bot_username: "{{ bot_handle }}"
 
-# Plane project (1:1 with this agent).
+# Ticket-provider binding (linear | plane | trello).
+# The Scrum Master sentinel talks ONLY to this via .scripts/lib/ticket-provider.sh;
+# swapping providers is a one-line change here. Filled in by 42-ticket-provider.sh.
+ticket_provider:
+  name: {{ ticket_provider }}
+  board_id: ""
+  board_url: ""
+{%- if ticket_provider == 'linear' %}
+  team: ""        # Linear team key, e.g. DEL  (set before first sentinel run)
+  project: ""     # optional Linear project name to scope milestones/issues
+{%- elif ticket_provider == 'plane' %}
+  workspace: "{{ plane_workspace }}"
+  project: ""     # Plane project uuid (set by 42-ticket-provider.sh)
+{%- elif ticket_provider == 'trello' %}
+  board: ""       # Trello board id (set by 42-ticket-provider.sh)
+{%- endif %}
+  # Optional normalized-state name overrides for non-standard boards.
+  in_review: ""   # e.g. "In Review"
+  completed: ""   # e.g. "Done"
+
+# Scrum Master sentinel knobs (only meaningful for role: scrum-master).
+scrum_master:
+  grace_hours: 24            # delegated-review grace window (hours)
+  auto_review: true          # autonomous delegated-review escape hatch on/off
+  paired_pm: "{{ target_repo }}-pm"
+
+# Plane project (1:1 with this agent) — retained for fleet-registry back-compat.
 plane:
   # Empty -> resolved from ~/.config/hermes-agent-template/config.toml [plane].workspace
   workspace: "{{ plane_workspace }}"
-  # identifier is set by .scripts/40-plane.sh after creation
+  # identifier is set by .scripts/42-ticket-provider.sh after creation (plane only)
   identifier: ""
 
 # Bloodbank wiring (consumed + produced subjects).
