@@ -12,11 +12,46 @@ RUNTIME="$ROLE_DIR/runtime"
 
 log "[60] installing bloodbank consumer for $AGENT_ID"
 
-# The consumer.py template lives in the runtime-scaffold and was already
-# copied in step 20. We just need to verify it's there and tweak per-agent
-# values (substituted at scaffold-copy time, but we double-check).
+# Ensure the runtime consumer exists AND is rendered.
+#
+# Step 20 (20-runtime-repo.sh) only renders into a TMP dir during the
+# initial GH-repo push — the on-disk $RUNTIME_SCAFFOLD_DIR copy that lands
+# in the project repo keeps its `{{agent_id}}`/`{{repo}}`/`{{role}}`
+# placeholders. If $RUNTIME/bloodbank-consumer.py was ever lost (runtime
+# submodule wiped, manual rm, etc.) and then someone restored it by
+# copying from $RUNTIME_SCAFFOLD_DIR, they'd end up with an un-rendered
+# consumer subscribing to literal `bloodbank.evt.v1.repo.{{repo}}.>`.
+# This block handles both failure modes idempotently.
 CONSUMER="$RUNTIME/bloodbank-consumer.py"
-[[ -f "$CONSUMER" ]] || die "consumer template missing: $CONSUMER"
+SCAFFOLD_CONSUMER="$RUNTIME_SCAFFOLD_DIR/bloodbank-consumer.py"
+
+needs_restore=0
+if [[ ! -f "$CONSUMER" ]]; then
+  log "    consumer missing in runtime — restoring from scaffold"
+  needs_restore=1
+elif grep -qE '\{\{(agent_id|repo|role|display_name)\}\}' "$CONSUMER"; then
+  warn "    consumer in runtime has un-rendered placeholders — re-rendering"
+  needs_restore=1
+fi
+
+if [[ "$needs_restore" == "1" ]]; then
+  [[ -f "$SCAFFOLD_CONSUMER" ]] || die "scaffold source missing: $SCAFFOLD_CONSUMER"
+  cp "$SCAFFOLD_CONSUMER" "$CONSUMER"
+  # Same placeholder set + values as 20-runtime-repo.sh's render pass.
+  python3 - "$CONSUMER" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+agent_id, repo, role, display = sys.argv[2:6]
+mapping = {
+    "{{agent_id}}": agent_id, "{{repo}}": repo, "{{role}}": role,
+    "{{display_name}}": display,
+}
+t = p.read_text()
+for k, v in mapping.items():
+    t = t.replace(k, v)
+p.write_text(t)
+PYEOF
+fi
 chmod +x "$CONSUMER"
 
 # Health check: is NATS up?
