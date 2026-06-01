@@ -9,8 +9,9 @@ big picture and the file map.
 
 The Scrum Master is a first-class Hermes role, a peer of the `pm` role. It's
 materialized into a project at `agents/hermes/scrum-master/` and carries its own
-`role.yaml`, runtime, prompt, enforcement tools, and `systemd` units. The role
-id is `scrum-master`, and the display name is `<Repo> Scrum Master`.
+`role.yaml`, runtime, prompt, enforcement tools, and a scheduler unit
+(`systemd` on Linux, `launchd` on macOS). The role id is `scrum-master`, and the
+display name is `<Repo> Scrum Master`.
 
 You can provision it two ways:
 
@@ -20,13 +21,13 @@ You can provision it two ways:
   repo and provider through `90-chain-scrum-master.sh`.
 
 For the exact commands, see [Development guide:
-provisioning](development.md#provisioning-a-scrum-master).
+provisioning](development.md#provisioning-a-scrum-master-manual).
 
 ## The watch loop
 
-A `systemd` timer fires the runner,
-`template/.scripts/scrum-master/continuous-ticket-sentinel.sh`, about once a
-minute. The runner is a cheap heartbeat that decides whether a full,
+A scheduler (`systemd` timer on Linux, `launchd` agent on macOS) fires the
+runner, `template/.scripts/scrum-master/continuous-ticket-sentinel.sh`, about
+once a minute. The runner is a cheap heartbeat that decides whether a full,
 LLM-backed pass is worth running. This keeps cost low while staying responsive.
 
 The heartbeat reads the work-state file,
@@ -150,7 +151,7 @@ local spool that doesn't require NATS, so the loop stays reliable offline.
 
 A full pass moves through these components in order:
 
-1. The `systemd` timer triggers the runner.
+1. The scheduler (`systemd` timer or `launchd` agent) triggers the runner.
 2. The runner's heartbeat decides `run:full` and calls `hermes chat` with the
    prompt.
 3. The agent reads the runtime protocol docs and reconciles state by calling

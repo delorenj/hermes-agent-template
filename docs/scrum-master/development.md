@@ -101,9 +101,46 @@ A passing run prints `CLOSE authorized`, `FAKE TIC-1 -> completed`, and exits 0.
 
 </details>
 
-## Provisioning a Scrum Master
+## Local install (one command)
 
-Provision a standalone Scrum Master with Copier:
+For a local, single-machine deploy — the lowest-friction path, and the right
+one for handing the system to someone else — use `install-local.sh` at the
+repository root instead of driving Copier by hand. From inside the target
+project:
+
+```bash
+export PLANE_API_KEY=<key>   # or LINEAR_API_KEY / TRELLO_KEY + TRELLO_TOKEN
+curl -fsSL https://raw.githubusercontent.com/delorenj/hermes-agent-template/main/install-local.sh | sh
+```
+
+The script:
+
+1. installs `hermes` (its own installer) and `copier` if either is missing,
+2. writes a host-correct local `config.toml` (detects the hermes binary, leaves
+   cloud fields blank) if one doesn't exist,
+3. lists the boards on the chosen provider and prompts for the one to manage,
+4. provisions the `pm` and `scrum-master` roles through Copier with all cloud,
+   Telegram, and `systemd`/gateway steps skipped,
+5. binds the Scrum Master to the existing board (it never creates one — it
+   scrubs the provider key from Copier's environment so `42-ticket-provider.sh`
+   skips board creation),
+6. installs the sentinel as a `launchd` agent on macOS or a `systemd` timer on
+   Linux,
+7. smoke-tests the board connection through the adapter.
+
+Useful environment overrides (skip the prompts): `HAT_REPO`, `HAT_PROVIDER`,
+`HAT_ROLES`, `HAT_PLANE_WORKSPACE`, `HAT_PLANE_PROJECT`, `HAT_LINEAR_TEAM`,
+`HAT_TRELLO_BOARD`, and `HAT_DRY_RUN=1` to preview without changing anything.
+
+This local path does not wire Telegram or email. Those are convenience layers in
+the `pjangler` provisioner, not requirements for a working agent — talk to the
+agents with `agents/hermes/pm/hermes chat "..."` and let the sentinel run on its
+timer.
+
+## Provisioning a Scrum Master (manual)
+
+To drive Copier directly instead of using `install-local.sh`, provision a
+standalone Scrum Master with:
 
 ```bash
 cd /path/to/your-project
@@ -145,8 +182,15 @@ SKIP_TELEGRAM=1 SKIP_RUNTIME_REPO=1 SKIP_PLANE=1 SKIP_BLOODBANK=1 \
 
 After provisioning, set the board binding in
 `agents/hermes/scrum-master/role.yaml`. For Linear, set `ticket_provider.team`
-to the team key, and make `LINEAR_API_KEY` available to the role's `systemd`
-environment.
+to the team key. Make the provider key available to the sentinel's environment:
+on Linux through a `systemd` `EnvironmentFile` (for example
+`~/.hermes/<agent_id>.env`); on macOS the `launchd` agent sources that same
+per-agent env file, so write the key there.
+
+`SKIP_SYSTEMD` gates only the gateway, consumer, and checkpoint units in
+`70-systemd.sh`. The sentinel scheduler itself is installed by
+`75-scrum-master.sh`, which picks `launchd` on macOS and `systemd` on Linux
+regardless of that flag.
 
 ## Propagating changes
 
@@ -225,6 +269,12 @@ These cost real debugging time. Watch for them.
   into a variable instead.
 - **Quoting in `python3 -c`.** See the warning in
   [Providers: adding a provider](providers.md#adding-a-provider).
+- **`flock` is Linux-only.** macOS doesn't ship `flock`, so the runner falls
+  back to an atomic `mkdir` lock. Keep both paths working in the runner.
+- **Plane state is a bare UUID.** The Plane v1 API returns an issue's `state` as
+  a UUID with no embedded object, so the adapter must join issues against the
+  project's states map. Descriptions are `description_html`, not
+  `description_stripped`.
 - **Engine files render for every role.** Copier renders
   `template/.scripts/scrum-master/` and the provider files for all roles, not
   only `scrum-master`. They're inert for other roles because
@@ -236,20 +286,24 @@ These cost real debugging time. Watch for them.
 
 The following work is open for the incoming agent, roughly in priority order.
 
-1. **Live-verify the Plane and Trello adapters.** They're implemented against
-   the contract but unverified against real boards. Follow [Providers: verifying
-   an adapter](providers.md#verifying-an-adapter-against-a-live-board) with
-   Plane and Trello credentials, and fix any endpoint or field mismatches.
-2. **Give the Drumjangler Scrum Master its own runtime repo.** It currently
+1. **Live-verify the Trello adapter.** Linear and Plane are verified live
+   (Plane includes `transition` and `comment`). Trello is implemented against
+   the contract but unverified. Follow [Providers: verifying an
+   adapter](providers.md#verifying-an-adapter-against-a-live-board) with Trello
+   credentials, and fix any endpoint or field mismatches.
+2. **Confirm `install-local.sh` on a real macOS machine.** The Linux path is
+   verified end to end and the Plane adapter is verified live, but the macOS
+   `launchd` agent, the `mkdir` lock, and the assumption that the older Copier
+   steps (`10-hermes-profile.sh`, `80-registry.sh`) are Darwin-clean get their
+   first real run on a Mac.
+3. **Give the Drumjangler Scrum Master its own runtime repo.** It currently
    reuses the `pm` runtime through a symlink. Re-provision with
    `SKIP_TELEGRAM=1` and a dedicated runtime repo, then replace the symlink.
-3. **Confirm the first full Hermes pass after a cutover.** Heartbeat,
+4. **Confirm the first full Hermes pass after a cutover.** Heartbeat,
    adapter, and enforcement layers are verified, but the first live `run:full`
    pass with the new prompt is the last thing to watch.
-4. **Restrict engine-file rendering to the `scrum-master` role.** Use a Copier
+5. **Restrict engine-file rendering to the `scrum-master` role.** Use a Copier
    conditional file path so other roles don't receive inert engine files.
-5. **Add `transition` and `comment` to the live verification.** These write to
-   the board, so they need a disposable test ticket. Confirm them per provider.
 
 ## Read next
 

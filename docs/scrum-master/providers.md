@@ -51,8 +51,10 @@ The repository includes three adapters with different verification status.
   example, `DEL-42`), so the engine can pass identifiers through.
 - **Plane** (`providers/plane.sh`) uses the Plane REST API with `X-API-Key`
   authentication. A Plane project maps to the board, a cycle maps to the
-  milestone, and `state.group` maps to the state type. It's implemented but not
-  yet verified against a live board.
+  milestone, and `state.group` maps to the state type. It's verified live. Note
+  the v1 API returns an issue's `state` as a bare UUID with no `state_detail`,
+  so the adapter joins each issue against the project's states map; descriptions
+  come from `description_html`.
 - **Trello** (`providers/trello.sh`) uses the Trello REST API with `key` and
   `token` query-parameter authentication. A board maps to both the project and
   the milestone, a list maps to the state, and a card maps to the issue. It's
