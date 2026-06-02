@@ -27,7 +27,8 @@ use the project repo lane `bloodbank.v1.repo.<repo>.<entity>.<action>`, where
 | `…repo.<repo>.issue.evidence.created` | Evidence file created | `issue`, `evidence_file` |
 | `…repo.<repo>.issue.gate.passed` | Close gate passes | `issue`, `evidence_file` |
 | `…repo.<repo>.issue.gate.failed` | Close gate fails | `issue`, `evidence_file` |
-| `…repo.<repo>.issue.autonomous_review.decided` | Independent reviewer decides a human-review-only ticket on the operator's behalf | `issue`, `decision` (`closed`/`held`), `drift`, `close_gate`, `reviewer_agent`, `evidence_file`, `report_file` |
+| `…repo.<repo>.issue.autonomous_review.decided` | An independent adversarial review clears a review-lane ticket; the loop acts on the verdict autonomously and treats `accepted` tickets as done (left in the review lane) | `issue`, `decision` (`accepted`/`held`), `drift`, `close_gate`, `reviewer_agent`, `evidence_file`, `report_file` |
+| `…repo.<repo>.issue.review_rollback.recorded` | A review-accepted ticket is moved back to active because a dependent proved it broken | `issue`, `surfaced_by`, `reason` |
 | `…repo.<repo>.issue.truthcheck.flagged` | Status/evidence mismatch found | `issue`, `reason` |
 
 ## Rules
@@ -35,10 +36,10 @@ use the project repo lane `bloodbank.v1.repo.<repo>.<entity>.<action>`, where
 - Emit events for consequential transitions; do not invent types casually.
 - Event emission never replaces the board update or issue evidence.
 - If emission fails, continue and report the trail is incomplete.
-- Autonomous closure is legitimate only when
-  `issue.autonomous_review.decided` is emitted with `decision=closed` and
+- Autonomous acceptance is legitimate only when
+  `issue.autonomous_review.decided` is emitted with `decision=accepted` and
   `close_gate=pass` by `bin/issue-autonomous-review.sh`. That script will not
-  emit a `closed` decision while the close gate fails or drift is `significant`.
+  emit an `accepted` decision while the close gate fails or drift is `significant`.
 
 ## Canonical BloodBank
 

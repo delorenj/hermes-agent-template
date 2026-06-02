@@ -2,18 +2,20 @@
 
 This guide is the entry point for continuing development of the **Scrum Master**
 role: a provider-agnostic, always-on ticket sentinel with an autonomous
-delegated-review escape hatch. Read this first, then follow the links to the
-deeper guides. It's written so a Hermes agent (or a human) can pick up the work
-without prior context.
+adversarial review (act, do not wait). Read this first, then follow the links to
+the deeper guides. It's written so a Hermes agent (or a human) can pick up the
+work without prior context.
 
 ## What the Scrum Master is
 
 The Scrum Master is a Hermes agent role whose core loop keeps a project moving:
 it makes sure exactly one implementation worker is advancing a ready ticket, or
-it records why none can. When a ticket is complete and the only thing missing is
-human review, it runs an autonomous delegated review and, if the work hasn't
-drifted from the operator's locked intent, closes the ticket on the operator's
-behalf and emits a decision event.
+it records why none can. When a ticket reaches the review lane, it runs an
+independent, rigorous **adversarial review** and acts on the verdict
+autonomously — never parking work to wait on the operator. If the work hasn't
+drifted from the operator's locked intent and clears the gate, the review is
+`accepted`: the loop treats the ticket as done, unblocks dependents, and emits a
+decision event. A real finding is `held` and the ticket goes back to active.
 
 It talks to the ticket board through a pluggable adapter, so the same engine
 runs on Linear, Plane, or Trello. The engine lives once in this template (the
@@ -24,7 +26,7 @@ single source of truth) and propagates to every deployment with
 
 The following is true as of June 1, 2026.
 
-- The engine, the provider abstraction, and the autonomous delegated-review
+- The engine, the provider abstraction, and the autonomous adversarial-review
   enforcement are built, syntax-clean, and validated offline with a mock
   provider.
 - The **Linear** adapter is verified live against a real board (Drumjangler's
@@ -92,7 +94,7 @@ the agent to read at run time. Keep the two in sync when behavior changes.
 ## Read next
 
 - [Architecture](architecture.md): how the engine, the adapter contract, the
-  normalized states, and the autonomous delegated review fit together.
+  normalized states, and the autonomous adversarial review fit together.
 - [Providers](providers.md): the adapter contract reference and a step-by-step
   guide to adding or verifying a provider.
 - [Development guide](development.md): the edit, validate, and propagate

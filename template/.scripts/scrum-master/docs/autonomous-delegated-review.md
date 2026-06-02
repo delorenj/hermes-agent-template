@@ -1,40 +1,64 @@
-# Autonomous delegated review and closure
+# Autonomous adversarial review (act, do not wait)
 
 Status: Scrum Master engine protocol (provider-agnostic)
 
 ## Purpose
 
-The Scrum Master sentinel must not block for days when the only thing between a
-completed ticket and closure is an unavailable human reviewer. After a grace
-window, an **independent review agent** checks the work against the operator's
-locked intent. If there is no significant drift and the close gate passes, it
-closes the ticket on the operator's behalf — through the ticket-provider adapter
-(`tp transition <id> completed`) — and emits a BloodBank decision event carrying
+When a ticket reaches the review lane, the Scrum Master sentinel runs an
+**independent adversarial review** of the work against the operator's locked
+intent and acts on the verdict autonomously. This is the **normal per-pass
+path** for review-lane tickets — not a deliberately narrow escape hatch, and not
+the only sanctioned path. The reviewer is an **adversarial microscope**: it
+actively tries to break the work, surface unmet acceptance criteria, hidden
+regressions, and drift. On a clean adversarial verdict the loop treats the
+ticket as done and moves on — through the ticket-provider adapter
+(`tp transition <id> <state>`) — and emits a BloodBank decision event carrying
 the full report. This works identically on Linear, Plane, or Trello.
 
-This is the only sanctioned path for the agent to close a ticket without a
-human. It is deliberately narrow and loosens no other gate.
+The operator's verification is **deferred** to end-of-product QA over the review
+lane, backed by a queryable decision trail. A downstream regression rollback is
+the safety valve. The loop does NOT wait on a human to approve or close
+reviewed work.
 
-## Not for
+## Anti-stall rule
 
-Fires **only** when the sole remaining blocker is human review of completed
-work. Out of scope (record the blocker and wait):
+The continuous ticket sentinel MUST act on the adversarial verdict autonomously.
+It MUST NOT idle, stop, or end a pass solely because reviewed work awaits human
+approval. "Looks good, waiting on the operator" is **never** a resting state and
+never a terminal pass state. For any review-lane ticket there are exactly three
+legitimate outcomes:
+
+- the independent adversarial review has run and the ticket is **accepted**
+  (treat as done, move on); or
+- the review **held** it on a real finding (back to / stays active); or
+- the ticket has a genuine **out-of-scope blocker** (recorded and waited on).
+
+There is no fourth "waiting for the operator's sign-off" state.
+
+## Out-of-scope blockers (not cleared by review)
+
+The review does not clear an out-of-scope blocker. Record the blocker and wait,
+exactly as before:
 
 - Blocked on external credentials, third-party access, or paid actions.
 - Blocked on an undecided product decision.
-- Acceptance criteria not fully satisfied by repository evidence.
+- Acceptance criteria not actually satisfied by repository evidence.
 - Depends on another open, unblocked issue.
 
-## Trigger conditions (ALL)
+## Preconditions
 
-1. **Human-review-only blocker** — issue is `in_review`, complete, nothing
-   missing but a human's sign-off.
-2. **Grace window elapsed** — no human activity for `scrum_master.grace_hours`
-   (role.yaml; default 24h; override env `DRUMJANGLER_AUTO_REVIEW_GRACE_HOURS`).
-3. **Evidence exists** — complete evidence file under
+1. **Review-lane ticket** — issue is `in_review`, complete, with no out-of-scope
+   blocker outstanding.
+2. **Evidence exists** — complete evidence file under
    `_bmad-output/implementation-artifacts/issue-evidence/<ISSUE>.md`.
-4. **Independent reviewer available** — agent id differs from the implementer
-   recorded in the evidence (`Worker:` / `Implemented by:`) and from the PM.
+3. **Independent reviewer available** — the reviewer agent id MUST differ from
+   the implementer recorded in the evidence (`Worker:` / `Implemented by:`) and
+   from the delegating PM. An implementer NEVER clears their own work.
+
+There is no mandatory grace window. `scrum_master.grace_hours` (role.yaml;
+override env `DRUMJANGLER_AUTO_REVIEW_GRACE_HOURS`) defaults to `0` and is an
+optional operator knob only — set `>0` to reintroduce a wait. The reviewer does
+not wait for the operator's first right of refusal; it reviews and acts.
 
 ## Locked intent baseline
 
@@ -49,27 +73,44 @@ reviewer does not re-litigate intent.
   beyond the ACs or milestone; contradicts a locked decision/north star; pulls
   Later work into Now or touches another milestone; contradicts locked
   architecture; introduces a new external dependency/credential/paid action.
-- **minor (close allowed)** — internal refactors, extra tests, naming, cosmetic
+- **minor (accept allowed)** — internal refactors, extra tests, naming, cosmetic
   deviations within locked intent, docs.
 - **none** — matches locked intent and ACs.
 
-Only `none`/`minor` with no unresolved critical/high findings may close.
+Only `none`/`minor` with no unresolved critical/high findings may be accepted.
 
 ## Decision
 
-Run from the role's bin (couples gate + drift + event + closure):
+Run from the role's bin (couples gate + drift + event + acceptance):
+
+```bash
+.scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT>
+```
+
+- **accepted** — independent adversarial review cleared it (drift `none|minor`,
+  no unresolved critical/high findings, independence satisfied, close gate
+  passes); the loop treats the ticket as done and moves on; event emitted with
+  `decision=accepted`. The ticket comment states the autonomous acceptance and
+  points to the review report — it does NOT request approval.
+- **held** — any adversarial gate fails; the ticket goes back to / stays active;
+  event `decision=held` with the reason. When in doubt, hold.
+
+The close gate (evidence completeness) remains a HARD, AUTOMATED lock: the
+script will not emit an `accepted` decision while the close gate fails, drift is
+`significant`, an unresolved critical/high finding stands, or independence is
+not satisfied.
+
+## Treat review as done
+
+An adversarially-**accepted** `in_review` ticket equals `completed` for
+dependents and flow. By default the ticket STAYS in the review lane — it is the
+operator's deferred-QA queue — and is NOT auto-transitioned to `completed`.
+`--close` is an OPTIONAL flag (operator QA sweep) and is omitted by the normal
+loop:
 
 ```bash
 .scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
 ```
-
-- **closed** — all conditions met; ticket transitioned to `completed` via the
-  adapter; event emitted with `decision=closed`.
-- **held** — any condition fails; ticket stays open; event `decision=held` with
-  the reason. When in doubt, hold.
-
-The script will not emit a `closed` decision while the close gate fails or drift
-is `significant`.
 
 ## Decision event
 
@@ -77,8 +118,24 @@ is `significant`.
 bloodbank.v1.repo.<repo>.issue.autonomous_review.decided
 ```
 
-Required data: `issue`, `decision`, `drift`, `close_gate`, `reviewer_agent`,
-`evidence_file`, `report_file`. See `bloodbank-events.md`.
+Required data: `issue`, `decision` (`accepted | held`), `drift`, `close_gate`,
+`reviewer_agent`, `evidence_file`, `report_file`. See `bloodbank-events.md`.
+
+## Downstream regression rollback
+
+Deferring operator QA means a later dependent can prove a review-accepted
+feature is ACTUALLY BROKEN. When that happens, move the accepted ticket back to
+active (`started` if a worker takes it now, else `unstarted`) as a PREREQUISITE
+of the dependent, via the adapter (`tp transition <id> <state>`); comment naming
+the dependent + symptom; and emit:
+
+```text
+bloodbank.v1.repo.<repo>.issue.review_rollback.recorded
+```
+
+Required data: `issue`, `surfaced_by`, `reason`. The dependent is blocked on the
+prerequisite until it is fixed. This is expected and healthy — it is the trade
+for deferring operator QA, not a failure.
 
 ## Review report shape
 
@@ -100,11 +157,12 @@ Write `<ISSUE>.review.md`; the script validates it:
 ## Adversarial Findings
 - Critical/high findings: none
 ## Decision
-- Decision: close               # close | hold
+- Decision: accept              # accept | hold (legacy `close` tolerated)
 ```
 
 ## Operator override
 
 `scrum_master.auto_review: false` (role.yaml) or `SCRUM_MASTER_AUTO_REVIEW=off`
-disables the escape hatch. Autonomous closures are fully traceable via the
-decision events in `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`.
+disables autonomous acceptance. Autonomous acceptances are fully traceable via
+the decision events in
+`_bmad-output/implementation-artifacts/bloodbank-events.jsonl`.

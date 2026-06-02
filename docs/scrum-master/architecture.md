@@ -2,7 +2,7 @@
 
 This guide explains how the Scrum Master engine works: the watch loop, the
 provider abstraction, the normalized state model, and the autonomous
-delegated-review protocol. Read the [handoff overview](README.md) first for the
+adversarial-review protocol. Read the [handoff overview](README.md) first for the
 big picture and the file map.
 
 ## The role
@@ -46,7 +46,9 @@ decisions:
 A full pass runs `hermes chat` with the rendered prompt,
 `continuous-ticket-sentinel.prompt.md`. The prompt tells the agent to reconcile
 the board, the local evidence, and live worker state, then either delegate one
-worker, monitor the active worker, run a delegated review, or record a blocker.
+worker, monitor the active worker, run an autonomous adversarial review, or
+record a blocker. A pass never ends in a "looks good, waiting on the operator"
+state: the adversarial review acts on its own verdict.
 
 The runner writes the outcome back to the state file so dashboards and the next
 heartbeat can read it. The required fields are `source`, `agent_id`, `repo`,
@@ -92,20 +94,25 @@ The mapping is configurable per project in `role.yaml` under
 `in_review: "In Review"` and `completed: "Done"` to match your board's column
 names.
 
-## Autonomous delegated review
+## Autonomous adversarial review (act, do not wait)
 
-This is the feature that keeps a project from stalling for days when work is
-done but no human is available to review it. The full protocol ships into each
-deployment at
+This is the **normal per-pass path** for a ticket that has reached review: an
+independent, rigorous **adversarial review** that renders a verdict and the loop
+**acts on it autonomously**. It is not a narrow escape hatch and not an exception
+to a no-close rule — it is how reviewed work moves. The full protocol ships into
+each deployment at
 `template/.scripts/scrum-master/docs/autonomous-delegated-review.md`. Here's the
 shape.
 
-When the sentinel finds a ticket whose only remaining blocker is human review,
-and a grace window (`scrum_master.grace_hours`, default 24) has passed with no
-human activity, it delegates the review to an **independent** reviewer. The
-reviewer must not be the agent that implemented the ticket. The reviewer checks
-the work against the operator's **locked intent**: the acceptance criteria, the
-active milestone, the project's horizon model, and the product north star.
+When the sentinel finds a ticket in the review lane, it delegates the review to
+an **independent** reviewer. There is no mandatory grace window:
+`scrum_master.grace_hours` defaults to `0`, so the reviewer acts immediately. It
+remains an optional operator knob — set it `>0` to reintroduce a deliberate wait
+— but the default never parks completed work waiting on the operator. The
+reviewer must not be the agent that implemented the ticket. Acting as an
+adversarial microscope, the reviewer tries to break the work, checking it against
+the operator's **locked intent**: the acceptance criteria, the active milestone,
+the project's horizon model, and the product north star.
 
 The reviewer then runs the decision gate:
 
@@ -113,7 +120,8 @@ The reviewer then runs the decision gate:
 .scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
 ```
 
-This script couples four checks so a closure can't slip through on a weak basis:
+This script couples four checks so an acceptance can't slip through on a weak
+basis:
 
 1. The close gate passes (`issue-close-gate.sh` confirms the evidence file is
    complete).
@@ -121,18 +129,40 @@ This script couples four checks so a closure can't slip through on a weak basis:
 3. Drift is `none` or `minor`, never `significant`.
 4. There are no unresolved critical or high findings.
 
-If all four hold, the script closes the ticket through the adapter
-(`tp transition <id> completed`) and emits a decision event with
-`decision=closed`. If any check fails, the ticket stays open and the script
-emits `decision=held` with the reason. When in doubt, it holds.
+If all four hold, the script renders an `accepted` verdict and emits a decision
+event with `decision=accepted`. **Treat review as done:** an accepted `in_review`
+ticket counts as `completed` for dependents and flow, so downstream work is
+unblocked immediately. By default the ticket **stays in the review lane**, which
+serves as the operator's deferred-QA queue — it is not auto-transitioned to
+`completed`. The `--close` flag is optional (an operator QA sweep can use it to
+drive `tp transition <id> completed`); the normal loop omits it. If any check
+fails, the ticket goes back to / stays active and the script emits
+`decision=held` with the reason. When in doubt, it holds.
 
-The escape hatch is deliberately narrow. It never applies to tickets blocked on
-credentials, external access, paid actions, or product decisions. Those still
-wait for a human.
+This is an adversarial review, not a lightweight or sanity check — the reviewer
+is hard to satisfy. It never clears tickets blocked on credentials, external
+access, paid actions, or undecided product decisions. Those genuine out-of-scope
+blockers are recorded and waited on exactly as before.
+
+### Downstream regression rollback
+
+Deferring operator QA buys speed, and the safety valve is a downstream regression
+rollback. If a later dependent proves a review-accepted feature is **actually
+broken**, the loop moves that feature back to active (`started` if a worker takes
+it now, else `unstarted`) as a prerequisite of the dependent, comments naming the
+dependent and the symptom, and emits
+
+```text
+bloodbank.v1.repo.<repo>.issue.review_rollback.recorded
+```
+
+carrying `{issue, surfaced_by, reason}`. The dependent stays blocked on the
+prerequisite until the fix lands. This is expected and healthy — it is the trade
+for deferring operator QA, not a failure of the review.
 
 ### Decision events
 
-Every delegated-review decision, whether `closed` or `held`, emits a local
+Every adversarial-review decision, whether `accepted` or `held`, emits a local
 BloodBank-style event:
 
 ```text
@@ -140,8 +170,9 @@ bloodbank.v1.repo.<repo>.issue.autonomous_review.decided
 ```
 
 The event carries `issue`, `decision`, `drift`, `close_gate`, `reviewer_agent`,
-`evidence_file`, and `report_file`. It's the operator's accountability record of
-a decision made on their behalf. The emitter is
+`evidence_file`, and `report_file`. Together with the
+`issue.review_rollback.recorded` event it forms the operator's queryable
+accountability trail for every autonomous decision. The emitter is
 `template/.scripts/scrum-master/bin/emit-event.py`, and the event types are
 documented in `template/.scripts/scrum-master/docs/bloodbank-events.md`. Events
 append to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`, a
@@ -156,10 +187,12 @@ A full pass moves through these components in order:
    prompt.
 3. The agent reads the runtime protocol docs and reconciles state by calling
    `tp` (the adapter) for board data.
-4. The agent delegates a worker, monitors one, records a blocker, or runs a
-   delegated review.
-5. A delegated review runs the enforcement tools in `bin/`, which close through
-   `tp transition` and emit a decision event.
+4. The agent delegates a worker, monitors one, records a blocker, or runs an
+   autonomous adversarial review.
+5. An adversarial review runs the enforcement tools in `bin/`, which render an
+   `accepted` or `held` verdict and emit a decision event; the loop acts on the
+   verdict (treat as done and unblock dependents, or send the ticket back to
+   active) without waiting on the operator.
 6. The runner writes the outcome to the state file for the next heartbeat.
 
 ## Read next

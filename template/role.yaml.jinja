@@ -42,8 +42,8 @@ ticket_provider:
 
 # Scrum Master sentinel knobs (only meaningful for role: scrum-master).
 scrum_master:
-  grace_hours: 24            # delegated-review grace window (hours)
-  auto_review: true          # autonomous delegated-review escape hatch on/off
+  grace_hours: 0             # 0 = no human-approval wait (adversarially-reviewed review-lane = done); set >0 to require a wait
+  auto_review: true          # autonomous adversarial review (act, do not wait) on/off
   paired_pm: "{{ target_repo }}-pm"
 
 # Plane project (1:1 with this agent) — retained for fleet-registry back-compat.

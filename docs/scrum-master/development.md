@@ -73,8 +73,8 @@ PY
 ```
 
 Finally, run the enforcement quartet end to end with a mock provider. This
-proves the close and hold branches, the decision-event emission, and
-adapter-based closure without touching a real board.
+proves the accept and hold branches, the decision-event emission, and the
+optional adapter-based transition without touching a real board.
 
 <details>
 <summary>Mock-provider end-to-end test</summary>
@@ -86,18 +86,20 @@ mkdir -p "$RD/.scripts/lib" "$RD/.scripts/providers" "$RD/.scripts/scrum-master/
 ( cd "$T" && git init -q && git config user.email t@t && git config user.name t )
 cp template/.scripts/lib/ticket-provider.sh "$RD/.scripts/lib/"
 cp template/.scripts/scrum-master/bin/* "$RD/.scripts/scrum-master/bin/"
-printf 'repo: demo\nrole: scrum-master\nagent_id: demo-sm\nticket_provider:\n  name: fake\nscrum_master:\n  grace_hours: 24\n  auto_review: true\n' > "$RD/role.yaml"
+printf 'repo: demo\nrole: scrum-master\nagent_id: demo-sm\nticket_provider:\n  name: fake\nscrum_master:\n  grace_hours: 0\n  auto_review: true\n' > "$RD/role.yaml"
 printf '#!/usr/bin/env sh\nop="$1"; shift 2>/dev/null||true\ncase "$op" in\n transition) echo "FAKE $1 -> $2" >&2; echo ok;;\n comment) echo okc;; *) echo f;; esac\n' > "$RD/.scripts/providers/fake.sh"
 chmod +x "$RD/.scripts/providers/fake.sh" "$RD/.scripts/scrum-master/bin/"*.sh
 EV="$T/_bmad-output/implementation-artifacts/issue-evidence"
 printf '## Issue\n- Worker: codex\n## Acceptance Criteria\n- AC1: done\n## Repo Changes\n- x\n## Verification\n- Command: t\n- Result: pass\n## Ledger Update\n- Ledger updated: yes\n## Known Gaps\n- None\n## Close Recommendation\nClose recommendation: ready\n' > "$EV/TIC-1.md"
-printf '## Reviewer\n- Reviewer agent: rev\n- Independent of implementer: yes\n## Locked Intent Baseline\n- Acceptance criteria source: board\n## Drift Assessment\n- Drift assessment: none\n## Adversarial Findings\n- Critical/high findings: none\n## Decision\n- Decision: close\n' > "$EV/TIC-1.review.md"
+printf '## Reviewer\n- Reviewer agent: rev\n- Independent of implementer: yes\n## Locked Intent Baseline\n- Acceptance criteria source: board\n## Drift Assessment\n- Drift assessment: none\n## Adversarial Findings\n- Critical/high findings: none\n## Decision\n- Decision: accept\n' > "$EV/TIC-1.review.md"
 export BLOODBANK_EVENTS_LOG="$T/e.jsonl"
 bash "$RD/.scripts/scrum-master/bin/issue-autonomous-review.sh" TIC-1 "$EV/TIC-1.review.md" --close
 rm -rf "$T"
 ```
 
-A passing run prints `CLOSE authorized`, `FAKE TIC-1 -> completed`, and exits 0.
+A passing run prints `ACCEPTED — treat as done (no human wait)`,
+`FAKE TIC-1 -> completed` (from the optional `--close` sweep this test passes),
+and exits 0.
 
 </details>
 

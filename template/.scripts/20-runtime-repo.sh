@@ -120,8 +120,10 @@ fi
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
   log "    migrating profile state into the runtime submodule"
-  # Preserve any keys/state hermes profile create left
-  for f in auth.json auth.lock .env config.yaml; do
+  # Preserve per-runtime config/secrets from profile creation. OAuth provider
+  # credentials are fleet-shared via HERMES_OAUTH_FILE, so do not clone
+  # auth.json/auth.lock into each runtime.
+  for f in .env config.yaml; do
     [[ -f "$PROFILE_HOME/$f" && ! -e "$RUNTIME_LOCAL/$f" ]] && cp "$PROFILE_HOME/$f" "$RUNTIME_LOCAL/$f"
   done
   rm -rf "$PROFILE_HOME"

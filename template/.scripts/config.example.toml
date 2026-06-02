@@ -21,6 +21,10 @@ runtime_scaffold_dir = "/home/delorenj/code/hermes-agent-template/runtime-scaffo
 # Shared fleet source-of-truth env file + fleet registry. ~ is expanded.
 fleet_env = "~/.hermes/fleet.env"
 registry_file = "~/.hermes/agents-registry.yaml"
+# Shared auth roots. HERMES_OAUTH_FILE is the Hermes provider OAuth store
+# (including openai-codex); CODEX_HOME is for Codex CLI/app-server auth.
+oauth_file = "~/.hermes/auth.json"
+codex_home = "~/.codex"
 # Canonical external skills dir mirrored into each agent profile.
 canonical_skills_dir = "/home/delorenj/.agents/skills"
 # Skills symlinked into every agent's runtime skills root.

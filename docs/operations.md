@@ -54,6 +54,8 @@ different machine/user, edit this one file:
 [fleet]
 hermes_bin = "/path/to/hermes-agent/.venv/bin/hermes"
 hermes_repo = "/path/to/hermes-agent"
+oauth_file = "~/.hermes/auth.json"
+codex_home = "~/.codex"
 canonical_skills_dir = "/path/to/.agents/skills"
 
 [github]
@@ -80,9 +82,14 @@ still work unchanged).
 - `HERMES_FLEET_BIN` (the exact Hermes executable all agents use)
 - `HERMES_FLEET_REPO` (the upstream/fork checkout you keep on the edge)
 - `HERMES_FLEET_REGISTRY_FILE` (defaults to `~/.hermes/agents-registry.yaml`)
+- `HERMES_FLEET_OAUTH_FILE` (shared Hermes provider OAuth store)
+- `HERMES_FLEET_CODEX_HOME` (shared Codex CLI/app-server auth/config home)
 
 If you `git pull`/sync the repo at `HERMES_FLEET_REPO` and rebuild/update that
 same binary path, every wrapper benefits immediately with no per-agent edits.
+For Codex auth, run `hermes auth add openai-codex` through any generated agent
+launcher once; all agents using the same fleet env read the same Hermes OAuth
+store afterward.
 
 To retrofit older provisioned agents onto this model, run:
 

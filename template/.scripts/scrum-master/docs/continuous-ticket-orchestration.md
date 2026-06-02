@@ -9,9 +9,10 @@ moving it, or the Scrum Master records why none can. Prefer one live thread over
 a quiet backlog. WIP limit: one active worker ticket.
 
 The Scrum Master owns the watch loop. Workers (codex, opencode, copilot, …) own
-implementation. The Scrum Master does not write application code or approve
-merges. It may close a ticket only via the autonomous delegated-review protocol
-(`autonomous-delegated-review.md`).
+implementation. The Scrum Master clears review-lane work via the autonomous
+adversarial review (act, do not wait) protocol
+(`autonomous-delegated-review.md`), and still does not write application code or
+approve merges.
 
 ## Ticket access
 
@@ -49,16 +50,26 @@ refresh its evidence file before spawning exactly one worker.
 
 Stop without spawning only when: the board/evidence cannot be inspected; every
 candidate is blocked by external evidence/credentials/product decisions (a
-ticket blocked **only** on human review is NOT a stop condition — route it to
-delegated review); a worker is already active and healthy; or the next action
-needs destructive git ops / production credentials / a paid action.
+ticket blocked **only** on human review is NOT a stop condition — run it through
+the independent adversarial review and act on the verdict immediately, no
+waiting; and a dependent blocked **only** on a review-accepted feature is NOT
+blocked); a worker is already active and healthy; or the next action needs
+destructive git ops / production credentials / a paid action.
+
+The loop never ends a pass with work parked waiting on the operator.
 
 ## Review and closure
 
 1. Run ticket verification.
 2. Run the close gate: `.scripts/scrum-master/bin/issue-close-gate.sh <ISSUE>`.
-3. Gate pass → recommend closure; human-review-only + grace elapsed → autonomous
-   delegated review (`autonomous-delegated-review.md`).
+3. Run the independent adversarial review — an adversarial microscope, with the
+   reviewer agent NOT the implementer (`autonomous-delegated-review.md`). On a
+   clean adversarial verdict the loop autonomously treats the ticket as done
+   (leaving it in the review lane as the operator's deferred-QA queue) and moves
+   on with no grace wait. A real finding holds it back to active.
 4. Gate fail → leave open, record missing evidence.
+5. Downstream regression rollback: if a later dependent proves a
+   review-accepted feature is actually broken, move it back to active as a
+   prerequisite of the dependent and record the rollback.
 
 Board status is not proof. Repository evidence and the close gate are proof.

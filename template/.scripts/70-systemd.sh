@@ -36,6 +36,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HERMES_HOME=$RUNTIME
+Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
+Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-$RUNTIME/.env
 ExecStart=$HERMES_BIN gateway run --replace
 Restart=on-failure
@@ -59,6 +61,8 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$RUNTIME
 Environment=HERMES_HOME=$RUNTIME
+Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
+Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-$RUNTIME/.env
 ExecStart=$HERMES_AGENT_REPO/.venv/bin/python $RUNTIME/bloodbank-consumer.py
 Restart=on-failure

@@ -149,6 +149,8 @@ fi
 # Tools we expect on the host
 HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin '/home/delorenj/code/hermes-agent/.venv/bin/hermes')}}"
 HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo '/home/delorenj/code/hermes-agent')}}"
+HERMES_OAUTH_FILE="${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$(config_get fleet.oauth_file "$HOME/.hermes/auth.json")}}"
+CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_home "$HOME/.codex")}}"
 # Prefer a scaffold vendored into this agent directory; fall back to the configured template path.
 RUNTIME_SCAFFOLD_DIR="${RUNTIME_SCAFFOLD_DIR:-$ROLE_DIR/.runtime-scaffold}"
 if [[ ! -d "$RUNTIME_SCAFFOLD_DIR" ]]; then
@@ -165,7 +167,8 @@ BLOODBANK_COMPOSE_DIR="${BLOODBANK_COMPOSE_DIR:-$(config_get bloodbank.compose_d
 PLANE_BASE="${PLANE_BASE:-$(config_get plane.base 'https://plane.delo.sh')}"
 PLANE_API_KEY="${PLANE_API_KEY:-${PLANE_33GOD_API_KEY:-}}"
 
-export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \
+export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO HERMES_OAUTH_FILE CODEX_HOME \
+       RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \
        BLOODBANK_NATS_HOST BLOODBANK_NATS_PORT BLOODBANK_COMPOSE_DIR \
        PLANE_BASE PLANE_API_KEY
 

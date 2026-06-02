@@ -20,7 +20,8 @@ runs second (for each agent role you want) to drop agents into it.
 
 The template provisions several roles. The `pm` role handles project management
 and triage. The `scrum-master` role runs a provider-agnostic ticket sentinel
-(Linear, Plane, or Trello) with an autonomous delegated-review escape hatch.
+(Linear, Plane, or Trello) with an autonomous adversarial review (act, do not
+wait).
 
 To work on or extend the Scrum Master, start with the [Scrum Master handoff
 guide](docs/scrum-master/README.md).
@@ -62,6 +63,7 @@ you to review it. Keys:
 | --- | --- | --- |
 | `fleet` | `hermes_bin`, `hermes_repo` | Shared Hermes executable + repo checkout |
 | `fleet` | `fleet_env`, `registry_file` | Fleet source-of-truth + registry locations |
+| `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
 | `fleet` | `canonical_skills_dir`, `symlinked_runtime_skills` | Skills mirrored into each profile |
 | `github` | `runtime_repo_owner` | Owner of the `agent-hm-*` runtime repos |
@@ -107,9 +109,15 @@ All generated launchers read `~/.hermes/fleet.env` for:
 - `HERMES_FLEET_BIN`
 - `HERMES_FLEET_REPO`
 - `HERMES_FLEET_REGISTRY_FILE`
+- `HERMES_FLEET_OAUTH_FILE`
+- `HERMES_FLEET_CODEX_HOME`
 
 If you sync/pull your shared Hermes repo and keep the same binary path, every
-agent wrapper picks it up automatically. To retrofit existing wrappers:
+agent wrapper picks it up automatically. `HERMES_FLEET_OAUTH_FILE` is the
+shared Hermes provider OAuth store, including `openai-codex`; `HERMES_FLEET_CODEX_HOME`
+is the shared Codex CLI/app-server config/auth home.
+
+To retrofit existing wrappers and user systemd units:
 
 ```bash
 cd /home/delorenj/code/hermes-agent-template
