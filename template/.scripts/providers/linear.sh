@@ -33,6 +33,23 @@ print(mm.group(1).strip() if mm else "")
 PY
 }
 
+# pj_cfg KEY — read ticket_provider.<KEY> from the repo-root .project.json (the
+# SOT), walking up from the role dir. Preferred over role.yaml.
+pj_cfg() {
+  python3 - "$ROLE_DIR" "$1" <<'PY'
+import sys, json, pathlib
+start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
+for parent in [start, *start.parents]:
+    f = parent / ".project.json"
+    if f.is_file():
+        try: tp = (json.loads(f.read_text()).get("ticket_provider") or {})
+        except Exception: tp = {}
+        print(tp.get(key, "") if isinstance(tp, dict) else ""); break
+else:
+    print("")
+PY
+}
+
 # gql QUERY [VARS_JSON] — POST a GraphQL request, print data JSON, fail on errors.
 gql() {
   need_key
@@ -58,8 +75,8 @@ print(json.dumps(body.get("data") or {}))
 PY
 }
 
-TEAM="$(tp_cfg team)"
-PROJECT="$(tp_cfg project)"
+TEAM="$(pj_cfg team)"; [ -n "$TEAM" ] || TEAM="$(tp_cfg team)"
+PROJECT="$(pj_cfg project)"; [ -n "$PROJECT" ] || PROJECT="$(tp_cfg project)"
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
 SM_DONE="$(tp_cfg completed)"; SM_DONE="${SM_DONE:-Done}"
 

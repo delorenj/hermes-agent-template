@@ -35,7 +35,24 @@ print(mm.group(1).strip() if mm else "")
 PY
 }
 
-BOARD="$(tp_cfg board)"
+# pj_cfg KEY — read ticket_provider.<KEY> from the repo-root .project.json (the
+# SOT), walking up from the role dir. Preferred over role.yaml.
+pj_cfg() {
+  python3 - "$ROLE_DIR" "$1" <<'PY'
+import sys, json, pathlib
+start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
+for parent in [start, *start.parents]:
+    f = parent / ".project.json"
+    if f.is_file():
+        try: tp = (json.loads(f.read_text()).get("ticket_provider") or {})
+        except Exception: tp = {}
+        print(tp.get(key, "") if isinstance(tp, dict) else ""); break
+else:
+    print("")
+PY
+}
+
+BOARD="$(pj_cfg board_id)"; [ -n "$BOARD" ] || BOARD="$(tp_cfg board)"
 # Normalized -> Trello list name (overridable via role.yaml state_map keys).
 list_name_for() {
   case "$1" in

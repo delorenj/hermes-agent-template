@@ -36,8 +36,27 @@ print(mm.group(1).strip() if mm else "")
 PY
 }
 
-WS="$(tp_cfg workspace)"; WS="${WS:-${PLANE_WORKSPACE:-}}"
-PROJ="$(tp_cfg project)"
+# pj_cfg KEY — read ticket_provider.<KEY> from the repo-root .project.json (the
+# SOT), walking up from the role dir. This is preferred over role.yaml so all of
+# a repo's agents resolve to the same board.
+pj_cfg() {
+  python3 - "$ROLE_DIR" "$1" <<'PY'
+import sys, json, pathlib
+start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
+for parent in [start, *start.parents]:
+    f = parent / ".project.json"
+    if f.is_file():
+        try: tp = (json.loads(f.read_text()).get("ticket_provider") or {})
+        except Exception: tp = {}
+        print(tp.get(key, "") if isinstance(tp, dict) else ""); break
+else:
+    print("")
+PY
+}
+
+# Board binding: .project.json (SOT) first, then role.yaml, then env.
+WS="$(pj_cfg workspace)"; [ -n "$WS" ] || WS="$(tp_cfg workspace)"; WS="${WS:-${PLANE_WORKSPACE:-}}"
+PROJ="$(pj_cfg board_id)"; [ -n "$PROJ" ] || PROJ="$(tp_cfg project)"
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
 SM_DONE="$(tp_cfg completed)"; SM_DONE="${SM_DONE:-Done}"
 API="$BASE/api/v1/workspaces/$WS"
