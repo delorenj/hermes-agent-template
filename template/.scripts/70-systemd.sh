@@ -105,8 +105,11 @@ mkdir -p "$RUNTIME/logs"
 
 if systemd_user_available; then
   systemctl --user daemon-reload
+  # `enable --now` both enables (persist across login) AND starts the unit now, so a
+  # freshly provisioned agent comes up live instead of dormant. Units with missing
+  # creds (e.g. a gateway with no Telegram token yet) fail softly via Restart=on-failure.
   for u in "$GW_UNIT" "$CSM_UNIT" "$CKPT_TIMER"; do
-    systemctl --user enable "$u" >/dev/null 2>&1 && log "    enabled: $u" || warn "    failed to enable: $u"
+    systemctl --user enable --now "$u" >/dev/null 2>&1 && log "    enabled + started: $u" || warn "    failed to enable/start: $u"
   done
 else
   warn "    systemd --user not available; units installed at $SYS_DIR but not enabled"

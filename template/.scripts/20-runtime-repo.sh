@@ -110,7 +110,10 @@ else
   rm -rf "$RUNTIME_LOCAL"
   (
     cd "$PROJECT_PATH"
-    git submodule add "$REMOTE_URL" "$REL_SUBMODULE_PATH" 2>&1 | tail -3
+    # -f forces the add even if a repo .gitignore matches the runtime path
+    # (e.g. a stray `runtime/` rule). The runtime is a tracked submodule gitlink,
+    # never ignored content, so forcing past .gitignore is always correct here.
+    git submodule add -f "$REMOTE_URL" "$REL_SUBMODULE_PATH" 2>&1 | tail -3
   )
 fi
 
