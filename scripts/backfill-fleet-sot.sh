@@ -28,8 +28,8 @@ PYEOF
 
 FLEET_ENV="${HERMES_FLEET_ENV:-$(cfg fleet.fleet_env "$HOME/.hermes/fleet.env")}"
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
-DEFAULT_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin /home/delorenj/code/hermes-agent/.venv/bin/hermes)}"
-DEFAULT_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo /home/delorenj/code/hermes-agent)}"
+DEFAULT_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}"
+DEFAULT_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.hermes/hermes-agent")}"
 DEFAULT_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$(cfg fleet.oauth_file "$HOME/.hermes/auth.json")}"
 DEFAULT_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$(cfg fleet.codex_home "$HOME/.codex")}"
 SCAFFOLD_SRC="$(cd "$(dirname "$0")/../template/.runtime-scaffold" && pwd)"
@@ -187,14 +187,14 @@ for agent_id, cfg in agents.items():
             "  source \"$FLEET_ENV\"\n"
             "fi\n\n"
             "# Tools we expect on the host\n"
-            "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-/home/delorenj/code/hermes-agent/.venv/bin/hermes}}\"\n"
-            "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-/home/delorenj/code/hermes-agent}}\"\n"
+            "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-$HOME/.hermes/hermes-agent/.venv/bin/hermes}}\"\n"
+            "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.hermes/hermes-agent}}\"\n"
             "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
             "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n"
             "# Prefer a scaffold vendored into this agent directory; fall back to legacy template path.\n"
             "RUNTIME_SCAFFOLD_DIR=\"${RUNTIME_SCAFFOLD_DIR:-$ROLE_DIR/.runtime-scaffold}\"\n"
             "if [[ ! -d \"$RUNTIME_SCAFFOLD_DIR\" ]]; then\n"
-            "  RUNTIME_SCAFFOLD_DIR=\"${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-/home/delorenj/code/hermes-agent-template/runtime-scaffold}\"\n"
+            "  RUNTIME_SCAFFOLD_DIR=\"${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-$HOME/code/hermes-agent-template/runtime-scaffold}\"\n"
             "fi\n"
             "REGISTRY_FILE=\"${REGISTRY_FILE:-${HERMES_FLEET_REGISTRY_FILE:-$HOME/.hermes/agents-registry.yaml}}\"\n"
         )
@@ -202,8 +202,8 @@ for agent_id, cfg in agents.items():
             lib_text = lib_text.replace(old_block, new_block)
         if "HERMES_OAUTH_FILE=" not in lib_text:
             lib_text = lib_text.replace(
-                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-/home/delorenj/code/hermes-agent}}\"\n",
-                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-/home/delorenj/code/hermes-agent}}\"\n"
+                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.hermes/hermes-agent}}\"\n",
+                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.hermes/hermes-agent}}\"\n"
                 "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
                 "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n",
             )
@@ -234,7 +234,7 @@ for agent_id, cfg in agents.items():
         "  # shellcheck disable=SC1090\n"
         "  source \"$FLEET_ENV\"\n"
         "fi\n\n"
-        "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-/home/delorenj/code/hermes-agent/.venv/bin/hermes}}\"\n\n"
+        "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-$HOME/.hermes/hermes-agent/.venv/bin/hermes}}\"\n\n"
         "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
         "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n\n"
         "if [[ ! -d \"$HERMES_HOME\" ]]; then\n"

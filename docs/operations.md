@@ -228,4 +228,4 @@ rm -rf agents/hermes/<role>
 - That was a `--clone-all` bug; we switched to `--clone`. If you see it, just `rm -rf` the nested tree. The template's 10-hermes-profile.sh also has a belt-and-suspenders rm.
 
 ### `hermes` launcher complains about HERMES_BIN
-- Check the launcher script: `./agents/hermes/<role>/hermes` references `/home/delorenj/code/hermes-agent/.venv/bin/hermes`. Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.
+- Check the launcher script: `./agents/hermes/<role>/hermes` falls back to `$HOME/.hermes/hermes-agent/.venv/bin/hermes` (after `$HERMES_BIN`, `fleet.env`, and config.toml). Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.

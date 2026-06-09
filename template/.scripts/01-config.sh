@@ -21,8 +21,8 @@ else
     cat > "$CONFIG" <<'TOML'
 # hermes-agent-template config — edit for your environment.
 [fleet]
-hermes_bin = "/home/delorenj/code/hermes-agent/.venv/bin/hermes"
-hermes_repo = "/home/delorenj/code/hermes-agent"
+hermes_bin = "~/.hermes/hermes-agent/.venv/bin/hermes"
+hermes_repo = "~/.hermes/hermes-agent"
 fleet_env = "~/.hermes/fleet.env"
 registry_file = "~/.hermes/agents-registry.yaml"
 canonical_skills_dir = "/home/delorenj/.agents/skills"

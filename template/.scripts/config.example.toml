@@ -12,12 +12,12 @@
 
 [fleet]
 # Absolute path to the shared Hermes executable every agent launcher execs.
-hermes_bin = "/home/delorenj/code/hermes-agent/.venv/bin/hermes"
+hermes_bin = "~/.hermes/hermes-agent/.venv/bin/hermes"
 # Checkout of the hermes-agent repo. Its .venv is used to install nats-py, etc.
-hermes_repo = "/home/delorenj/code/hermes-agent"
+hermes_repo = "~/.hermes/hermes-agent"
 # Fallback runtime scaffold dir — used only when an agent's vendored
 # ./.runtime-scaffold is missing.
-runtime_scaffold_dir = "/home/delorenj/code/hermes-agent-template/runtime-scaffold"
+runtime_scaffold_dir = "~/code/hermes-agent-template/runtime-scaffold"
 # Shared fleet source-of-truth env file + fleet registry. ~ is expanded.
 fleet_env = "~/.hermes/fleet.env"
 registry_file = "~/.hermes/agents-registry.yaml"
