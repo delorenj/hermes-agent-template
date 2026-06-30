@@ -134,5 +134,25 @@ if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
   log "    $PROFILE_HOME -> $RUNTIME_LOCAL"
 fi
 
+if [[ "$ROLE" == "pm" ]]; then
+  VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
+  if [[ -d "$VOXXY_PLUGIN_DIR" ]]; then
+    mkdir -p "$RUNTIME_LOCAL/plugins/tts"
+    ln -sfn "$VOXXY_PLUGIN_DIR" "$RUNTIME_LOCAL/plugins/tts/voxxy"
+    log "    linked Voxxy plugin into runtime"
+  else
+    warn "    Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR"
+  fi
+
+  if [[ -x "$HERMES_BIN" ]]; then
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.provider voxxy >/dev/null 2>&1 || true
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.voice rick >/dev/null 2>&1 || true
+    log "    set PM runtime TTS provider -> voxxy"
+  else
+    warn "    Hermes bin missing; skipped PM Voxxy config"
+  fi
+fi
+
 rm -rf "$TMP"
 mark_done 20-runtime-repo

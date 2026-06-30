@@ -74,6 +74,28 @@ PYEOF
   chmod 600 "$PROFILE_ENV"
 fi
 
+if [[ "$ROLE" == "pm" ]]; then
+  VOX_URL_VALUE="${VOX_URL:-$(config_get fleet.vox_url 'https://vox.delo.sh')}"
+  if [[ -n "$VOX_URL_VALUE" ]]; then
+    log "    ensuring VOX_URL is present for PM voice mode"
+    python3 - "$PROFILE_ENV" "$VOX_URL_VALUE" <<'PYEOF'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+vox_url = sys.argv[2]
+lines = path.read_text().splitlines() if path.exists() else []
+for idx, line in enumerate(lines):
+    if line.startswith("VOX_URL="):
+        lines[idx] = f'VOX_URL="{vox_url}"'
+        break
+else:
+    lines.append(f'VOX_URL="{vox_url}"')
+path.write_text("\n".join(lines) + "\n")
+PYEOF
+    chmod 600 "$PROFILE_ENV"
+  fi
+fi
+
 # Apply role-specific config overrides.
 log "    setting terminal.cwd = $REPO_PATH"
 env HERMES_HOME="$PROFILE_HOME" "$HERMES_BIN" config set terminal.cwd "$REPO_PATH"

@@ -54,6 +54,8 @@ if [[ -f "$FLEET_ENV" ]]; then
 fi
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
 PROFILES_DIR="${HERMES_FLEET_HOME:-$HOME/.hermes}/profiles"
+VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(cfg fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
+VOX_URL_VALUE="${VOX_URL:-$(cfg fleet.vox_url 'https://vox.delo.sh')}"
 
 APPLY=0
 RESTART=1
@@ -113,6 +115,25 @@ CONTESTED_DIRS="$(read_registry | cut -f2 | sort | uniq -d)"
 
 note() {  # note <agent> <status> <message>
   printf '%-34s %-7s %s\n' "$1" "$2" "$3"
+}
+
+ensure_env_key() {  # ensure_env_key <path> <key> <value>
+  python3 - "$1" "$2" "$3" <<'PYEOF'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+lines = path.read_text().splitlines() if path.exists() else []
+needle = f"{key}="
+for idx, line in enumerate(lines):
+    if line.startswith(needle):
+        lines[idx] = f'{key}="{value}"'
+        break
+else:
+    lines.append(f'{key}="{value}"')
+path.write_text("\n".join(lines) + "\n")
+PYEOF
 }
 
 wanted_agent() {
@@ -207,6 +228,101 @@ while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit consumer_uni
       changed=1; FIXED=$((FIXED + 1))
     else
       note "$agent_id" DRIFT "role.yaml profile != $profile_name"
+      DRIFT=$((DRIFT + 1))
+    fi
+  fi
+
+  # 5. PM fleet voice contract: runtime plugin symlink + Voxxy config + VOX_URL.
+  role_name="$(basename "$role_dir")"
+  if [[ "$role_name" == "pm" && -d "$runtime" ]]; then
+    plugin_link="$runtime/plugins/tts/voxxy"
+    if [[ -d "$VOXXY_PLUGIN_DIR" ]]; then
+      if [[ -L "$plugin_link" ]]; then
+        if [[ "$(readlink -f "$plugin_link")" != "$(readlink -f "$VOXXY_PLUGIN_DIR")" ]]; then
+          if [[ $APPLY -eq 1 ]]; then
+            mkdir -p "$runtime/plugins/tts"
+            ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
+            note "$agent_id" FIXED "runtime Voxxy plugin relinked"
+            changed=1; FIXED=$((FIXED + 1))
+          else
+            note "$agent_id" DRIFT "runtime Voxxy plugin points at $(readlink "$plugin_link")"
+            DRIFT=$((DRIFT + 1))
+          fi
+        fi
+      elif [[ -e "$plugin_link" ]]; then
+        note "$agent_id" DRIFT "$plugin_link exists and is not a symlink (MANUAL: merge runtime plugin state)"
+        DRIFT=$((DRIFT + 1))
+      else
+        if [[ $APPLY -eq 1 ]]; then
+          mkdir -p "$runtime/plugins/tts"
+          ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
+          note "$agent_id" FIXED "runtime Voxxy plugin linked"
+          changed=1; FIXED=$((FIXED + 1))
+        else
+          note "$agent_id" DRIFT "runtime Voxxy plugin missing"
+          DRIFT=$((DRIFT + 1))
+        fi
+      fi
+    else
+      note "$agent_id" DRIFT "configured Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR (MANUAL: install voxxy repo)"
+      DRIFT=$((DRIFT + 1))
+    fi
+
+    runtime_env="$runtime/.env"
+    if [[ -n "$VOX_URL_VALUE" ]]; then
+      vox_env_status="$(python3 - "$runtime_env" "$VOX_URL_VALUE" <<'PYEOF'
+import pathlib, sys
+path = pathlib.Path(sys.argv[1])
+expected = sys.argv[2]
+if not path.exists():
+    print('missing-file')
+    raise SystemExit(0)
+for line in path.read_text().splitlines():
+    if line.startswith('VOX_URL='):
+        current = line.split('=', 1)[1].strip().strip('"').strip("'")
+        print('ok' if current == expected else 'mismatch')
+        raise SystemExit(0)
+print('missing-key')
+PYEOF
+)"
+      case "$vox_env_status" in
+        ok) ;;
+        *)
+          if [[ $APPLY -eq 1 ]]; then
+            ensure_env_key "$runtime_env" VOX_URL "$VOX_URL_VALUE"
+            chmod 600 "$runtime_env" 2>/dev/null || true
+            note "$agent_id" FIXED "runtime .env VOX_URL -> $VOX_URL_VALUE"
+            changed=1; FIXED=$((FIXED + 1))
+          else
+            note "$agent_id" DRIFT "runtime .env missing/incorrect VOX_URL"
+            DRIFT=$((DRIFT + 1))
+          fi
+          ;;
+      esac
+    fi
+
+    config_status="$(python3 - "$runtime/config.yaml" <<'PYEOF'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+if not path.exists():
+    print('missing')
+    raise SystemExit(0)
+text = path.read_text()
+provider = 'voxxy' if 'provider: voxxy' in text else 'other'
+plugin = 'yes' if 'tts/voxxy' in text else 'no'
+voice = 'rick' if 'voice: rick' in text else 'other'
+print(f'{provider}|{plugin}|{voice}')
+PYEOF
+)"
+    if [[ "$APPLY" -eq 1 ]]; then
+      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
+      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.provider voxxy >/dev/null 2>&1 || true
+      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.voice rick >/dev/null 2>&1 || true
+      note "$agent_id" FIXED "runtime TTS config enforced -> voxxy/rick"
+      changed=1; FIXED=$((FIXED + 1))
+    elif [[ "$config_status" != "voxxy|yes|rick" ]]; then
+      note "$agent_id" DRIFT "runtime Voxxy config missing from config.yaml"
       DRIFT=$((DRIFT + 1))
     fi
   fi

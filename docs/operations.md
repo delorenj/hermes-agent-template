@@ -26,8 +26,8 @@ invocations).
 | 00 banner | Print identity | n/a |
 | 01 config | Seed `~/.config/hermes-agent-template/config.toml` from the shipped example if absent (see [Configuration](#configuration)) | n/a |
 | 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
-| 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills` | n/a |
-| 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from role-local `.runtime-scaffold/`, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime | `SKIP_RUNTIME_REPO=1` |
+| 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills`; PM roles also seed `VOX_URL` in profile `.env` | n/a |
+| 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from role-local `.runtime-scaffold/`, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime; PM roles also link the Voxxy plugin and set `tts.provider: voxxy` | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Install consumer (renders from scaffold w/ agent values), health-check NATS, install nats-py via uv if missing | `SKIP_BLOODBANK=1` |
@@ -57,6 +57,8 @@ hermes_repo = "/path/to/hermes-agent"
 oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
 canonical_skills_dir = "/path/to/.agents/skills"
+voxxy_plugin_dir = "~/code/voxxy/plugins/tts/voxxy"
+vox_url = "https://vox.delo.sh"
 
 [github]
 runtime_repo_owner = "your-gh-owner"

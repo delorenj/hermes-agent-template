@@ -27,6 +27,9 @@ oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
 # Canonical external skills dir mirrored into each agent profile.
 canonical_skills_dir = "/home/delorenj/.agents/skills"
+# Voxxy plugin + service defaults for Hermes PM agents.
+voxxy_plugin_dir = "~/code/voxxy/plugins/tts/voxxy"
+vox_url = "https://vox.delo.sh"
 # Skills symlinked into every agent's runtime skills root.
 symlinked_runtime_skills = [
   "delonet-conventions",
