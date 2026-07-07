@@ -1,15 +1,15 @@
-# Continuous ticket orchestration (Scrum Master engine)
+# Continuous ticket orchestration (sentinel engine)
 
-Status: Scrum Master engine protocol (provider-agnostic)
+Status: sentinel engine protocol (provider-agnostic)
 
 ## Invariant
 
 If a ready ticket exists, exactly one implementation worker must be actively
-moving it, or the Scrum Master records why none can. Prefer one live thread over
+moving it, or the sentinel records why none can. Prefer one live thread over
 a quiet backlog. WIP limit: one active worker ticket.
 
-The Scrum Master owns the watch loop. Workers (codex, opencode, copilot, …) own
-implementation. The Scrum Master clears review-lane work via the autonomous
+The sentinel owns the watch loop. Workers (codex, opencode, copilot, …) own
+implementation. The sentinel clears review-lane work via the autonomous
 adversarial review (act, do not wait) protocol
 (`autonomous-delegated-review.md`), and still does not write application code or
 approve merges.
@@ -61,7 +61,7 @@ The loop never ends a pass with work parked waiting on the operator.
 ## Review and closure
 
 1. Run ticket verification.
-2. Run the close gate: `.scripts/scrum-master/bin/issue-close-gate.sh <ISSUE>`.
+2. Run the close gate: `.scripts/sentinel/bin/issue-close-gate.sh <ISSUE>`.
 3. Run the independent adversarial review — an adversarial microscope, with the
    reviewer agent NOT the implementer (`autonomous-delegated-review.md`). On a
    clean adversarial verdict the loop autonomously treats the ticket as done

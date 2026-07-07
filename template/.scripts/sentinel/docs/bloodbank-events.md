@@ -1,6 +1,6 @@
-# Scrum Master workflow events
+# Sentinel workflow events
 
-Status: Scrum Master engine protocol (provider-agnostic)
+Status: Sentinel engine protocol (provider-agnostic)
 
 ## Purpose
 
@@ -12,7 +12,7 @@ what happened.
 ## Emitter
 
 ```bash
-.scripts/scrum-master/bin/emit-event.py <event_type> --field key=value [...]
+.scripts/sentinel/bin/emit-event.py <event_type> --field key=value [...]
 ```
 
 Appends to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`

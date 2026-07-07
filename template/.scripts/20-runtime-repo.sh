@@ -59,9 +59,14 @@ for p in root.rglob("*"):
             pass
 PYEOF
 
-# 3. Copy current global config.yaml so the agent inherits provider/skills.
-if [[ -f "$HOME/.hermes/config.yaml" ]]; then
-  cp "$HOME/.hermes/config.yaml" "$TMP/config.yaml"
+# 3. Seed the runtime config from the canonical PM config — the fleet's single
+#    config source of truth (defaults to the global ~/.hermes/config.yaml). This
+#    is a provision-time snapshot; Hermes loads $HERMES_HOME/config.yaml directly
+#    (there is no live profile inheritance). Override via config.toml
+#    [fleet].canonical_pm_config to share one curated PM config across all repos.
+CANONICAL_PM_CONFIG="$(config_get fleet.canonical_pm_config "$HOME/.hermes/config.yaml")"
+if [[ -f "$CANONICAL_PM_CONFIG" ]]; then
+  cp "$CANONICAL_PM_CONFIG" "$TMP/config.yaml"
 fi
 # Copy the project's SOUL.md as the canonical starting personality.
 cp "$ROLE_DIR/SOUL.md" "$TMP/SOUL.md"
@@ -117,21 +122,46 @@ else
   )
 fi
 
-# 6. Symlink the runtime back into ~/.hermes/profiles/<name>/ so hermes finds it.
-# Actually we WANT HERMES_HOME = the runtime dir, not the cloned profile.
-# Move the profile contents into runtime, then symlink the profile dir to runtime.
+# 6. Fold the staging profile state into the runtime, then symlink the profile
+# name AT the runtime. HERMES_HOME is the runtime submodule, but the profile
+# symlink is LOAD-BEARING: hermes resolves agents launched as
+# `hermes --profile <name>` through ~/.hermes/profiles/<name> (and recreates it
+# as a fresh standalone dir if it's missing, disconnecting the agent from its
+# runtime), so that name MUST resolve to the runtime.
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
-  log "    migrating profile state into the runtime submodule"
-  # Preserve per-runtime config/secrets from profile creation. OAuth provider
-  # credentials are fleet-shared via HERMES_OAUTH_FILE, so do not clone
-  # auth.json/auth.lock into each runtime.
+  log "    migrating staging profile state into the runtime submodule"
+  # OAuth provider credentials are fleet-shared via HERMES_OAUTH_FILE, so do not
+  # clone auth.json/auth.lock into each runtime.
   for f in .env config.yaml; do
     [[ -f "$PROFILE_HOME/$f" && ! -e "$RUNTIME_LOCAL/$f" ]] && cp "$PROFILE_HOME/$f" "$RUNTIME_LOCAL/$f"
   done
   rm -rf "$PROFILE_HOME"
-  ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"
-  log "    $PROFILE_HOME -> $RUNTIME_LOCAL"
+fi
+ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"
+log "    profile symlink $PROFILE_HOME -> $RUNTIME_LOCAL"
+
+# Apply the one genuine per-repo config delta directly to the runtime config.
+env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set terminal.cwd "$PROJECT_PATH" >/dev/null 2>&1 || true
+
+if [[ "$ROLE" == "pm" ]]; then
+  VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
+  if [[ -d "$VOXXY_PLUGIN_DIR" ]]; then
+    mkdir -p "$RUNTIME_LOCAL/plugins/tts"
+    ln -sfn "$VOXXY_PLUGIN_DIR" "$RUNTIME_LOCAL/plugins/tts/voxxy"
+    log "    linked Voxxy plugin into runtime"
+  else
+    warn "    Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR"
+  fi
+
+  if [[ -x "$HERMES_BIN" ]]; then
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.provider voxxy >/dev/null 2>&1 || true
+    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.voice rick >/dev/null 2>&1 || true
+    log "    set PM runtime TTS provider -> voxxy"
+  else
+    warn "    Hermes bin missing; skipped PM Voxxy config"
+  fi
 fi
 
 if [[ "$ROLE" == "pm" ]]; then

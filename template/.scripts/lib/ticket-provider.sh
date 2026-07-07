@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Ticket-provider adapter dispatcher — the single seam between the Scrum Master
+# Ticket-provider adapter dispatcher — the single seam between the heartbeat
 # sentinel engine and a concrete ticket system (Linear | Plane | Trello).
 #
 # The engine NEVER calls a provider directly. It calls `tp <op> [args...]`,

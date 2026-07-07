@@ -1,36 +1,35 @@
-# Scrum Master architecture
+# Heartbeat sentinel architecture
 
-This guide explains how the Scrum Master engine works: the watch loop, the
-provider abstraction, the normalized state model, and the autonomous
+This guide explains how the heartbeat sentinel engine works: the heartbeat loop,
+the provider abstraction, the normalized state model, and the autonomous
 adversarial-review protocol. Read the [handoff overview](README.md) first for the
 big picture and the file map.
 
-## The role
+## Who owns it
 
-The Scrum Master is a first-class Hermes role, a peer of the `pm` role. It's
-materialized into a project at `agents/hermes/scrum-master/` and carries its own
-`role.yaml`, runtime, prompt, enforcement tools, and a scheduler unit
-(`systemd` on Linux, `launchd` on macOS). The role id is `scrum-master`, and the
-display name is `<Repo> Scrum Master`.
+The sentinel is owned by the unified `pm` role. It's materialized into a project
+at `agents/hermes/pm/`, where the PM carries its `role.yaml`, runtime, the
+sentinel prompt, the enforcement tools under `.scripts/sentinel/`, and the
+heartbeat runner. There is no separate `scrum-master` role; its
+continuous-ticket-sentinel duties fold into the PM and run out-of-band on the
+PM's heartbeat timer.
 
-You can provision it two ways:
+You provision it by provisioning the PM: run Copier with `--data role=pm` (the
+`70-systemd.sh` step installs the fused `heartbeat` timer that drives the
+sentinel). For the exact commands, see [Development guide:
+provisioning](development.md#provisioning-the-pm-manual).
 
-- **Standalone**, by running Copier with `--data role=scrum-master`.
-- **As a PM add-on**, by answering `yes` to the `with_scrum_master` question
-  during a `pm` provision. That chains a Scrum Master provision for the same
-  repo and provider through `90-chain-scrum-master.sh`.
-
-For the exact commands, see [Development guide:
-provisioning](development.md#provisioning-a-scrum-master-manual).
-
-## The watch loop
+## The heartbeat loop
 
 A scheduler (`systemd` timer on Linux, `launchd` agent on macOS) fires the
-runner, `template/.scripts/scrum-master/continuous-ticket-sentinel.sh`, about
-once a minute. The runner is a cheap heartbeat that decides whether a full,
-LLM-backed pass is worth running. This keeps cost low while staying responsive.
+runner, `template/.scripts/heartbeat.sh`, about once a minute. Each tick fuses
+two jobs: a board-reconciliation **sentinel pass** and a **gated runtime
+checkpoint**. The sentinel pass is a cheap heartbeat that decides whether a
+full, LLM-backed reconciliation pass is worth running; the checkpoint
+(commit+push of the runtime submodule) is gated to at most once an hour. This
+keeps cost low while staying responsive.
 
-The heartbeat reads the work-state file,
+The sentinel reads the work-state file,
 `runtime/continuous-ticket-sentinel-state.json`, and chooses one of these
 decisions:
 
@@ -44,7 +43,7 @@ decisions:
 - `run:full`: none of the above hold, so the runner executes a full pass.
 
 A full pass runs `hermes chat` with the rendered prompt,
-`continuous-ticket-sentinel.prompt.md`. The prompt tells the agent to reconcile
+`sentinel.prompt.md`. The prompt tells the agent to reconcile
 the board, the local evidence, and live worker state, then either delegate one
 worker, monitor the active worker, run an autonomous adversarial review, or
 record a blocker. A pass never ends in a "looks good, waiting on the operator"
@@ -101,12 +100,12 @@ independent, rigorous **adversarial review** that renders a verdict and the loop
 **acts on it autonomously**. It is not a narrow escape hatch and not an exception
 to a no-close rule — it is how reviewed work moves. The full protocol ships into
 each deployment at
-`template/.scripts/scrum-master/docs/autonomous-delegated-review.md`. Here's the
+`template/.scripts/sentinel/docs/autonomous-delegated-review.md`. Here's the
 shape.
 
 When the sentinel finds a ticket in the review lane, it delegates the review to
 an **independent** reviewer. There is no mandatory grace window:
-`scrum_master.grace_hours` defaults to `0`, so the reviewer acts immediately. It
+`reconcile.grace_hours` defaults to `0`, so the reviewer acts immediately. It
 remains an optional operator knob — set it `>0` to reintroduce a deliberate wait
 — but the default never parks completed work waiting on the operator. The
 reviewer must not be the agent that implemented the ticket. Acting as an
@@ -117,7 +116,7 @@ the project's horizon model, and the product north star.
 The reviewer then runs the decision gate:
 
 ```bash
-.scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
+.scripts/sentinel/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
 ```
 
 This script couples four checks so an acceptance can't slip through on a weak
@@ -173,8 +172,8 @@ The event carries `issue`, `decision`, `drift`, `close_gate`, `reviewer_agent`,
 `evidence_file`, and `report_file`. Together with the
 `issue.review_rollback.recorded` event it forms the operator's queryable
 accountability trail for every autonomous decision. The emitter is
-`template/.scripts/scrum-master/bin/emit-event.py`, and the event types are
-documented in `template/.scripts/scrum-master/docs/bloodbank-events.md`. Events
+`template/.scripts/sentinel/bin/emit-event.py`, and the event types are
+documented in `template/.scripts/sentinel/docs/bloodbank-events.md`. Events
 append to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`, a
 local spool that doesn't require NATS, so the loop stays reliable offline.
 
@@ -182,18 +181,20 @@ local spool that doesn't require NATS, so the loop stays reliable offline.
 
 A full pass moves through these components in order:
 
-1. The scheduler (`systemd` timer or `launchd` agent) triggers the runner.
-2. The runner's heartbeat decides `run:full` and calls `hermes chat` with the
-   prompt.
+1. The scheduler (`systemd` timer or `launchd` agent) triggers the heartbeat
+   runner (`heartbeat.sh`).
+2. The runner's sentinel logic decides `run:full` and calls `hermes chat` with
+   the prompt.
 3. The agent reads the runtime protocol docs and reconciles state by calling
    `tp` (the adapter) for board data.
 4. The agent delegates a worker, monitors one, records a blocker, or runs an
    autonomous adversarial review.
-5. An adversarial review runs the enforcement tools in `bin/`, which render an
-   `accepted` or `held` verdict and emit a decision event; the loop acts on the
-   verdict (treat as done and unblock dependents, or send the ticket back to
-   active) without waiting on the operator.
-6. The runner writes the outcome to the state file for the next heartbeat.
+5. An adversarial review runs the enforcement tools in `.scripts/sentinel/bin/`,
+   which render an `accepted` or `held` verdict and emit a decision event; the
+   loop acts on the verdict (treat as done and unblock dependents, or send the
+   ticket back to active) without waiting on the operator.
+6. The runner writes the outcome to the state file for the next tick, then
+   opportunistically checkpoints the runtime (gated to ~hourly) before exiting.
 
 ## Read next
 

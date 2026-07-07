@@ -50,13 +50,13 @@ grep -q 'Close recommendation: ready' "$FILE" || { printf 'Close recommendation 
 
 if [ "$FAIL" -ne 0 ]; then
   python3 "$EMIT" "$EVT_PREFIX.gate.failed" --root "$ROOT" \
-    --source "repo://scrum-master/bin/issue-close-gate.sh" \
+    --source "repo://sentinel/bin/issue-close-gate.sh" \
     --field issue="$ISSUE" --field evidence_file="$FILE" --quiet </dev/null || true
   printf '\nCLOSE GATE: FAIL for %s\n' "$ISSUE" >&2
   exit 1
 fi
 
 python3 "$EMIT" "$EVT_PREFIX.gate.passed" --root "$ROOT" \
-  --source "repo://scrum-master/bin/issue-close-gate.sh" \
+  --source "repo://sentinel/bin/issue-close-gate.sh" \
   --field issue="$ISSUE" --field evidence_file="$FILE" --quiet </dev/null || true
 printf 'CLOSE GATE: PASS for %s\n' "$ISSUE"

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Emit a local BloodBank-style CloudEvents envelope (provider-agnostic).
 
-Dependency-free. Appends JSONL locally so the Scrum Master engine records an
+Dependency-free. Appends JSONL locally so the sentinel engine records an
 event trail even when NATS/BloodBank is offline. Identical envelope shape to the
-Hermes gateway; see .scripts/scrum-master/docs/bloodbank-events.md.
+Hermes gateway; see .scripts/sentinel/docs/bloodbank-events.md.
 """
 from __future__ import annotations
 
@@ -55,8 +55,8 @@ def main() -> int:
     parser.add_argument("--field", action="append", type=parse_field, default=[])
     parser.add_argument("--data-json")
     parser.add_argument("--source")
-    parser.add_argument("--producer", default=os.environ.get("BLOODBANK_PRODUCER", "local-script:scrum-master"))
-    parser.add_argument("--service", default=os.environ.get("BLOODBANK_SERVICE", "hermes-scrum-master"))
+    parser.add_argument("--producer", default=os.environ.get("BLOODBANK_PRODUCER", "local-script:sentinel"))
+    parser.add_argument("--service", default=os.environ.get("BLOODBANK_SERVICE", "hermes-sentinel"))
     parser.add_argument("--actor-id", default=os.environ.get("BLOODBANK_ACTOR_ID", os.environ.get("USER", "local-agent")))
     parser.add_argument("--actor-cli", default=os.environ.get("BLOODBANK_ACTOR_CLI", "script"))
     parser.add_argument("--correlation-id", default=os.environ.get("BLOODBANK_CORRELATION_ID"))
@@ -75,7 +75,7 @@ def main() -> int:
     if not log_path.is_absolute():
         log_path = root / log_path
 
-    source = args.source or "repo://scrum-master/bin/emit-event.py"
+    source = args.source or "repo://sentinel/bin/emit-event.py"
     event = {
         "specversion": "1.0",
         "type": args.event_type,

@@ -29,8 +29,8 @@
                   │     ├── config.yaml                    │
                   │     ├── SOUL.md (evolving)             │
                   │     ├── memories/                      │   auto-checkpointed
-                  │     ├── sessions/sessions.db  (LFS)    │   hourly + on
-                  │     ├── decisions/                     │   session end
+                  │     ├── sessions/sessions.db  (LFS)    │   by the heartbeat
+                  │     ├── decisions/                     │   + on session end
                   │     └── bloodbank-consumer.py          │
                   └────────────────────────────────────────┘
 ```
@@ -63,17 +63,22 @@ emitted. Putting it in git gives:
 - **Forkability**: experiment with a copy on a branch, merge if it works out.
 - **Cross-machine**: same agent state on big-chungus and on the laptop.
 
-## Checkpoint cadence
+## Heartbeat cadence (reconcile + checkpoint)
 
-A systemd `--user` timer runs `.scripts/checkpoint.sh` every hour. The script:
+A systemd `--user` timer runs `.scripts/heartbeat.sh` frequently (about once a
+minute). Each tick fuses two jobs into one:
 
-1. `cd` into the runtime submodule
-2. `git add -A`
-3. Commits only if dirty (exits clean otherwise)
-4. Pushes to `origin`
+1. **Board-reconciliation sentinel pass** — the PM's continuous ticket sentinel.
+   The runner's own cooldown/lock logic decides whether a full, LLM-backed
+   reconciliation pass is worth running (it rate-limits the expensive Hermes
+   call); see [the sentinel docs](sentinel/README.md).
+2. **Gated runtime checkpoint** — after the sentinel decision, the runner calls
+   `.scripts/checkpoint.sh`, gated to at most once an hour. The checkpoint:
+   `cd`s into the runtime submodule, `git add -A`, commits only if dirty (exits
+   clean otherwise), and pushes to `origin`.
 
-On session end, a hermes hook (TBD path) does the same thing immediately so
-nothing in-flight is lost between hourly ticks.
+On session end, a hermes hook (TBD path) checkpoints immediately so nothing
+in-flight is lost between heartbeat ticks.
 
 Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters git.
 They're in `.gitignore` and live only on the host machine.

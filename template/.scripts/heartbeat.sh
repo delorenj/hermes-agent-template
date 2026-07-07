@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
-# Provider-agnostic continuous-ticket sentinel heartbeat (Scrum Master engine).
+# Unified agent heartbeat: continuous board-reconciliation sentinel pass +
+# gated runtime checkpoint, fused into one systemd-timer tick.
 #
-# Runs often (systemd timer). Only invokes Hermes when local state says no worker
-# is active, the worker heartbeat is stale, or the last full run is outside the
-# cooldown window. The full pass executes the role's
-# continuous-ticket-sentinel.prompt.md, which reasons about tickets through the
-# ticket-provider adapter (Linear | Plane | Trello) — never a hardcoded backend.
+# Runs often (systemd timer, ~1 min). Only invokes Hermes for a full
+# reconciliation pass when local state says no worker is active, the worker
+# heartbeat is stale, or the last full run is outside the cooldown window. The
+# full pass executes the role's sentinel.prompt.md, which reasons about tickets
+# through the ticket-provider adapter (Linear | Plane | Trello) — never a
+# hardcoded backend. After the sentinel decision (skip OR full), it
+# opportunistically checkpoints the runtime submodule (commit+push) at most once
+# per HEARTBEAT_CHECKPOINT_MIN_INTERVAL_SECONDS, so memory/session state stays
+# durable without pushing every minute.
 set -euo pipefail
 
-ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .scripts/scrum-master
-ROLE_DIR="$(cd "$ENGINE_DIR/../.." && pwd)"
+ROLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # agents/hermes/<role>
 RUNTIME="$ROLE_DIR/runtime"
-PROMPT_FILE="$ENGINE_DIR/continuous-ticket-sentinel.prompt.md"
+PROMPT_FILE="$ROLE_DIR/.scripts/sentinel.prompt.md"
 STATE_FILE="$RUNTIME/continuous-ticket-sentinel-state.json"
 LOCK_FILE="$RUNTIME/continuous-ticket-sentinel.lock"
 ROLE_YAML="$ROLE_DIR/role.yaml"
-LOG_FILE="$RUNTIME/logs/continuous-ticket-sentinel.log"
+LOG_FILE="$RUNTIME/logs/heartbeat.log"
+CHECKPOINT_BIN="$ROLE_DIR/.scripts/checkpoint.sh"
+CHECKPOINT_STAMP="$RUNTIME/.last-checkpoint"
 
 # Hermes binary: explicit env > ~/.config/hermes-agent/hermes-bin > PATH.
 HERMES_BIN="${HERMES_BIN:-}"
@@ -30,6 +36,24 @@ fi
 ACTIVE_MAX_IDLE_SECONDS="${SENTINEL_ACTIVE_MAX_IDLE_SECONDS:-600}"
 FULL_RUN_COOLDOWN_SECONDS="${SENTINEL_FULL_RUN_COOLDOWN_SECONDS:-300}"
 BLOCKED_FULL_RUN_COOLDOWN_SECONDS="${SENTINEL_BLOCKED_FULL_RUN_COOLDOWN_SECONDS:-900}"
+CHECKPOINT_MIN_INTERVAL_SECONDS="${HEARTBEAT_CHECKPOINT_MIN_INTERVAL_SECONDS:-3600}"
+
+# Opportunistic runtime checkpoint, fused into the heartbeat. Runs at most once
+# per interval; checkpoint.sh is itself a no-op on a clean tree, so this only
+# commits+pushes when there is genuinely new state AND enough time has passed
+# since the last push. Never fails the heartbeat — checkpoint is best-effort.
+maybe_checkpoint() {
+  [[ -x "$CHECKPOINT_BIN" ]] || return 0
+  local now last
+  now="$(date +%s)"
+  last="$(cat "$CHECKPOINT_STAMP" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  if (( now - last >= CHECKPOINT_MIN_INTERVAL_SECONDS )); then
+    printf '%s' "$now" > "$CHECKPOINT_STAMP" 2>/dev/null || true
+    printf '[heartbeat] checkpoint tick (>= %ss since last push)\n' "$CHECKPOINT_MIN_INTERVAL_SECONDS"
+    "$CHECKPOINT_BIN" || true
+  fi
+}
 
 yaml_value() {
   python3 - "$ROLE_YAML" "$1" <<'PYEOF'
@@ -42,9 +66,37 @@ print(m.group(1).strip() if m else "")
 PYEOF
 }
 
+yaml_block_value() {
+  python3 - "$ROLE_YAML" "$1" "$2" <<'PYEOF'
+import re, sys
+from pathlib import Path
+path, block_name, key = sys.argv[1:4]
+text = Path(path).read_text()
+m = re.search(rf'(?m)^{re.escape(block_name)}:[ \t]*\n((?:[ \t]+\S.*\n?)*)', text)
+block = m.group(1) if m else ""
+me = re.search(rf'(?m)^[ \t]+{re.escape(key)}:[ \t]*([^\n#]*)', block)
+value = me.group(1).strip() if me else ""
+print(value.strip().strip('"').strip("'"))
+PYEOF
+}
+
+# True only when role.yaml has a reconcile: block with enabled: true. Block-aware
+# so an unrelated `enabled:` leaf elsewhere in the file can't flip it on.
+reconcile_enabled() {
+  python3 - "$ROLE_YAML" <<'PYEOF'
+import re, sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text()
+m = re.search(r'(?m)^reconcile:[ \t]*\n((?:[ \t]+\S.*\n?)*)', text)
+block = m.group(1) if m else ""
+me = re.search(r'(?m)^[ \t]+enabled:[ \t]*"?([A-Za-z]+)"?', block)
+print("true" if (me and me.group(1).lower() == "true") else "false")
+PYEOF
+}
+
 AGENT_ID="$(yaml_value agent_id)"
 REPO_NAME="$(yaml_value repo)"
-PROVIDER="$(yaml_value name)"   # ticket_provider.name leaf
+PROVIDER="$(yaml_block_value ticket_provider name)"
 
 repo_root() {
   local dir="$ROLE_DIR"
@@ -63,7 +115,7 @@ mkdir -p "$RUNTIME/logs"
 if command -v flock >/dev/null 2>&1; then
   exec 9>"$LOCK_FILE"
   if ! flock -n 9; then
-    printf '[sentinel] another heartbeat/full run is active; skipping\n'; exit 0
+    printf '[heartbeat] another heartbeat/full run is active; skipping\n'; exit 0
   fi
 else
   LOCK_DIR="$LOCK_FILE.d"
@@ -71,12 +123,22 @@ else
     # Steal a stale lock older than 60 minutes (a crashed run left it behind).
     if [ -n "$(find "$LOCK_DIR" -maxdepth 0 -mmin +60 2>/dev/null)" ]; then
       rmdir "$LOCK_DIR" 2>/dev/null && mkdir "$LOCK_DIR" 2>/dev/null \
-        || { printf '[sentinel] another run active; skipping\n'; exit 0; }
+        || { printf '[heartbeat] another run active; skipping\n'; exit 0; }
     else
-      printf '[sentinel] another heartbeat/full run is active; skipping\n'; exit 0
+      printf '[heartbeat] another heartbeat/full run is active; skipping\n'; exit 0
     fi
   fi
   trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+fi
+
+# Reconcile gate: the autonomous board-reconciliation pass runs only when
+# role.yaml's reconcile.enabled is true. Default off → the heartbeat just
+# checkpoints (behaves like the legacy hourly checkpoint timer). Flip
+# reconcile.enabled to opt a repo into autonomous board reconciliation.
+if [[ "$(reconcile_enabled)" != "true" ]]; then
+  printf '[heartbeat] reconcile disabled (reconcile.enabled != true) — checkpoint-only tick\n'
+  maybe_checkpoint
+  exit 0
 fi
 
 decision="$(
@@ -145,7 +207,9 @@ state.update({"source":"hermes-continuous-ticket-sentinel","agent_id":agent_id,"
 state.setdefault("updated_at", now_iso); state.setdefault("summary", state.get("reason") or decision)
 tmp = path.with_suffix(path.suffix + ".tmp"); tmp.write_text(json.dumps(state, indent=2, sort_keys=True)+"\n"); tmp.replace(path)
 PYEOF
-    printf '[sentinel] %s\n' "$decision"; exit 0
+    printf '[heartbeat] %s\n' "$decision"
+    maybe_checkpoint
+    exit 0
     ;;
 esac
 
@@ -158,7 +222,7 @@ state = json.loads(path.read_text()) if path.exists() else {}
 now = time.time()
 state.update({"source":"hermes-continuous-ticket-sentinel","agent_id":agent_id,"repo":repo,
     "ticket_provider":provider,"status":"checking",
-    "summary":"Scrum Master is reconciling the ticket board, evidence, and worker state.",
+    "summary":"PM is reconciling the ticket board, evidence, and worker state.",
     "log_path":log_path,"last_heartbeat_at":datetime.fromtimestamp(now,timezone.utc).isoformat(),
     "last_decision":decision,"last_full_run_epoch":now,
     "last_full_run_started_at":datetime.fromtimestamp(now,timezone.utc).isoformat()})
@@ -185,11 +249,12 @@ state["last_runner_exit_code"] = exit_code; state["last_runner_completed_at"] = 
 state.setdefault("last_full_run_epoch", time.time())
 if state.get("status") == "checking":
     state["status"] = "idle" if exit_code == 0 else "error"
-    state["summary"] = ("Scrum Master completed the reconciliation pass without claiming work."
-        if exit_code == 0 else "Scrum Master reconciliation failed; inspect the sentinel log.")
+    state["summary"] = ("PM completed the reconciliation pass without claiming work."
+        if exit_code == 0 else "PM reconciliation failed; inspect the heartbeat log.")
     state.setdefault("updated_at", now_iso)
 tmp = path.with_suffix(path.suffix + ".tmp"); tmp.write_text(json.dumps(state, indent=2, sort_keys=True)+"\n"); tmp.replace(path)
 print(0 if state.get("status") in {"active","blocked","stalled","idle"} else exit_code)
 PYEOF
 )"
+maybe_checkpoint
 exit "$runner_exit"

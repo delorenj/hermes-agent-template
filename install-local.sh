@@ -1,8 +1,10 @@
 #!/usr/bin/env sh
-# Least-friction local install of Hermes PM + Scrum Master roles into a project.
+# Least-friction local install of the Hermes PM role into a project.
 #
 # Local-only: no GitHub runtime repo, no Telegram, no NATS/BloodBank, no Plane
-# project creation. It binds the Scrum Master to a ticket board you already have.
+# project creation. It binds the PM to a ticket board you already have. The PM
+# runs the continuous ticket sentinel out-of-band on its heartbeat timer
+# (board-reconciliation pass + gated runtime checkpoint, one tick).
 # Works on macOS (launchd) and Linux (systemd).
 #
 # One-liner (from anywhere inside the target project):
@@ -14,7 +16,7 @@
 # Environment overrides (skip the prompts):
 #   HAT_REPO=<name>            project/repo name (default: basename of CWD)
 #   HAT_PROVIDER=linear|plane|trello   (default: plane)
-#   HAT_ROLES="pm scrum-master"        roles to install (default: both)
+#   HAT_ROLES="pm"                     roles to install (default: pm)
 #   HAT_DRY_RUN=1              print actions, change nothing
 #   Provider creds: LINEAR_API_KEY | PLANE_API_KEY+PLANE_BASE | TRELLO_KEY+TRELLO_TOKEN
 set -eu
@@ -102,9 +104,9 @@ ask HAT_PROVIDER "Ticket provider (linear|plane|trello)" "plane"
 PROVIDER="$HAT_PROVIDER"
 ask HAT_REPO "Project/repo name" "$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]')"
 REPO="$HAT_REPO"
-SM_ENV="$HOME/.hermes/${REPO}-scrum-master.env"
+PM_ENV="$HOME/.hermes/${REPO}-pm.env"
 
-# These get written into the scrum-master role.yaml binding after render.
+# These get written into the pm role.yaml binding after render.
 # Pre-seed from optional env knobs so the install can run non-interactively.
 TP_WORKSPACE="${HAT_PLANE_WORKSPACE:-}"; TP_PROJECT="${HAT_PLANE_PROJECT:-}"
 TP_TEAM="${HAT_LINEAR_TEAM:-}"; TP_BOARD="${HAT_TRELLO_BOARD:-}"
@@ -151,10 +153,10 @@ TRELLO_TOKEN=$TRELLO_TOKEN"
   *) die "unknown provider: $PROVIDER" ;;
 esac
 
-say "4. writing provider credentials to $SM_ENV"
+say "4. writing provider credentials to $PM_ENV"
 if [ "${HAT_DRY_RUN:-0}" != "1" ]; then
   mkdir -p "$HOME/.hermes"; umask 077
-  printf '%s\n' "$CRED_LINES" > "$SM_ENV"
+  printf '%s\n' "$CRED_LINES" > "$PM_ENV"
 fi
 
 # --- 5. Provision each role with copier (cloud + Telegram + systemd skipped) --
@@ -162,7 +164,7 @@ fi
 # we bind to the existing board below.
 export SKIP_TELEGRAM=1 SKIP_EMAIL=1 SKIP_RUNTIME_REPO=1 SKIP_PLANE=1 \
        SKIP_BLOODBANK=1 SKIP_SYSTEMD=1
-ROLES="${HAT_ROLES:-pm scrum-master}"
+ROLES="${HAT_ROLES:-pm}"
 for ROLE in $ROLES; do
   say "5. provisioning role: $ROLE"
   DEST="$PROJECT_DIR/agents/hermes/$ROLE"
@@ -174,12 +176,12 @@ for ROLE in $ROLES; do
         --data target_repo='$REPO' --data role='$ROLE' --data ticket_provider='$PROVIDER'"
 done
 
-# --- 6. Bind the Scrum Master to the existing board --------------------------
-SM_ROLE="$PROJECT_DIR/agents/hermes/scrum-master/role.yaml"
-if [ -f "$SM_ROLE" ] && [ "${HAT_DRY_RUN:-0}" != "1" ]; then
-  say "6. binding scrum-master to your $PROVIDER board"
+# --- 6. Bind the PM to the existing board ------------------------------------
+PM_ROLE="$PROJECT_DIR/agents/hermes/pm/role.yaml"
+if [ -f "$PM_ROLE" ] && [ "${HAT_DRY_RUN:-0}" != "1" ]; then
+  say "6. binding pm to your $PROVIDER board"
   TP_WORKSPACE="$TP_WORKSPACE" TP_PROJECT="$TP_PROJECT" TP_TEAM="$TP_TEAM" \
-  TP_BOARD="$TP_BOARD" PROVIDER="$PROVIDER" python3 - "$SM_ROLE" <<'PY'
+  TP_BOARD="$TP_BOARD" PROVIDER="$PROVIDER" python3 - "$PM_ROLE" <<'PY'
 import os, re, sys, pathlib
 p = pathlib.Path(sys.argv[1]); t = p.read_text()
 def setleaf(text, key, val):
@@ -196,19 +198,19 @@ PY
 fi
 
 # --- 7. Smoke test the board connection --------------------------------------
-if [ "${HAT_DRY_RUN:-0}" != "1" ] && [ -f "$SM_ROLE" ]; then
+if [ "${HAT_DRY_RUN:-0}" != "1" ] && [ -f "$PM_ROLE" ]; then
   say "7. smoke test: reading your board through the adapter"
-  LIB="$PROJECT_DIR/agents/hermes/scrum-master/.scripts/lib/ticket-provider.sh"
-  ( set -a; . "$SM_ENV" 2>/dev/null; set +a
+  LIB="$PROJECT_DIR/agents/hermes/pm/.scripts/lib/ticket-provider.sh"
+  ( set -a; . "$PM_ENV" 2>/dev/null; set +a
     bash -c '. "$1"; tp resolve && echo "   issues: $(tp list_issues | python3 -c "import sys,json;print(len(json.load(sys.stdin)))")"' _ "$LIB" ) \
-    || warn "   smoke test failed — check the binding in $SM_ROLE and creds in $SM_ENV"
+    || warn "   smoke test failed — check the binding in $PM_ROLE and creds in $PM_ENV"
 fi
 
 say ""
 say "Done. Talk to the PM:   agents/hermes/pm/hermes chat \"status\""
 if [ "$OS" = "Darwin" ]; then
-  say "Sentinel (launchd):     launchctl list | grep $REPO-scrum-master"
+  say "Sentinel (launchd):     launchctl list | grep $REPO-pm-heartbeat"
 else
-  say "Sentinel (systemd):     systemctl --user status hermes-$REPO-scrum-master-continuous-ticket-sentinel.timer"
+  say "Sentinel (systemd):     systemctl --user status hermes-$REPO-pm-heartbeat.timer"
 fi
-say "Provider creds live in: $SM_ENV"
+say "Provider creds live in: $PM_ENV"

@@ -3,9 +3,9 @@
 #
 # Source of truth is the repo-root .project.json `ticket_provider` block
 # (written by the CommonProject base template). The model is:
-#   ONE board per repo — the PM owns it, the Scrum Master sentinel watches it.
-# So we never mint a per-agent, role-suffixed board ("Foo PM" / "Foo Scrum
-# Master"). Instead:
+#   ONE board per repo — the PM owns it, and its heartbeat reconciliation pass
+# watches it. So we never mint a per-agent, role-suffixed board ("Foo PM" /
+# "Foo Sentinel"). Instead:
 #   1. If .project.json already names a board  -> BIND to it (no creation).
 #   2. Otherwise (hermes run on a repo with no CommonProject board yet)
 #      -> create ONE repo-named board and write it back into .project.json so

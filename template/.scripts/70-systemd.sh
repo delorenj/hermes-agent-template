@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install systemd --user units: gateway, consumer, and hourly checkpoint timer.
+# Install systemd --user units: gateway, consumer, and a fused heartbeat timer
+# (board-reconciliation sentinel pass + gated runtime checkpoint, one tick).
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
@@ -8,22 +9,15 @@ already_done 70-systemd && { log "[70] systemd already installed — skipping"; 
 [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
 
 RUNTIME="$ROLE_DIR/runtime"
+REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"
-mkdir -p "$SYS_DIR"
+mkdir -p "$SYS_DIR" "$RUNTIME/logs"
 
-# Resolve absolute path to the runtime checkpoint helper
-CHECKPOINT_BIN="$ROLE_DIR/.scripts/checkpoint.sh"
-cp "$(dirname "$0")/checkpoint.sh" "$CHECKPOINT_BIN" 2>/dev/null || cat > "$CHECKPOINT_BIN" <<'CKPT'
-#!/usr/bin/env bash
-set -euo pipefail
-RUNTIME_DIR="$(cd "$(dirname "$0")/../runtime" && pwd)"
-cd "$RUNTIME_DIR"
-git add -A
-if git diff --cached --quiet; then exit 0; fi
-git -c commit.gpgsign=false commit -m "checkpoint $(date -Iseconds)" >/dev/null
-git push origin HEAD 2>&1 | tail -1 || true
-CKPT
-chmod +x "$CHECKPOINT_BIN"
+# The heartbeat runner (board-reconciliation sentinel pass + gated checkpoint)
+# and the checkpoint helper both render into the role dir; just ensure they are
+# executable. heartbeat.sh calls checkpoint.sh internally.
+HEARTBEAT_BIN="$ROLE_DIR/.scripts/heartbeat.sh"
+chmod +x "$HEARTBEAT_BIN" "$ROLE_DIR/.scripts/checkpoint.sh" 2>/dev/null || true
 
 # Gateway unit
 GW_UNIT="hermes-${AGENT_ID}-gateway.service"
@@ -74,41 +68,54 @@ StandardError=append:$RUNTIME/logs/consumer.log
 WantedBy=default.target
 UNIT
 
-# Hourly checkpoint timer
-CKPT_SVC="hermes-${AGENT_ID}-checkpoint.service"
-CKPT_TIMER="hermes-${AGENT_ID}-checkpoint.timer"
-cat > "$SYS_DIR/$CKPT_SVC" <<UNIT
+# Fused heartbeat: board-reconciliation sentinel pass + gated runtime checkpoint.
+# Frequent ticks (1 min); heartbeat.sh's own cooldown/lock logic rate-limits the
+# full Hermes pass, and the checkpoint is gated to ~hourly inside the runner.
+# The per-agent EnvironmentFiles load ticket-provider creds for the sentinel pass.
+HB_SVC="hermes-${AGENT_ID}-heartbeat.service"
+HB_TIMER="hermes-${AGENT_ID}-heartbeat.timer"
+cat > "$SYS_DIR/$HB_SVC" <<UNIT
 [Unit]
-Description=Hermes Runtime Checkpoint — $DISPLAY_NAME
+Description=Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=$CHECKPOINT_BIN
-StandardOutput=append:$RUNTIME/logs/checkpoint.log
-StandardError=append:$RUNTIME/logs/checkpoint.log
+WorkingDirectory=$REPO_ROOT
+Environment=HERMES_HOME=$RUNTIME
+Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
+Environment=CODEX_HOME=$CODEX_HOME
+EnvironmentFile=-%h/.config/hermes-agent/env
+EnvironmentFile=-%h/.hermes/env
+EnvironmentFile=-%h/.hermes/hermes-agent.env
+EnvironmentFile=-%h/.hermes/${AGENT_ID}.env
+EnvironmentFile=-$RUNTIME/.env
+ExecStart=$HEARTBEAT_BIN
+TimeoutStartSec=45min
+StandardOutput=append:$RUNTIME/logs/heartbeat.log
+StandardError=append:$RUNTIME/logs/heartbeat.log
 UNIT
-cat > "$SYS_DIR/$CKPT_TIMER" <<UNIT
+cat > "$SYS_DIR/$HB_TIMER" <<UNIT
 [Unit]
-Description=Hourly checkpoint for $AGENT_ID
+Description=Heartbeat (reconcile + checkpoint) for $AGENT_ID
 
 [Timer]
-OnBootSec=15min
-OnUnitActiveSec=1h
-Unit=$CKPT_SVC
+OnBootSec=1min
+OnUnitInactiveSec=1min
+Unit=$HB_SVC
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 UNIT
 
-mkdir -p "$RUNTIME/logs"
-
 if systemd_user_available; then
   systemctl --user daemon-reload
   # `enable --now` both enables (persist across login) AND starts the unit now, so a
   # freshly provisioned agent comes up live instead of dormant. Units with missing
   # creds (e.g. a gateway with no Telegram token yet) fail softly via Restart=on-failure.
-  for u in "$GW_UNIT" "$CSM_UNIT" "$CKPT_TIMER"; do
+  for u in "$GW_UNIT" "$CSM_UNIT" "$HB_TIMER"; do
     systemctl --user enable --now "$u" >/dev/null 2>&1 && log "    enabled + started: $u" || warn "    failed to enable/start: $u"
   done
 else

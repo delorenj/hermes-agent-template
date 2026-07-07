@@ -173,11 +173,11 @@ export LINEAR_API_KEY="$(grep -E '^(export )?LINEAR_API_KEY=' \
   ~/.hermes/<agent>.env | head -1 | sed -E 's/^(export )?LINEAR_API_KEY=//; s/^"//; s/"$//')"
 
 # 2. Stage a role directory bound to the real board.
-T=$(mktemp -d); RD="$T/agents/hermes/scrum-master"
+T=$(mktemp -d); RD="$T/agents/hermes/pm"
 mkdir -p "$RD/.scripts/lib" "$RD/.scripts/providers"
 cp template/.scripts/lib/ticket-provider.sh "$RD/.scripts/lib/"
 cp template/.scripts/providers/linear.sh "$RD/.scripts/providers/"
-printf 'repo: demo\nrole: scrum-master\nticket_provider:\n  name: linear\n  team: DEL\n' \
+printf 'repo: demo\nrole: pm\nticket_provider:\n  name: linear\n  team: DEL\n' \
   > "$RD/role.yaml"
 
 # 3. Run the read operations.
