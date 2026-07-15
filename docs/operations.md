@@ -118,7 +118,7 @@ systemctl --user start hermes-${AGENT}-gateway.service
 | --- | --- |
 | Telegram | DM `@<repo>_<role>_bot` (once Telegram is wired) |
 | Local CLI | `./agents/hermes/<role>/hermes chat "..."` |
-| Bloodbank | Publish to subject `bloodbank.cmd.v1.agent.<agent_id>.<verb>.requested` |
+| Bloodbank | Publish to `bloodbank.cmd.v1.agent.task.assign` with `data.target_agent_id = <agent_id>` |
 
 ## Inspect fleet state
 
@@ -219,7 +219,8 @@ rm -rf agents/hermes/<role>
 ### Consumer not seeing events
 - Verify NATS is up: `docker compose -f ~/code/33GOD/bloodbank/compose/docker-compose.yml ps`
 - Tail consumer: `journalctl --user -fu hermes-<agent>-consumer.service`
-- Make sure something is actually publishing to `bloodbank.evt.v1.repo.<repo>.*`
+- Make sure something is publishing canonical repo events such as
+  `bloodbank.evt.v1.repo.issue.updated` with `data.repo = <repo>`
 
 ### Heartbeat not checkpointing (runtime not pushing)
 The checkpoint runs inside the heartbeat tick (after the board-reconciliation

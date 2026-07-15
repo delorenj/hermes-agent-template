@@ -3,8 +3,12 @@
 Bloodbank consumer for hermes agent {{agent_id}}.
 
 Subscribes to:
-    bloodbank.evt.v1.repo.{{repo}}.>
-    bloodbank.cmd.v1.agent.{{agent_id}}.>
+    bloodbank.evt.v1.repo.>
+    bloodbank.cmd.v1.agent.>
+
+The Bloodbank subject identifies the fixed domain/entity/action route. Repo and
+agent identifiers stay in envelope data, so this consumer filters repo events
+by ``data.repo`` and agent commands by ``data.target_agent_id``.
 
 For each event/command received, writes it to the agent's notification queue at
 $HERMES_HOME/bloodbank-inbox/<timestamp>.json so the gateway can ingest it on
@@ -47,8 +51,8 @@ PRODUCER = f"hermes-agent:{AGENT_ID}"
 SOURCE   = f"hermes://agent/{AGENT_ID}"
 
 SUBJECTS = [
-    f"bloodbank.evt.v1.repo.{REPO}.>",
-    f"bloodbank.cmd.v1.agent.{AGENT_ID}.>",
+    "bloodbank.evt.v1.repo.>",
+    "bloodbank.cmd.v1.agent.>",
 ]
 
 KIND_MARKERS = {"event": "evt", "command": "cmd", "reply": "rpy"}
@@ -60,8 +64,8 @@ def _now():
 
 def _subject_and_domain(ce_type, kind):
     parts = ce_type.split(".")
-    if len(parts) != 5 or parts[0] != "bloodbank" or not parts[1].startswith("v"):
-        raise ValueError(f"type {ce_type!r} must match bloodbank.vN.<domain>.<entity>.<action>")
+    if len(parts) != 5 or parts[0] != "bloodbank" or parts[1] != "v1":
+        raise ValueError(f"type {ce_type!r} must match bloodbank.v1.<domain>.<entity>.<action>")
     if kind not in KIND_MARKERS:
         raise ValueError(f"unknown envelope kind {kind!r}")
     _vendor, version, domain, entity, action = parts
@@ -93,6 +97,33 @@ def build_envelope(ce_type, data, *, kind="event", correlationid=None, causation
     return env
 
 
+def _is_for_consumer(subject, payload):
+    """Route canonical subjects using identifiers carried in envelope data."""
+    if not isinstance(payload, dict):
+        return False
+    parts = subject.split(".")
+    if len(parts) != 6 or parts[0] != "bloodbank" or parts[2] != "v1":
+        return False
+
+    _vendor, kind, version, domain, entity, action = parts
+    if kind not in KIND_MARKERS.values():
+        return False
+    if KIND_MARKERS.get(payload.get("kind")) != kind:
+        return False
+    if payload.get("subject") != subject:
+        return False
+    if payload.get("type") != f"bloodbank.{version}.{domain}.{entity}.{action}":
+        return False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return False
+    if kind == "evt" and domain == "repo":
+        return data.get("repo") == REPO
+    if kind == "cmd" and domain == "agent":
+        return data.get("target_agent_id") == AGENT_ID
+    return False
+
+
 async def main():
     nc = await nats.connect(NATS_URL, name=f"hermes-{AGENT_ID}")
     stop = asyncio.Event()
@@ -101,7 +132,10 @@ async def main():
         try:
             payload = json.loads(msg.data.decode())
         except Exception:
-            payload = {"_raw": msg.data.decode(errors="replace")}
+            sys.stderr.write(f"[bloodbank-consumer:{AGENT_ID}] skipped unroutable payload on {msg.subject}\n")
+            return
+        if not _is_for_consumer(msg.subject, payload):
+            return
         entry = {
             "received_at": _now(),
             "subject": msg.subject,
@@ -123,7 +157,7 @@ async def main():
         "bloodbank.v1.agent.online.changed",
         {"agent_id": AGENT_ID, "repo": REPO, "role": ROLE, "state": "online"},
     )
-    await nc.publish("bloodbank.evt.v1.agent.online.changed", json.dumps(online).encode())
+    await nc.publish(online["subject"], json.dumps(online).encode())
 
     def _shutdown(*_):
         stop.set()
@@ -136,7 +170,7 @@ async def main():
         "bloodbank.v1.agent.online.changed",
         {"agent_id": AGENT_ID, "repo": REPO, "role": ROLE, "state": "offline"},
     )
-    await nc.publish("bloodbank.evt.v1.agent.online.changed", json.dumps(offline).encode())
+    await nc.publish(offline["subject"], json.dumps(offline).encode())
     await nc.drain()
 
 

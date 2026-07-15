@@ -101,9 +101,11 @@ archive-on-retire clean.
 ## Bloodbank wiring
 
 Each consumer subscribes to two lanes:
-- `bloodbank.evt.v1.repo.<repo>.>`   — events affecting this repo
-- `bloodbank.cmd.v1.agent.<agent_id>.>` — commands targeting THIS agent specifically
+- `bloodbank.evt.v1.repo.>` — canonical repo-domain events, filtered by `data.repo`
+- `bloodbank.cmd.v1.agent.>` — canonical agent-domain commands, filtered by `data.target_agent_id`
 
 Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
 `producer = hermes-agent:<id>`, `source = hermes://agent/<id>`. The naming
-spec is owned by Holyfields (`~/code/33GOD/bloodbank/docs/event-naming.md`).
+contract is owned by Bloodbank (`~/code/33GOD/bloodbank/docs/event-naming.md`).
+Repo and agent identifiers belong in envelope data, actor, or source fields,
+never in type or subject tokens.

@@ -13,7 +13,7 @@ and recoverable on failure.
 | `memories/MEMORY.md` | yes | The condensed mental-model summary loaded each session |
 | `memories/USER.md` | yes | The operator's persona (Jarad DeLorenzo, ...) |
 | `sessions/sessions.db` | yes (LFS) | SQLite store of every conversation |
-| `bloodbank-consumer.py` | yes | NATS subscriber for repo-scoped events |
+| `bloodbank-consumer.py` | yes | NATS subscriber using canonical subjects plus envelope routing data |
 | `decisions/` | yes | Agent-emitted decisions, one file per important call |
 | `.env` | **no** | API keys + Telegram bot token (per-machine secret) |
 | `auth.json` | **no** | Deprecated local OAuth store; fleet auth defaults to `HERMES_OAUTH_FILE=~/.hermes/auth.json` |
