@@ -8,6 +8,13 @@ load_role_env
 already_done 70-systemd && { log "[70] systemd already installed — skipping"; exit 0; }
 [[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
 
+if [[ "$ROLE" == "reporter" ]]; then
+  log "[70] reporter systemd — gateway/consumer intentionally not installed"
+  log "    use the reporter runtime's explicit install command after credential and policy preflight"
+  mark_done 70-systemd
+  exit 0
+fi
+
 RUNTIME="$ROLE_DIR/runtime"
 REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"

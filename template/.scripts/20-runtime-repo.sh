@@ -9,6 +9,7 @@ already_done 20-runtime-repo && { log "[20] runtime repo already set up — skip
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 RUNTIME_LOCAL="$ROLE_DIR/runtime"
+PROJECT_PATH="$(project_repo_path)" || die "no project git root"
 GH_OWNER="${RUNTIME_REPO%%/*}"
 GH_NAME="${RUNTIME_REPO##*/}"
 
@@ -64,9 +65,52 @@ PYEOF
 #    is a provision-time snapshot; Hermes loads $HERMES_HOME/config.yaml directly
 #    (there is no live profile inheritance). Override via config.toml
 #    [fleet].canonical_pm_config to share one curated PM config across all repos.
-CANONICAL_PM_CONFIG="$(config_get fleet.canonical_pm_config "$HOME/.hermes/config.yaml")"
-if [[ -f "$CANONICAL_PM_CONFIG" ]]; then
-  cp "$CANONICAL_PM_CONFIG" "$TMP/config.yaml"
+if [[ "$ROLE" == "reporter" ]]; then
+  # Reporter runtimes are least-privilege deltas. Never copy the shared PM
+  # config: it may contain dashboard credentials, write-capable MCPs, or broad tools.
+  MODEL_PROVIDER="$(yaml_get model.provider)"
+  MODEL_NAME="$(yaml_get model.name)"
+  CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir "$HOME/.agents/skills")}"
+  python3 - "$TMP/config.yaml" "$PROJECT_PATH" "${HERMES_TIMEZONE:-America/New_York}" \
+    "$MODEL_PROVIDER" "$MODEL_NAME" "$CANONICAL_SKILLS_DIR" "$ROLE" <<'PYEOF'
+import json, pathlib, re, sys
+path, cwd, timezone, provider, model, skills, role = sys.argv[1:8]
+if not re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z_]+)*", timezone):
+    raise SystemExit("unsafe timezone")
+config = {
+    "timezone": timezone,
+    "terminal": {"cwd": cwd},
+    "skills": {"external_dirs": [skills]},
+}
+if provider or model:
+    config["model"] = {}
+    if provider:
+        config["model"]["provider"] = provider
+    if model:
+        config["model"]["default"] = model
+config["platform_toolsets"] = {
+    "cli": ["web", "delegation", "no_mcp"],
+    "cron": ["web", "delegation", "no_mcp"],
+}
+config["agent"] = {
+    "disabled_toolsets": [
+        "browser", "terminal", "file", "code_execution", "cronjob",
+        "kanban", "homeassistant", "computer_use", "project", "skills",
+    ]
+}
+config["delegation"] = {"max_spawn_depth": 1, "inherit_mcp_toolsets": False}
+pathlib.Path(path).write_text(json.dumps(config, indent=2) + "\n")
+PYEOF
+  cat > "$TMP/profile.yaml" <<'YAML'
+config:
+  inherit_from: default
+  save_mode: delta
+YAML
+else
+  CANONICAL_PM_CONFIG="$(config_get fleet.canonical_pm_config "$HOME/.hermes/config.yaml")"
+  if [[ -f "$CANONICAL_PM_CONFIG" ]]; then
+    cp "$CANONICAL_PM_CONFIG" "$TMP/config.yaml"
+  fi
 fi
 # Copy the project's SOUL.md as the canonical starting personality.
 cp "$ROLE_DIR/SOUL.md" "$TMP/SOUL.md"
@@ -79,15 +123,17 @@ if [[ "$REMOTE_HAS_CONTENT" == "0" ]]; then
     git lfs install --local >/dev/null 2>&1 || warn "git-lfs not installed; sessions.db will commit as raw binary"
     git lfs track "*.db" >/dev/null 2>&1 || true
     git lfs track "*.sqlite" >/dev/null 2>&1 || true
+    python3 "$ROLE_DIR/.scripts/secret-scan.py" "$TMP"
     git add -A
+    python3 "$ROLE_DIR/.scripts/secret-scan.py" "$TMP"
     git -c commit.gpgsign=false commit -m "Initial scaffold for $AGENT_ID" >/dev/null
     git remote add origin "$REMOTE_URL"
+    python3 "$ROLE_DIR/.scripts/secret-scan.py" "$TMP"
     git push -u origin main 2>&1 | tail -3
   )
 fi
 
 # 5. Submodule-add into the role dir
-PROJECT_PATH="$(project_repo_path)" || die "no project git root"
 # Compute relative path from the ROLE dir (which exists), then append /runtime
 REL_ROLE_PATH="$(realpath --relative-to="$PROJECT_PATH" "$ROLE_DIR")"
 REL_SUBMODULE_PATH="${REL_ROLE_PATH}/runtime"
@@ -130,10 +176,15 @@ fi
 # runtime), so that name MUST resolve to the runtime.
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
-  log "    migrating staging profile state into the runtime submodule"
-  # OAuth provider credentials are fleet-shared via HERMES_OAUTH_FILE, so do not
-  # clone auth.json/auth.lock into each runtime.
-  for f in .env config.yaml; do
+  log "    migrating profile state into the runtime submodule"
+  # OAuth provider credentials are fleet-shared via HERMES_OAUTH_FILE. Reporter
+  # profiles never migrate .env; other roles preserve upstream PM behavior.
+  if [[ "$ROLE" == "reporter" ]]; then
+    MIGRATE_FILES=(config.yaml profile.yaml)
+  else
+    MIGRATE_FILES=(.env config.yaml)
+  fi
+  for f in "${MIGRATE_FILES[@]}"; do
     [[ -f "$PROFILE_HOME/$f" && ! -e "$RUNTIME_LOCAL/$f" ]] && cp "$PROFILE_HOME/$f" "$RUNTIME_LOCAL/$f"
   done
   rm -rf "$PROFILE_HOME"
