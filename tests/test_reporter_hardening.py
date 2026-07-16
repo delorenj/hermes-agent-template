@@ -52,6 +52,9 @@ class ReporterTemplateHardeningTests(unittest.TestCase):
             self.assertIn('[[ "$ROLE" == "reporter" ]]', systemd_script)
             self.assertNotIn('cp "$HOME/.hermes/config.yaml"', runtime_script)
             self.assertIn("delta-only runtime config", runtime_script)
+            self.assertIn('role == "reporter"', runtime_script)
+            self.assertIn('"disabled_toolsets"', runtime_script)
+            self.assertIn('"no_mcp"', runtime_script)
             self.assertIn(".env.*", ignore)
             self.assertIn(".scripts/.done-*", (target / ".gitignore").read_text())
 
