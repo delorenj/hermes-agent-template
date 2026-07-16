@@ -66,7 +66,7 @@ PYEOF
 #    (there is no live profile inheritance). Override via config.toml
 #    [fleet].canonical_pm_config to share one curated PM config across all repos.
 if [[ "$ROLE" == "reporter" ]]; then
-  # Reporter runtimes are least-privilege deltas. Never copy the shared PM
+  # Generate a delta-only runtime config for least-privilege reporters. Never copy the shared PM
   # config: it may contain dashboard credentials, write-capable MCPs, or broad tools.
   MODEL_PROVIDER="$(yaml_get model.provider)"
   MODEL_NAME="$(yaml_get model.name)"
@@ -194,26 +194,6 @@ log "    profile symlink $PROFILE_HOME -> $RUNTIME_LOCAL"
 
 # Apply the one genuine per-repo config delta directly to the runtime config.
 env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set terminal.cwd "$PROJECT_PATH" >/dev/null 2>&1 || true
-
-if [[ "$ROLE" == "pm" ]]; then
-  VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
-  if [[ -d "$VOXXY_PLUGIN_DIR" ]]; then
-    mkdir -p "$RUNTIME_LOCAL/plugins/tts"
-    ln -sfn "$VOXXY_PLUGIN_DIR" "$RUNTIME_LOCAL/plugins/tts/voxxy"
-    log "    linked Voxxy plugin into runtime"
-  else
-    warn "    Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR"
-  fi
-
-  if [[ -x "$HERMES_BIN" ]]; then
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.provider voxxy >/dev/null 2>&1 || true
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.voice rick >/dev/null 2>&1 || true
-    log "    set PM runtime TTS provider -> voxxy"
-  else
-    warn "    Hermes bin missing; skipped PM Voxxy config"
-  fi
-fi
 
 if [[ "$ROLE" == "pm" ]]; then
   VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
