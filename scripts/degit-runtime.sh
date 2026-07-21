@@ -97,7 +97,10 @@ layer_a(){ # $1 = absolute runtime dir
   # Is it a gitlink submodule (mode 160000) in the index?
   if git -C "$PROJ" ls-files --stage -- "$rel" 2>/dev/null | grep -q '^160000 '; then
     note "Layer A: '$rel' is a gitlink submodule -> de-submodule"
-    run git -C "$PROJ" rm --cached -q -- "$rel"
+    # -f: the gitlink may be staged with a pointer differing from HEAD (e.g. a
+    # freshly-added, not-yet-committed submodule). --cached is index-only and
+    # never touches the working tree, so forcing is safe.
+    run git -C "$PROJ" rm --cached -f -q -- "$rel"
     if [ -f "$PROJ/.gitmodules" ] && git -C "$PROJ" config -f "$PROJ/.gitmodules" --get "submodule.$rel.url" >/dev/null 2>&1; then
       run git -C "$PROJ" config -f "$PROJ/.gitmodules" --remove-section "submodule.$rel"
       # Drop .gitmodules entirely once no [submodule] sections remain.
