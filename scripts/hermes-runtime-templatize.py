@@ -34,6 +34,15 @@ from pathlib import Path
 
 DEFAULT_PACK = Path("/home/delorenj/code/skillex/packs/hermes-base/0.18.2")
 
+# The canonical fleet skills.external_dirs (in precedence order). Every agent
+# should carry exactly these; `provision` normalizes to them (preserving any
+# agent-specific extras).
+MAINLINE_EXTERNAL_DIRS = [
+    "/home/delorenj/code/skillex/skill-sets/global/.system",
+    "/home/delorenj/code/skillex/packs/bmad/6.10.2",
+    str(DEFAULT_PACK),
+]
+
 # Mirror hermes agent/skill_utils.py: only these dirs are pruned from skill
 # scanning, and a SKILL.md inside a skill's support dir is progressive-
 # disclosure data, not an active skill root. Keeping this identical means we
@@ -158,6 +167,52 @@ def wire(cfg: Path, pack: Path, apply: bool) -> bool:
     return True
 
 
+def set_external_dirs(cfg: Path, dirs: list[str], apply: bool) -> str:
+    """Normalize skills.external_dirs to `dirs` (canonical order) + preserve any
+    agent-specific extras. Creates skills:/external_dirs: if absent. Idempotent."""
+    if not cfg.is_file():
+        return "no config.yaml"
+    lines = cfg.read_text(encoding="utf-8").splitlines()
+    skills_i = next((i for i, l in enumerate(lines) if re.match(r"^skills:\s*$", l)), None)
+    items = [f"  - {d}" for d in dirs]
+    if skills_i is None:
+        new = lines[:]
+        if new and new[-1].strip() != "":
+            new.append("")
+        new += ["skills:", "  external_dirs:"] + items
+        action = "created skills.external_dirs"
+    else:
+        end = next((j for j in range(skills_i + 1, len(lines)) if lines[j] and not lines[j][0].isspace()), len(lines))
+        ext_i = next((j for j in range(skills_i + 1, end) if re.match(r"^\s*external_dirs:", lines[j])), None)
+        if ext_i is None:
+            new = lines[:skills_i + 1] + ["  external_dirs:"] + items + lines[skills_i + 1:]
+            action = "added external_dirs under skills:"
+        else:
+            m = re.match(r"^(\s*)external_dirs:\s*(.*)$", lines[ext_i])
+            indent, inline = m.group(1), m.group(2).strip()
+            existing, item_end = [], ext_i + 1
+            if inline == "":
+                while item_end < end and lines[item_end].strip().startswith("- "):
+                    existing.append(re.sub(r"^-\s*", "", lines[item_end].strip()))
+                    item_end += 1
+            elif inline != "[]":
+                existing = [x.strip() for x in inline.strip("[]").split(",") if x.strip()]
+            merged = list(dirs) + [x for x in existing if x not in dirs]
+            new = lines[:ext_i] + [f"{indent}external_dirs:"] + [f"{indent}- {d}" for d in merged] + lines[item_end:]
+            action = "normalized external_dirs"
+    if new == lines:
+        return "ok (already mainline)"
+    if apply:
+        cfg.write_text("\n".join(new) + "\n", encoding="utf-8")
+    return action
+
+
+def provision(root: Path, dirs: list[str], apply: bool) -> None:
+    for rt in runtimes(root):
+        print(f"-- {rt}")
+        print("   " + set_external_dirs(rt / "config.yaml", dirs, apply))
+
+
 def prune_empty_categories(sk: Path, apply: bool) -> int:
     """Remove immediate child dirs of skills/ that hold no SKILL.md anymore."""
     n = 0
@@ -232,12 +287,13 @@ def verify(root: Path, pack: Path) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("dedup", "verify"):
+    for name in ("dedup", "verify", "provision"):
         s = sub.add_parser(name)
         s.add_argument("--root", default=".")
         s.add_argument("--pack", default=str(DEFAULT_PACK))
-        if name == "dedup":
+        if name in ("dedup", "provision"):
             s.add_argument("--apply", action="store_true")
+        if name == "dedup":
             s.add_argument("--slug", default=None, help="agent scope token (default: repo dir basename, lowercased)")
     a = ap.parse_args()
     root = Path(a.root).resolve()
@@ -246,6 +302,12 @@ def main() -> int:
         print(f"ERROR: no skills under pack {pack}", file=sys.stderr); return 2
     if a.cmd == "verify":
         return verify(root, pack)
+    if a.cmd == "provision":
+        mode = "APPLY" if a.apply else "dry-run"
+        print(f"== provision external_dirs ({mode}) :: {root} ==")
+        provision(root, MAINLINE_EXTERNAL_DIRS, a.apply)
+        print("\nRESULT:", "applied." if a.apply else "dry-run. --apply to write the mainline external_dirs.")
+        return 0
     slug = (a.slug or root.name).lower()
     mode = "APPLY" if a.apply else "dry-run"
     print(f"== templatize dedup ({mode}) :: {root} :: slug={slug} :: pack={pack} ==")
