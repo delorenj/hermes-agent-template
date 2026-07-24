@@ -179,20 +179,29 @@ def install_lease(role_dir: Path, apply: bool) -> str:
     return "; ".join(msgs)
 
 
-def unify(role_dir: Path, spec: dict, apply: bool) -> None:
+def unify(role_dir: Path, spec: dict, apply: bool, repo_override: str | None = None) -> None:
     r = load_role(role_dir)
     if r is None:
-        print(f"  SKIP: no role.yaml at {role_dir} (bare-layout agent — handle separately)"); return
+        if not repo_override:
+            print(f"  SKIP: no role.yaml at {role_dir} (bare-layout agent — pass --repo to unify it)"); return
+        r = {"repo": repo_override, "role": "pm", "agent_id": f"{repo_override}-pm"}
+        print(f"  (synthesized identity for bare agent: {r['agent_id']})")
     idt = identity(r, spec)
-    soul = render = SOUL_TMPL.format(**idt)
-    soul_path = role_dir / "SOUL.md"
-    cur = soul_path.read_text() if soul_path.is_file() else ""
-    if cur.strip() == render.strip():
-        print(f"  SOUL: already unified ({idt['agent_id']})")
-    else:
-        if apply:
-            soul_path.write_text(render)
-        print(f"  SOUL: {'written' if apply else 'would write'} ({idt['agent_id']})")
+    render = SOUL_TMPL.format(**idt)
+    # Write BOTH the role-dir source AND the LIVE runtime/SOUL.md that hermes
+    # actually loads (HERMES_HOME=runtime). Provisioning copies source->runtime,
+    # but for an already-deployed agent we must update the live copy directly.
+    for label, sp in (("src ", role_dir / "SOUL.md"),
+                      ("live", role_dir / "runtime" / "SOUL.md")):
+        if not sp.parent.exists():
+            continue
+        cur = sp.read_text() if sp.is_file() else ""
+        if cur.strip() == render.strip():
+            print(f"  SOUL[{label}]: already unified ({idt['agent_id']})")
+        else:
+            if apply:
+                sp.write_text(render)
+            print(f"  SOUL[{label}]: {'written' if apply else 'would write'} ({idt['agent_id']})")
     print("  " + neutralize_config(role_dir / "runtime" / "config.yaml", apply))
     print("  " + install_lease(role_dir, apply))
 
@@ -201,12 +210,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--role-dir", required=True)
     ap.add_argument("--spec", default=str(SPEC_DEFAULT))
+    ap.add_argument("--repo", default=None, help="synthesize identity for a bare agent with no role.yaml")
     ap.add_argument("--apply", action="store_true")
     a = ap.parse_args()
     spec = yaml.safe_load(Path(a.spec).read_text())
     role_dir = Path(a.role_dir).expanduser().resolve()
     print(f"== unify ({'APPLY' if a.apply else 'dry-run'}) :: {role_dir}")
-    unify(role_dir, spec, a.apply)
+    unify(role_dir, spec, a.apply, a.repo)
     return 0
 
 
