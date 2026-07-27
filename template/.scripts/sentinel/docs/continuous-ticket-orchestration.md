@@ -272,7 +272,11 @@ is selected only when the rendered output's canonical path is exactly
 `<candidate>/agents/hermes/<role>` and the descriptor-bound candidate
 `.project.json` contains a string `project_name` byte-equal to the Copier
 `target_repo`; otherwise provisioning normalizes only the output root and
-leaves the ancestor untouched.
+leaves the ancestor untouched. Manifest decoding is strict RFC JSON and rejects
+`NaN`, `Infinity`, and `-Infinity`. The selected repository and manifest
+descriptors and device/inode identities remain held and are revalidated
+immediately before repository chmod; the same manifest descriptor is used for
+manifest chmod and remains open through both mutations.
 
 The provider script and controller source are opened by descriptor, receive
 only the already-bound configuration, and execute from inherited descriptors

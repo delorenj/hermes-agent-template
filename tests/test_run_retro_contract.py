@@ -4617,17 +4617,31 @@ class CopierBootstrapTrustTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return output
 
-    def run_first_task(self, output, marker):
+    def run_first_task(self, output, marker, trace_path=None):
         task = rendered_copier_task()
         self.assertIsInstance(task, str)
         environment = dict(os.environ)
         environment["HERMES_BOOTSTRAP_TEST_MARKER"] = str(marker)
+        command = ["/bin/sh", "-c", task]
+        if trace_path is not None:
+            strace = shutil.which("strace")
+            if strace is None:
+                self.skipTest("strace is unavailable")
+            command = [
+                strace,
+                "-f",
+                "-qq",
+                "-yy",
+                "-e",
+                "trace=openat,close,fchmod,newfstatat",
+                "-o",
+                str(trace_path),
+                *command,
+            ]
         return subprocess.run(
-            task,
+            command,
             cwd=output,
             env=environment,
-            shell=True,
-            executable="/bin/sh",
             text=True,
             capture_output=True,
             check=False,
@@ -4643,7 +4657,7 @@ class CopierBootstrapTrustTests(unittest.TestCase):
             """
         )
 
-    def managed_ancestor(self, root, project_name):
+    def managed_ancestor(self, root, project_name, manifest_bytes=None):
         repository = subprocess.run(
             ["git", "init", "--quiet", str(root)],
             text=True,
@@ -4652,10 +4666,11 @@ class CopierBootstrapTrustTests(unittest.TestCase):
         )
         self.assertEqual(repository.returncode, 0, repository.stderr)
         project = root / ".project.json"
-        project.write_text(
-            json.dumps({"project_name": project_name}) + "\n",
-            encoding="utf-8",
-        )
+        if manifest_bytes is None:
+            manifest_bytes = (
+                json.dumps({"project_name": project_name}) + "\n"
+            ).encode()
+        project.write_bytes(manifest_bytes)
         implementation = root / "_bmad-output" / "implementation-artifacts"
         retros = implementation / "run-retros"
         retros.mkdir(parents=True)
@@ -4732,6 +4747,132 @@ class CopierBootstrapTrustTests(unittest.TestCase):
             self.assertEqual(set(original), set(expected))
             self.assert_modes(expected)
             self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+
+    def assert_nonstandard_json_constant_declines_ancestor(self, token):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root, root / "agents" / "hermes" / "pm")
+            document = (
+                f'{{"project_name":"pjangler","non_standard":{token}}}\n'
+            ).encode()
+            expected = self.managed_ancestor(
+                root,
+                "pjangler",
+                manifest_bytes=document,
+            )
+
+            result = self.run_first_task(output, root / "unexpected-marker")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_modes(expected)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+
+    def test_nan_manifest_declines_ancestor_normalization(self):
+        self.assert_nonstandard_json_constant_declines_ancestor("NaN")
+
+    def test_infinity_manifest_declines_ancestor_normalization(self):
+        self.assert_nonstandard_json_constant_declines_ancestor("Infinity")
+
+    def test_negative_infinity_manifest_declines_ancestor_normalization(self):
+        self.assert_nonstandard_json_constant_declines_ancestor("-Infinity")
+
+    def test_noncanonical_manifest_matrix_declines_ancestor_normalization(self):
+        cases = {
+            "ordinary_malformed": b'{"project_name":"pjangler",}\n',
+            "oversized": (
+                b'{"project_name":"pjangler","padding":"' + (b"x" * 65536) + b'"}\n'
+            ),
+            "non_utf8": b'{"project_name":"pjangler","value":"\xff"}\n',
+            "non_object": b'["pjangler"]\n',
+            "non_string_project_name": b'{"project_name":1}\n',
+            "nan": b'{"project_name":"pjangler","value":NaN}\n',
+            "positive_infinity": (b'{"project_name":"pjangler","value":Infinity}\n'),
+            "negative_infinity": (b'{"project_name":"pjangler","value":-Infinity}\n'),
+        }
+        for name, document in cases.items():
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+                    root = pathlib.Path(tmp)
+                    root.chmod(0o755)
+                    output = self.render(
+                        root,
+                        root / "agents" / "hermes" / "pm",
+                    )
+                    expected = self.managed_ancestor(
+                        root,
+                        "pjangler",
+                        manifest_bytes=document,
+                    )
+
+                    result = self.run_first_task(
+                        output,
+                        root / "unexpected-marker",
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assert_modes(expected)
+                    self.assertEqual(
+                        stat.S_IMODE(output.stat().st_mode),
+                        0o755,
+                    )
+
+    @unittest.skipUnless(
+        sys.platform.startswith("linux"),
+        "descriptor syscall ordering receipt is Linux-specific",
+    )
+    def test_manifest_descriptor_remains_bound_through_repository_chmod(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root, root / "agents" / "hermes" / "pm")
+            self.managed_ancestor(root, "pjangler")
+            trace_path = root / "bootstrap.strace"
+
+            result = self.run_first_task(
+                output,
+                root / "unexpected-marker",
+                trace_path=trace_path,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = trace_path.read_text(encoding="utf-8").splitlines()
+            project_path = str(root / ".project.json")
+            repository_path = str(root)
+            manifest_open = next(
+                index
+                for index, line in enumerate(lines)
+                if "openat(" in line
+                and '".project.json"' in line
+                and f"<{project_path}>" in line
+            )
+            manifest_close = next(
+                index
+                for index, line in enumerate(
+                    lines[manifest_open + 1 :],
+                    manifest_open + 1,
+                )
+                if "close(" in line and f"<{project_path}>" in line
+            )
+            repository_chmod = next(
+                index
+                for index, line in enumerate(
+                    lines[manifest_open + 1 :],
+                    manifest_open + 1,
+                )
+                if "fchmod(" in line and f"<{repository_path}>" in line
+            )
+            manifest_chmod = next(
+                index
+                for index, line in enumerate(
+                    lines[manifest_open + 1 :],
+                    manifest_open + 1,
+                )
+                if "fchmod(" in line and f"<{project_path}>" in line
+            )
+            self.assertLess(manifest_open, repository_chmod)
+            self.assertLess(repository_chmod, manifest_chmod)
+            self.assertLess(manifest_chmod, manifest_close)
 
     def test_bootstrap_file_symlink_is_rejected_without_chmod_or_execution(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
@@ -5015,6 +5156,9 @@ class ProtocolParityTests(unittest.TestCase):
             "canonical path is exactly",
             "`project_name` byte-equal",
             "normalizes only the output root",
+            "strict RFC JSON",
+            "same manifest descriptor",
+            "remains open through both mutations",
             "mode `& 0022 == 0`",
             "artifact and binding descriptors",
             "retained configuration",
