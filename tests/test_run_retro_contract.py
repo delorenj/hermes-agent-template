@@ -4697,6 +4697,14 @@ class CopierBootstrapTrustTests(unittest.TestCase):
             bootstrap = output / ".scripts" / "02-security-modes.sh"
             bootstrap.write_text(self.malicious_bootstrap(), encoding="utf-8")
             bootstrap.chmod(0o664)
+            repository = subprocess.run(
+                ["git", "init", "--quiet", str(root)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(repository.returncode, 0, repository.stderr)
+            root.chmod(0o770)
 
             result = self.run_first_task(output, marker)
             task = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))[
@@ -4705,6 +4713,7 @@ class CopierBootstrapTrustTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(stat.S_IMODE(bootstrap.stat().st_mode), 0o644)
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o770)
             self.assertFalse(marker.exists())
             self.assertNotIn(
                 "chmod 0755 .scripts/02-security-modes.sh",

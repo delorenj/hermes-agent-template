@@ -461,7 +461,22 @@ _tasks:
                     and "\0" not in candidate
                     and os.path.realpath(candidate) == candidate
                 ):
-                    repo_path = candidate
+                    candidate_project = os.path.join(
+                        candidate,
+                        ".project.json",
+                    )
+                    try:
+                        candidate_metadata = os.stat(
+                            candidate_project,
+                            follow_symlinks=False,
+                        )
+                    except FileNotFoundError:
+                        candidate_metadata = None
+                    except OSError:
+                        raise SystemExit(ERROR) from None
+                    if candidate_metadata is not None:
+                        validate(candidate_metadata, "file")
+                        repo_path = candidate
 
         if repo_path == role_path:
             repo_fd = os.dup(root_fd)
