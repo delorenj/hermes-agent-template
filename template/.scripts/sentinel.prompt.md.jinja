@@ -237,23 +237,45 @@ comment / transition per the lifecycle) before the general reconcile below.
     reloads the artifact and derives the exact prepared provider, source/target,
     marker, and body before any external side effect; `TICKET_PROVIDER` cannot
     redirect it. Null source records `no_target_issue` with no board call.
-    Otherwise a cross-user host-global cross-run lock is a whole-device `flock`
-    on the root-owned `/dev/null` character device. It creates no predictable
-    directory or key file, persists no repository, credential, source, marker,
-    or protected value, safely serializes hash collisions, and releases stale
-    ownership only when the final inherited descriptor closes. Repository
-    copies, replacements, and distinct UIDs therefore cannot fork the
-    exhaustive-lookup/at-most-once-post lock domain. The provider script is
-    opened by descriptor, receives only the already-bound configuration, and
-    executes portably from its descriptor through shell stdin. Its process
-    starts a new session/process group and inherits both the lock descriptor and
-    a private containment descriptor for controller-SIGKILL safety. On every
-    success, failure, timeout, or output overflow, bounded portable open-file
-    holder enumeration plus process-group signaling terminates and reaps the
-    full tree, including `setsid` and reparented double-fork descendants, before
-    finalization and before the lock descriptor closes.
+    Otherwise a bounded cross-user host-global cross-run lock binds the exact
+    Linux abstract Unix-socket name `NUL +
+    hermes.run-retro.comment-lock.v1. + <64-hex-comment-fingerprint>`. The
+    namespace has no writable filesystem path, directory, key file, symlink, or
+    permission race; it persists no repository, credential, source, body, or
+    protected value. Equal logical comment keys contend and different keys have
+    different names, so unrelated deliveries do not serialize. Acquisition is
+    nonblocking with a finite deadline (maximum 300 seconds); an artifact-lock
+    timeout returns `stalled`, while a comment-lock timeout records
+    `failed|response_unknown`, in either case without launching the provider.
+    Repository copies, replacements, and distinct UIDs in the host network
+    namespace therefore share exactly one
+    exhaustive-lookup/at-most-once-post lock domain.
 
-    Plane uses the supported `/work-items/{id}/comments/` list/create endpoints
+    The provider script and controller source are opened by descriptor, receive
+    only the already-bound configuration, and execute from inherited
+    descriptors through Python/shell stdin. A detached trusted supervisor—not
+    the delivery controller—owns the keyed socket for the complete provider
+    lifetime, so controller `SIGKILL` cannot release exclusion. On Linux it
+    accepts only a root-owned, non-group/world-writable Bubblewrap executable,
+    creates a private PID namespace with `--unshare-pid --as-pid-1`, and blocks
+    the adapter before execution until a bounded typed `--info-fd` response has
+    yielded the host PID and an open pidfd for namespace PID 1. Success exits
+    PID 1; timeout, overflow, or failure signals that pidfd. Either transition
+    makes the kernel destroy and reap the complete namespace—including
+    `setsid`, reparented double-fork, and all-descriptor-closing
+    descendants—before finalization and before the keyed socket closes.
+    Missing/invalid containment or pre-launch inventory fails closed on a finite
+    deadline with no provider launch. After launch, the already-held pidfd is
+    used for bounded terminal cleanup, and failure to prove containment
+    completion fails closed before finalization or socket release. Unsupported
+    platforms perform no board side effect. Provider temporary storage honors
+    `TMPDIR`; artifact and comment lock acquisition are both bounded.
+
+    Plane and Trello `resolve_issue_id` HTTP bodies go first to bounded private
+    `TMPDIR` files and undergo strict UTF-8/JSON/type/canonical-ID validation
+    before any shell variable can normalize bytes; NUL, malformed, oversized,
+    null, or numeric identities fail closed. Plane uses the supported
+    `/work-items/{id}/comments/` list/create endpoints
     and exhausts `per_page=100` plus `cursor` pages. Every HTTP-200 lookup
     envelope must have typed `results`, `count`, `total_results`,
     `next_page_results`, and `next_cursor`; each result has a canonical string

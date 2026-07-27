@@ -30,9 +30,6 @@ actions_file=""; response_file=""
 cleanup_http_files() {
   [ -z "$actions_file" ] || rm -f "$actions_file"
   [ -z "$response_file" ] || rm -f "$response_file"
-  case "${TMPDIR:-}" in
-    /var/tmp/hermes-provider-*) rmdir "$TMPDIR" 2>/dev/null || true ;;
-  esac
 }
 trap cleanup_http_files EXIT HUP INT TERM
 
@@ -252,12 +249,23 @@ if not re.fullmatch(r"[A-Za-z0-9]+",value):
 print(value)
 PY
 )" || die "invalid issue reference"
-    if ! CARD="$(api GET "cards/$NORMALIZED" "fields=id" 2>/dev/null)"; then
+    response_file="$(new_http_body_file)" || die "issue lookup failed"
+    if ! api GET "cards/$NORMALIZED" "fields=id" >"$response_file" 2>/dev/null; then
       die "issue lookup failed"
     fi
-    ID="$(printf '%s' "$CARD" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("id",""))
-except Exception: print("")')"
+    ID="$(HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$response_file" <<'PY'
+import json,os,re,sys
+try:
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8"))
+ value=data.get("id") if isinstance(data,dict) else None
+ print(value if isinstance(value,str) and re.fullmatch(r"[0-9a-f]{24}",value) else "")
+except Exception:
+ print("")
+PY
+)"
+    rm -f "$response_file"; response_file=""
     CANONICAL="$(canonical_card_id "$ID" 2>/dev/null || true)"
     [ -n "$CANONICAL" ] || die "issue not found or provider returned a non-canonical card id"
     printf '%s\n' "$CANONICAL"

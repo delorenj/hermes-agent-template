@@ -15,6 +15,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -141,9 +142,13 @@ MAX_INPUT_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 64 * 1024
 MAX_PROVIDER_OUTPUT_BYTES = 64 * 1024
 PROVIDER_TIMEOUT_SECONDS = 120.0
-PROVIDER_TERMINATION_GRACE_SECONDS = 0.5
+LOCK_ACQUISITION_TIMEOUT_SECONDS = 5.0
+LOCK_ACQUISITION_MAX_SECONDS = 300.0
+LOCK_RETRY_SECONDS = 0.01
+SUPERVISOR_SHUTDOWN_SECONDS = 2.0
 MAX_EPOCH_US = 253402300799999999
-GLOBAL_COMMENT_LOCK_ANCHOR = Path("/dev/null")
+GLOBAL_COMMENT_LOCK_NAMESPACE = b"\0hermes.run-retro.comment-lock.v1."
+LINUX_CONTAINMENT_CANDIDATES = (Path("/usr/bin/bwrap"), Path("/bin/bwrap"))
 
 
 class RetroError(Exception):
@@ -152,6 +157,54 @@ class RetroError(Exception):
     def __init__(self, category: str):
         super().__init__(category)
         self.category = category
+
+
+def _bounded_seconds(
+    value: Any,
+    *,
+    category: str,
+    maximum: float,
+) -> float:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise RetroError(category) from None
+    if not math.isfinite(seconds) or seconds <= 0 or seconds > maximum:
+        raise RetroError(category)
+    return seconds
+
+
+def _lock_timeout_seconds() -> float:
+    return _bounded_seconds(
+        os.environ.get(
+            "HERMES_LOCK_TIMEOUT_SECONDS",
+            str(LOCK_ACQUISITION_TIMEOUT_SECONDS),
+        ),
+        category="lock_timeout",
+        maximum=LOCK_ACQUISITION_MAX_SECONDS,
+    )
+
+
+def _acquire_flock(descriptor: int, *, timeout_seconds: float) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise RetroError("lock_timeout") from None
+            time.sleep(min(LOCK_RETRY_SECONDS, max(0.0, deadline - time.monotonic())))
+
+
+def _comment_lock_name(marker: str) -> bytes:
+    match = re.fullmatch(r"\[run-retro-comment:([0-9a-f]{64})\]", marker)
+    if match is None:
+        raise RetroError("invalid_artifact")
+    name = GLOBAL_COMMENT_LOCK_NAMESPACE + match.group(1).encode("ascii")
+    if len(name) > 107:
+        raise RetroError("invalid_artifact")
+    return name
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -1139,7 +1192,7 @@ def _safe_lock(directory_fd: int, name: str) -> Iterator[int]:
         if created:
             os.fsync(descriptor)
             _fsync_directory(directory_fd)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _acquire_flock(descriptor, timeout_seconds=_lock_timeout_seconds())
         yield descriptor
     finally:
         with contextlib.suppress(OSError):
@@ -1161,58 +1214,44 @@ def _artifact_lock(store: RetroStore, fingerprint: str) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _global_comment_lock() -> Iterator[int]:
-    descriptor = -1
+def _global_comment_lock(
+    marker: str,
+    *,
+    timeout_seconds: float | None = None,
+) -> Iterator[socket.socket]:
+    lock_socket: socket.socket | None = None
+    name = _comment_lock_name(marker)
     try:
-        path_metadata = os.stat(GLOBAL_COMMENT_LOCK_ANCHOR, follow_symlinks=False)
-        if (
-            not stat.S_ISCHR(path_metadata.st_mode)
-            or path_metadata.st_uid != 0
-            or stat.S_IMODE(path_metadata.st_mode) & 0o006 != 0o006
-        ):
-            raise RetroError("unsafe_artifact_path")
-        descriptor = os.open(
-            GLOBAL_COMMENT_LOCK_ANCHOR,
-            os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        if sys.platform != "linux":
+            raise RetroError("provider_containment_unavailable")
+        lock_socket = socket.socket(
+            socket.AF_UNIX,
+            socket.SOCK_STREAM | getattr(socket, "SOCK_CLOEXEC", 0),
         )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISCHR(metadata.st_mode) or (
-            metadata.st_dev,
-            metadata.st_ino,
-            metadata.st_rdev,
-        ) != (
-            path_metadata.st_dev,
-            path_metadata.st_ino,
-            path_metadata.st_rdev,
-        ):
-            raise RetroError("unsafe_artifact_path")
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield descriptor
+        lock_socket.set_inheritable(False)
+        deadline = time.monotonic() + (
+            timeout_seconds if timeout_seconds is not None else _lock_timeout_seconds()
+        )
+        while True:
+            try:
+                lock_socket.bind(name)
+                break
+            except OSError as error:
+                if error.errno != errno.EADDRINUSE:
+                    raise RetroError("provider_containment_unavailable") from None
+                if time.monotonic() >= deadline:
+                    raise RetroError("lock_timeout") from None
+                time.sleep(
+                    min(LOCK_RETRY_SECONDS, max(0.0, deadline - time.monotonic()))
+                )
+        yield lock_socket
     except RetroError:
         raise
     except OSError:
-        raise RetroError("unsafe_artifact_path") from None
+        raise RetroError("provider_containment_unavailable") from None
     finally:
-        if descriptor >= 0:
-            # Do not explicitly LOCK_UN: a provider subtree inherits this open
-            # file description for controller-SIGKILL safety. The kernel
-            # releases the lock only after the final inherited descriptor closes.
-            os.close(descriptor)
-
-
-@contextlib.contextmanager
-def _comment_lock(
-    repository: RepositorySession,
-    store: RetroStore,
-    document: dict[str, Any],
-) -> Iterator[int]:
-    _assert_store_path(store)
-    comment_marker(document)
-    with _global_comment_lock() as descriptor:
-        _assert_store_path(store)
-        _assert_repository_path(repository)
-        _assert_store_path(store)
-        yield descriptor
+        if lock_socket is not None:
+            lock_socket.close()
 
 
 def _immutable_view(
@@ -1418,231 +1457,214 @@ def _provider_script_fd(
                 os.close(directory_fd)
 
 
-def _enable_child_subreaper() -> None:
+def _trusted_executable(path: Path) -> bool:
+    try:
+        path_metadata = os.stat(path, follow_symlinks=False)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            metadata = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISREG(metadata.st_mode)
+        and path_metadata.st_uid == 0
+        and metadata.st_uid == 0
+        and stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+        and stat.S_IMODE(metadata.st_mode) & 0o111 != 0
+        and (metadata.st_dev, metadata.st_ino)
+        == (path_metadata.st_dev, path_metadata.st_ino)
+    )
+
+
+def _containment_executable() -> Path:
     if sys.platform != "linux":
+        raise RetroError("provider_containment_unavailable")
+    for candidate in LINUX_CONTAINMENT_CANDIDATES:
+        if _trusted_executable(candidate):
+            return candidate
+    raise RetroError("provider_containment_unavailable")
+
+
+def _contained_provider_command(
+    provider: str,
+    source_issue: str,
+    marker: str,
+    body: str,
+    *,
+    info_fd: int,
+    block_fd: int,
+) -> list[str]:
+    executable = _containment_executable()
+    return [
+        str(executable),
+        "--unshare-pid",
+        "--as-pid-1",
+        "--die-with-parent",
+        "--info-fd",
+        str(info_fd),
+        "--block-fd",
+        str(block_fd),
+        "--dev-bind",
+        "/",
+        "/",
+        "--proc",
+        "/proc",
+        "--",
+        "sh",
+        "-s",
+        "ensure_comment",
+        source_issue,
+        marker,
+        body,
+    ]
+
+
+def _terminate_supervisor(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+    try:
+        process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        try:
+            process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise RetroError("provider_containment_unavailable") from None
+
+
+def _read_containment_info(descriptor: int) -> int:
+    selector = selectors.DefaultSelector()
+    buffer = bytearray()
+
+    def parsed_child_pid() -> int | None:
+        try:
+            text = bytes(buffer).decode("utf-8")
+            data, end = json.JSONDecoder().raw_decode(text)
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        if text[end:].strip():
+            raise RetroError("provider_containment_unavailable")
+        child_pid = data.get("child-pid") if isinstance(data, dict) else None
+        pid_namespace = data.get("pid-namespace") if isinstance(data, dict) else None
+        if (
+            not isinstance(child_pid, int)
+            or isinstance(child_pid, bool)
+            or child_pid <= 1
+            or not isinstance(pid_namespace, int)
+            or isinstance(pid_namespace, bool)
+            or pid_namespace <= 0
+        ):
+            raise RetroError("provider_containment_unavailable")
+        return child_pid
+
+    try:
+        os.set_blocking(descriptor, False)
+        selector.register(descriptor, selectors.EVENT_READ)
+        deadline = time.monotonic() + SUPERVISOR_SHUTDOWN_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RetroError("provider_containment_unavailable")
+            if not selector.select(min(remaining, 0.05)):
+                continue
+            try:
+                chunk = os.read(descriptor, 4096)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            if len(buffer) > 4096:
+                raise RetroError("provider_containment_unavailable")
+            child_pid = parsed_child_pid()
+            if child_pid is not None:
+                return child_pid
+        child_pid = parsed_child_pid()
+        if child_pid is None:
+            raise RetroError("provider_containment_unavailable")
+        return child_pid
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RetroError("provider_containment_unavailable") from None
+    finally:
+        selector.close()
+
+
+def _open_pidfd(pid: int) -> int:
+    if hasattr(os, "pidfd_open"):
+        try:
+            return os.pidfd_open(pid, 0)
+        except OSError:
+            raise RetroError("provider_containment_unavailable") from None
+    if sys.platform != "linux" or os.uname().machine not in {
+        "aarch64",
+        "arm64",
+        "ppc64le",
+        "x86_64",
+    }:
+        raise RetroError("provider_containment_unavailable")
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        descriptor = libc.syscall(434, pid, 0)
+        if descriptor < 0:
+            raise OSError(ctypes.get_errno(), "pidfd_open")
+        return int(descriptor)
+    except (AttributeError, OSError):
+        raise RetroError("provider_containment_unavailable") from None
+
+
+def _signal_pidfd(pidfd: int, signum: signal.Signals) -> None:
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(pidfd, signum)
         return
     try:
         import ctypes
 
         libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:
-            return
-    except (AttributeError, OSError):
-        return
-
-
-def _process_parent_map() -> dict[int, int]:
-    try:
-        result = subprocess.run(
-            ["ps", "-Ao", "pid=,ppid="],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if result.returncode != 0 or len(result.stdout) > MAX_PROVIDER_OUTPUT_BYTES:
-        return {}
-    parents: dict[int, int] = {}
-    for line in result.stdout.decode("ascii", "ignore").splitlines():
-        fields = line.split()
-        if len(fields) != 2:
-            continue
-        try:
-            pid, parent = (int(field) for field in fields)
-        except ValueError:
-            continue
-        parents[pid] = parent
-    return parents
-
-
-def _descendant_pids(root_pid: int) -> set[int]:
-    parents = _process_parent_map()
-    descendants: set[int] = set()
-    frontier = {root_pid}
-    while frontier:
-        children = {
-            pid
-            for pid, parent in parents.items()
-            if parent in frontier and pid not in descendants
-        }
-        descendants.update(children)
-        frontier = children
-    descendants.discard(os.getpid())
-    return descendants
-
-
-def _expand_descendant_set(roots: set[int]) -> set[int]:
-    expanded = set(roots)
-    for root in tuple(roots):
-        expanded.update(_descendant_pids(root))
-    expanded.discard(os.getpid())
-    return expanded
-
-
-def _signal_pids(pids: set[int], signum: signal.Signals) -> None:
-    for pid in sorted(pids, reverse=True):
-        if pid <= 1 or pid == os.getpid():
-            continue
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.kill(pid, signum)
-
-
-def _reap_known_children(pids: set[int]) -> None:
-    for pid in pids:
-        with contextlib.suppress(ChildProcessError, ProcessLookupError):
-            os.waitpid(pid, os.WNOHANG)
-
-
-def _provider_containment_marker(directory: str) -> tuple[Path, int]:
-    path = Path(directory) / "containment"
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            path,
-            os.O_RDWR
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-        ):
-            raise RetroError("provider_containment_unavailable")
-        return path, descriptor
-    except RetroError:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise
-    except OSError:
-        if descriptor >= 0:
-            os.close(descriptor)
-        raise RetroError("provider_containment_unavailable") from None
-
-
-def _provider_holder_pids(path: Path) -> set[int]:
-    if sys.platform == "linux":
-        try:
-            target = os.stat(path, follow_symlinks=False)
-            pids: set[int] = set()
-            with os.scandir("/proc") as processes:
-                for process in processes:
-                    if not process.name.isdecimal():
-                        continue
-                    try:
-                        with os.scandir(f"/proc/{process.name}/fd") as descriptors:
-                            for descriptor in descriptors:
-                                try:
-                                    metadata = os.stat(descriptor.path)
-                                except OSError:
-                                    continue
-                                if (metadata.st_dev, metadata.st_ino) == (
-                                    target.st_dev,
-                                    target.st_ino,
-                                ):
-                                    pids.add(int(process.name))
-                                    break
-                    except OSError:
-                        continue
-            if os.getpid() not in pids:
-                raise RetroError("provider_containment_unavailable")
-            return pids
-        except RetroError:
-            raise
-        except OSError:
-            pass
-    try:
-        result = subprocess.run(
-            ["lsof", "-n", "-w", "-F", "p", "--", str(path)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-            timeout=1.0,
-        )
-    except (OSError, subprocess.SubprocessError):
-        raise RetroError("provider_containment_unavailable") from None
-    if result.returncode != 0 or len(result.stdout) > MAX_PROVIDER_OUTPUT_BYTES:
-        raise RetroError("provider_containment_unavailable")
-    pids: set[int] = set()
-    try:
-        lines = result.stdout.decode("ascii").splitlines()
-        for line in lines:
-            if not re.fullmatch(r"p[1-9][0-9]*", line):
-                raise ValueError
-            pids.add(int(line[1:]))
-    except (UnicodeError, ValueError):
-        raise RetroError("provider_containment_unavailable") from None
-    if os.getpid() not in pids:
-        raise RetroError("provider_containment_unavailable")
-    return pids
-
-
-def _pid_exists(pid: int) -> bool:
-    if pid <= 1 or pid == os.getpid():
-        return False
-    try:
-        os.kill(pid, 0)
+        result = libc.syscall(424, pidfd, int(signum), 0, 0)
+        if result != 0:
+            error = ctypes.get_errno()
+            if error == errno.ESRCH:
+                raise ProcessLookupError(error, "pidfd_send_signal")
+            raise OSError(error, "pidfd_send_signal")
     except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+        raise
+    except (AttributeError, OSError):
+        raise RetroError("provider_containment_unavailable") from None
 
 
-def _provider_holder_pids_until_available(path: Path) -> set[int]:
-    while True:
-        try:
-            return _provider_holder_pids(path)
-        except RetroError:
-            # Once a provider has started, losing containment inventory must
-            # retain the inherited comment lock instead of finalizing while an
-            # untracked descendant could still perform an external effect.
-            time.sleep(0.05)
-
-
-def _terminate_provider_tree(
+def _terminate_contained_provider(
     process: subprocess.Popen[bytes],
-    containment_path: Path,
+    pidfd: int,
 ) -> None:
-    known = _descendant_pids(process.pid)
-    known.add(process.pid)
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    _signal_pids(known, signal.SIGKILL)
-    known.update(_provider_holder_pids_until_available(containment_path))
-    known.discard(os.getpid())
-    known = _expand_descendant_set(known)
-    known.update(_provider_holder_pids_until_available(containment_path))
-    known.discard(os.getpid())
-    _signal_pids(known, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=PROVIDER_TERMINATION_GRACE_SECONDS)
-    if process.poll() is None:
+    if process.poll() is None and pidfd >= 0:
         with contextlib.suppress(ProcessLookupError):
-            process.kill()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=PROVIDER_TERMINATION_GRACE_SECONDS)
-    while True:
-        known = _expand_descendant_set(known)
-        holders = _provider_holder_pids_until_available(containment_path) - {
-            os.getpid()
-        }
-        known.update(holders)
-        _signal_pids(holders, signal.SIGKILL)
-        _reap_known_children(known)
-        live = {pid for pid in known if _pid_exists(pid)}
-        if not live:
-            return
-        time.sleep(0.01)
+            _signal_pidfd(pidfd, signal.SIGKILL)
+    try:
+        process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        try:
+            process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            raise RetroError("provider_containment_unavailable") from None
 
 
 def _bounded_provider_output(
     process: subprocess.Popen[bytes],
+    *,
+    timeout_seconds: float,
 ) -> tuple[bytes, bytes]:
     streams = {
         process.stdout: bytearray(),
@@ -1655,7 +1677,7 @@ def _bounded_provider_output(
                 raise RetroError("provider_io_failed")
             os.set_blocking(stream.fileno(), False)
             selector.register(stream, selectors.EVENT_READ)
-        deadline = time.monotonic() + PROVIDER_TIMEOUT_SECONDS
+        deadline = time.monotonic() + timeout_seconds
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1692,81 +1714,311 @@ def _bounded_provider_output(
                     stream.close()
 
 
-def _invoke_provider(
-    repository: RepositorySession,
+def _provider_supervisor_payload(
     stored: dict[str, Any],
-    script_fd: int,
-    lock_descriptor: int,
     provider_config: dict[str, Any],
 ) -> dict[str, Any]:
-    _assert_repository_path(repository)
-    provider = stored["provider"]
+    return {
+        "provider": stored["provider"],
+        "source_issue": stored["source_issue"],
+        "marker": comment_marker(stored),
+        "body": comment_body(stored),
+        "provider_config": provider_config,
+        "provider_timeout_seconds": _bounded_seconds(
+            PROVIDER_TIMEOUT_SECONDS,
+            category="provider_timeout",
+            maximum=LOCK_ACQUISITION_MAX_SECONDS,
+        ),
+        "lock_timeout_seconds": _lock_timeout_seconds(),
+    }
+
+
+def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
+    expected = {
+        "provider",
+        "source_issue",
+        "marker",
+        "body",
+        "provider_config",
+        "provider_timeout_seconds",
+        "lock_timeout_seconds",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise RetroError("invalid_input")
+    provider = value["provider"]
+    if not isinstance(provider, str) or provider not in PROVIDERS:
+        raise RetroError("invalid_input")
+    source_issue = canonical_issue_id(provider, value["source_issue"])
+    if source_issue != value["source_issue"]:
+        raise RetroError("invalid_input")
+    marker = value["marker"]
+    _comment_lock_name(marker)
+    body = value["body"]
+    if not isinstance(body, str) or body.count(marker) != 1:
+        raise RetroError("invalid_input")
+    provider_config = value["provider_config"]
+    if not isinstance(provider_config, dict):
+        raise RetroError("invalid_input")
+    provider_timeout = _bounded_seconds(
+        value["provider_timeout_seconds"],
+        category="provider_timeout",
+        maximum=LOCK_ACQUISITION_MAX_SECONDS,
+    )
+    lock_timeout = _bounded_seconds(
+        value["lock_timeout_seconds"],
+        category="lock_timeout",
+        maximum=LOCK_ACQUISITION_MAX_SECONDS,
+    )
+    return {
+        "provider": provider,
+        "source_issue": source_issue,
+        "marker": marker,
+        "body": body,
+        "provider_config": provider_config,
+        "provider_timeout_seconds": provider_timeout,
+        "lock_timeout_seconds": lock_timeout,
+    }
+
+
+def _read_supervisor_payload(descriptor: int) -> dict[str, Any]:
+    try:
+        with os.fdopen(os.dup(descriptor), "rb", closefd=True) as handle:
+            payload = _read_bounded(
+                handle,
+                MAX_INPUT_BYTES,
+                overflow_category="input_too_large",
+            )
+        return _validated_supervisor_payload(json.loads(payload.decode("utf-8")))
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RetroError("invalid_input") from None
+
+
+def _run_contained_provider(
+    payload: dict[str, Any],
+    script_fd: int,
+) -> dict[str, Any]:
+    provider = payload["provider"]
+    source_issue = payload["source_issue"]
     environment = dict(os.environ)
     environment["TICKET_PROVIDER"] = provider
     environment["HERMES_BOUND_PROVIDER_CONFIG"] = "1"
     environment["HERMES_BOUND_TICKET_PROVIDER_JSON"] = json.dumps(
-        provider_config,
+        payload["provider_config"],
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
+    stored_identity = {"provider": provider, "source_issue": source_issue}
+    process: subprocess.Popen[bytes] | None = None
+    info_read_fd = -1
+    info_write_fd = -1
+    block_read_fd = -1
+    block_write_fd = -1
+    pidfd = -1
     try:
-        marker = comment_marker(stored)
-        body = comment_body(stored)
-        _enable_child_subreaper()
-        if os.getpid() not in _process_parent_map():
-            raise RetroError("provider_containment_unavailable")
         os.lseek(script_fd, 0, os.SEEK_SET)
         with tempfile.TemporaryDirectory(
-            prefix="hermes-provider-", dir="/var/tmp"
+            prefix="hermes-provider-",
+            dir=os.environ.get("TMPDIR"),
         ) as provider_tmp:
             environment["TMPDIR"] = provider_tmp
-            containment_path, containment_descriptor = _provider_containment_marker(
-                provider_tmp
+            info_read_fd, info_write_fd = os.pipe()
+            block_read_fd, block_write_fd = os.pipe()
+            process = subprocess.Popen(
+                _contained_provider_command(
+                    provider,
+                    source_issue,
+                    payload["marker"],
+                    payload["body"],
+                    info_fd=info_write_fd,
+                    block_fd=block_read_fd,
+                ),
+                stdin=script_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                start_new_session=True,
+                pass_fds=(info_write_fd, block_read_fd),
             )
-            process: subprocess.Popen[bytes] | None = None
+            os.close(info_write_fd)
+            info_write_fd = -1
+            os.close(block_read_fd)
+            block_read_fd = -1
             try:
-                if _provider_holder_pids(containment_path) != {os.getpid()}:
-                    raise RetroError("provider_containment_unavailable")
-                process = subprocess.Popen(
-                    [
-                        "sh",
-                        "-s",
-                        "ensure_comment",
-                        stored["source_issue"],
-                        marker,
-                        body,
-                    ],
-                    stdin=script_fd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=environment,
-                    start_new_session=True,
-                    pass_fds=(lock_descriptor, containment_descriptor),
+                child_pid = _read_containment_info(info_read_fd)
+                pidfd = _open_pidfd(child_pid)
+                os.write(block_write_fd, b"1")
+                os.close(block_write_fd)
+                block_write_fd = -1
+                stdout, _ = _bounded_provider_output(
+                    process,
+                    timeout_seconds=payload["provider_timeout_seconds"],
                 )
-                stdout, _ = _bounded_provider_output(process)
             finally:
-                if process is not None:
-                    _terminate_provider_tree(process, containment_path)
-                os.close(containment_descriptor)
-    except RetroError:
+                _terminate_contained_provider(process, pidfd)
+    except (OSError, RetroError):
         return _provider_failure(
-            stored, "response_unknown", "provider response not confirmed"
+            stored_identity,
+            "response_unknown",
+            "provider response not confirmed",
         )
+    finally:
+        for descriptor in (
+            info_read_fd,
+            info_write_fd,
+            block_read_fd,
+            block_write_fd,
+            pidfd,
+        ):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+    if process is None or process.returncode != 0:
+        return _provider_failure(
+            stored_identity,
+            "response_unknown",
+            "provider response not confirmed",
+        )
+    try:
+        result = json.loads(stdout.decode("utf-8"))
+        return _validated_result(stored_identity, result)
+    except (UnicodeError, json.JSONDecodeError, RetroError, TypeError, ValueError):
+        return _provider_failure(
+            stored_identity,
+            "response_unknown",
+            "provider response not confirmed",
+        )
+
+
+def _supervise_provider(script_fd: int, payload_fd: int) -> dict[str, Any]:
+    try:
+        if not stat.S_ISREG(os.fstat(script_fd).st_mode):
+            raise RetroError("provider_unavailable")
     except OSError:
-        return _provider_failure(
-            stored, "response_unknown", "provider response not confirmed"
+        raise RetroError("provider_unavailable") from None
+    payload = _read_supervisor_payload(payload_fd)
+    with _global_comment_lock(
+        payload["marker"],
+        timeout_seconds=payload["lock_timeout_seconds"],
+    ):
+        return _run_contained_provider(payload, script_fd)
+
+
+def _controller_source_fd() -> int:
+    path = Path(__file__)
+    descriptor = -1
+    try:
+        path_metadata = os.stat(path, follow_symlinks=False)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
-    if process.returncode != 0:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or (
+            metadata.st_dev,
+            metadata.st_ino,
+        ) != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        ):
+            raise RetroError("provider_containment_unavailable")
+        return descriptor
+    except RetroError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RetroError("provider_containment_unavailable") from None
+
+
+def _invoke_provider(
+    repository: RepositorySession,
+    stored: dict[str, Any],
+    script_fd: int,
+    provider_config: dict[str, Any],
+) -> dict[str, Any]:
+    _assert_repository_path(repository)
+    try:
+        _containment_executable()
+    except RetroError as error:
+        if error.category != "provider_containment_unavailable":
+            raise
         return _provider_failure(
-            stored, "response_unknown", "provider response not confirmed"
+            stored,
+            "response_unknown",
+            "provider response not confirmed",
+        )
+    payload = _canonical_json(_provider_supervisor_payload(stored, provider_config))
+    source_fd = -1
+    payload_read_fd = -1
+    payload_write_fd = -1
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        source_fd = _controller_source_fd()
+        payload_read_fd, payload_write_fd = os.pipe()
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-",
+                "_supervise-provider",
+                "--script-fd",
+                str(script_fd),
+                "--payload-fd",
+                str(payload_read_fd),
+            ],
+            stdin=source_fd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(script_fd, payload_read_fd),
+            start_new_session=True,
+            env=dict(os.environ),
+        )
+        os.close(payload_read_fd)
+        payload_read_fd = -1
+        with os.fdopen(payload_write_fd, "wb", closefd=True) as handle:
+            payload_write_fd = -1
+            handle.write(payload)
+        total_timeout = (
+            _lock_timeout_seconds()
+            + PROVIDER_TIMEOUT_SECONDS
+            + SUPERVISOR_SHUTDOWN_SECONDS
+        )
+        stdout, _ = _bounded_provider_output(
+            process,
+            timeout_seconds=total_timeout,
+        )
+    except (OSError, RetroError):
+        return _provider_failure(
+            stored,
+            "response_unknown",
+            "provider response not confirmed",
+        )
+    finally:
+        if process is not None:
+            with contextlib.suppress(RetroError):
+                _terminate_supervisor(process)
+        for descriptor in (source_fd, payload_read_fd, payload_write_fd):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+    if process is None or process.returncode != 0:
+        return _provider_failure(
+            stored,
+            "response_unknown",
+            "provider response not confirmed",
         )
     try:
         result = json.loads(stdout.decode("utf-8"))
         return _validated_result(stored, result)
     except (UnicodeError, json.JSONDecodeError, RetroError, TypeError, ValueError):
         return _provider_failure(
-            stored, "response_unknown", "provider response not confirmed"
+            stored,
+            "response_unknown",
+            "provider response not confirmed",
         )
 
 
@@ -1805,31 +2057,31 @@ def deliver(
                     stored["provider"],
                 )
                 with provider_context as script_fd:
-                    with _comment_lock(repository, store, stored) as lock_descriptor:
-                        _assert_repository_path(repository)
-                        _assert_store_path(store)
-                        current = _read_artifact_at(store, fingerprint)
-                        if current is None:
-                            raise RetroError("invalid_artifact")
-                        if _immutable_view(
-                            current, IMMUTABLE_FIELDS
-                        ) != _immutable_view(stored, IMMUTABLE_FIELDS):
-                            raise RetroError("immutable_intent_mismatch")
-                        if current["routing"]["status"] in SUCCESS_STATUSES:
-                            return {
-                                "status": current["routing"]["status"],
-                                "artifact_fingerprint": fingerprint,
-                                "artifact_path": store.relative_path(fingerprint),
-                                "transition": "preserved_terminal",
-                            }
-                        result = _invoke_provider(
-                            repository,
-                            current,
-                            script_fd,
-                            lock_descriptor,
-                            repository.provider_config,
-                        )
-                        return _finalize_at(store, fingerprint, result)
+                    _assert_repository_path(repository)
+                    _assert_store_path(store)
+                    current = _read_artifact_at(store, fingerprint)
+                    if current is None:
+                        raise RetroError("invalid_artifact")
+                    if _immutable_view(current, IMMUTABLE_FIELDS) != _immutable_view(
+                        stored, IMMUTABLE_FIELDS
+                    ):
+                        raise RetroError("immutable_intent_mismatch")
+                    if current["routing"]["status"] in SUCCESS_STATUSES:
+                        return {
+                            "status": current["routing"]["status"],
+                            "artifact_fingerprint": fingerprint,
+                            "artifact_path": store.relative_path(fingerprint),
+                            "transition": "preserved_terminal",
+                        }
+                    result = _invoke_provider(
+                        repository,
+                        current,
+                        script_fd,
+                        repository.provider_config,
+                    )
+                    _assert_repository_path(repository)
+                    _assert_store_path(store)
+                    return _finalize_at(store, fingerprint, result)
             except RetroError as error:
                 if error.category != "provider_unavailable":
                     raise
@@ -1905,11 +2157,38 @@ def _parser() -> argparse.ArgumentParser:
     comment_parser = subparsers.add_parser("comment-body")
     comment_parser.add_argument("--repo-root", required=True, type=Path)
     comment_parser.add_argument("--artifact-fingerprint", required=True)
+    supervisor_parser = subparsers.add_parser("_supervise-provider")
+    supervisor_parser.add_argument("--script-fd", required=True, type=int)
+    supervisor_parser.add_argument("--payload-fd", required=True, type=int)
     return parser
+
+
+def _supervisor_main(script_fd: int, payload_fd: int) -> int:
+    try:
+        result = _supervise_provider(script_fd, payload_fd)
+        output = _canonical_json(result)
+        return_code = 0
+    except RetroError as error:
+        output = _canonical_json(
+            {"status": "stalled", "error_category": error.category}
+        )
+        return_code = 3
+    except (OSError, UnicodeError, ValueError, TypeError):
+        output = _canonical_json(
+            {"status": "stalled", "error_category": "provider_containment_unavailable"}
+        )
+        return_code = 3
+    try:
+        os.write(sys.stdout.fileno(), output)
+    except OSError:
+        pass
+    return return_code
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "_supervise-provider":
+        return _supervisor_main(args.script_fd, args.payload_fd)
     try:
         repo_root = args.repo_root.resolve()
         if args.command == "prepare":

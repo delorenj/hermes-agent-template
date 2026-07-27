@@ -92,9 +92,6 @@ page_file=""; response_file=""
 cleanup_http_files() {
   [ -z "$page_file" ] || rm -f "$page_file"
   [ -z "$response_file" ] || rm -f "$response_file"
-  case "${TMPDIR:-}" in
-    /var/tmp/hermes-provider-*) rmdir "$TMPDIR" 2>/dev/null || true ;;
-  esac
 }
 trap cleanup_http_files EXIT HUP INT TERM
 
@@ -391,38 +388,95 @@ if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}",value)
 print(value)
 PY
 )" || die "invalid issue reference"
-    ID=""
-    if DIRECT="$(api GET "projects/$PROJ/work-items/$NORMALIZED/" 2>/dev/null)"; then
-      ID="$(printf '%s' "$DIRECT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+    ID=""; direct_status="missing"
+    response_file="$(new_http_body_file)" || die "issue lookup failed"
+    if api GET "projects/$PROJ/work-items/$NORMALIZED/" >"$response_file" 2>/dev/null; then
+      direct_status="$(HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$response_file" <<'PY'
+import json,os,re,sys,uuid
+try:
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8"))
+ value=data.get("id") if isinstance(data,dict) else None
+ if not isinstance(value,str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value):
+  raise ValueError
+ if str(uuid.UUID(value)) != value: raise ValueError
+ print("valid:"+value)
+except Exception:
+ print("invalid")
+PY
+)"
+      case "$direct_status" in
+        valid:*) ID="${direct_status#valid:}" ;;
+        *) die "issue lookup failed" ;;
+      esac
     fi
+    rm -f "$response_file"; response_file=""
     if [ -z "$ID" ]; then
       # The caller should normally pass the canonical id from list_issues. This
       # exhaustive fallback safely resolves sequence/key references.
-      if plane_pages_find "projects/$PROJ/work-items/" issue "$NORMALIZED"; then
-        cursor=""; page_count=0
-        while :; do
-          path="projects/$PROJ/work-items/?per_page=100"
-          [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
-          PAGE="$(api GET "$path")" || die "issue lookup failed"
-          ID="$(printf '%s' "$PAGE" | NEEDLE="$NORMALIZED" python3 -c 'import json,os,sys
-d=json.load(sys.stdin); rows=d.get("results",[]) if isinstance(d,dict) else d if isinstance(d,list) else []
-n=os.environ["NEEDLE"].casefold()
-lookup=n.rsplit("-",1)[-1] if "-" in n and n.rsplit("-",1)[-1].isdigit() else n
-for row in rows:
- vals=[str(row.get("id","")),str(row.get("sequence_id","")),str(row.get("identifier",""))]
- p=str(row.get("project_identifier",""))
- if p and row.get("sequence_id") is not None: vals.append(p+"-"+str(row["sequence_id"]))
- if lookup in [v.casefold() for v in vals if v]:
-  print(row.get("id","")); break')"
-          [ -z "$ID" ] || break
-          cursor="$(printf '%s' "$PAGE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("next_cursor","") if d.get("next_page_results",False) else "")')"
-          [ -n "$cursor" ] || break
-          page_count=$((page_count + 1)); [ "$page_count" -lt 10000 ] || die "issue pagination failed"
-        done
-      else
-        rc=$?
-        [ "$rc" -eq 1 ] || die "issue lookup failed"
-      fi
+      cursor=""; page_count=0
+      while :; do
+        path="projects/$PROJ/work-items/?per_page=100"
+        [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
+        page_file="$(new_http_body_file)" || die "issue lookup failed"
+        if ! api GET "$path" >"$page_file" 2>/dev/null; then
+          die "issue lookup failed"
+        fi
+        state="$(HTTP_MAX_BYTES="$HTTP_MAX_BYTES" NEEDLE="$NORMALIZED" python3 - "$page_file" <<'PY'
+import json,os,re,sys,uuid
+try:
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8"))
+ if not isinstance(data,dict) or not isinstance(data.get("results"),list): raise ValueError
+ rows=data["results"]; has_next=data.get("next_page_results"); next_cursor=data.get("next_cursor")
+ if not isinstance(has_next,bool): raise ValueError
+ needle=os.environ["NEEDLE"].casefold()
+ lookup=needle.rsplit("-",1)[-1] if "-" in needle and needle.rsplit("-",1)[-1].isdigit() else needle
+ for row in rows:
+  if not isinstance(row,dict): raise ValueError
+  value=row.get("id")
+  if not isinstance(value,str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value) or str(uuid.UUID(value))!=value:
+   raise ValueError
+  sequence=row.get("sequence_id")
+  identifier=row.get("identifier")
+  project=row.get("project_identifier")
+  if sequence is not None and (not isinstance(sequence,int) or isinstance(sequence,bool)): raise ValueError
+  if identifier is not None and not isinstance(identifier,str): raise ValueError
+  if project is not None and not isinstance(project,str): raise ValueError
+  values=[value]
+  if sequence is not None: values.append(str(sequence))
+  if identifier: values.append(identifier)
+  if project and sequence is not None: values.append(project+"-"+str(sequence))
+  if lookup in [item.casefold() for item in values]:
+   print("found:"+value); raise SystemExit(0)
+ if has_next:
+  if not isinstance(next_cursor,str) or not re.fullmatch(r"[A-Za-z0-9._~:-]{1,512}",next_cursor):
+   raise ValueError
+  print("more:"+next_cursor)
+ elif next_cursor in (None,""):
+  print("absent")
+ else:
+  raise ValueError
+except Exception:
+ print("invalid")
+PY
+)"
+        rm -f "$page_file"; page_file=""
+        case "$state" in
+          found:*) ID="${state#found:}"; break ;;
+          more:*)
+            next="${state#more:}"
+            [ "$next" != "$cursor" ] || die "issue pagination failed"
+            cursor="$next"
+            page_count=$((page_count + 1))
+            [ "$page_count" -lt 10000 ] || die "issue pagination failed"
+            ;;
+          absent) break ;;
+          *) die "issue lookup failed" ;;
+        esac
+      done
     fi
     CANONICAL="$(canonical_uuid "$ID" 2>/dev/null || true)"
     [ -n "$CANONICAL" ] || die "issue not found or provider returned a non-canonical UUID"
