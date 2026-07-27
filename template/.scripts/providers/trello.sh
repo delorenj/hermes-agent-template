@@ -116,7 +116,13 @@ try:
     command = sys.argv[3:]
     if limit <= 0 or per_request <= 0 or not command:
         raise ValueError
-    deadline = time.monotonic() + per_request
+    hard_deadline = time.monotonic() + per_request
+    available = hard_deadline - time.monotonic()
+    if available <= 0:
+        raise TimeoutError
+    cleanup_window = min(1.0, max(0.05, available * 0.2))
+    cleanup_window = min(cleanup_window, available / 2)
+    io_deadline = hard_deadline - cleanup_window
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
@@ -126,6 +132,26 @@ try:
     )
     streams = {process.stdout: bytearray(), process.stderr: bytearray()}
     selector = selectors.DefaultSelector()
+    failed = False
+
+    def terminate_group():
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        remaining = hard_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        process.wait(timeout=remaining)
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= hard_deadline:
+                raise TimeoutError
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            time.sleep(min(0.01, max(0.0, hard_deadline - time.monotonic())))
+
     for stream in streams:
         if stream is None:
             raise OSError
@@ -133,7 +159,7 @@ try:
         selector.register(stream, selectors.EVENT_READ)
     try:
         while selector.get_map():
-            remaining = deadline - time.monotonic()
+            remaining = io_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
             events = selector.select(min(remaining, 0.05))
@@ -156,22 +182,25 @@ try:
                 stream_limit = limit if stream is process.stdout else 8192
                 if len(buffer) > stream_limit:
                     raise OverflowError
-        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        process.wait(timeout=max(0.0, io_deadline - time.monotonic()))
         if process.returncode != 0:
             raise OSError
-        sys.stdout.buffer.write(bytes(streams[process.stdout]))
+    except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
+        failed = True
     finally:
+        try:
+            terminate_group()
+        except (OSError, TimeoutError, subprocess.SubprocessError):
+            failed = True
         selector.close()
         for stream in streams:
             if stream is not None:
                 with contextlib.suppress(OSError):
                     stream.close()
+    if failed:
+        raise SystemExit(22)
+    sys.stdout.buffer.write(bytes(streams[process.stdout]))
 except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
-    if "process" in locals() and process.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=1)
     raise SystemExit(22)
 PY
 }

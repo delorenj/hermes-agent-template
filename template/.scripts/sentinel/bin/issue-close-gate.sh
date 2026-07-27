@@ -18,7 +18,21 @@ ROLE_DIR="$(cd "$BIN_DIR/../../.." && pwd)"
 ROLE_YAML="$ROLE_DIR/role.yaml"
 EMIT="$BIN_DIR/emit-event.py"
 RUN_RETRO="$BIN_DIR/run-retro.py"
-ROOT="${2:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
+if [ "${2:-}" != "" ]; then
+  ROOT="$(CDPATH= cd -- "$2" 2>/dev/null && pwd -P)" || {
+    printf 'Invalid repository root.\n' >&2
+    exit 2
+  }
+else
+  ROOT="$(git -C "$ROLE_DIR" rev-parse --show-toplevel 2>/dev/null)" || {
+    printf 'Cannot resolve the installed role repository.\n' >&2
+    exit 2
+  }
+fi
+[ -f "$ROOT/.project.json" ] || {
+  printf 'Invalid repository root.\n' >&2
+  exit 2
+}
 cd "$ROOT"
 
 REPO="$(sed -n 's/^repo:[[:space:]]*//p' "$ROLE_YAML" 2>/dev/null | head -n1 | tr -d '"' | tr -d '\r')"

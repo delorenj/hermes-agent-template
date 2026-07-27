@@ -167,10 +167,14 @@ Artifact identity is run-scoped and independent of mutable/content-derived
 values. Comment identity and the exact comment body are derived only from
 immutable closed-shape intent, so one marker maps to one body in every retry
 state. An adjacent no-replace `.bindings/<artifact_fingerprint>.sha256` record
-is closed JSON: it first binds the immutable digest with null final
-digest/transition, then atomically binds the full canonical final-document
-digest and byte-equal `routing.proof.transition_id`. Thus a hand-edited
-terminal status or proof cannot satisfy `--final`. Its exact fields are
+is closed JSON. Initial publication writes a unique exclusive temp in the held
+bindings directory, fsyncs and validates it, links it to the final name without
+replacement, fsyncs the final file and directory, and removes the temp. A crash
+can leave only an ignorable unique temp, never a zero-byte final-name poison;
+retry validates or publishes the same immutable binding. Final delivery
+atomically replaces that binding with the full canonical final-document digest
+and byte-equal `routing.proof.transition_id`. Thus a hand-edited terminal status
+or proof cannot satisfy `--final`. Its exact fields are
 `schema=hermes.run-retro.binding`, `schema_version=1`, `immutable_sha256`,
 `final_document_sha256`, and `transition_id`. `immutable_sha256` hashes
 canonical UTF-8 JSON plus one final LF for the immutable artifact view;
@@ -181,22 +185,21 @@ use distinct paths; identical cross-run improvements share one marker and body.
 
 `prepare`, delivery, and finalization use one descriptor-anchored repository
 lifetime: hold the parent and repository descriptors, read `.project.json`,
-bind the store, provider script, and provider configuration, hold the locks,
-and finalize without reopening configuration or executable content by
-pathname. Revalidate the bound repository entry before every external
+then hold the exact retro and bindings directory descriptors, provider script,
+provider configuration, and locks through finalization without reopening
+configuration or executable content by pathname. Revalidate the bound
+repository entry before every external
 effect; root replacement is `unsafe_artifact_path` and performs no board
 call. Traverse
 every `_bmad-output/implementation-artifacts/run-retros` component with
 descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Revalidate the
 bound directory before every create and after opening an empty `O_EXCL`
-temp but before writing data. Mutation targets are addressed from the held
-repository descriptor through
-`_bmad-output/implementation-artifacts/run-retros`, never through the
-replaceable root pathname, so root replacement updates neither a binding
-nor an artifact in the replacement tree, and a store
-relocation at temp creation or durable replacement cannot redirect a
-transient or durable write outside the repository; return only
-`unsafe_artifact_path`. A new artifact uses file
+temp but before writing data. Every binding create/link/replace uses only its
+already-held `bindings_fd` plus a bare filename; every artifact
+create/link/replace uses only its already-held `retro_fd` plus a bare filename.
+No mutation passes a multi-component path, so replacement of any intermediate
+directory cannot redirect a transient or durable write into an attacker tree.
+A detected root/store replacement returns `unsafe_artifact_path`. A new artifact uses file
 fsync, validation, no-replace link, final-file fsync, parent-directory fsync,
 and parse/read-back. Updates use a unique exclusive temp, file fsync, atomic
 replace, final-file and directory fsync, and read-back. Never overwrite corrupt
@@ -209,6 +212,17 @@ Only after durable `prepared|reused`, call exactly:
 ```bash
 tp ensure_comment <artifact-fingerprint>
 ```
+
+The public `run-retro.py finalize` surface always returns
+`untrusted_finalization`; caller-supplied provider JSON can never produce a
+terminal proof. `deliver` alone creates an in-memory, artifact-fingerprint and
+immutable-digest-bound transition after the bound provider execution (or
+internal null-source decision), HMAC-seals its canonical result with a
+process-private key, and consumes it exactly once before mutation. The
+transition ID written to the artifact and final binding comes from that sealed
+one-shot evidence. It cannot be replayed, split across artifacts, or
+self-attested through a result file; a crash before consumption requires a
+fresh idempotent delivery lookup.
 
 This operation accepts no provider, issue, marker, or body argument. It reloads
 the artifact and derives the exact prepared provider, source/target, marker, and
@@ -250,6 +264,11 @@ shutdown/reap window. Failure to prove containment completion fails closed
 before finalization or socket release. Unsupported
 platforms perform no board side effect. Provider temporary storage honors
 `TMPDIR`; artifact and comment lock acquisition are both bounded.
+Plane/Trello curl controllers reserve teardown time inside their hard request
+or operation deadline, signal the original process group even after its leader
+exits, wait/reap the leader, and verify the group no longer exists before
+returning or releasing the keyed delivery lock. Overflow, timeout, or a
+surviving descendant fails closed.
 
 Plane and Trello `resolve_issue_id` HTTP bodies go through an independent
 streaming byte limiter before bounded private
@@ -265,7 +284,11 @@ have typed `results`, `count`, `total_results`, `next_page_results`, and
 count/cumulative-total agreement, unique item IDs, and a new typed cursor on
 every continuing page, with a 2,000-comment safety bound. Plane issue
 resolution has one operation-wide deadline across the direct lookup and all
-pages, and rejects any repeated cursor cycle, including A-B-A. Collection drift,
+pages, and rejects any repeated cursor cycle, including A-B-A.
+`next_page_results=false` is authoritative terminal state for live work-item
+and comment collection envelopes; a typed non-empty terminal `next_cursor`
+such as `100:1:0` is ignored and is never followed. Cursor validation and cycle
+detection apply to continuing pages only. Collection drift,
 duplicate IDs/cursors, malformed or oversized envelopes, and incomplete final
 pages are `failed|lookup_failed` with no post. A successful POST must return a
 canonical string UUID `id`; null,
@@ -292,4 +315,7 @@ A stored `failed` delivery remains retryable evidence but never satisfies
 `--final`; only `posted|already_present|no_target_issue` passes this checkpoint.
 The issue close gate applies the same helper to every run-retro artifact and
 requires `--final` for each one, so editing a status/proof without
-the bound final transition blocks closure.
+the bound final transition blocks closure. When `REPO_ROOT` is omitted, an
+absolute gate invocation resolves the Git repository containing its installed
+`ROLE_DIR`, never the caller's current directory; an explicit root must resolve
+to a repository containing `.project.json`.

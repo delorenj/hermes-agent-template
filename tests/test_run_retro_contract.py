@@ -62,6 +62,21 @@ def load_helper():
 RETRO = load_helper()
 
 
+def trusted_finalize(repo_root, fingerprint, result):
+    """Exercise the internal one-shot transition seam without public finalize."""
+    if not hasattr(RETRO, "_issue_trusted_transition"):
+        return RETRO.finalize(repo_root, fingerprint, result)
+    with RETRO._repository(repo_root) as repository:
+        with RETRO._retro_store(repository, create=False) as store:
+            stored = RETRO._read_artifact_at(store, fingerprint)
+            transition = RETRO._issue_trusted_transition(
+                stored,
+                fingerprint,
+                result,
+            )
+            return RETRO._finalize_at(store, fingerprint, transition)
+
+
 def base_intent(run_id="00000000-0000-4000-8000-000000000001", source=ISSUE_ID):
     return {
         "run_id": run_id,
@@ -186,7 +201,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
     def test_6_lost_response_can_finalize_already_present_on_retry(self):
         prepared = RETRO.prepare(self.repo.root, base_intent())
         fingerprint = prepared["artifact_fingerprint"]
-        RETRO.finalize(
+        trusted_finalize(
             self.repo.root,
             fingerprint,
             {
@@ -198,7 +213,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             },
         )
         RETRO.prepare(self.repo.root, base_intent())
-        RETRO.finalize(
+        trusted_finalize(
             self.repo.root,
             fingerprint,
             {
@@ -216,7 +231,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
 
     def test_7_no_source_finalizes_without_a_target(self):
         prepared = RETRO.prepare(self.repo.root, base_intent(source=None))
-        RETRO.finalize(
+        trusted_finalize(
             self.repo.root,
             prepared["artifact_fingerprint"],
             {
@@ -233,6 +248,448 @@ class RunRetroSerialContractTests(unittest.TestCase):
         )
         self.assertIsNone(document["source_issue"])
         self.assertTrue(document["operator_action_required"])
+
+
+class RunRetroV12RegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = RepoFixture()
+        self._restores = []
+
+    def tearDown(self):
+        for restore in reversed(self._restores):
+            restore()
+        self.repo.close()
+
+    def _retro_path(self):
+        return (
+            self.repo.root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+        )
+
+    def _swap_retro_to_external(self, suffix):
+        retro = self._retro_path()
+        held = self.repo.root.parent / f"{self.repo.root.name}-{suffix}-held"
+        external = self.repo.root.parent / f"{self.repo.root.name}-{suffix}-external"
+        retro.rename(held)
+        external.mkdir()
+        retro.symlink_to(external, target_is_directory=True)
+
+        def restore():
+            if retro.is_symlink():
+                retro.unlink()
+            if retro.exists():
+                shutil.rmtree(retro)
+            if held.exists():
+                held.rename(retro)
+            shutil.rmtree(external, ignore_errors=True)
+
+        self._restores.append(restore)
+        return held, external
+
+    def test_public_finalize_rejects_fabricated_posted_result(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        result_path = self.repo.root / "fabricated-result.json"
+        result_path.write_text(
+            json.dumps(
+                {
+                    "provider": "plane",
+                    "status": "posted",
+                    "target_issue": ISSUE_ID,
+                    "error_category": None,
+                    "error_summary": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "finalize",
+                "--repo-root",
+                str(self.repo.root),
+                "--artifact-fingerprint",
+                prepared["artifact_fingerprint"],
+                "--result",
+                str(result_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(
+            RETRO.read_artifact(self.repo.artifact(prepared["artifact_fingerprint"]))[
+                "routing"
+            ]["status"],
+            "prepared",
+        )
+        validate = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "validate",
+                "--repo-root",
+                str(self.repo.root),
+                "--artifact-fingerprint",
+                prepared["artifact_fingerprint"],
+                "--final",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(validate.returncode, 3)
+        evidence = (
+            self.repo.root
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "issue-evidence"
+            / "PJAN-21.md"
+        )
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(
+            textwrap.dedent(
+                """\
+                ## Issue
+                PJAN-21
+                ## Acceptance Criteria
+                Locked.
+                ## Repo Changes
+                Scoped.
+                ## Verification
+                Verified.
+                ## Ledger Update
+                Ledger updated: yes
+                ## Known Gaps
+                None material.
+                ## Close Recommendation
+                Close recommendation: ready
+                """
+            ),
+            encoding="utf-8",
+        )
+        gate = subprocess.run(
+            ["sh", str(CLOSE_GATE_PATH), "PJAN-21", str(self.repo.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "TMPDIR": str(self.repo.root)},
+        )
+        self.assertEqual(gate.returncode, 1)
+        self.assertIn("Retro finalization proof failed.", gate.stderr)
+
+    def test_trusted_transition_is_bound_single_use_and_not_self_attested(self):
+        first = RETRO.prepare(self.repo.root, base_intent())
+        second = RETRO.prepare(
+            self.repo.root,
+            base_intent("00000000-0000-4000-8000-000000000002"),
+        )
+        success = {
+            "provider": "plane",
+            "status": "posted",
+            "target_issue": ISSUE_ID,
+            "error_category": None,
+            "error_summary": None,
+        }
+        with RETRO._repository(self.repo.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                first_stored = RETRO._read_artifact_at(
+                    store,
+                    first["artifact_fingerprint"],
+                )
+                transition = RETRO._issue_trusted_transition(
+                    first_stored,
+                    first["artifact_fingerprint"],
+                    success,
+                )
+                with self.assertRaisesRegex(
+                    RETRO.RetroError,
+                    "untrusted_finalization",
+                ):
+                    RETRO._finalize_at(
+                        store,
+                        second["artifact_fingerprint"],
+                        transition,
+                    )
+                RETRO._finalize_at(
+                    store,
+                    first["artifact_fingerprint"],
+                    transition,
+                )
+                with self.assertRaisesRegex(
+                    RETRO.RetroError,
+                    "untrusted_finalization",
+                ):
+                    RETRO._finalize_at(
+                        store,
+                        first["artifact_fingerprint"],
+                        transition,
+                    )
+                fabricated = RETRO._TrustedTransition(
+                    artifact_fingerprint=second["artifact_fingerprint"],
+                    immutable_sha256=transition.immutable_sha256,
+                    transition_id="33333333-3333-4333-8333-333333333333",
+                    result_json=transition.result_json,
+                    seal="0" * 64,
+                )
+                with self.assertRaisesRegex(
+                    RETRO.RetroError,
+                    "untrusted_finalization",
+                ):
+                    RETRO._finalize_at(
+                        store,
+                        second["artifact_fingerprint"],
+                        fabricated,
+                    )
+
+    def test_intermediate_replacement_cannot_redirect_binding_create(self):
+        original_open = RETRO.os.open
+        swapped = False
+        external = None
+
+        def swap_before_binding_create(path, flags, *args, **kwargs):
+            nonlocal swapped, external
+            directory_fd = kwargs.get("dir_fd")
+            try:
+                directory_path = os.readlink(f"/proc/self/fd/{directory_fd}")
+            except (OSError, TypeError):
+                directory_path = ""
+            if (
+                not swapped
+                and flags & RETRO.os.O_CREAT
+                and (
+                    ".sha256" in str(path)
+                    or pathlib.Path(directory_path).name == ".bindings"
+                )
+            ):
+                _, external = self._swap_retro_to_external("binding-create")
+                (external / ".bindings").mkdir()
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            RETRO.os,
+            "open",
+            side_effect=swap_before_binding_create,
+        ):
+            with contextlib.suppress(RETRO.RetroError):
+                RETRO.prepare(self.repo.root, base_intent())
+        self.assertTrue(swapped)
+        self.assertEqual(list((external / ".bindings").iterdir()), [])
+
+    def test_intermediate_replacement_cannot_redirect_artifact_link(self):
+        original_link = RETRO.os.link
+        swapped = False
+        external = None
+
+        def swap_before_link(source, target, *args, **kwargs):
+            nonlocal swapped, external
+            if not swapped:
+                held, external = self._swap_retro_to_external("artifact-link")
+                source_name = pathlib.Path(str(source)).name
+                if "/" in str(source):
+                    shutil.copy2(held / source_name, external / source_name)
+                swapped = True
+            return original_link(source, target, *args, **kwargs)
+
+        with mock.patch.object(RETRO.os, "link", side_effect=swap_before_link):
+            with contextlib.suppress(RETRO.RetroError):
+                RETRO.prepare(self.repo.root, base_intent())
+        self.assertTrue(swapped)
+        self.assertEqual(list(external.glob("*.json")), [])
+
+    def test_intermediate_replacement_cannot_redirect_artifact_replace(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        fingerprint = prepared["artifact_fingerprint"]
+        original_replace = RETRO.os.replace
+        swapped = False
+        external = None
+
+        def swap_before_replace(source, target, *args, **kwargs):
+            nonlocal swapped, external
+            if not swapped:
+                held, external = self._swap_retro_to_external("artifact-replace")
+                source_name = pathlib.Path(str(source)).name
+                if "/" in str(source):
+                    shutil.copy2(held / source_name, external / source_name)
+                swapped = True
+            return original_replace(source, target, *args, **kwargs)
+
+        with RETRO._repository(self.repo.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                document = RETRO._read_artifact_at(store, fingerprint)
+                updated = json.loads(json.dumps(document))
+                updated["routing"] = {
+                    "status": "failed",
+                    "error_category": "response_unknown",
+                    "updated_at_epoch_us": (
+                        document["routing"]["updated_at_epoch_us"] + 1
+                    ),
+                    "proof": {"status": "unverified", "transition_id": None},
+                }
+                with mock.patch.object(
+                    RETRO.os,
+                    "replace",
+                    side_effect=swap_before_replace,
+                ):
+                    with contextlib.suppress(RETRO.RetroError):
+                        RETRO._durable_replace(store, fingerprint, updated)
+        self.assertTrue(swapped)
+        self.assertEqual(list(external.glob("*.json")), [])
+
+    def test_intermediate_replacement_cannot_redirect_binding_replace(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        original_replace = RETRO.os.replace
+        swapped = False
+        external = None
+
+        def swap_before_binding_replace(source, target, *args, **kwargs):
+            nonlocal swapped, external
+            directory_fd = kwargs.get("src_dir_fd")
+            try:
+                directory_path = os.readlink(f"/proc/self/fd/{directory_fd}")
+            except (OSError, TypeError):
+                directory_path = ""
+            if not swapped and pathlib.Path(directory_path).name == ".bindings":
+                held, external = self._swap_retro_to_external("binding-replace")
+                (external / ".bindings").mkdir()
+                source_name = pathlib.Path(str(source)).name
+                if "/" in str(source):
+                    shutil.copy2(
+                        held / ".bindings" / source_name,
+                        external / ".bindings" / source_name,
+                    )
+                swapped = True
+            return original_replace(source, target, *args, **kwargs)
+
+        with mock.patch.object(
+            RETRO.os,
+            "replace",
+            side_effect=swap_before_binding_replace,
+        ):
+            with contextlib.suppress(RETRO.RetroError):
+                trusted_finalize(
+                    self.repo.root,
+                    prepared["artifact_fingerprint"],
+                    {
+                        "provider": "plane",
+                        "status": "posted",
+                        "target_issue": ISSUE_ID,
+                        "error_category": None,
+                        "error_summary": None,
+                    },
+                )
+        self.assertTrue(swapped)
+        self.assertEqual(list((external / ".bindings").iterdir()), [])
+
+    def test_initial_binding_crash_leaves_no_permanent_poison_and_retries(self):
+        original_fdopen = RETRO.os.fdopen
+        crashed = False
+
+        def crash_before_binding_write(descriptor, *args, **kwargs):
+            nonlocal crashed
+            try:
+                descriptor_path = os.readlink(f"/proc/self/fd/{descriptor}")
+            except OSError:
+                descriptor_path = ""
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if (
+                not crashed
+                and "/.bindings/" in descriptor_path
+                and ".sha256" in descriptor_path
+                and "w" in mode
+            ):
+                crashed = True
+                raise RuntimeError("simulated crash before binding write")
+            return original_fdopen(descriptor, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                RETRO.os,
+                "fdopen",
+                side_effect=crash_before_binding_write,
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertTrue(crashed)
+        bindings = self._retro_path() / ".bindings"
+        self.assertEqual(
+            [path for path in bindings.iterdir() if path.name.endswith(".sha256")],
+            [],
+        )
+        self.assertEqual(list(bindings.iterdir()), [])
+        retry = RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(retry["status"], "prepared")
+
+    def test_absolute_close_gate_does_not_trust_unrelated_cwd(self):
+        installed = self.repo.root / "installed-role"
+        bin_dir = installed / ".scripts" / "sentinel" / "bin"
+        schema_dir = installed / ".scripts" / "sentinel" / "schemas"
+        bin_dir.mkdir(parents=True)
+        schema_dir.mkdir(parents=True)
+        shutil.copy2(CLOSE_GATE_PATH, bin_dir / "issue-close-gate.sh")
+        shutil.copy2(HELPER_PATH, bin_dir / "run-retro.py")
+        shutil.copy2(
+            ROOT / "template" / ".scripts" / "sentinel" / "bin" / "emit-event.py",
+            bin_dir / "emit-event.py",
+        )
+        shutil.copy2(SCHEMA_PATH, schema_dir / SCHEMA_PATH.name)
+        (installed / "role.yaml").write_text("repo: installed\n", encoding="utf-8")
+        (installed / ".project.json").write_text(
+            json.dumps(
+                {
+                    "project_name": "installed",
+                    "ticket_provider": {"type": "plane"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        subprocess.run(["git", "init", "-q", str(installed)], check=True)
+
+        unrelated = self.repo.root / "unrelated"
+        subprocess.run(
+            ["git", "init", "-q", str(unrelated)],
+            check=True,
+        )
+        evidence = (
+            unrelated
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "issue-evidence"
+            / "PJAN-21.md"
+        )
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(
+            textwrap.dedent(
+                """\
+                ## Issue
+                PJAN-21
+                ## Acceptance Criteria
+                Locked.
+                ## Repo Changes
+                Fabricated.
+                ## Verification
+                Fabricated.
+                ## Ledger Update
+                Ledger updated: yes
+                ## Known Gaps
+                None material.
+                ## Close Recommendation
+                Close recommendation: ready
+                """
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["sh", str(bin_dir / "issue-close-gate.sh"), "PJAN-21"],
+            cwd=unrelated,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Missing issue evidence file", result.stderr)
 
 
 class RunRetroDurabilityTests(unittest.TestCase):
@@ -302,7 +759,14 @@ class RunRetroDurabilityTests(unittest.TestCase):
             prepared = RETRO.prepare(self.repo.root, base_intent())
         self.assertGreaterEqual(file_sync.call_count, 1)
         self.assertGreaterEqual(directory_sync.call_count, 2)
-        no_replace.assert_called_once()
+        self.assertEqual(no_replace.call_count, 2)
+        for call in no_replace.call_args_list:
+            self.assertNotIn("/", str(call.args[0]))
+            self.assertNotIn("/", str(call.args[1]))
+            self.assertEqual(
+                call.kwargs["src_dir_fd"],
+                call.kwargs["dst_dir_fd"],
+            )
         path = self.repo.artifact(prepared["artifact_fingerprint"])
         self.assertFalse(list(path.parent.glob(f".{path.name}.tmp.*")))
 
@@ -330,7 +794,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
         path = self.repo.artifact(prepared["artifact_fingerprint"])
         original = path.read_bytes()
         with self.assertRaisesRegex(RETRO.RetroError, "wrong_comment_target"):
-            RETRO.finalize(
+            trusted_finalize(
                 self.repo.root,
                 prepared["artifact_fingerprint"],
                 {
@@ -706,8 +1170,8 @@ class RunRetroDurabilityTests(unittest.TestCase):
             "error_category": "response_unknown",
             "error_summary": "provider response not confirmed",
         }
-        RETRO.finalize(self.repo.root, fingerprint, success)
-        result = RETRO.finalize(self.repo.root, fingerprint, stale)
+        trusted_finalize(self.repo.root, fingerprint, success)
+        result = trusted_finalize(self.repo.root, fingerprint, stale)
         self.assertEqual(result["status"], "posted")
         self.assertEqual(result["transition"], "preserved_terminal")
         document = RETRO.read_artifact(
@@ -717,7 +1181,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
 
     def test_final_checkpoint_rejects_failed_delivery(self):
         prepared = RETRO.prepare(self.repo.root, base_intent())
-        RETRO.finalize(
+        trusted_finalize(
             self.repo.root,
             prepared["artifact_fingerprint"],
             {
@@ -821,7 +1285,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
 
     def test_close_gate_accepts_provider_finalized_bound_transition(self):
         prepared = RETRO.prepare(self.repo.root, base_intent())
-        RETRO.finalize(
+        trusted_finalize(
             self.repo.root,
             prepared["artifact_fingerprint"],
             {
@@ -1039,7 +1503,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
         relocated = self.repo.root.parent / f"{self.repo.root.name}-temp-window"
         self.addCleanup(shutil.rmtree, relocated, True)
         original_open = RETRO.os.open
-        observed_outside = []
+        observed_components = []
         swapped = False
 
         def swap_during_temp_create(path, flags, *args, **kwargs):
@@ -1056,7 +1520,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
                 try:
                     descriptor = original_open(path, flags, *args, **kwargs)
                 finally:
-                    observed_outside.extend(item.name for item in relocated.iterdir())
+                    observed_components.append(str(path))
                 return descriptor
             return original_open(path, flags, *args, **kwargs)
 
@@ -1065,7 +1529,10 @@ class RunRetroDurabilityTests(unittest.TestCase):
             self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
         ):
             RETRO.prepare(self.repo.root, base_intent())
-        self.assertFalse(any(".json.tmp." in item for item in observed_outside))
+        self.assertTrue(swapped)
+        self.assertTrue(observed_components)
+        self.assertTrue(all("/" not in item for item in observed_components))
+        self.assertFalse(any(".json.tmp." in item.name for item in relocated.iterdir()))
 
     def test_relocation_at_durable_replace_never_updates_artifact_outside_repo(self):
         prepared = RETRO.prepare(self.repo.root, base_intent())
@@ -1091,7 +1558,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
             mock.patch.object(RETRO.os, "replace", side_effect=swap_during_replace),
             self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
         ):
-            RETRO.finalize(
+            trusted_finalize(
                 self.repo.root,
                 prepared["artifact_fingerprint"],
                 {
@@ -1102,11 +1569,8 @@ class RunRetroDurabilityTests(unittest.TestCase):
                     "error_summary": None,
                 },
             )
-        outside = relocated / f"{prepared['artifact_fingerprint']}.json"
-        self.assertEqual(
-            json.loads(outside.read_text(encoding="utf-8"))["routing"]["status"],
-            "prepared",
-        )
+        self.assertTrue(swapped)
+        self.assertFalse(self.repo.artifact(prepared["artifact_fingerprint"]).exists())
 
     def test_relocated_store_is_rejected_before_immutable_binding_write(self):
         relocated = self.repo.root.parent / f"{self.repo.root.name}-relocated-binding"
@@ -1149,10 +1613,18 @@ class RunRetroDurabilityTests(unittest.TestCase):
 
         def replace_root_at_binding_create(path, flags, *args, **kwargs):
             nonlocal swapped
+            directory_fd = kwargs.get("dir_fd")
+            try:
+                directory_path = os.readlink(f"/proc/self/fd/{directory_fd}")
+            except (OSError, TypeError):
+                directory_path = ""
             if (
                 not swapped
                 and flags & RETRO.os.O_CREAT
-                and str(path).endswith(".sha256")
+                and (
+                    ".sha256" in str(path)
+                    or pathlib.Path(directory_path).name == ".bindings"
+                )
             ):
                 root.rename(held_root)
                 root.mkdir()
@@ -1215,7 +1687,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
         ):
-            RETRO.finalize(
+            trusted_finalize(
                 root,
                 prepared["artifact_fingerprint"],
                 {
@@ -2611,6 +3083,83 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertEqual(log.count("work-items/"), 1)
         self.assertNotIn("per_page=100", log)
 
+    def test_plane_terminal_work_item_page_ignores_live_nonempty_cursor(self):
+        self.write_curl(
+            textwrap.dedent(
+                f"""\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *"work-items/PJAN-999/"*) exit 22 ;;
+                esac
+                printf '{{"results":[{{"id":"{ISSUE_ID}","sequence_id":21,"identifier":"PJAN-21","project_identifier":"PJAN"}}],"count":1,"total_results":1,"next_page_results":false,"next_cursor":"100:1:0"}}\\n'
+                """
+            )
+        )
+        result = self.run_plane_resolve("PJAN-999")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "issue not found or provider returned a non-canonical UUID",
+            result.stderr,
+        )
+        self.assertNotIn("issue lookup failed", result.stderr)
+
+    def test_plane_terminal_comment_page_ignores_live_nonempty_cursor(self):
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *"-X POST"*)
+                    printf '{"id":"33333333-3333-4333-8333-333333333333"}\\n'
+                    ;;
+                  *)
+                    printf '{"results":[],"count":0,"total_results":0,"next_page_results":false,"next_cursor":"100:1:0"}\\n'
+                    ;;
+                esac
+                """
+            )
+        )
+        result = self.run_plane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "posted")
+        self.assertIn("-X POST", self.log.read_text(encoding="utf-8"))
+
+    def test_plane_stream_overflow_reaps_group_after_curl_leader_exit(self):
+        delayed = self.root / "plane-curl-delayed-effect"
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import pathlib
+                import sys
+                import time
+
+                child = os.fork()
+                if child:
+                    os._exit(0)
+                try:
+                    for _ in range(40):
+                        os.write(1, b"x" * 4096)
+                except BrokenPipeError:
+                    pass
+                time.sleep(0.4)
+                pathlib.Path(os.environ["DELAYED_EFFECT"]).write_text("escaped")
+                os._exit(0)
+                """
+            )
+        )
+        result = self.run_plane_resolve(
+            extra_env={"DELAYED_EFFECT": str(delayed)},
+            timeout=2,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        time.sleep(0.7)
+        self.assertFalse(delayed.exists())
+
     def test_plane_issue_resolution_rejects_a_b_a_cursor_cycles(self):
         counter = self.root / "cursor-count"
         self.write_curl(
@@ -2982,6 +3531,41 @@ class TrelloDeliveryContractTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(result.stdout, "")
 
+    def test_trello_stream_overflow_reaps_group_after_curl_leader_exit(self):
+        delayed = self.root / "trello-curl-delayed-effect"
+        curl = self.bin / "curl"
+        curl.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import pathlib
+                import time
+
+                child = os.fork()
+                if child:
+                    os._exit(0)
+                try:
+                    for _ in range(40):
+                        os.write(1, b"x" * 4096)
+                except BrokenPipeError:
+                    pass
+                time.sleep(0.4)
+                pathlib.Path(os.environ["DELAYED_EFFECT"]).write_text("escaped")
+                os._exit(0)
+                """
+            ),
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        result = self.run_trello_resolve(
+            extra_env={"DELAYED_EFFECT": str(delayed)},
+            timeout=2,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        time.sleep(0.7)
+        self.assertFalse(delayed.exists())
+
     def test_trello_rejects_numeric_post_id_and_bounds_every_http_read(self):
         curl = self.bin / "curl"
         curl.write_text(
@@ -3239,6 +3823,16 @@ class ProtocolParityTests(unittest.TestCase):
             "controller deadline",
             "repository descriptor",
             "issue close gate",
+            "untrusted_finalization",
+            "HMAC",
+            "`bindings_fd`",
+            "`retro_fd`",
+            "bare filename",
+            "zero-byte final-name poison",
+            "`next_page_results=false`",
+            "`100:1:0`",
+            "original process group",
+            "caller's current directory",
         ]
         for token in required:
             with self.subTest(token=token):

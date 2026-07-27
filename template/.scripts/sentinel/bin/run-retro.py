@@ -8,6 +8,7 @@ import contextlib
 import errno
 import fcntl
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -1111,32 +1112,49 @@ def _ensure_binding(
     _assert_store_path(store)
     bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=True)
     name = f"{fingerprint}.sha256"
+    temporary = _unique_temp_name(name)
     payload = _canonical_json(_prepared_binding(document))
     descriptor = -1
     try:
         _assert_store_path(store)
-        try:
-            descriptor = os.open(
-                store.repo_relative(f".bindings/{name}"),
-                os.O_WRONLY
-                | os.O_CREAT
-                | os.O_EXCL
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=store.repo_fd,
-            )
-        except FileExistsError:
-            _validate_binding_at(bindings_fd, fingerprint, document)
-            return
-        _assert_store_path(store)
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=bindings_fd,
+        )
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
+        value = _read_utf8_json_at(
+            bindings_fd,
+            temporary,
+            category="invalid_artifact",
+            max_bytes=1024,
+            overflow_category="invalid_artifact",
+        )
+        _validate_binding_value(value, document, require_final=False)
+        try:
+            os.link(
+                temporary,
+                name,
+                src_dir_fd=bindings_fd,
+                dst_dir_fd=bindings_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            _validate_binding_at(bindings_fd, fingerprint, document)
+            return
+        _fsync_file(bindings_fd, name)
         _fsync_directory(bindings_fd)
         _validate_binding_at(bindings_fd, fingerprint, document)
+        _assert_store_path(store)
     except RetroError:
         raise
     except OSError:
@@ -1145,6 +1163,8 @@ def _ensure_binding(
         if descriptor >= 0:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=bindings_fd)
         os.close(bindings_fd)
 
 
@@ -1172,14 +1192,14 @@ def _finalize_binding(
             return
         final_value = _final_binding(document)
         descriptor = os.open(
-            store.repo_relative(f".bindings/{temporary}"),
+            temporary,
             os.O_WRONLY
             | os.O_CREAT
             | os.O_EXCL
             | getattr(os, "O_CLOEXEC", 0)
             | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=store.repo_fd,
+            dir_fd=bindings_fd,
         )
         _assert_store_path(store)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
@@ -1197,10 +1217,10 @@ def _finalize_binding(
         _validate_binding_value(value, document, require_final=True)
         _assert_store_path(store)
         os.replace(
-            store.repo_relative(f".bindings/{temporary}"),
-            store.repo_relative(f".bindings/{name}"),
-            src_dir_fd=store.repo_fd,
-            dst_dir_fd=store.repo_fd,
+            temporary,
+            name,
+            src_dir_fd=bindings_fd,
+            dst_dir_fd=bindings_fd,
         )
         _fsync_file(bindings_fd, name)
         _fsync_directory(bindings_fd)
@@ -1210,6 +1230,7 @@ def _finalize_binding(
             document,
             require_final=True,
         )
+        _assert_store_path(store)
     except RetroError:
         raise
     except OSError:
@@ -1239,10 +1260,10 @@ def _write_exclusive_temp(
     descriptor = -1
     try:
         descriptor = os.open(
-            store.repo_relative(temporary),
+            temporary,
             flags,
             0o600,
-            dir_fd=store.repo_fd,
+            dir_fd=directory_fd,
         )
         _assert_store_path(store)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
@@ -1283,10 +1304,10 @@ def _durable_create(
         _assert_store_path(store)
         try:
             os.link(
-                store.repo_relative(temporary),
-                store.repo_relative(name),
-                src_dir_fd=store.repo_fd,
-                dst_dir_fd=store.repo_fd,
+                temporary,
+                name,
+                src_dir_fd=store.retro_fd,
+                dst_dir_fd=store.retro_fd,
                 follow_symlinks=False,
             )
         except FileExistsError:
@@ -1298,6 +1319,7 @@ def _durable_create(
         os.unlink(temporary, dir_fd=store.retro_fd)
         _fsync_directory(store.retro_fd)
         _read_artifact_at(store, fingerprint)
+        _assert_store_path(store)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=store.retro_fd)
@@ -1315,16 +1337,17 @@ def _durable_replace(
         _assert_store_path(store)
         try:
             os.replace(
-                store.repo_relative(temporary),
-                store.repo_relative(name),
-                src_dir_fd=store.repo_fd,
-                dst_dir_fd=store.repo_fd,
+                temporary,
+                name,
+                src_dir_fd=store.retro_fd,
+                dst_dir_fd=store.retro_fd,
             )
         except OSError:
             raise RetroError("unsafe_artifact_path") from None
         _fsync_file(store.retro_fd, name)
         _fsync_directory(store.retro_fd)
         _read_artifact_at(store, fingerprint)
+        _assert_store_path(store)
     finally:
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=store.retro_fd)
@@ -1499,17 +1522,123 @@ def _validated_result(stored: dict[str, Any], result: Any) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class _TrustedTransition:
+    artifact_fingerprint: str
+    immutable_sha256: str
+    transition_id: str
+    result_json: bytes
+    seal: str
+
+
+_TRANSITION_KEY = os.urandom(32)
+_ACTIVE_TRANSITIONS: dict[str, str] = {}
+
+
+def _transition_preimage(
+    fingerprint: str,
+    immutable_sha256: str,
+    transition_id: str,
+    result_json: bytes,
+) -> bytes:
+    return b"\n".join(
+        (
+            b"hermes.run-retro.trusted-transition.v1",
+            fingerprint.encode("ascii"),
+            immutable_sha256.encode("ascii"),
+            transition_id.encode("ascii"),
+            result_json,
+            b"",
+        )
+    )
+
+
+def _issue_trusted_transition(
+    stored: dict[str, Any],
+    fingerprint: str,
+    result: dict[str, Any],
+) -> _TrustedTransition:
+    if not SHA256_RE.fullmatch(fingerprint):
+        raise RetroError("invalid_artifact")
+    normalized = _validated_result(stored, result)
+    immutable_sha256 = _immutable_digest(stored)
+    transition_id = str(uuid.uuid4())
+    result_json = _canonical_json(normalized)
+    seal = hmac.new(
+        _TRANSITION_KEY,
+        _transition_preimage(
+            fingerprint,
+            immutable_sha256,
+            transition_id,
+            result_json,
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    _ACTIVE_TRANSITIONS[transition_id] = seal
+    return _TrustedTransition(
+        artifact_fingerprint=fingerprint,
+        immutable_sha256=immutable_sha256,
+        transition_id=transition_id,
+        result_json=result_json,
+        seal=seal,
+    )
+
+
+def _consume_trusted_transition(
+    stored: dict[str, Any],
+    fingerprint: str,
+    transition: _TrustedTransition,
+) -> tuple[dict[str, Any], str]:
+    if type(transition) is not _TrustedTransition:
+        raise RetroError("untrusted_finalization")
+    try:
+        transition_id = canonical_invocation_id(transition.transition_id)
+        result = json.loads(transition.result_json.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RetroError("untrusted_finalization") from None
+    normalized = _validated_result(stored, result)
+    immutable_sha256 = _immutable_digest(stored)
+    expected_seal = hmac.new(
+        _TRANSITION_KEY,
+        _transition_preimage(
+            fingerprint,
+            immutable_sha256,
+            transition_id,
+            _canonical_json(normalized),
+        ),
+        hashlib.sha256,
+    ).hexdigest()
+    if (
+        transition.artifact_fingerprint != fingerprint
+        or transition.immutable_sha256 != immutable_sha256
+        or transition.transition_id != transition_id
+        or transition.result_json != _canonical_json(normalized)
+        or not hmac.compare_digest(transition.seal, expected_seal)
+        or not hmac.compare_digest(
+            _ACTIVE_TRANSITIONS.get(transition_id, ""),
+            expected_seal,
+        )
+    ):
+        raise RetroError("untrusted_finalization")
+    del _ACTIVE_TRANSITIONS[transition_id]
+    return normalized, transition_id
+
+
 def _finalize_at(
     store: RetroStore,
     fingerprint: str,
-    result: dict[str, Any],
+    transition: _TrustedTransition,
 ) -> dict[str, Any]:
     with _artifact_lock(store, fingerprint):
         _assert_store_path(store)
         stored = _read_artifact_at(store, fingerprint)
         if stored is None:
             raise RetroError("invalid_artifact")
-        normalized = _validated_result(stored, result)
+        normalized, transition_id = _consume_trusted_transition(
+            stored,
+            fingerprint,
+            transition,
+        )
         stored_status = stored["routing"]["status"]
         incoming_status = normalized["status"]
         if stored_status in SUCCESS_STATUSES or stored_status == "no_target_issue":
@@ -1538,7 +1667,7 @@ def _finalize_at(
             "proof": (
                 {
                     "status": "verified",
-                    "transition_id": str(uuid.uuid4()),
+                    "transition_id": transition_id,
                 }
                 if incoming_status in CHECKPOINT_STATUSES
                 else {
@@ -1570,13 +1699,12 @@ def _finalize_at(
 
 
 def finalize(
-    repo_root: Path, fingerprint: str, result: dict[str, Any]
+    repo_root: Path,
+    fingerprint: str,
+    result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    if not SHA256_RE.fullmatch(fingerprint):
-        raise RetroError("invalid_artifact")
-    with _repository(repo_root) as repository:
-        with _retro_store(repository, create=False) as store:
-            return _finalize_at(store, fingerprint, result)
+    del repo_root, fingerprint, result
+    raise RetroError("untrusted_finalization")
 
 
 def comment_body(document: dict[str, Any]) -> str:
@@ -2149,19 +2277,24 @@ def _controller_timeout_seconds() -> float:
 def _invoke_provider(
     repository: RepositorySession,
     stored: dict[str, Any],
+    fingerprint: str,
     script_fd: int,
     provider_config: dict[str, Any],
-) -> dict[str, Any]:
+) -> _TrustedTransition:
     _assert_repository_path(repository)
     try:
         _containment_executable()
     except RetroError as error:
         if error.category != "provider_containment_unavailable":
             raise
-        return _provider_failure(
+        return _issue_trusted_transition(
             stored,
-            "response_unknown",
-            "provider response not confirmed",
+            fingerprint,
+            _provider_failure(
+                stored,
+                "response_unknown",
+                "provider response not confirmed",
+            ),
         )
     payload = _canonical_json(_provider_supervisor_payload(stored, provider_config))
     source_fd = -1
@@ -2198,10 +2331,14 @@ def _invoke_provider(
             timeout_seconds=_controller_timeout_seconds(),
         )
     except (OSError, RetroError):
-        return _provider_failure(
+        return _issue_trusted_transition(
             stored,
-            "response_unknown",
-            "provider response not confirmed",
+            fingerprint,
+            _provider_failure(
+                stored,
+                "response_unknown",
+                "provider response not confirmed",
+            ),
         )
     finally:
         if process is not None:
@@ -2212,19 +2349,27 @@ def _invoke_provider(
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
     if process is None or process.returncode != 0:
-        return _provider_failure(
+        return _issue_trusted_transition(
             stored,
-            "response_unknown",
-            "provider response not confirmed",
+            fingerprint,
+            _provider_failure(
+                stored,
+                "response_unknown",
+                "provider response not confirmed",
+            ),
         )
     try:
         result = json.loads(stdout.decode("utf-8"))
-        return _validated_result(stored, result)
+        return _issue_trusted_transition(stored, fingerprint, result)
     except (UnicodeError, json.JSONDecodeError, RetroError, TypeError, ValueError):
-        return _provider_failure(
+        return _issue_trusted_transition(
             stored,
-            "response_unknown",
-            "provider response not confirmed",
+            fingerprint,
+            _provider_failure(
+                stored,
+                "response_unknown",
+                "provider response not confirmed",
+            ),
         )
 
 
@@ -2248,13 +2393,17 @@ def deliver(
                 return _finalize_at(
                     store,
                     fingerprint,
-                    {
-                        "provider": stored["provider"],
-                        "status": "no_target_issue",
-                        "target_issue": None,
-                        "error_category": None,
-                        "error_summary": None,
-                    },
+                    _issue_trusted_transition(
+                        stored,
+                        fingerprint,
+                        {
+                            "provider": stored["provider"],
+                            "status": "no_target_issue",
+                            "target_issue": None,
+                            "error_category": None,
+                            "error_summary": None,
+                        },
+                    ),
                 )
             try:
                 provider_context = _provider_script_fd(
@@ -2293,6 +2442,7 @@ def deliver(
                     result = _invoke_provider(
                         repository,
                         current,
+                        fingerprint,
                         script_fd,
                         repository.provider_config,
                     )
@@ -2305,10 +2455,14 @@ def deliver(
                 return _finalize_at(
                     store,
                     fingerprint,
-                    _provider_failure(
+                    _issue_trusted_transition(
                         stored,
-                        "serialization_failed",
-                        "provider adapter unavailable",
+                        fingerprint,
+                        _provider_failure(
+                            stored,
+                            "serialization_failed",
+                            "provider adapter unavailable",
+                        ),
                     ),
                 )
 
@@ -2415,7 +2569,6 @@ def main(argv: list[str] | None = None) -> int:
             result = finalize(
                 repo_root,
                 args.artifact_fingerprint,
-                _load_input(args.result),
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "deliver":

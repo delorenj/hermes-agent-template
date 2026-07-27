@@ -113,12 +113,19 @@ try:
     command = sys.argv[3:]
     if limit <= 0 or per_request <= 0 or not command:
         raise ValueError
-    deadline = time.monotonic() + per_request
+    hard_deadline = time.monotonic() + per_request
     operation_ns = os.environ.get("HERMES_HTTP_DEADLINE_NS")
     if operation_ns:
-        deadline = min(deadline, int(operation_ns) / 1_000_000_000)
-    if deadline <= time.monotonic():
+        hard_deadline = min(
+            hard_deadline,
+            int(operation_ns) / 1_000_000_000,
+        )
+    available = hard_deadline - time.monotonic()
+    if available <= 0:
         raise TimeoutError
+    cleanup_window = min(1.0, max(0.05, available * 0.2))
+    cleanup_window = min(cleanup_window, available / 2)
+    io_deadline = hard_deadline - cleanup_window
     process = subprocess.Popen(
         command,
         stdin=subprocess.DEVNULL,
@@ -128,6 +135,26 @@ try:
     )
     streams = {process.stdout: bytearray(), process.stderr: bytearray()}
     selector = selectors.DefaultSelector()
+    failed = False
+
+    def terminate_group():
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        remaining = hard_deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError
+        process.wait(timeout=remaining)
+        while True:
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            if time.monotonic() >= hard_deadline:
+                raise TimeoutError
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            time.sleep(min(0.01, max(0.0, hard_deadline - time.monotonic())))
+
     for stream in streams:
         if stream is None:
             raise OSError
@@ -135,7 +162,7 @@ try:
         selector.register(stream, selectors.EVENT_READ)
     try:
         while selector.get_map():
-            remaining = deadline - time.monotonic()
+            remaining = io_deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError
             events = selector.select(min(remaining, 0.05))
@@ -158,22 +185,25 @@ try:
                 stream_limit = limit if stream is process.stdout else 8192
                 if len(buffer) > stream_limit:
                     raise OverflowError
-        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        process.wait(timeout=max(0.0, io_deadline - time.monotonic()))
         if process.returncode != 0:
             raise OSError
-        sys.stdout.buffer.write(bytes(streams[process.stdout]))
+    except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
+        failed = True
     finally:
+        try:
+            terminate_group()
+        except (OSError, TimeoutError, subprocess.SubprocessError):
+            failed = True
         selector.close()
         for stream in streams:
             if stream is not None:
                 with contextlib.suppress(OSError):
                     stream.close()
+    if failed:
+        raise SystemExit(22)
+    sys.stdout.buffer.write(bytes(streams[process.stdout]))
 except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
-    if "process" in locals() and process.poll() is None:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(process.pid, signal.SIGKILL)
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=1)
     raise SystemExit(22)
 PY
 }
@@ -284,7 +314,8 @@ if (not isinstance(rows,list) or not isinstance(count,int) or isinstance(count,b
     or count != len(rows) or count > 100
     or not isinstance(total,int) or isinstance(total,bool)
     or total<0 or total>int(os.environ["SNAPSHOT_MAX"])
-    or not isinstance(has_next,bool)):
+    or not isinstance(has_next,bool)
+    or (next_cursor is not None and not isinstance(next_cursor,str))):
  print("invalid"); raise SystemExit(0)
 snapshot=os.environ["SNAPSHOT_TOTAL"]
 if snapshot and total != int(snapshot):
@@ -317,8 +348,9 @@ if has_next:
   print("invalid"); raise SystemExit(0)
  state="more"
 else:
- if next_cursor not in (None,"") or cumulative != total:
+ if cumulative != total:
   print("invalid"); raise SystemExit(0)
+ next_cursor=""
  state="absent"
 if any(os.environ["MARKER"] in row["comment_html"] for row in rows):
  state="found"
@@ -528,7 +560,8 @@ try:
  data=json.loads(raw.decode("utf-8"))
  if not isinstance(data,dict) or not isinstance(data.get("results"),list): raise ValueError
  rows=data["results"]; has_next=data.get("next_page_results"); next_cursor=data.get("next_cursor")
- if not isinstance(has_next,bool): raise ValueError
+ if (not isinstance(has_next,bool)
+     or (next_cursor is not None and not isinstance(next_cursor,str))): raise ValueError
  needle=os.environ["NEEDLE"].casefold()
  lookup=needle.rsplit("-",1)[-1] if "-" in needle and needle.rsplit("-",1)[-1].isdigit() else needle
  for row in rows:
@@ -552,10 +585,8 @@ try:
   if not isinstance(next_cursor,str) or not re.fullmatch(r"[A-Za-z0-9._~:-]{1,512}",next_cursor):
    raise ValueError
   print("more:"+next_cursor)
- elif next_cursor in (None,""):
+ elif not has_next:
   print("absent")
- else:
-  raise ValueError
 except Exception:
  print("invalid")
 PY
