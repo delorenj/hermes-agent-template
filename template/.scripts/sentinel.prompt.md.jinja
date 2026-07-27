@@ -124,7 +124,7 @@ comment / transition per the lifecycle) before the general reconcile below.
 
     Persist exactly one durable JSON artifact for this invocation at
     `_bmad-output/implementation-artifacts/run-retros/<artifact_fingerprint>.json`.
-    The schema is `hermes.run-retro`, version `2`, and requires:
+    The schema is `hermes.run-retro`, version `3`, and requires:
     `schema`, `schema_version`, `artifact_fingerprint`, `comment_fingerprint`,
     `run_id`, `correlation_id`, `repo`, `source_issue`,
     `local_tracking_reference`, `decisions` (`what_hurt`,
@@ -137,10 +137,11 @@ comment / transition per the lifecycle) before the general reconcile below.
     that same `run_id` for every retry of that invocation, but generate or accept
     a different `run_id` for every distinct invocation. Use the triggering event
     correlation ID when present; otherwise use `run_id` as `correlation_id`, and
-    keep it unchanged on retries. Set `repo` to the installing repository.
-    `recorded_at` is the first successful artifact-write time and is immutable;
-    `updated_at` is the latest successful atomic-write time. Both use RFC 3339
-    UTC.
+    keep it unchanged on retries. Set `repo` once per invocation to the
+    installing repository's canonical project identity and keep it unchanged on
+    retries. `recorded_at` is the first successful artifact-write time and is
+    immutable; `updated_at` is the latest successful atomic-write time. Both use
+    RFC 3339 UTC.
 
     Before fingerprinting, artifact writing, or commenting, sanitize the answers.
     Never copy tokens, credentials, raw logs, customer data/PII, or private or
@@ -155,19 +156,39 @@ comment / transition per the lifecycle) before the general reconcile below.
       UTF-8 lines, in order: `hermes.run-retro.comment`, `2`, `repo`,
       `source_issue` (or the literal `no_target_issue`),
       `decisions.what_hurt`, `decisions.what_should_change`, and
-      `decisions.fix_scope`.
+      `decisions.fix_scope`. Here `2` is the independent comment-fingerprint
+      algorithm version, retained so this schema repair does not change existing
+      content markers.
     - `artifact_fingerprint` is lowercase SHA-256 hex of exactly these four
-      UTF-8 lines, in order: `hermes.run-retro.artifact`, `2`, `run_id`, and
-      `comment_fingerprint`.
+      UTF-8 lines, in order: `hermes.run-retro.artifact`, `3`, `repo`, and
+      `run_id`. Here `3` is the artifact schema version.
 
     For both preimages, terminate every line, including the last, with one LF
     byte (`\n`); use no other separators or extra bytes. Set
     `comment_fingerprint_marker` to
     `[run-retro-comment:<comment_fingerprint>]`. The artifact fingerprint is
-    run-scoped and therefore creates a different path for distinct invocations
-    even when their sanitized content is identical. The comment fingerprint
-    deliberately excludes `run_id`, `correlation_id`, timestamps, and routing
-    outcome so identical sanitized improvements deduplicate across runs.
+    run-scoped and deliberately excludes `comment_fingerprint`, decisions,
+    source issue, correlation ID, timestamps, and routing outcome. Under schema
+    version `3`, the same canonical `repo` plus `run_id` therefore always derives
+    the same artifact path, even if retry input changes; distinct `run_id` values
+    derive distinct paths even when sanitized content is identical. The comment
+    fingerprint deliberately excludes `run_id`, `correlation_id`, timestamps, and
+    routing outcome so identical sanitized improvements deduplicate across runs.
+
+    Before any source-issue lookup or comment, inspect the deterministic artifact
+    path if it exists. Parse it and validate schema/version, filename, both
+    recomputed fingerprints, and every immutable field. The immutable fields are
+    `schema`, `schema_version`, `artifact_fingerprint`, `comment_fingerprint`,
+    `run_id`, `correlation_id`, `repo`, `source_issue`,
+    `local_tracking_reference`, `decisions`, `protected_evidence_refs`,
+    `sanitization`, and `recorded_at`; only `comment`,
+    `operator_action_required`, and `updated_at` are mutable routing fields.
+    Recompute `comment_fingerprint` from the current normalized, sanitized input
+    and compare the stored immutable sanitized content field-for-field. If the
+    existing artifact is corrupt or invalid, or if any immutable field or the
+    stored comment fingerprint differs from the recomputed input, return
+    `stalled` before calling `tp get_issue` or `tp comment`; do not overwrite the
+    artifact, create another path, or post a source comment.
 
     Route idempotently. If `source_issue` is null, do not invent a target or post
     a comment; record `target_issue: null`, `status: no_target_issue`, and
@@ -182,36 +203,34 @@ comment / transition per the lifecycle) before the general reconcile below.
     follow-up exists; `local_tracking_reference` may name only an already-existing
     ticket on the installing repo's board, otherwise it is null.
 
-    Write the complete JSON to a temporary file in the artifact directory, flush,
-    sync, and close it, then parse it and validate every required field and enum.
-    Recompute both fingerprints from their exact preimages; require the artifact
-    filename stem to equal `artifact_fingerprint`, require
-    `comment_fingerprint_marker` to equal its derived marker, and require
-    nonempty, unchanged `run_id` and `correlation_id`. Atomically rename the
-    validated file to `<artifact_fingerprint>.json`, then reopen and parse the
-    final path and repeat schema/version, identity, routing-status, and
-    sanitization validation.
+    For the first write, write the complete JSON to a temporary file in the
+    artifact directory, flush, sync, and close it, then parse it and validate
+    every required field and enum. Recompute both fingerprints from their exact
+    preimages; require the artifact filename stem to equal
+    `artifact_fingerprint`, require `comment_fingerprint_marker` to equal its
+    derived marker, and require nonempty, unchanged `run_id` and
+    `correlation_id`. Atomically rename the validated file to
+    `<artifact_fingerprint>.json`, then reopen and parse the final path and
+    repeat schema/version, identity, routing-status, and sanitization validation.
 
     A retry of the same invocation reuses only its valid matching
-    `<artifact_fingerprint>.json`: preserve `recorded_at` and all identity and
-    sanitized-content fields, inspect comments again, and atomically update only
-    `comment`, `operator_action_required`, and `updated_at`. If a previous post
-    succeeded but its response was lost, finding the marker records
+    `<artifact_fingerprint>.json` after the pre-routing validation above:
+    preserve every immutable field, inspect comments again, and atomically update
+    only `comment`, `operator_action_required`, and `updated_at`. If a previous
+    post succeeded but its response was lost, finding the marker records
     `already_present`; if the marker is absent, retry `tp comment` and record
     `posted` or `failed`. A distinct invocation must never reuse or overwrite a
-    prior run's artifact, even when `comment_fingerprint` matches; it writes its
-    own run-scoped path and uses the shared comment fingerprint only for comment
-    deduplication. An existing path that fails identity or parse validation makes
-    the pass `stalled` and must not be overwritten. Retain every valid
+    prior run's artifact; it writes its own run-scoped path and uses the shared
+    comment fingerprint only for comment deduplication. Retain every valid
     run-scoped artifact across loop cleanup.
 12. **Final retro checkpoint.** Do not finish the pass or go idle until step 11's
     final artifact exists at
     `_bmad-output/implementation-artifacts/run-retros/<artifact_fingerprint>.json`,
     its parse/read-back validation proves the schema/version, run/correlation
-    identity, both recomputed fingerprints, filename, marker, sanitization, and
-    routing status, and its comment status is one of `posted`,
-    `already_present`, `failed`, or `no_target_issue`. A failed write or
-    validation makes the pass `stalled`; record that failure without exposing
-    protected data.
+    identity, both recomputed fingerprints, filename, marker, immutable content
+    agreement, sanitization, and routing status, and its comment status is one of
+    `posted`, `already_present`, `failed`, or `no_target_issue`. A failed write,
+    corrupt artifact, or immutable-content mismatch makes the pass `stalled`;
+    record that failure without exposing protected data.
 
 Do not rely on a hard-coded seed ticket. Query the board every pass.
