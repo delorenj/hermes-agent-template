@@ -143,15 +143,21 @@ try:
  data=json.load(sys.stdin)
 except Exception:
  print("invalid"); raise SystemExit(0)
-rows=data.get("results",[]) if isinstance(data,dict) else data if isinstance(data,list) else None
-if not isinstance(rows,list):
+if not isinstance(data,dict) or "results" not in data or "total_results" not in data:
+ print("invalid"); raise SystemExit(0)
+rows=data["results"]; total=data["total_results"]
+if (not isinstance(rows,list) or not isinstance(total,int) or isinstance(total,bool)
+    or total<0):
  print("invalid"); raise SystemExit(0)
 marker=os.environ["MARKER"]; limit=int(os.environ["LIMIT"]); offset=int(os.environ["OFFSET"])
-if any(marker in str(row.get("comment_html","")) for row in rows if isinstance(row,dict)):
+if (len(rows)>limit or offset<0 or offset>total or offset+len(rows)>total
+    or (offset<total and not rows)
+    or any(not isinstance(row,dict) or not isinstance(row.get("comment_html"),str)
+           for row in rows)):
+ print("invalid"); raise SystemExit(0)
+if any(marker in row["comment_html"] for row in rows):
  print("found")
-elif isinstance(data,dict) and isinstance(data.get("total_results"),int):
- print("absent" if offset+len(rows)>=data["total_results"] else "more:"+str(offset+len(rows)))
-elif len(rows)<limit:
+elif offset+len(rows)==total:
  print("absent")
 else:
  print("more:"+str(offset+len(rows)))')"
