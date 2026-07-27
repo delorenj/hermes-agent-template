@@ -119,8 +119,10 @@ effect** with:
 
 Repository identity comes only from `.project.json.project_name`: Unicode
 NFKC, trim, casefold, ASCII, then
-`[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?`. Provider comes only from
-`.project.json.ticket_provider.type`. Input has exactly `run_id`,
+`[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?`, with credential-shaped
+prefixes (`xox*`, live/test payment keys, Google/AWS access keys, and GitHub
+tokens) rejected before fingerprinting. Provider and its complete bound
+configuration come only from `.project.json.ticket_provider`. Input has exactly `run_id`,
 `correlation_id`, `source_issue`, `local_tracking_reference`, `decisions`,
 `protected_evidence_refs`, and `sanitization`. Set `run_id` once per invocation
 and reuse it only for that invocation's retry; use the event correlation ID or
@@ -133,7 +135,12 @@ validation and runtime validation accept the same serialized JSON documents.
 The JSON stores only canonical closed-shape intent plus routing; duplicated
 target, fingerprints, marker, and body are not serialized because their
 computed equality cannot be expressed portably in Draft 2020-12.
-`routing.updated_at_epoch_us` is a bounded integer epoch-microsecond value. Only
+Draft `integer` semantics accept any finite mathematically integral JSON
+number (including an integral decimal representation); generated
+`routing.updated_at_epoch_us` values use integer notation and remain bounded.
+Every schema/runtime string pattern uses the ECMAScript actual-end guard
+`$(?![\s\S])`, so a final newline is rejected identically.
+Only
 `routing.status`, `routing.error_category`, and
 `routing.updated_at_epoch_us` are mutable. The immutable operator flag is true
 for a null source or external/template/fleet scope and false only for a
@@ -163,13 +170,20 @@ changed content returns `stalled` without overwrite or comment; distinct runs
 use distinct paths; identical cross-run improvements share one marker and body.
 
 `prepare`, delivery, and finalization use one descriptor-anchored repository
-lifetime: read `.project.json`, bind the store and provider script, hold the
-locks, and finalize without reopening the repository by pathname. Traverse
+lifetime: hold the parent and repository descriptors, read `.project.json`,
+bind the store, provider script, and provider configuration, hold the locks,
+and finalize without reopening configuration or executable content by
+pathname. Revalidate the bound repository entry before every external
+effect; root replacement is `unsafe_artifact_path` and performs no board
+call. Traverse
 every `_bmad-output/implementation-artifacts/run-retros` component with
 descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Revalidate the
-bound directory before every create and after opening an empty `O_EXCL` temp but
-before writing data; if any component was relocated, create no new artifact or
-lock entry and return only `unsafe_artifact_path`. A new artifact uses file
+bound directory before every create and after opening an empty `O_EXCL`
+temp but before writing data. Mutation targets are addressed from the held
+repository-parent descriptor through the bound repository name, so a store
+relocation at temp creation or durable replacement cannot redirect a
+transient or durable write outside the repository; return only
+`unsafe_artifact_path`. A new artifact uses file
 fsync, validation, no-replace link, final-file fsync, parent-directory fsync,
 and parse/read-back. Updates use a unique exclusive temp, file fsync, atomic
 replace, final-file and directory fsync, and read-back. Never overwrite corrupt
@@ -186,12 +200,17 @@ tp ensure_comment <artifact-fingerprint>
 This operation accepts no provider, issue, marker, or body argument. It reloads
 the artifact and derives the exact prepared provider, source/target, marker, and
 body before any external side effect; `TICKET_PROVIDER` cannot redirect it.
-Null source records `no_target_issue` with no board call. Otherwise a safe
-cross-run lock keyed by provider, source, and marker covers exhaustive lookup
-plus at-most-once post. The provider script is opened by descriptor before
-execution. Its process starts a new session/process group, inherits the lock
-descriptor for controller-SIGKILL safety, and on timeout or output overflow the
-controller terminates and reaps the full group before releasing the lock.
+Null source records `no_target_issue` with no board call. Otherwise a
+permission-checked host-global cross-run lock under
+`/var/tmp/hermes-run-retro-comment-locks-<uid>` is keyed by repository,
+provider, source, and marker; repository copies and replacements therefore
+cannot fork the exhaustive-lookup/at-most-once-post lock domain. The provider
+script is opened by descriptor, receives only the already-bound configuration,
+and executes portably from its descriptor through shell stdin. Its process
+starts a new session/process group and inherits the lock descriptor for
+controller-SIGKILL safety. On timeout or output overflow, portable descendant
+enumeration plus process-group signaling terminates and reaps the full tree,
+including descendants that call `setsid`, before releasing the lock.
 
 Plane uses the supported `/work-items/{id}/comments/` list/create endpoints and
 exhausts `per_page=100` plus `cursor` pages. Every HTTP-200 lookup envelope must
@@ -207,7 +226,9 @@ numeric, malformed, oversized, or noncanonical responses are
 `failed|response_unknown`. Retry rescans and records `already_present` if the
 marker landed. Provider and target in every result must exactly match the
 prepared values. Terminal `posted|already_present|no_target_issue` is monotonic:
-delayed failure finalization cannot overwrite it.
+delayed failure finalization cannot overwrite it. Linear and Trello apply the
+same fixed HTTP-body/time bounds and strict canonical string-ID checks; numeric,
+null, malformed, noncanonical, or oversized lookup/post responses fail closed.
 
 ## Final retro checkpoint
 
@@ -219,3 +240,5 @@ fingerprints/body, closed summary grammar, epoch-microsecond bounds,
 sanitization, target/source result equality, and final routing status. A write,
 fsync, lookup, validation, corrupt-artifact, wrong-target, timeout, overflow, or
 immutable-input failure makes the pass `stalled`; record only its safe category.
+A stored `failed` delivery remains retryable evidence but never satisfies
+`--final`; only `posted|already_present|no_target_issue` passes this checkpoint.

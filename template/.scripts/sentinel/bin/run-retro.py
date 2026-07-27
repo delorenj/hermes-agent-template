@@ -9,6 +9,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
@@ -31,6 +33,7 @@ ARTIFACT_DOMAIN = "hermes.run-retro.artifact"
 COMMENT_DOMAIN = "hermes.run-retro.comment"
 FINAL_STATUSES = {"posted", "already_present", "failed", "no_target_issue"}
 SUCCESS_STATUSES = {"posted", "already_present"}
+CHECKPOINT_STATUSES = {*SUCCESS_STATUSES, "no_target_issue"}
 ALL_STATUSES = {"prepared", *FINAL_STATUSES}
 FAILURE_CATEGORIES = {
     "lookup_failed",
@@ -78,17 +81,21 @@ IMMUTABLE_FIELDS = (
 INPUT_DERIVED_IMMUTABLE_FIELDS = IMMUTABLE_FIELDS
 ROOT_FIELDS = {*IMMUTABLE_FIELDS, "routing"}
 ROUTING_FIELDS = {"status", "error_category", "updated_at_epoch_us"}
-SAFE_REPO_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
+SAFE_REPO_RE = re.compile(
+    r"^(?!(?:xox[a-z]?)-)(?!(?:sk|pk|rk)_(?:live|test)_)(?!aiza)"
+    r"(?!(?:akia|asia)[a-z0-9])(?!(?:gh[pousr])_)"
+    r"[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$(?![\s\S])"
+)
 RFC_UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-"
-    r"[0-9a-f]{12}$"
+    r"[0-9a-f]{12}$(?![\s\S])"
 )
-TRELLO_ID_RE = re.compile(r"^[0-9a-f]{24}$")
+TRELLO_ID_RE = re.compile(r"^[0-9a-f]{24}$(?![\s\S])")
 SAFE_REF_RE = re.compile(
     r"^evidence:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    r"[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\s\S])"
 )
-SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$(?![\s\S])")
 SAFE_SIGNALS = (
     "slow_feedback",
     "manual_rework",
@@ -121,7 +128,7 @@ SAFE_SUMMARY_RE = re.compile(
     + "|".join(SAFE_SIGNALS)
     + r"); action=(?:"
     + "|".join(SAFE_ACTIONS)
-    + r")$"
+    + r")$(?![\s\S])"
 )
 ERROR_SUMMARY_BY_CATEGORY = {
     "lookup_failed": "comment lookup failed; no post attempted",
@@ -136,6 +143,9 @@ MAX_PROVIDER_OUTPUT_BYTES = 64 * 1024
 PROVIDER_TIMEOUT_SECONDS = 120.0
 PROVIDER_TERMINATION_GRACE_SECONDS = 0.5
 MAX_EPOCH_US = 253402300799999999
+GLOBAL_COMMENT_LOCK_ROOT = (
+    Path("/var/tmp") / f"hermes-run-retro-comment-locks-{os.getuid()}"
+)
 
 
 class RetroError(Exception):
@@ -472,9 +482,14 @@ def _build_prepared(
 
 
 def _valid_epoch_us(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= MAX_EPOCH_US
     return (
-        isinstance(value, int)
-        and not isinstance(value, bool)
+        isinstance(value, float)
+        and math.isfinite(value)
+        and value.is_integer()
         and 0 <= value <= MAX_EPOCH_US
     )
 
@@ -548,7 +563,7 @@ def validate_document(
     if (
         not isinstance(status_value, str)
         or status_value not in ALL_STATUSES
-        or (require_final and status_value not in FINAL_STATUSES)
+        or (require_final and status_value not in CHECKPOINT_STATUSES)
     ):
         raise RetroError("invalid_artifact")
     if not _valid_epoch_us(routing["updated_at_epoch_us"]):
@@ -624,15 +639,21 @@ def _walk_directories(parent_fd: int, parts: tuple[str, ...], *, create: bool) -
 @dataclass
 class RepositorySession:
     repo_root: Path
+    parent_fd: int
+    repo_name: str
     repo_fd: int
     repo_identity: tuple[int, int]
     repo: str
     provider: str
+    provider_config: dict[str, Any]
 
 
 @dataclass
 class RetroStore:
     repo_root: Path
+    parent_fd: int
+    repo_name: str
+    repo_identity: tuple[int, int]
     repo_fd: int
     retro_fd: int
     retro_identity: tuple[int, int]
@@ -644,6 +665,16 @@ class RetroStore:
 
     def relative_path(self, fingerprint: str) -> str:
         return "/".join((*RETRO_PARTS, self.artifact_name(fingerprint)))
+
+    def parent_relative(self, name: str) -> str:
+        if (
+            not name
+            or name in {".", ".."}
+            or name.startswith("/")
+            or any(part in {".", ".."} for part in Path(name).parts)
+        ):
+            raise RetroError("unsafe_artifact_path")
+        return "/".join((self.repo_name, *RETRO_PARTS, name))
 
 
 @contextlib.contextmanager
@@ -662,6 +693,9 @@ def _retro_store(
             raise RetroError("unsafe_artifact_path")
         yield RetroStore(
             repo_root=repository.repo_root,
+            parent_fd=repository.parent_fd,
+            repo_name=repository.repo_name,
+            repo_identity=repository.repo_identity,
             repo_fd=repository.repo_fd,
             retro_fd=retro_fd,
             retro_identity=(metadata.st_dev, metadata.st_ino),
@@ -672,7 +706,28 @@ def _retro_store(
                 os.close(retro_fd)
 
 
+def _assert_repository_path(repository: RepositorySession | RetroStore) -> None:
+    current = -1
+    try:
+        current = os.open(
+            repository.repo_name,
+            _directory_flags(),
+            dir_fd=repository.parent_fd,
+        )
+        metadata = os.fstat(current)
+        if (metadata.st_dev, metadata.st_ino) != repository.repo_identity:
+            raise RetroError("unsafe_artifact_path")
+    except RetroError:
+        raise
+    except OSError:
+        raise RetroError("unsafe_artifact_path") from None
+    finally:
+        if current >= 0:
+            os.close(current)
+
+
 def _assert_store_path(store: RetroStore) -> None:
+    _assert_repository_path(store)
     current = _walk_directories(store.repo_fd, RETRO_PARTS, create=False)
     try:
         metadata = os.fstat(current)
@@ -726,9 +781,15 @@ def _read_utf8_json_at(
 
 @contextlib.contextmanager
 def _repository(repo_root: Path) -> Iterator[RepositorySession]:
+    repo_root = Path(os.path.abspath(repo_root))
+    parent_fd = -1
+    repo_fd = -1
     try:
-        repo_fd = os.open(repo_root, _directory_flags())
+        parent_fd = os.open(repo_root.parent, _directory_flags())
+        repo_fd = os.open(repo_root.name, _directory_flags(), dir_fd=parent_fd)
     except OSError:
+        if parent_fd >= 0:
+            os.close(parent_fd)
         raise RetroError("unsafe_artifact_path") from None
     try:
         metadata = os.fstat(repo_fd)
@@ -741,16 +802,29 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
             max_bytes=MAX_INPUT_BYTES,
             overflow_category="configuration_too_large",
         )
+        try:
+            provider_config = project["ticket_provider"]
+        except (KeyError, TypeError):
+            raise RetroError("invalid_provider") from None
+        if not isinstance(provider_config, dict):
+            raise RetroError("invalid_provider")
         yield RepositorySession(
             repo_root=repo_root,
+            parent_fd=parent_fd,
+            repo_name=repo_root.name,
             repo_fd=repo_fd,
             repo_identity=(metadata.st_dev, metadata.st_ino),
             repo=_canonical_repo_from_project(project),
             provider=_canonical_provider_from_project(project),
+            provider_config=provider_config,
         )
     finally:
-        with contextlib.suppress(OSError):
-            os.close(repo_fd)
+        if repo_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(repo_fd)
+        if parent_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(parent_fd)
 
 
 def canonical_repo_identity(repo_root: Path) -> str:
@@ -902,14 +976,14 @@ def _ensure_binding(
         _assert_store_path(store)
         try:
             descriptor = os.open(
-                name,
+                store.parent_relative(f".bindings/{name}"),
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
-                dir_fd=bindings_fd,
+                dir_fd=store.parent_fd,
             )
         except FileExistsError:
             _validate_binding_at(bindings_fd, fingerprint, document)
@@ -948,13 +1022,25 @@ def _write_exclusive_temp(
     )
     descriptor = -1
     try:
-        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        descriptor = os.open(
+            store.parent_relative(temporary),
+            flags,
+            0o600,
+            dir_fd=store.parent_fd,
+        )
         _assert_store_path(store)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             descriptor = -1
             handle.write(_canonical_json(document))
             handle.flush()
             os.fsync(handle.fileno())
+    except OSError:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=directory_fd)
+        raise RetroError("unsafe_artifact_path") from None
     except BaseException:
         if descriptor >= 0:
             with contextlib.suppress(OSError):
@@ -981,14 +1067,16 @@ def _durable_create(
         _assert_store_path(store)
         try:
             os.link(
-                temporary,
-                name,
-                src_dir_fd=store.retro_fd,
-                dst_dir_fd=store.retro_fd,
+                store.parent_relative(temporary),
+                store.parent_relative(name),
+                src_dir_fd=store.parent_fd,
+                dst_dir_fd=store.parent_fd,
                 follow_symlinks=False,
             )
         except FileExistsError:
             raise RetroError("artifact_conflict") from None
+        except OSError:
+            raise RetroError("unsafe_artifact_path") from None
         _fsync_file(store.retro_fd, name)
         _fsync_directory(store.retro_fd)
         os.unlink(temporary, dir_fd=store.retro_fd)
@@ -1009,12 +1097,15 @@ def _durable_replace(
     try:
         _validate_temp(store.retro_fd, temporary, name)
         _assert_store_path(store)
-        os.replace(
-            temporary,
-            name,
-            src_dir_fd=store.retro_fd,
-            dst_dir_fd=store.retro_fd,
-        )
+        try:
+            os.replace(
+                store.parent_relative(temporary),
+                store.parent_relative(name),
+                src_dir_fd=store.parent_fd,
+                dst_dir_fd=store.parent_fd,
+            )
+        except OSError:
+            raise RetroError("unsafe_artifact_path") from None
         _fsync_file(store.retro_fd, name)
         _fsync_directory(store.retro_fd)
         _read_artifact_at(store, fingerprint)
@@ -1072,23 +1163,61 @@ def _artifact_lock(store: RetroStore, fingerprint: str) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _comment_lock(store: RetroStore, document: dict[str, Any]) -> Iterator[int]:
+def _global_comment_lock_directory() -> Iterator[int]:
+    parent_fd = -1
+    directory_fd = -1
+    try:
+        parent_fd = os.open(GLOBAL_COMMENT_LOCK_ROOT.parent, _directory_flags())
+        try:
+            os.mkdir(GLOBAL_COMMENT_LOCK_ROOT.name, 0o700, dir_fd=parent_fd)
+            _fsync_directory(parent_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(
+            GLOBAL_COMMENT_LOCK_ROOT.name,
+            _directory_flags(),
+            dir_fd=parent_fd,
+        )
+        metadata = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) & 0o077
+        ):
+            raise RetroError("unsafe_artifact_path")
+        yield directory_fd
+    except RetroError:
+        raise
+    except OSError:
+        raise RetroError("unsafe_artifact_path") from None
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+        if parent_fd >= 0:
+            os.close(parent_fd)
+
+
+@contextlib.contextmanager
+def _comment_lock(
+    repository: RepositorySession,
+    store: RetroStore,
+    document: dict[str, Any],
+) -> Iterator[int]:
     _assert_store_path(store)
-    locks = _walk_directories(store.retro_fd, (".locks", "comments"), create=True)
     key = _sha256_lines(
         [
+            document["repo"],
             document["provider"],
             document["source_issue"] or "no_target_issue",
             comment_marker(document),
         ]
     )
-    try:
+    with _global_comment_lock_directory() as locks:
         _assert_store_path(store)
         with _safe_lock(locks, f"{key}.lock") as descriptor:
+            _assert_repository_path(repository)
             _assert_store_path(store)
             yield descriptor
-    finally:
-        os.close(locks)
 
 
 def _immutable_view(
@@ -1204,10 +1333,9 @@ def _finalize_at(
         validate_document(
             updated,
             path=Path(store.artifact_name(fingerprint)),
-            require_final=True,
         )
         _durable_replace(store, fingerprint, updated)
-        _read_artifact_at(store, fingerprint, require_final=True)
+        _read_artifact_at(store, fingerprint)
     return {
         "status": incoming_status,
         "artifact_fingerprint": fingerprint,
@@ -1253,11 +1381,26 @@ def _provider_failure(
 
 
 @contextlib.contextmanager
-def _provider_script_fd(providers_dir: Path, provider: str) -> Iterator[int]:
+def _provider_script_fd(
+    repository: RepositorySession,
+    providers_dir: Path,
+    provider: str,
+) -> Iterator[int]:
     directory_fd = -1
     script_fd = -1
     try:
-        directory_fd = os.open(providers_dir, _directory_flags())
+        absolute_providers = Path(os.path.abspath(providers_dir))
+        try:
+            relative = absolute_providers.relative_to(repository.repo_root)
+        except ValueError:
+            raise RetroError("provider_unavailable") from None
+        if not relative.parts:
+            raise RetroError("provider_unavailable")
+        directory_fd = _walk_directories(
+            repository.repo_fd,
+            tuple(relative.parts),
+            create=False,
+        )
         script_fd = os.open(
             f"{provider}.sh",
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
@@ -1265,7 +1408,10 @@ def _provider_script_fd(providers_dir: Path, provider: str) -> Iterator[int]:
         )
         if not stat.S_ISREG(os.fstat(script_fd).st_mode):
             raise OSError
+        _assert_repository_path(repository)
         yield script_fd
+    except RetroError:
+        raise
     except OSError:
         raise RetroError("provider_unavailable") from None
     finally:
@@ -1290,30 +1436,87 @@ def _enable_child_subreaper() -> None:
         return
 
 
-def _reap_process_group(process_group: int) -> None:
-    deadline = time.monotonic() + PROVIDER_TERMINATION_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        reaped = False
-        while True:
-            try:
-                child, _ = os.waitpid(-process_group, os.WNOHANG)
-            except ChildProcessError:
-                return
-            if child <= 0:
-                break
-            reaped = True
-        if not reaped:
-            time.sleep(0.01)
+def _process_parent_map() -> dict[int, int]:
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid=,ppid="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0 or len(result.stdout) > MAX_PROVIDER_OUTPUT_BYTES:
+        return {}
+    parents: dict[int, int] = {}
+    for line in result.stdout.decode("ascii", "ignore").splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, parent = (int(field) for field in fields)
+        except ValueError:
+            continue
+        parents[pid] = parent
+    return parents
 
 
-def _terminate_provider_group(process: subprocess.Popen[bytes]) -> None:
+def _descendant_pids(root_pid: int) -> set[int]:
+    parents = _process_parent_map()
+    descendants: set[int] = set()
+    frontier = {root_pid}
+    while frontier:
+        children = {
+            pid
+            for pid, parent in parents.items()
+            if parent in frontier and pid not in descendants
+        }
+        descendants.update(children)
+        frontier = children
+    descendants.discard(os.getpid())
+    return descendants
+
+
+def _expand_descendant_set(roots: set[int]) -> set[int]:
+    expanded = set(roots)
+    for root in tuple(roots):
+        expanded.update(_descendant_pids(root))
+    expanded.discard(os.getpid())
+    return expanded
+
+
+def _signal_pids(pids: set[int], signum: signal.Signals) -> None:
+    for pid in sorted(pids, reverse=True):
+        if pid <= 1 or pid == os.getpid():
+            continue
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(pid, signum)
+
+
+def _reap_known_children(pids: set[int]) -> None:
+    for pid in pids:
+        with contextlib.suppress(ChildProcessError, ProcessLookupError):
+            os.waitpid(pid, os.WNOHANG)
+
+
+def _terminate_provider_tree(process: subprocess.Popen[bytes]) -> None:
+    known = _descendant_pids(process.pid)
+    known.add(process.pid)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGTERM)
+    _signal_pids(known, signal.SIGTERM)
     deadline = time.monotonic() + PROVIDER_TERMINATION_GRACE_SECONDS
-    while process.poll() is None and time.monotonic() < deadline:
+    while time.monotonic() < deadline:
+        known.update(_descendant_pids(process.pid))
+        _reap_known_children(known)
+        if process.poll() is not None:
+            break
         time.sleep(0.01)
+    known = _expand_descendant_set(known)
     with contextlib.suppress(ProcessLookupError):
         os.killpg(process.pid, signal.SIGKILL)
+    _signal_pids(known, signal.SIGKILL)
     with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=PROVIDER_TERMINATION_GRACE_SECONDS)
     if process.poll() is None:
@@ -1321,7 +1524,23 @@ def _terminate_provider_group(process: subprocess.Popen[bytes]) -> None:
             process.kill()
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=PROVIDER_TERMINATION_GRACE_SECONDS)
-    _reap_process_group(process.pid)
+    while True:
+        known = _expand_descendant_set(known)
+        _signal_pids(known, signal.SIGKILL)
+        _reap_known_children(known)
+        live = set()
+        for pid in known:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                live.add(pid)
+            else:
+                live.add(pid)
+        if not live:
+            return
+        time.sleep(0.01)
 
 
 def _bounded_provider_output(
@@ -1366,7 +1585,7 @@ def _bounded_provider_output(
         process.wait(timeout=remaining)
         return bytes(streams[process.stdout]), bytes(streams[process.stderr])
     except (OSError, subprocess.TimeoutExpired, RetroError):
-        _terminate_provider_group(process)
+        _terminate_provider_tree(process)
         raise RetroError("provider_io_failed") from None
     finally:
         selector.close()
@@ -1377,31 +1596,51 @@ def _bounded_provider_output(
 
 
 def _invoke_provider(
-    stored: dict[str, Any], script_fd: int, lock_descriptor: int
+    repository: RepositorySession,
+    stored: dict[str, Any],
+    script_fd: int,
+    lock_descriptor: int,
+    provider_config: dict[str, Any],
 ) -> dict[str, Any]:
+    _assert_repository_path(repository)
     provider = stored["provider"]
     environment = dict(os.environ)
     environment["TICKET_PROVIDER"] = provider
+    environment["HERMES_BOUND_PROVIDER_CONFIG"] = "1"
+    environment["HERMES_BOUND_TICKET_PROVIDER_JSON"] = json.dumps(
+        provider_config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     try:
         marker = comment_marker(stored)
         body = comment_body(stored)
         _enable_child_subreaper()
-        process = subprocess.Popen(
-            [
-                "sh",
-                f"/proc/self/fd/{script_fd}",
-                "ensure_comment",
-                stored["source_issue"],
-                marker,
-                body,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=environment,
-            start_new_session=True,
-            pass_fds=(lock_descriptor, script_fd),
-        )
-        stdout, _ = _bounded_provider_output(process)
+        if os.getpid() not in _process_parent_map():
+            raise RetroError("provider_containment_unavailable")
+        os.lseek(script_fd, 0, os.SEEK_SET)
+        with tempfile.TemporaryDirectory(
+            prefix="hermes-provider-", dir="/var/tmp"
+        ) as provider_tmp:
+            environment["TMPDIR"] = provider_tmp
+            process = subprocess.Popen(
+                [
+                    "sh",
+                    "-s",
+                    "ensure_comment",
+                    stored["source_issue"],
+                    marker,
+                    body,
+                ],
+                stdin=script_fd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=environment,
+                start_new_session=True,
+                pass_fds=(lock_descriptor,),
+            )
+            stdout, _ = _bounded_provider_output(process)
     except RetroError:
         return _provider_failure(
             stored, "response_unknown", "provider response not confirmed"
@@ -1453,11 +1692,13 @@ def deliver(
                 )
             try:
                 provider_context = _provider_script_fd(
+                    repository,
                     providers_dir or _default_providers_dir(),
                     stored["provider"],
                 )
                 with provider_context as script_fd:
-                    with _comment_lock(store, stored) as lock_descriptor:
+                    with _comment_lock(repository, store, stored) as lock_descriptor:
+                        _assert_repository_path(repository)
                         _assert_store_path(store)
                         current = _read_artifact_at(store, fingerprint)
                         if current is None:
@@ -1474,9 +1715,11 @@ def deliver(
                                 "transition": "preserved_terminal",
                             }
                         result = _invoke_provider(
+                            repository,
                             current,
                             script_fd,
                             lock_descriptor,
+                            repository.provider_config,
                         )
                         return _finalize_at(store, fingerprint, result)
             except RetroError as error:

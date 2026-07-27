@@ -17,14 +17,22 @@
 set -eu
 
 OP="${1:-}"; shift 2>/dev/null || true
-ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-ROLE_YAML="$ROLE_DIR/role.yaml"
+if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+  ROLE_DIR=""; ROLE_YAML=""
+else
+  ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+  ROLE_YAML="$ROLE_DIR/role.yaml"
+fi
 BASE="${PLANE_BASE:-https://plane.delo.sh}"
 
 die() { echo "plane: $*" >&2; exit 1; }
 need_key() { [ -n "${PLANE_API_KEY:-}" ] || die "PLANE_API_KEY is not set"; }
 
 tp_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    pj_cfg "$1"
+    return
+  fi
   [ -f "$ROLE_YAML" ] || return 0
   python3 - "$ROLE_YAML" "$1" <<'PY'
 import sys, re, pathlib
@@ -40,6 +48,22 @@ PY
 # SOT), walking up from the role dir. This is preferred over role.yaml so all of
 # a repo's agents resolve to the same board.
 pj_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    python3 - "$1" <<'PY'
+import json, os, sys
+try:
+    config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+    value = config.get(sys.argv[1], "") if isinstance(config, dict) else ""
+except Exception:
+    raise SystemExit(1)
+if value is None:
+    value = ""
+if not isinstance(value, (str, int, float, bool)):
+    raise SystemExit(1)
+print(str(value))
+PY
+    return
+  fi
   python3 - "$ROLE_DIR" "$1" <<'PY'
 import sys, json, pathlib
 start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
@@ -63,6 +87,16 @@ API="$BASE/api/v1/workspaces/$WS"
 HTTP_MAX_BYTES=131072
 HTTP_TIMEOUT_SECONDS=120
 COMMENT_SNAPSHOT_MAX=2000
+page_file=""; response_file=""
+
+cleanup_http_files() {
+  [ -z "$page_file" ] || rm -f "$page_file"
+  [ -z "$response_file" ] || rm -f "$response_file"
+  case "${TMPDIR:-}" in
+    /var/tmp/hermes-provider-*) rmdir "$TMPDIR" 2>/dev/null || true ;;
+  esac
+}
+trap cleanup_http_files EXIT HUP INT TERM
 
 # api METHOD PATH [JSON_BODY] — call Plane REST, print response body.
 api() {
@@ -77,6 +111,11 @@ api() {
     curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
       -X "$method" "$API/$path" -H "X-API-Key: $PLANE_API_KEY"
   fi
+}
+
+new_http_body_file() {
+  umask 077
+  mktemp "${TMPDIR:-/tmp}/hermes-plane-http.XXXXXX"
 }
 
 urlencode() {
@@ -143,12 +182,17 @@ plane_comments_find() {
   while :; do
     path="projects/$PROJ/work-items/$work_item_id/comments/?per_page=100"
     [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
-    if ! page="$(api GET "$path" 2>/dev/null)"; then
+    page_file="$(new_http_body_file)" || return 2
+    if ! api GET "$path" >"$page_file" 2>/dev/null; then
+      rm -f "$page_file"
       return 2
     fi
-    state="$(printf '%s' "$page" | MARKER="$marker" CURRENT_CURSOR="$cursor" SNAPSHOT_TOTAL="$snapshot_total" SEEN_COUNT="$seen_count" SEEN_IDS="$seen_ids" SEEN_CURSORS="$seen_cursors" SNAPSHOT_MAX="$COMMENT_SNAPSHOT_MAX" python3 -c 'import json,os,re,sys,uuid
+    state="$(MARKER="$marker" CURRENT_CURSOR="$cursor" SNAPSHOT_TOTAL="$snapshot_total" SEEN_COUNT="$seen_count" SEEN_IDS="$seen_ids" SEEN_CURSORS="$seen_cursors" SNAPSHOT_MAX="$COMMENT_SNAPSHOT_MAX" HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$page_file" <<'PY'
+import json,os,re,sys,uuid
 try:
- data=json.load(sys.stdin)
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8"))
 except Exception:
  print("invalid"); raise SystemExit(0)
 required={"results","count","total_results","next_page_results","next_cursor"}
@@ -198,7 +242,10 @@ else:
  state="absent"
 if any(os.environ["MARKER"] in row["comment_html"] for row in rows):
  state="found"
-print("\t".join((state,str(total),next_cursor or "",",".join(ids))))')"
+print("\t".join((state,str(total),next_cursor or "",",".join(ids))))
+PY
+)"
+    rm -f "$page_file"
     tab="$(printf '\t')"
     IFS="$tab" read -r disposition total next page_ids <<EOF
 $state
@@ -409,19 +456,30 @@ body="<p>"+html.escape(sys.argv[1]).replace("\n","<br>")+"</p>"
 print(json.dumps({"comment_html":body},separators=(",",":")))
 PY
 )"
-    if ! RESPONSE="$(api POST "projects/$PROJ/work-items/$ID/comments/" "$PAYLOAD" 2>/dev/null)"; then
+    response_file="$(new_http_body_file)" || {
+      printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      exit 0
+    }
+    if ! api POST "projects/$PROJ/work-items/$ID/comments/" "$PAYLOAD" >"$response_file" 2>/dev/null; then
+      rm -f "$response_file"
       printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
-    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,re,sys,uuid
+    COMMENT_ID="$(HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$response_file" <<'PY'
+import json,os,re,sys,uuid
 try:
- data=json.load(sys.stdin); value=data.get("id") if isinstance(data,dict) else None
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8")); value=data.get("id") if isinstance(data,dict) else None
  if not isinstance(value,str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value):
   raise ValueError
  canonical=str(uuid.UUID(value))
  print(value if canonical==value else "")
 except Exception:
- print("")')"
+ print("")
+PY
+)"
+    rm -f "$response_file"
     if [ -z "$COMMENT_ID" ]; then
       printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
     else

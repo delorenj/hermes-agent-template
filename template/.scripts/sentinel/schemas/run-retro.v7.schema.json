@@ -34,7 +34,7 @@
     },
     "repo": {
       "type": "string",
-      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+      "pattern": "^(?!(?:xox[a-z]?)-)(?!(?:sk|pk|rk)_(?:live|test)_)(?!aiza)(?!(?:akia|asia)[a-z0-9])(?!(?:gh[pousr])_)[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$(?![\\s\\S])"
     },
     "provider": {
       "enum": [
@@ -384,15 +384,15 @@
   "$defs": {
     "rfcUuid": {
       "type": "string",
-      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\\s\\S])"
     },
     "trelloId": {
       "type": "string",
-      "pattern": "^[0-9a-f]{24}$"
+      "pattern": "^[0-9a-f]{24}$(?![\\s\\S])"
     },
     "evidenceRef": {
       "type": "string",
-      "pattern": "^evidence:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+      "pattern": "^evidence:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$(?![\\s\\S])"
     },
     "epochMicroseconds": {
       "type": "integer",
@@ -401,7 +401,7 @@
     },
     "safeSummary": {
       "type": "string",
-      "pattern": "^signal=(?:slow_feedback|manual_rework|flaky_validation|unclear_contract|missing_capability|dependency_delay|coordination_gap|environment_drift|documentation_gap|review_rework|no_material_friction|other_process_friction); action=(?:automate_check|clarify_contract|add_test|improve_tooling|update_documentation|isolate_dependency|tighten_review|improve_coordination|stabilize_environment|retain_current_process|operator_followup)$"
+      "pattern": "^signal=(?:slow_feedback|manual_rework|flaky_validation|unclear_contract|missing_capability|dependency_delay|coordination_gap|environment_drift|documentation_gap|review_rework|no_material_friction|other_process_friction); action=(?:automate_check|clarify_contract|add_test|improve_tooling|update_documentation|isolate_dependency|tighten_review|improve_coordination|stabilize_environment|retain_current_process|operator_followup)$(?![\\s\\S])"
     },
     "categorizedSummary": {
       "type": "object",

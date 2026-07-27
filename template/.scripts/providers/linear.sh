@@ -13,14 +13,22 @@
 set -eu
 
 OP="${1:-}"; shift 2>/dev/null || true
-ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-ROLE_YAML="$ROLE_DIR/role.yaml"
+if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+  ROLE_DIR=""; ROLE_YAML=""
+else
+  ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+  ROLE_YAML="$ROLE_DIR/role.yaml"
+fi
 
 die() { echo "linear: $*" >&2; exit 1; }
 need_key() { [ -n "${LINEAR_API_KEY:-}" ] || die "LINEAR_API_KEY is not set"; }
 
 # tp_cfg KEY — read ticket_provider.<KEY> from role.yaml (best-effort, flat).
 tp_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    pj_cfg "$1"
+    return
+  fi
   [ -f "$ROLE_YAML" ] || return 0
   python3 - "$ROLE_YAML" "$1" <<'PY'
 import sys, re, pathlib
@@ -36,6 +44,22 @@ PY
 # pj_cfg KEY — read ticket_provider.<KEY> from the repo-root .project.json (the
 # SOT), walking up from the role dir. Preferred over role.yaml.
 pj_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    python3 - "$1" <<'PY'
+import json, os, sys
+try:
+    config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+    value = config.get(sys.argv[1], "") if isinstance(config, dict) else ""
+except Exception:
+    raise SystemExit(1)
+if value is None:
+    value = ""
+if not isinstance(value, (str, int, float, bool)):
+    raise SystemExit(1)
+print(str(value))
+PY
+    return
+  fi
   python3 - "$ROLE_DIR" "$1" <<'PY'
 import sys, json, pathlib
 start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
@@ -57,21 +81,36 @@ gql() {
   python3 - "$1" "$_vars" <<'PY'
 import json, os, sys, urllib.request, urllib.error
 q, variables = sys.argv[1], json.loads(sys.argv[2])
+limit=131072
 req = urllib.request.Request(
-    "https://api.linear.app/graphql",
+    os.environ.get("LINEAR_API_URL","https://api.linear.app/graphql"),
     data=json.dumps({"query": q, "variables": variables}).encode(),
     headers={"Authorization": os.environ["LINEAR_API_KEY"],
              "Content-Type": "application/json"},
     method="POST")
 try:
-    body = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    with urllib.request.urlopen(req, timeout=30) as response:
+        raw=response.read(limit+1)
 except urllib.error.HTTPError as e:
-    body = json.loads(e.read() or "{}")
-except urllib.error.URLError as e:
-    print(f"linear request failed: {e}", file=sys.stderr); sys.exit(1)
+    try:
+        raw=e.read(limit+1)
+    except OSError:
+        print("linear request failed", file=sys.stderr); sys.exit(1)
+except (urllib.error.URLError, OSError):
+    print("linear request failed", file=sys.stderr); sys.exit(1)
+try:
+    if len(raw)>limit: raise ValueError
+    body=json.loads((raw or b"{}").decode("utf-8"))
+except (UnicodeError, ValueError, json.JSONDecodeError):
+    print("linear response invalid", file=sys.stderr); sys.exit(1)
+if not isinstance(body,dict):
+    sys.exit(1)
 if body.get("errors"):
     print(json.dumps(body["errors"]), file=sys.stderr); sys.exit(1)
-print(json.dumps(body.get("data") or {}))
+data=body.get("data")
+if not isinstance(data,dict):
+    sys.exit(1)
+print(json.dumps(data,separators=(",",":")))
 PY
 }
 
@@ -100,17 +139,40 @@ linear_comment_marker_state() {
     if ! page="$(gql 'query($id:String!,$after:String){ issue(id:$id){ comments(first:100,after:$after){ nodes{id body} pageInfo{hasNextPage endCursor} } } }' "$variables" 2>/dev/null)"; then
       return 2
     fi
-    state="$(printf '%s' "$page" | MARKER="$marker" python3 -c 'import json,os,sys
+    state="$(printf '%s' "$page" | MARKER="$marker" python3 -c 'import json,os,re,sys,uuid
 try: data=json.load(sys.stdin)
 except Exception: print("invalid"); raise SystemExit(0)
 issue=data.get("issue")
 if not isinstance(issue,dict): print("invalid"); raise SystemExit(0)
-comments=(issue.get("comments") or {})
-rows=comments.get("nodes") or []; marker=os.environ["MARKER"]
-if any(marker in str(row.get("body","")) for row in rows):
+comments=issue.get("comments")
+if not isinstance(comments,dict): print("invalid"); raise SystemExit(0)
+rows=comments.get("nodes"); page_info=comments.get("pageInfo")
+if not isinstance(rows,list) or len(rows)>100 or not isinstance(page_info,dict):
+ print("invalid"); raise SystemExit(0)
+has_next=page_info.get("hasNextPage"); end_cursor=page_info.get("endCursor")
+if not isinstance(has_next,bool):
+ print("invalid"); raise SystemExit(0)
+if has_next:
+ if not isinstance(end_cursor,str) or not re.fullmatch(r"[A-Za-z0-9._~:-]{1,512}",end_cursor):
+  print("invalid"); raise SystemExit(0)
+elif end_cursor is not None:
+ print("invalid"); raise SystemExit(0)
+ids=[]
+for row in rows:
+ if not isinstance(row,dict) or not isinstance(row.get("id"),str) or not isinstance(row.get("body"),str):
+  print("invalid"); raise SystemExit(0)
+ try: canonical=str(uuid.UUID(row["id"]))
+ except ValueError: print("invalid"); raise SystemExit(0)
+ if canonical!=row["id"] or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",row["id"]):
+  print("invalid"); raise SystemExit(0)
+ ids.append(row["id"])
+if len(ids)!=len(set(ids)):
+ print("invalid"); raise SystemExit(0)
+marker=os.environ["MARKER"]
+if any(marker in row["body"] for row in rows):
  print("found")
-elif (comments.get("pageInfo") or {}).get("hasNextPage"):
- print("more:"+str((comments.get("pageInfo") or {}).get("endCursor","")))
+elif has_next:
+ print("more:"+end_cursor)
 else:
  print("absent")')"
     case "$state" in
@@ -237,10 +299,20 @@ if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(
       printf '{"provider":"linear","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
-    RESULT="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
+    RESULT="$(printf '%s' "$RESPONSE" | python3 -c 'import json,re,sys,uuid
 try:
  d=json.load(sys.stdin).get("commentCreate") or {}
- print("posted" if d.get("success") and (d.get("comment") or {}).get("id") else "failed")
+ if not isinstance(d,dict) or not isinstance(d.get("success"),bool):
+  print("unknown"); raise SystemExit(0)
+ if d["success"] is False:
+  print("failed"); raise SystemExit(0)
+ comment=d.get("comment")
+ value=comment.get("id") if isinstance(comment,dict) else None
+ if not isinstance(value,str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value):
+  print("unknown"); raise SystemExit(0)
+ try: canonical=str(uuid.UUID(value))
+ except ValueError: print("unknown"); raise SystemExit(0)
+ print("posted" if canonical==value else "unknown")
 except Exception: print("unknown")')"
     case "$RESULT" in
       posted) printf '{"provider":"linear","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID" ;;

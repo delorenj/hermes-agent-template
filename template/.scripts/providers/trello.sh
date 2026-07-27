@@ -16,14 +16,34 @@
 set -eu
 
 OP="${1:-}"; shift 2>/dev/null || true
-ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-ROLE_YAML="$ROLE_DIR/role.yaml"
-API="https://api.trello.com/1"
+if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+  ROLE_DIR=""; ROLE_YAML=""
+else
+  ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+  ROLE_YAML="$ROLE_DIR/role.yaml"
+fi
+API="${TRELLO_API_URL:-https://api.trello.com/1}"
+HTTP_MAX_BYTES=131072
+HTTP_TIMEOUT_SECONDS=120
+actions_file=""; response_file=""
+
+cleanup_http_files() {
+  [ -z "$actions_file" ] || rm -f "$actions_file"
+  [ -z "$response_file" ] || rm -f "$response_file"
+  case "${TMPDIR:-}" in
+    /var/tmp/hermes-provider-*) rmdir "$TMPDIR" 2>/dev/null || true ;;
+  esac
+}
+trap cleanup_http_files EXIT HUP INT TERM
 
 die() { echo "trello: $*" >&2; exit 1; }
 need_key() { [ -n "${TRELLO_KEY:-}" ] && [ -n "${TRELLO_TOKEN:-}" ] || die "TRELLO_KEY and TRELLO_TOKEN must be set"; }
 
 tp_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    pj_cfg "$1"
+    return
+  fi
   [ -f "$ROLE_YAML" ] || return 0
   python3 - "$ROLE_YAML" "$1" <<'PY'
 import sys, re, pathlib
@@ -38,6 +58,22 @@ PY
 # pj_cfg KEY — read ticket_provider.<KEY> from the repo-root .project.json (the
 # SOT), walking up from the role dir. Preferred over role.yaml.
 pj_cfg() {
+  if [ "${HERMES_BOUND_PROVIDER_CONFIG:-0}" = 1 ]; then
+    python3 - "$1" <<'PY'
+import json, os, sys
+try:
+    config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+    value = config.get(sys.argv[1], "") if isinstance(config, dict) else ""
+except Exception:
+    raise SystemExit(1)
+if value is None:
+    value = ""
+if not isinstance(value, (str, int, float, bool)):
+    raise SystemExit(1)
+print(str(value))
+PY
+    return
+  fi
   python3 - "$ROLE_DIR" "$1" <<'PY'
 import sys, json, pathlib
 start = pathlib.Path(sys.argv[1]).resolve(); key = sys.argv[2]
@@ -71,7 +107,13 @@ api() {
   method="$1"; path="$2"; extra="${3:-}"
   sep="?"; case "$path" in *\?*) sep="&" ;; esac
   url="$API/$path${sep}key=$TRELLO_KEY&token=$TRELLO_TOKEN${extra:+&$extra}"
-  curl -fsS -X "$method" "$url"
+  curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+    -X "$method" "$url"
+}
+
+new_http_body_file() {
+  umask 077
+  mktemp "${TMPDIR:-/tmp}/hermes-trello-http.XXXXXX"
 }
 
 canonical_card_id() {
@@ -91,20 +133,41 @@ trello_comment_marker_state() {
   while :; do
     query="filter=commentCard&limit=1000"
     [ -z "$before" ] || query="$query&before=$before"
-    if ! actions="$(api GET "cards/$card_id/actions" "$query" 2>/dev/null)"; then
+    actions_file="$(new_http_body_file)" || return 2
+    if ! api GET "cards/$card_id/actions" "$query" >"$actions_file" 2>/dev/null; then
+      rm -f "$actions_file"
       return 2
     fi
-    state="$(printf '%s' "$actions" | MARKER="$marker" python3 -c 'import json,os,sys
-try: rows=json.load(sys.stdin)
+    state="$(MARKER="$marker" HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$actions_file" <<'PY'
+import json,os,re,sys
+try:
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ rows=json.loads(raw.decode("utf-8"))
 except Exception: print("invalid"); raise SystemExit(0)
 if not isinstance(rows,list): print("invalid"); raise SystemExit(0)
 marker=os.environ["MARKER"]
-if any(marker in str((row.get("data") or {}).get("text","")) for row in rows):
+ids=[]
+for row in rows:
+ if not isinstance(row,dict) or not isinstance(row.get("id"),str):
+  print("invalid"); raise SystemExit(0)
+ if not re.fullmatch(r"[0-9a-f]{24}",row["id"]):
+  print("invalid"); raise SystemExit(0)
+ data=row.get("data")
+ if not isinstance(data,dict) or not isinstance(data.get("text"),str):
+  print("invalid"); raise SystemExit(0)
+ ids.append(row["id"])
+if len(ids)!=len(set(ids)):
+ print("invalid"); raise SystemExit(0)
+if any(marker in row["data"]["text"] for row in rows):
  print("found")
 elif len(rows)<1000:
  print("absent")
 else:
- print("more:"+str(rows[-1].get("id","")))')"
+ print("more:"+rows[-1]["id"])
+PY
+)"
+    rm -f "$actions_file"
     case "$state" in
       found) return 0 ;;
       absent) return 1 ;;
@@ -222,13 +285,28 @@ if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(
       fi
     fi
     ENCODED="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$BODY")"
-    if ! RESPONSE="$(api POST "cards/$ID/actions/comments" "text=$ENCODED" 2>/dev/null)"; then
+    response_file="$(new_http_body_file)" || {
+      printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      exit 0
+    }
+    if ! api POST "cards/$ID/actions/comments" "text=$ENCODED" >"$response_file" 2>/dev/null; then
+      rm -f "$response_file"
       printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
-    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("id",""))
-except Exception: print("")')"
+    COMMENT_ID="$(HTTP_MAX_BYTES="$HTTP_MAX_BYTES" python3 - "$response_file" <<'PY'
+import json,os,re,sys
+try:
+ raw=open(sys.argv[1],"rb").read(int(os.environ["HTTP_MAX_BYTES"])+1)
+ if len(raw)>int(os.environ["HTTP_MAX_BYTES"]): raise ValueError
+ data=json.loads(raw.decode("utf-8"))
+ value=data.get("id") if isinstance(data,dict) else None
+ print(value if isinstance(value,str) and re.fullmatch(r"[0-9a-f]{24}",value) else "")
+except Exception:
+ print("")
+PY
+)"
+    rm -f "$response_file"
     if [ -z "$COMMENT_ID" ]; then
       printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
     else
