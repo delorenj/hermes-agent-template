@@ -171,8 +171,11 @@ is closed JSON. Initial publication writes a unique exclusive temp in the held
 bindings directory, fsyncs and validates it, links it to the final name without
 replacement, fsyncs the final file and directory, and removes the temp. A crash
 can leave only an ignorable unique temp, never a zero-byte final-name poison;
-retry validates or publishes the same immutable binding. Final delivery
-atomically replaces that binding with the full canonical final-document digest
+retry validates or publishes the same immutable binding. A retry that finds the
+valid existing final binding fsyncs that file and the bindings directory,
+validates it again, and revalidates the bound directory identities before
+reuse. Final delivery atomically replaces that binding with the full
+canonical final-document digest
 and byte-equal `routing.proof.transition_id`. Thus a hand-edited terminal status
 or proof cannot satisfy `--final`. Its exact fields are
 `schema=hermes.run-retro.binding`, `schema_version=1`, `immutable_sha256`,
@@ -192,16 +195,22 @@ repository entry before every external
 effect; root replacement is `unsafe_artifact_path` and performs no board
 call. Traverse
 every `_bmad-output/implementation-artifacts/run-retros` component with
-descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Revalidate the
-bound directory before every create and after opening an empty `O_EXCL`
-temp but before writing data. Every binding create/link/replace uses only its
-already-held `bindings_fd` plus a bare filename; every artifact
-create/link/replace uses only its already-held `retro_fd` plus a bare filename.
-No mutation passes a multi-component path, so replacement of any intermediate
-directory cannot redirect a transient or durable write into an attacker tree.
-A detected root/store replacement returns `unsafe_artifact_path`. A new artifact uses file
-fsync, validation, no-replace link, final-file fsync, parent-directory fsync,
-and parse/read-back. Updates use a unique exclusive temp, file fsync, atomic
+descriptor-relative `O_NOFOLLOW` operations that reject symlinks. The
+unprivileged threat model trusts same-OS-UID peer processes. It rejects
+symlinks, replacement path components or trees, stale identities detectable
+before mutation, and untrusted repository content. Revalidate the bound
+repository, retro, and bindings directory identities before every mutation and
+after opening an empty `O_EXCL` temp but before writing data. Every binding
+create/link/replace uses only its already-held `bindings_fd` plus a bare
+filename; every artifact create/link/replace uses only its already-held
+`retro_fd` plus a bare filename. A detected root/store/bindings replacement
+returns `unsafe_artifact_path` before mutation. This unprivileged controller
+does not claim to prevent an independent trusted same-UID peer from renaming an
+already-open directory inside the final syscall window; privileged
+immutable/mount helpers and trusted mutation daemons are deferred. A new
+artifact uses file fsync, validation, no-replace link, final-file fsync,
+parent-directory fsync, and parse/read-back. Updates use a unique exclusive
+temp, file fsync, atomic
 replace, final-file and directory fsync, and read-back. Never overwrite corrupt
 or mismatched immutable content. Stdin, input JSON, artifact JSON, provider
 stdout/stderr, and HTTP bodies have fixed byte limits; overflow returns a

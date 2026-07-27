@@ -734,6 +734,8 @@ class RetroStore:
     repo_fd: int
     retro_fd: int
     retro_identity: tuple[int, int]
+    bindings_fd: int
+    bindings_identity: tuple[int, int]
 
     def artifact_name(self, fingerprint: str) -> str:
         if not SHA256_RE.fullmatch(fingerprint):
@@ -759,6 +761,7 @@ def _retro_store(
     repository: RepositorySession, *, create: bool
 ) -> Iterator[RetroStore]:
     retro_fd = -1
+    bindings_fd = -1
     try:
         retro_fd = _walk_directories(
             repository.repo_fd,
@@ -768,6 +771,10 @@ def _retro_store(
         metadata = os.fstat(retro_fd)
         if not stat.S_ISDIR(metadata.st_mode):
             raise RetroError("unsafe_artifact_path")
+        bindings_fd = _walk_directories(retro_fd, (".bindings",), create=create)
+        bindings_metadata = os.fstat(bindings_fd)
+        if not stat.S_ISDIR(bindings_metadata.st_mode):
+            raise RetroError("unsafe_artifact_path")
         yield RetroStore(
             repo_root=repository.repo_root,
             parent_fd=repository.parent_fd,
@@ -776,8 +783,16 @@ def _retro_store(
             repo_fd=repository.repo_fd,
             retro_fd=retro_fd,
             retro_identity=(metadata.st_dev, metadata.st_ino),
+            bindings_fd=bindings_fd,
+            bindings_identity=(
+                bindings_metadata.st_dev,
+                bindings_metadata.st_ino,
+            ),
         )
     finally:
+        if bindings_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(bindings_fd)
         if retro_fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(retro_fd)
@@ -810,6 +825,16 @@ def _assert_store_path(store: RetroStore) -> None:
         metadata = os.fstat(current)
         if (metadata.st_dev, metadata.st_ino) != store.retro_identity:
             raise RetroError("unsafe_artifact_path")
+        bindings = _walk_directories(current, (".bindings",), create=False)
+        try:
+            bindings_metadata = os.fstat(bindings)
+            if (
+                bindings_metadata.st_dev,
+                bindings_metadata.st_ino,
+            ) != store.bindings_identity:
+                raise RetroError("unsafe_artifact_path")
+        finally:
+            os.close(bindings)
     finally:
         os.close(current)
 
@@ -1037,6 +1062,7 @@ def _validate_binding_value(
         raise RetroError("invalid_artifact")
     if (
         value["schema"] != BINDING_SCHEMA
+        or type(value["schema_version"]) is not int
         or value["schema_version"] != BINDING_SCHEMA_VERSION
         or not isinstance(value["immutable_sha256"], str)
         or not SHA256_RE.fullmatch(value["immutable_sha256"])
@@ -1092,16 +1118,12 @@ def _validate_binding(
     require_final: bool = False,
 ) -> None:
     _assert_store_path(store)
-    bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=False)
-    try:
-        _validate_binding_at(
-            bindings_fd,
-            fingerprint,
-            document,
-            require_final=require_final,
-        )
-    finally:
-        os.close(bindings_fd)
+    _validate_binding_at(
+        store.bindings_fd,
+        fingerprint,
+        document,
+        require_final=require_final,
+    )
 
 
 def _ensure_binding(
@@ -1110,7 +1132,7 @@ def _ensure_binding(
     document: dict[str, Any],
 ) -> None:
     _assert_store_path(store)
-    bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=True)
+    bindings_fd = store.bindings_fd
     name = f"{fingerprint}.sha256"
     temporary = _unique_temp_name(name)
     payload = _canonical_json(_prepared_binding(document))
@@ -1150,6 +1172,10 @@ def _ensure_binding(
             )
         except FileExistsError:
             _validate_binding_at(bindings_fd, fingerprint, document)
+            _fsync_file(bindings_fd, name)
+            _fsync_directory(bindings_fd)
+            _validate_binding_at(bindings_fd, fingerprint, document)
+            _assert_store_path(store)
             return
         _fsync_file(bindings_fd, name)
         _fsync_directory(bindings_fd)
@@ -1165,7 +1191,6 @@ def _ensure_binding(
                 os.close(descriptor)
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=bindings_fd)
-        os.close(bindings_fd)
 
 
 def _finalize_binding(
@@ -1174,7 +1199,7 @@ def _finalize_binding(
     document: dict[str, Any],
 ) -> None:
     _assert_store_path(store)
-    bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=False)
+    bindings_fd = store.bindings_fd
     name = f"{fingerprint}.sha256"
     temporary = _unique_temp_name(name)
     descriptor = -1
@@ -1241,7 +1266,6 @@ def _finalize_binding(
                 os.close(descriptor)
         with contextlib.suppress(OSError):
             os.unlink(temporary, dir_fd=bindings_fd)
-        os.close(bindings_fd)
 
 
 def _write_exclusive_temp(

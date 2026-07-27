@@ -692,6 +692,257 @@ class RunRetroV12RegressionTests(unittest.TestCase):
         self.assertIn("Missing issue evidence file", result.stderr)
 
 
+class RunRetroV13RegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.repo = RepoFixture()
+
+    def tearDown(self):
+        self.repo.close()
+
+    def _retro_path(self):
+        return (
+            self.repo.root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+        )
+
+    def _snapshot(self, path):
+        result = {}
+        for item in sorted(path.rglob("*")):
+            relative = str(item.relative_to(path))
+            result[relative] = None if item.is_dir() else item.read_bytes()
+        return result
+
+    def _binding_path(self, fingerprint):
+        return self._retro_path() / ".bindings" / f"{fingerprint}.sha256"
+
+    def test_retro_relocation_before_mutation_fails_without_any_tree_write(self):
+        retro = self._retro_path()
+        outside = self.repo.root.parent / f"{self.repo.root.name}-retro-outside"
+        with RETRO._repository(self.repo.root) as repository:
+            proposed = RETRO._build_prepared(
+                repository.repo,
+                repository.provider,
+                base_intent(),
+            )
+            fingerprint = RETRO._document_fingerprint(proposed)
+            with RETRO._retro_store(repository, create=True) as store:
+                retro.rename(outside)
+                retro.mkdir()
+                try:
+                    outside_before = self._snapshot(outside)
+                    replacement_before = self._snapshot(retro)
+                    with self.assertRaisesRegex(
+                        RETRO.RetroError,
+                        "unsafe_artifact_path",
+                    ):
+                        RETRO._ensure_binding(store, fingerprint, proposed)
+                    self.assertEqual(self._snapshot(outside), outside_before)
+                    self.assertEqual(self._snapshot(retro), replacement_before)
+                finally:
+                    shutil.rmtree(retro)
+                    outside.rename(retro)
+
+    def test_bindings_replacement_before_mutation_is_rejected_without_writes(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        fingerprint = prepared["artifact_fingerprint"]
+        bindings = self._retro_path() / ".bindings"
+        outside = self.repo.root.parent / f"{self.repo.root.name}-bindings-outside"
+        with RETRO._repository(self.repo.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                document = RETRO._read_artifact_at(store, fingerprint)
+                bindings.rename(outside)
+                bindings.mkdir()
+                try:
+                    outside_before = self._snapshot(outside)
+                    replacement_before = self._snapshot(bindings)
+                    with self.assertRaisesRegex(
+                        RETRO.RetroError,
+                        "unsafe_artifact_path",
+                    ):
+                        RETRO._ensure_binding(store, fingerprint, document)
+                    self.assertEqual(self._snapshot(outside), outside_before)
+                    self.assertEqual(self._snapshot(bindings), replacement_before)
+                finally:
+                    shutil.rmtree(bindings)
+                    outside.rename(bindings)
+
+    def test_retry_fsyncs_binding_after_crash_between_link_and_barriers(self):
+        original_link = RETRO.os.link
+        crashed = False
+
+        def crash_after_binding_link(source, target, *args, **kwargs):
+            nonlocal crashed
+            result = original_link(source, target, *args, **kwargs)
+            if not crashed and str(target).endswith(".sha256"):
+                crashed = True
+                raise RuntimeError("simulated crash after binding link")
+            return result
+
+        with (
+            mock.patch.object(
+                RETRO.os,
+                "link",
+                side_effect=crash_after_binding_link,
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertTrue(crashed)
+
+        with RETRO._repository(self.repo.root) as repository:
+            proposed = RETRO._build_prepared(
+                repository.repo,
+                repository.provider,
+                base_intent(),
+            )
+            fingerprint = RETRO._document_fingerprint(proposed)
+        binding = self._binding_path(fingerprint)
+        self.assertTrue(binding.is_file())
+        self.assertGreater(binding.stat().st_size, 0)
+        self.assertFalse(self.repo.artifact(fingerprint).exists())
+
+        original_validate = RETRO._validate_binding_at
+        original_file_sync = RETRO._fsync_file
+        original_directory_sync = RETRO._fsync_directory
+        original_assert_path = RETRO._assert_store_path
+        events = []
+
+        def is_bindings_fd(descriptor):
+            held = os.fstat(descriptor)
+            current = os.stat(binding.parent, follow_symlinks=False)
+            return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+
+        def record_validate(descriptor, *args, **kwargs):
+            if is_bindings_fd(descriptor):
+                events.append("validate")
+            return original_validate(descriptor, *args, **kwargs)
+
+        def record_file_sync(descriptor, name):
+            if is_bindings_fd(descriptor):
+                events.append("file-fsync")
+            return original_file_sync(descriptor, name)
+
+        def record_directory_sync(descriptor):
+            if is_bindings_fd(descriptor):
+                events.append("directory-fsync")
+            return original_directory_sync(descriptor)
+
+        def record_path_check(store):
+            events.append("path-check")
+            return original_assert_path(store)
+
+        with (
+            mock.patch.object(
+                RETRO,
+                "_validate_binding_at",
+                side_effect=record_validate,
+            ),
+            mock.patch.object(
+                RETRO,
+                "_fsync_file",
+                side_effect=record_file_sync,
+            ),
+            mock.patch.object(
+                RETRO,
+                "_fsync_directory",
+                side_effect=record_directory_sync,
+            ),
+            mock.patch.object(
+                RETRO,
+                "_assert_store_path",
+                side_effect=record_path_check,
+            ),
+        ):
+            retry = RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(retry["status"], "prepared")
+
+        expected = [
+            "validate",
+            "file-fsync",
+            "directory-fsync",
+            "validate",
+            "path-check",
+        ]
+        cursor = 0
+        for event in events:
+            if event == expected[cursor]:
+                cursor += 1
+                if cursor == len(expected):
+                    break
+        self.assertEqual(cursor, len(expected), events)
+
+    def test_prepared_binding_rejects_boolean_schema_versions(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        fingerprint = prepared["artifact_fingerprint"]
+        binding = self._binding_path(fingerprint)
+        original = json.loads(binding.read_text(encoding="utf-8"))
+        with RETRO._repository(self.repo.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                document = RETRO._read_artifact_at(store, fingerprint)
+        for boolean in (True, False):
+            with self.subTest(schema_version=boolean):
+                value = dict(original)
+                value["schema_version"] = boolean
+                binding.write_text(
+                    json.dumps(value, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with RETRO._repository(self.repo.root) as repository:
+                    with RETRO._retro_store(repository, create=False) as store:
+                        with self.assertRaises(RETRO.RetroError):
+                            RETRO._validate_binding(
+                                store,
+                                fingerprint,
+                                document,
+                            )
+        binding.write_text(
+            json.dumps(original, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_final_binding_rejects_boolean_schema_versions(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        fingerprint = prepared["artifact_fingerprint"]
+        trusted_finalize(
+            self.repo.root,
+            fingerprint,
+            {
+                "provider": "plane",
+                "status": "posted",
+                "target_issue": ISSUE_ID,
+                "error_category": None,
+                "error_summary": None,
+            },
+        )
+        binding = self._binding_path(fingerprint)
+        original = json.loads(binding.read_text(encoding="utf-8"))
+        with RETRO._repository(self.repo.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                document = RETRO._read_artifact_at(
+                    store, fingerprint, require_final=True
+                )
+        for boolean in (True, False):
+            with self.subTest(schema_version=boolean):
+                value = dict(original)
+                value["schema_version"] = boolean
+                binding.write_text(
+                    json.dumps(value, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                with RETRO._repository(self.repo.root) as repository:
+                    with RETRO._retro_store(repository, create=False) as store:
+                        with self.assertRaises(RETRO.RetroError):
+                            RETRO._validate_binding(
+                                store,
+                                fingerprint,
+                                document,
+                                require_final=True,
+                            )
+        binding.write_text(
+            json.dumps(original, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+
 class RunRetroDurabilityTests(unittest.TestCase):
     def setUp(self):
         self.repo = RepoFixture()
@@ -3828,6 +4079,13 @@ class ProtocolParityTests(unittest.TestCase):
             "`bindings_fd`",
             "`retro_fd`",
             "bare filename",
+            "same-OS-UID peer processes",
+            "stale identities",
+            "untrusted repository content",
+            "final syscall window",
+            "immutable/mount helpers",
+            "trusted mutation daemons",
+            "valid existing final binding",
             "zero-byte final-name poison",
             "`next_page_results=false`",
             "`100:1:0`",
