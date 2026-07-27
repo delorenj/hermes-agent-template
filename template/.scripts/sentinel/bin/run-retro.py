@@ -746,6 +746,87 @@ def _validate_trusted_descriptor(
     return metadata
 
 
+def _open_trusted_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    executable: bool = False,
+    category: str,
+) -> tuple[int, tuple[int, int]]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+        metadata = _validate_trusted_descriptor(
+            descriptor,
+            kind="file",
+            executable=executable,
+            category=category,
+        )
+        return descriptor, (metadata.st_dev, metadata.st_ino)
+    except RetroError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise
+    except OSError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        raise RetroError(category) from None
+
+
+def _assert_trusted_file_at(
+    directory_fd: int,
+    name: str,
+    descriptor: int,
+    identity: tuple[int, int],
+    *,
+    executable: bool = False,
+    category: str,
+) -> None:
+    metadata = _validate_trusted_descriptor(
+        descriptor,
+        kind="file",
+        executable=executable,
+        category=category,
+    )
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise RetroError(category)
+    current = -1
+    try:
+        current, current_identity = _open_trusted_file_at(
+            directory_fd,
+            name,
+            executable=executable,
+            category=category,
+        )
+        if current_identity != identity:
+            raise RetroError(category)
+    finally:
+        if current >= 0:
+            os.close(current)
+
+
+def _read_json_descriptor(
+    descriptor: int,
+    *,
+    category: str,
+    max_bytes: int,
+    overflow_category: str,
+) -> tuple[Any, bytes]:
+    try:
+        payload = os.pread(descriptor, max_bytes + 1, 0)
+        if len(payload) > max_bytes:
+            raise RetroError(overflow_category)
+        return json.loads(payload.decode("utf-8")), payload
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RetroError(category) from None
+
+
 def _open_directory_component(parent_fd: int, name: str, *, create: bool) -> int:
     if not name or "/" in name or name in {".", ".."}:
         raise RetroError("unsafe_artifact_path")
@@ -773,11 +854,22 @@ def _open_directory_component(parent_fd: int, name: str, *, create: bool) -> int
     return descriptor
 
 
-def _walk_directories(parent_fd: int, parts: tuple[str, ...], *, create: bool) -> int:
+def _walk_directories(
+    parent_fd: int,
+    parts: tuple[str, ...],
+    *,
+    create: bool,
+    category: str = "unsafe_artifact_path",
+) -> int:
     current = os.dup(parent_fd)
     try:
         for part in parts:
             child = _open_directory_component(current, part, create=create)
+            _validate_trusted_descriptor(
+                child,
+                kind="directory",
+                category=category,
+            )
             os.close(current)
             current = child
         return current
@@ -793,22 +885,12 @@ def _walk_trusted_directories(
     *,
     category: str,
 ) -> int:
-    current = os.dup(parent_fd)
-    try:
-        for part in parts:
-            child = _open_directory_component(current, part, create=False)
-            _validate_trusted_descriptor(
-                child,
-                kind="directory",
-                category=category,
-            )
-            os.close(current)
-            current = child
-        return current
-    except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(current)
-        raise
+    return _walk_directories(
+        parent_fd,
+        parts,
+        create=False,
+        category=category,
+    )
 
 
 @dataclass
@@ -818,6 +900,7 @@ class RepositorySession:
     repo_name: str
     repo_fd: int
     repo_identity: tuple[int, int]
+    project_fd: int
     project_identity: tuple[int, int]
     project_sha256: str
     repo: str
@@ -856,6 +939,28 @@ class RetroStore:
         return "/".join((*RETRO_PARTS, name))
 
 
+@dataclass
+class TrustedArtifactSnapshot:
+    fingerprint: str
+    artifact_name: str
+    artifact_fd: int
+    artifact_identity: tuple[int, int]
+    artifact_sha256: str
+    binding_name: str
+    binding_fd: int
+    binding_identity: tuple[int, int]
+    binding_sha256: str
+    document: dict[str, Any]
+
+
+@dataclass
+class TrustedProviderScript:
+    directory_fd: int
+    name: str
+    descriptor: int
+    identity: tuple[int, int]
+
+
 @contextlib.contextmanager
 def _retro_store(
     repository: RepositorySession, *, create: bool
@@ -863,6 +968,11 @@ def _retro_store(
     retro_fd = -1
     bindings_fd = -1
     try:
+        _validate_trusted_descriptor(
+            repository.repo_fd,
+            kind="directory",
+            category="unsafe_artifact_path",
+        )
         retro_fd = _walk_directories(
             repository.repo_fd,
             RETRO_PARTS,
@@ -928,13 +1038,18 @@ def _assert_repository_inputs(repository: RepositorySession) -> None:
     )
     if (metadata.st_dev, metadata.st_ino) != repository.repo_identity:
         raise RetroError("unsafe_artifact_path")
-    project, project_identity, project_sha256 = _read_trusted_project_at(
+    _assert_trusted_file_at(
         repository.repo_fd,
-        require_trusted_permissions=True,
+        ".project.json",
+        repository.project_fd,
+        repository.project_identity,
+        category="invalid_repository_identity",
+    )
+    project, project_sha256 = _read_trusted_project_descriptor(
+        repository.project_fd,
     )
     if (
-        project_identity != repository.project_identity
-        or not hmac.compare_digest(project_sha256, repository.project_sha256)
+        not hmac.compare_digest(project_sha256, repository.project_sha256)
         or _canonical_repo_from_project(project) != repository.repo
         or _canonical_provider_from_project(project) != repository.provider
         or project.get("ticket_provider") != repository.provider_config
@@ -976,9 +1091,11 @@ def _read_utf8_json_at(
     descriptor = -1
     try:
         descriptor = os.open(name, flags, dir_fd=directory_fd)
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RetroError("unsafe_artifact_path")
+        _validate_trusted_descriptor(
+            descriptor,
+            kind="file",
+            category=category,
+        )
         with os.fdopen(descriptor, "rb", closefd=True) as handle:
             descriptor = -1
             payload = _read_bounded(
@@ -1005,45 +1122,42 @@ def _read_utf8_json_at(
                 os.close(descriptor)
 
 
-def _read_trusted_project_at(
+def _read_trusted_project_descriptor(
+    descriptor: int,
+) -> tuple[dict[str, Any], str]:
+    document, payload = _read_json_descriptor(
+        descriptor,
+        category="invalid_repository_identity",
+        max_bytes=MAX_INPUT_BYTES,
+        overflow_category="configuration_too_large",
+    )
+    if not isinstance(document, dict):
+        raise RetroError("invalid_repository_identity")
+    return document, hashlib.sha256(payload).hexdigest()
+
+
+def _open_trusted_project_at(
     repo_fd: int,
-    *,
-    require_trusted_permissions: bool,
-) -> tuple[dict[str, Any], tuple[int, int], str]:
+) -> tuple[int, dict[str, Any], tuple[int, int], str]:
     descriptor = -1
     try:
-        descriptor = os.open(
+        descriptor, identity = _open_trusted_file_at(
+            repo_fd,
             ".project.json",
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=repo_fd,
+            category="invalid_repository_identity",
         )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
-            raise RetroError("invalid_repository_identity")
-        if require_trusted_permissions:
-            _validate_trusted_metadata(
-                metadata,
-                kind="file",
-                category="invalid_repository_identity",
-            )
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = -1
-            payload = _read_bounded(
-                handle,
-                MAX_INPUT_BYTES,
-                overflow_category="configuration_too_large",
-            )
-        document = json.loads(payload.decode("utf-8"))
-        if not isinstance(document, dict):
-            raise RetroError("invalid_repository_identity")
+        document, digest = _read_trusted_project_descriptor(descriptor)
+        opened_descriptor = descriptor
+        descriptor = -1
         return (
+            opened_descriptor,
             document,
-            (metadata.st_dev, metadata.st_ino),
-            hashlib.sha256(payload).hexdigest(),
+            identity,
+            digest,
         )
     except RetroError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+    except OSError:
         raise RetroError("invalid_repository_identity") from None
     finally:
         if descriptor >= 0:
@@ -1056,6 +1170,7 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
     repo_root = Path(os.path.abspath(repo_root))
     parent_fd = -1
     repo_fd = -1
+    project_fd = -1
     try:
         parent_fd = os.open(repo_root.parent, _directory_flags())
         repo_fd = os.open(repo_root.name, _directory_flags(), dir_fd=parent_fd)
@@ -1065,11 +1180,18 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
         raise RetroError("unsafe_artifact_path") from None
     try:
         metadata = os.fstat(repo_fd)
-        if not stat.S_ISDIR(metadata.st_mode) or not _trusted_owner(metadata.st_uid):
-            raise RetroError("unsafe_artifact_path")
-        project, project_identity, project_sha256 = _read_trusted_project_at(
+        _validate_trusted_metadata(
+            metadata,
+            kind="directory",
+            category="unsafe_artifact_path",
+        )
+        (
+            project_fd,
+            project,
+            project_identity,
+            project_sha256,
+        ) = _open_trusted_project_at(
             repo_fd,
-            require_trusted_permissions=False,
         )
         try:
             provider_config = project["ticket_provider"]
@@ -1083,6 +1205,7 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
             repo_name=repo_root.name,
             repo_fd=repo_fd,
             repo_identity=(metadata.st_dev, metadata.st_ino),
+            project_fd=project_fd,
             project_identity=project_identity,
             project_sha256=project_sha256,
             repo=_canonical_repo_from_project(project),
@@ -1090,6 +1213,9 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
             provider_config=provider_config,
         )
     finally:
+        if project_fd >= 0:
+            with contextlib.suppress(OSError):
+                os.close(project_fd)
         if repo_fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(repo_fd)
@@ -1138,12 +1264,139 @@ def _read_artifact_at(
     return document
 
 
+def _assert_artifact_snapshot(
+    store: RetroStore,
+    snapshot: TrustedArtifactSnapshot,
+    *,
+    require_final: bool = False,
+) -> None:
+    _assert_store_path(store)
+    _assert_trusted_file_at(
+        store.retro_fd,
+        snapshot.artifact_name,
+        snapshot.artifact_fd,
+        snapshot.artifact_identity,
+        category="invalid_artifact",
+    )
+    _assert_trusted_file_at(
+        store.bindings_fd,
+        snapshot.binding_name,
+        snapshot.binding_fd,
+        snapshot.binding_identity,
+        category="invalid_artifact",
+    )
+    document, artifact_payload = _read_json_descriptor(
+        snapshot.artifact_fd,
+        category="invalid_artifact",
+        max_bytes=MAX_ARTIFACT_BYTES,
+        overflow_category="artifact_too_large",
+    )
+    binding, binding_payload = _read_json_descriptor(
+        snapshot.binding_fd,
+        category="invalid_artifact",
+        max_bytes=1024,
+        overflow_category="invalid_artifact",
+    )
+    if (
+        not isinstance(document, dict)
+        or not hmac.compare_digest(
+            hashlib.sha256(artifact_payload).hexdigest(),
+            snapshot.artifact_sha256,
+        )
+        or not hmac.compare_digest(
+            hashlib.sha256(binding_payload).hexdigest(),
+            snapshot.binding_sha256,
+        )
+        or document != snapshot.document
+    ):
+        raise RetroError("immutable_intent_mismatch")
+    validate_document(
+        document,
+        path=Path(snapshot.artifact_name),
+        require_final=require_final,
+    )
+    _validate_binding_value(binding, document, require_final=require_final)
+
+
+@contextlib.contextmanager
+def _trusted_artifact_snapshot(
+    store: RetroStore,
+    fingerprint: str,
+    *,
+    require_final: bool = False,
+) -> Iterator[TrustedArtifactSnapshot]:
+    artifact_fd = -1
+    binding_fd = -1
+    artifact_name = store.artifact_name(fingerprint)
+    binding_name = f"{fingerprint}.sha256"
+    try:
+        _assert_store_path(store)
+        artifact_fd, artifact_identity = _open_trusted_file_at(
+            store.retro_fd,
+            artifact_name,
+            category="invalid_artifact",
+        )
+        document, artifact_payload = _read_json_descriptor(
+            artifact_fd,
+            category="invalid_artifact",
+            max_bytes=MAX_ARTIFACT_BYTES,
+            overflow_category="artifact_too_large",
+        )
+        if not isinstance(document, dict):
+            raise RetroError("invalid_artifact")
+        validate_document(
+            document,
+            path=Path(artifact_name),
+            require_final=require_final,
+        )
+        binding_fd, binding_identity = _open_trusted_file_at(
+            store.bindings_fd,
+            binding_name,
+            category="invalid_artifact",
+        )
+        binding, binding_payload = _read_json_descriptor(
+            binding_fd,
+            category="invalid_artifact",
+            max_bytes=1024,
+            overflow_category="invalid_artifact",
+        )
+        _validate_binding_value(binding, document, require_final=require_final)
+        snapshot = TrustedArtifactSnapshot(
+            fingerprint=fingerprint,
+            artifact_name=artifact_name,
+            artifact_fd=artifact_fd,
+            artifact_identity=artifact_identity,
+            artifact_sha256=hashlib.sha256(artifact_payload).hexdigest(),
+            binding_name=binding_name,
+            binding_fd=binding_fd,
+            binding_identity=binding_identity,
+            binding_sha256=hashlib.sha256(binding_payload).hexdigest(),
+            document=document,
+        )
+        _assert_artifact_snapshot(
+            store,
+            snapshot,
+            require_final=require_final,
+        )
+        yield snapshot
+    finally:
+        for descriptor in (binding_fd, artifact_fd):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+
 def read_artifact(path: Path, *, require_final: bool = False) -> dict[str, Any]:
     try:
         directory_fd = os.open(path.parent, _directory_flags())
     except OSError:
         raise RetroError("unsafe_artifact_path") from None
     try:
+        _validate_trusted_descriptor(
+            directory_fd,
+            kind="directory",
+            category="unsafe_artifact_path",
+        )
         document = _read_utf8_json_at(
             directory_fd, path.name, category="invalid_artifact"
         )
@@ -1931,7 +2184,7 @@ def _provider_script_fd(
     repository: RepositorySession,
     providers_dir: Path,
     provider: str,
-) -> Iterator[int]:
+) -> Iterator[TrustedProviderScript]:
     directory_fd = -1
     script_fd = -1
     try:
@@ -1947,19 +2200,22 @@ def _provider_script_fd(
             tuple(relative.parts),
             category="provider_unavailable",
         )
-        script_fd = os.open(
-            f"{provider}.sh",
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_fd,
-        )
-        _validate_trusted_descriptor(
-            script_fd,
-            kind="file",
+        script_name = f"{provider}.sh"
+        script_fd, script_identity = _open_trusted_file_at(
+            directory_fd,
+            script_name,
             executable=True,
             category="provider_unavailable",
         )
         _assert_repository_inputs(repository)
-        yield script_fd
+        trusted_script = TrustedProviderScript(
+            directory_fd=directory_fd,
+            name=script_name,
+            descriptor=script_fd,
+            identity=script_identity,
+        )
+        _assert_provider_script(trusted_script)
+        yield trusted_script
     except RetroError:
         raise
     except OSError:
@@ -1971,6 +2227,17 @@ def _provider_script_fd(
         if directory_fd >= 0:
             with contextlib.suppress(OSError):
                 os.close(directory_fd)
+
+
+def _assert_provider_script(script: TrustedProviderScript) -> None:
+    _assert_trusted_file_at(
+        script.directory_fd,
+        script.name,
+        script.descriptor,
+        script.identity,
+        executable=True,
+        category="provider_unavailable",
+    )
 
 
 def _trusted_executable(path: Path) -> bool:
@@ -2354,6 +2621,9 @@ def _validated_provider_environment(
 def _provider_supervisor_payload(
     stored: dict[str, Any],
     provider_config: dict[str, Any],
+    repository: RepositorySession,
+    store: RetroStore,
+    snapshot: TrustedArtifactSnapshot,
     repo_root: Path | None = None,
 ) -> dict[str, Any]:
     return {
@@ -2369,6 +2639,19 @@ def _provider_supervisor_payload(
         "repo_root": (
             str(Path(os.path.abspath(repo_root))) if repo_root is not None else None
         ),
+        "trust": {
+            "repo_identity": list(repository.repo_identity),
+            "project_identity": list(repository.project_identity),
+            "project_sha256": repository.project_sha256,
+            "retro_identity": list(store.retro_identity),
+            "bindings_identity": list(store.bindings_identity),
+            "artifact_name": snapshot.artifact_name,
+            "artifact_identity": list(snapshot.artifact_identity),
+            "artifact_sha256": snapshot.artifact_sha256,
+            "binding_name": snapshot.binding_name,
+            "binding_identity": list(snapshot.binding_identity),
+            "binding_sha256": snapshot.binding_sha256,
+        },
         "provider_timeout_seconds": _bounded_seconds(
             PROVIDER_TIMEOUT_SECONDS,
             category="provider_timeout",
@@ -2387,6 +2670,7 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
         "provider_config",
         "provider_environment",
         "repo_root",
+        "trust",
         "provider_timeout_seconds",
         "lock_timeout_seconds",
     }
@@ -2420,6 +2704,61 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
         or str(Path(repo_root)) != repo_root
     ):
         raise RetroError("invalid_input")
+    trust = value["trust"]
+    trust_fields = {
+        "repo_identity",
+        "project_identity",
+        "project_sha256",
+        "retro_identity",
+        "bindings_identity",
+        "artifact_name",
+        "artifact_identity",
+        "artifact_sha256",
+        "binding_name",
+        "binding_identity",
+        "binding_sha256",
+    }
+    if not isinstance(trust, dict) or set(trust) != trust_fields:
+        raise RetroError("invalid_input")
+
+    def trusted_identity(name: str) -> tuple[int, int]:
+        identity = trust[name]
+        if (
+            not isinstance(identity, list)
+            or len(identity) != 2
+            or any(type(item) is not int or item < 0 for item in identity)
+        ):
+            raise RetroError("invalid_input")
+        return identity[0], identity[1]
+
+    normalized_trust = {
+        "repo_identity": trusted_identity("repo_identity"),
+        "project_identity": trusted_identity("project_identity"),
+        "project_sha256": trust["project_sha256"],
+        "retro_identity": trusted_identity("retro_identity"),
+        "bindings_identity": trusted_identity("bindings_identity"),
+        "artifact_name": trust["artifact_name"],
+        "artifact_identity": trusted_identity("artifact_identity"),
+        "artifact_sha256": trust["artifact_sha256"],
+        "binding_name": trust["binding_name"],
+        "binding_identity": trusted_identity("binding_identity"),
+        "binding_sha256": trust["binding_sha256"],
+    }
+    artifact_name = normalized_trust["artifact_name"]
+    binding_name = normalized_trust["binding_name"]
+    if (
+        not isinstance(artifact_name, str)
+        or not isinstance(binding_name, str)
+        or not artifact_name.endswith(".json")
+        or not SHA256_RE.fullmatch(artifact_name.removesuffix(".json"))
+        or binding_name != f"{artifact_name.removesuffix('.json')}.sha256"
+        or any(
+            not isinstance(normalized_trust[name], str)
+            or not SHA256_RE.fullmatch(normalized_trust[name])
+            for name in ("project_sha256", "artifact_sha256", "binding_sha256")
+        )
+    ):
+        raise RetroError("invalid_input")
     provider_timeout = _bounded_seconds(
         value["provider_timeout_seconds"],
         category="provider_timeout",
@@ -2438,6 +2777,7 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
         "provider_config": provider_config,
         "provider_environment": provider_environment,
         "repo_root": repo_root,
+        "trust": normalized_trust,
         "provider_timeout_seconds": provider_timeout,
         "lock_timeout_seconds": lock_timeout,
     }
@@ -2459,9 +2799,11 @@ def _read_supervisor_payload(descriptor: int) -> dict[str, Any]:
 
 
 def _assert_supervisor_repository(repo_fd: int, repo_root: str) -> None:
-    metadata = os.fstat(repo_fd)
-    if not stat.S_ISDIR(metadata.st_mode) or not _trusted_owner(metadata.st_uid):
-        raise RetroError("provider_containment_unavailable")
+    metadata = _validate_trusted_descriptor(
+        repo_fd,
+        kind="directory",
+        category="provider_containment_unavailable",
+    )
     path = Path(repo_root)
     parent_fd = -1
     current_fd = -1
@@ -2480,6 +2822,134 @@ def _assert_supervisor_repository(repo_fd: int, repo_root: str) -> None:
             if descriptor >= 0:
                 with contextlib.suppress(OSError):
                     os.close(descriptor)
+
+
+def _assert_supervisor_delivery_inputs(
+    payload: dict[str, Any],
+    *,
+    repo_fd: int,
+    project_fd: int,
+    retro_fd: int,
+    bindings_fd: int,
+    artifact_fd: int,
+    binding_fd: int,
+) -> None:
+    trust = payload["trust"]
+    repo_metadata = _validate_trusted_descriptor(
+        repo_fd,
+        kind="directory",
+        category="provider_containment_unavailable",
+    )
+    if (repo_metadata.st_dev, repo_metadata.st_ino) != trust["repo_identity"]:
+        raise RetroError("provider_containment_unavailable")
+    if payload["repo_root"] is not None:
+        _assert_supervisor_repository(repo_fd, payload["repo_root"])
+    _assert_trusted_file_at(
+        repo_fd,
+        ".project.json",
+        project_fd,
+        trust["project_identity"],
+        category="provider_containment_unavailable",
+    )
+    project, project_sha256 = _read_trusted_project_descriptor(project_fd)
+    if (
+        not hmac.compare_digest(project_sha256, trust["project_sha256"])
+        or _canonical_provider_from_project(project) != payload["provider"]
+        or project.get("ticket_provider") != payload["provider_config"]
+    ):
+        raise RetroError("immutable_intent_mismatch")
+    retro_metadata = _validate_trusted_descriptor(
+        retro_fd,
+        kind="directory",
+        category="provider_containment_unavailable",
+    )
+    bindings_metadata = _validate_trusted_descriptor(
+        bindings_fd,
+        kind="directory",
+        category="provider_containment_unavailable",
+    )
+    if (retro_metadata.st_dev, retro_metadata.st_ino) != trust["retro_identity"] or (
+        bindings_metadata.st_dev,
+        bindings_metadata.st_ino,
+    ) != trust["bindings_identity"]:
+        raise RetroError("provider_containment_unavailable")
+    current_retro = _walk_directories(
+        repo_fd,
+        RETRO_PARTS,
+        create=False,
+        category="provider_containment_unavailable",
+    )
+    try:
+        current_retro_metadata = os.fstat(current_retro)
+        if (
+            current_retro_metadata.st_dev,
+            current_retro_metadata.st_ino,
+        ) != trust["retro_identity"]:
+            raise RetroError("provider_containment_unavailable")
+        current_bindings = _walk_directories(
+            current_retro,
+            (".bindings",),
+            create=False,
+            category="provider_containment_unavailable",
+        )
+        try:
+            current_bindings_metadata = os.fstat(current_bindings)
+            if (
+                current_bindings_metadata.st_dev,
+                current_bindings_metadata.st_ino,
+            ) != trust["bindings_identity"]:
+                raise RetroError("provider_containment_unavailable")
+        finally:
+            os.close(current_bindings)
+    finally:
+        os.close(current_retro)
+    _assert_trusted_file_at(
+        retro_fd,
+        trust["artifact_name"],
+        artifact_fd,
+        trust["artifact_identity"],
+        category="provider_containment_unavailable",
+    )
+    _assert_trusted_file_at(
+        bindings_fd,
+        trust["binding_name"],
+        binding_fd,
+        trust["binding_identity"],
+        category="provider_containment_unavailable",
+    )
+    document, artifact_payload = _read_json_descriptor(
+        artifact_fd,
+        category="invalid_artifact",
+        max_bytes=MAX_ARTIFACT_BYTES,
+        overflow_category="artifact_too_large",
+    )
+    binding, binding_payload = _read_json_descriptor(
+        binding_fd,
+        category="invalid_artifact",
+        max_bytes=1024,
+        overflow_category="invalid_artifact",
+    )
+    if (
+        not isinstance(document, dict)
+        or not hmac.compare_digest(
+            hashlib.sha256(artifact_payload).hexdigest(),
+            trust["artifact_sha256"],
+        )
+        or not hmac.compare_digest(
+            hashlib.sha256(binding_payload).hexdigest(),
+            trust["binding_sha256"],
+        )
+    ):
+        raise RetroError("immutable_intent_mismatch")
+    validate_document(document, path=Path(trust["artifact_name"]))
+    _validate_binding_value(binding, document, require_final=False)
+    if (
+        document["provider"] != payload["provider"]
+        or document["source_issue"] != payload["source_issue"]
+        or comment_marker(document) != payload["marker"]
+        or comment_body(document) != payload["body"]
+    ):
+        raise RetroError("immutable_intent_mismatch")
 
 
 def _run_contained_provider(
@@ -2583,6 +3053,11 @@ def _supervise_provider(
     script_fd: int,
     payload_fd: int,
     repo_fd: int = -1,
+    project_fd: int = -1,
+    retro_fd: int = -1,
+    bindings_fd: int = -1,
+    artifact_fd: int = -1,
+    binding_fd: int = -1,
 ) -> dict[str, Any]:
     try:
         _validate_trusted_descriptor(
@@ -2594,47 +3069,63 @@ def _supervise_provider(
     except OSError:
         raise RetroError("provider_unavailable") from None
     payload = _read_supervisor_payload(payload_fd)
-    if payload["repo_root"] is not None:
-        _assert_supervisor_repository(repo_fd, payload["repo_root"])
+    trust_descriptors = {
+        "repo_fd": repo_fd,
+        "project_fd": project_fd,
+        "retro_fd": retro_fd,
+        "bindings_fd": bindings_fd,
+        "artifact_fd": artifact_fd,
+        "binding_fd": binding_fd,
+    }
+    _assert_supervisor_delivery_inputs(payload, **trust_descriptors)
     with _global_comment_lock(
         payload["marker"],
         timeout_seconds=payload["lock_timeout_seconds"],
     ):
+        _assert_supervisor_delivery_inputs(payload, **trust_descriptors)
         return _run_contained_provider(payload, script_fd, repo_fd)
 
 
-def _controller_source_fd() -> int:
-    path = Path(__file__)
+def _controller_source_fd(repository: RepositorySession) -> int:
+    path = Path(os.path.abspath(__file__))
+    directory_fd = -1
     descriptor = -1
     try:
-        path_metadata = os.stat(path, follow_symlinks=False)
-        descriptor = os.open(
-            path,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        relative = path.relative_to(repository.repo_root)
+        if not relative.parent.parts:
+            raise RetroError("provider_containment_unavailable")
+        directory_fd = _walk_trusted_directories(
+            repository.repo_fd,
+            tuple(relative.parent.parts),
+            category="provider_containment_unavailable",
         )
-        metadata = _validate_trusted_descriptor(
-            descriptor,
-            kind="file",
+        descriptor, identity = _open_trusted_file_at(
+            directory_fd,
+            relative.name,
             executable=True,
             category="provider_containment_unavailable",
         )
-        if (
-            metadata.st_dev,
-            metadata.st_ino,
-        ) != (
-            path_metadata.st_dev,
-            path_metadata.st_ino,
-        ):
-            raise RetroError("provider_containment_unavailable")
+        _assert_trusted_file_at(
+            directory_fd,
+            relative.name,
+            descriptor,
+            identity,
+            executable=True,
+            category="provider_containment_unavailable",
+        )
+        _assert_repository_inputs(repository)
         return descriptor
-    except RetroError:
+    except (RetroError, ValueError):
         if descriptor >= 0:
             os.close(descriptor)
-        raise
+        raise RetroError("provider_containment_unavailable") from None
     except OSError:
         if descriptor >= 0:
             os.close(descriptor)
         raise RetroError("provider_containment_unavailable") from None
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
 
 
 def _controller_timeout_seconds() -> float:
@@ -2648,18 +3139,17 @@ def _controller_timeout_seconds() -> float:
 
 def _invoke_provider(
     repository: RepositorySession,
+    store: RetroStore,
+    snapshot: TrustedArtifactSnapshot,
     stored: dict[str, Any],
     fingerprint: str,
-    script_fd: int,
+    script: TrustedProviderScript,
     provider_config: dict[str, Any],
 ) -> _TrustedTransition:
     _assert_repository_inputs(repository)
-    _validate_trusted_descriptor(
-        script_fd,
-        kind="file",
-        executable=True,
-        category="provider_unavailable",
-    )
+    _assert_store_path(store)
+    _assert_artifact_snapshot(store, snapshot)
+    _assert_provider_script(script)
     try:
         _containment_executable()
     except RetroError as error:
@@ -2678,6 +3168,9 @@ def _invoke_provider(
         _provider_supervisor_payload(
             stored,
             provider_config,
+            repository,
+            store,
+            snapshot,
             repository.repo_root,
         )
     )
@@ -2686,7 +3179,11 @@ def _invoke_provider(
     payload_write_fd = -1
     process: subprocess.Popen[bytes] | None = None
     try:
-        source_fd = _controller_source_fd()
+        source_fd = _controller_source_fd(repository)
+        _assert_repository_inputs(repository)
+        _assert_store_path(store)
+        _assert_artifact_snapshot(store, snapshot)
+        _assert_provider_script(script)
         payload_read_fd, payload_write_fd = os.pipe()
         process = subprocess.Popen(
             [
@@ -2694,16 +3191,35 @@ def _invoke_provider(
                 "-",
                 "_supervise-provider",
                 "--script-fd",
-                str(script_fd),
+                str(script.descriptor),
                 "--payload-fd",
                 str(payload_read_fd),
                 "--repo-fd",
                 str(repository.repo_fd),
+                "--project-fd",
+                str(repository.project_fd),
+                "--retro-fd",
+                str(store.retro_fd),
+                "--bindings-fd",
+                str(store.bindings_fd),
+                "--artifact-fd",
+                str(snapshot.artifact_fd),
+                "--binding-fd",
+                str(snapshot.binding_fd),
             ],
             stdin=source_fd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            pass_fds=(script_fd, payload_read_fd, repository.repo_fd),
+            pass_fds=(
+                script.descriptor,
+                payload_read_fd,
+                repository.repo_fd,
+                repository.project_fd,
+                store.retro_fd,
+                store.bindings_fd,
+                snapshot.artifact_fd,
+                snapshot.binding_fd,
+            ),
             start_new_session=True,
             env=_runtime_environment(include_tmpdir=True),
         )
@@ -2767,19 +3283,15 @@ def deliver(
         raise RetroError("invalid_artifact")
     with _repository(repo_root) as repository:
         with _retro_store(repository, create=False) as store:
-            stored = _read_artifact_at(store, fingerprint)
-            if stored is None:
-                raise RetroError("invalid_artifact")
-            if (
-                stored["repo"] != repository.repo
-                or stored["provider"] != repository.provider
-            ):
-                raise RetroError("immutable_intent_mismatch")
-            if stored["source_issue"] is None:
-                return _finalize_at(
-                    store,
-                    fingerprint,
-                    _issue_trusted_transition(
+            with _trusted_artifact_snapshot(store, fingerprint) as snapshot:
+                stored = snapshot.document
+                if (
+                    stored["repo"] != repository.repo
+                    or stored["provider"] != repository.provider
+                ):
+                    raise RetroError("immutable_intent_mismatch")
+                if stored["source_issue"] is None:
+                    transition = _issue_trusted_transition(
                         stored,
                         fingerprint,
                         {
@@ -2789,68 +3301,55 @@ def deliver(
                             "error_category": None,
                             "error_summary": None,
                         },
-                    ),
-                )
-            try:
-                provider_context = _provider_script_fd(
-                    repository,
-                    providers_dir or _default_providers_dir(),
-                    stored["provider"],
-                )
-                with provider_context as script_fd:
-                    _assert_repository_path(repository)
-                    _assert_store_path(store)
-                    current = _read_artifact_at(store, fingerprint)
-                    if current is None:
-                        raise RetroError("invalid_artifact")
-                    if _immutable_view(current, IMMUTABLE_FIELDS) != _immutable_view(
-                        stored, IMMUTABLE_FIELDS
-                    ):
-                        raise RetroError("immutable_intent_mismatch")
-                    if current["routing"]["status"] in SUCCESS_STATUSES:
-                        try:
-                            _validate_binding(
-                                store,
-                                fingerprint,
-                                current,
-                                require_final=True,
-                            )
-                        except RetroError as error:
-                            if error.category != "invalid_artifact":
-                                raise
-                        else:
-                            return {
-                                "status": current["routing"]["status"],
-                                "artifact_fingerprint": fingerprint,
-                                "artifact_path": store.relative_path(fingerprint),
-                                "transition": "preserved_terminal",
-                            }
-                    result = _invoke_provider(
-                        repository,
-                        current,
-                        fingerprint,
-                        script_fd,
-                        repository.provider_config,
                     )
-                    _assert_repository_path(repository)
-                    _assert_store_path(store)
-                    return _finalize_at(store, fingerprint, result)
-            except RetroError as error:
-                if error.category != "provider_unavailable":
-                    raise
-                return _finalize_at(
-                    store,
-                    fingerprint,
-                    _issue_trusted_transition(
-                        stored,
-                        fingerprint,
-                        _provider_failure(
+                else:
+                    try:
+                        provider_context = _provider_script_fd(
+                            repository,
+                            providers_dir or _default_providers_dir(),
+                            stored["provider"],
+                        )
+                        with provider_context as script:
+                            _assert_repository_inputs(repository)
+                            _assert_store_path(store)
+                            _assert_artifact_snapshot(store, snapshot)
+                            _assert_provider_script(script)
+                            if stored["routing"]["status"] in SUCCESS_STATUSES:
+                                _assert_artifact_snapshot(
+                                    store,
+                                    snapshot,
+                                    require_final=True,
+                                )
+                                return {
+                                    "status": stored["routing"]["status"],
+                                    "artifact_fingerprint": fingerprint,
+                                    "artifact_path": store.relative_path(fingerprint),
+                                    "transition": "preserved_terminal",
+                                }
+                            transition = _invoke_provider(
+                                repository,
+                                store,
+                                snapshot,
+                                stored,
+                                fingerprint,
+                                script,
+                                repository.provider_config,
+                            )
+                    except RetroError as error:
+                        if error.category != "provider_unavailable":
+                            raise
+                        transition = _issue_trusted_transition(
                             stored,
-                            "serialization_failed",
-                            "provider adapter unavailable",
-                        ),
-                    ),
-                )
+                            fingerprint,
+                            _provider_failure(
+                                stored,
+                                "serialization_failed",
+                                "provider adapter unavailable",
+                            ),
+                        )
+            _assert_repository_inputs(repository)
+            _assert_store_path(store)
+            return _finalize_at(store, fingerprint, transition)
 
 
 def _load_input(path: str) -> dict[str, Any]:
@@ -2918,12 +3417,35 @@ def _parser() -> argparse.ArgumentParser:
     supervisor_parser.add_argument("--script-fd", required=True, type=int)
     supervisor_parser.add_argument("--payload-fd", required=True, type=int)
     supervisor_parser.add_argument("--repo-fd", required=True, type=int)
+    supervisor_parser.add_argument("--project-fd", required=True, type=int)
+    supervisor_parser.add_argument("--retro-fd", required=True, type=int)
+    supervisor_parser.add_argument("--bindings-fd", required=True, type=int)
+    supervisor_parser.add_argument("--artifact-fd", required=True, type=int)
+    supervisor_parser.add_argument("--binding-fd", required=True, type=int)
     return parser
 
 
-def _supervisor_main(script_fd: int, payload_fd: int, repo_fd: int) -> int:
+def _supervisor_main(
+    script_fd: int,
+    payload_fd: int,
+    repo_fd: int,
+    project_fd: int,
+    retro_fd: int,
+    bindings_fd: int,
+    artifact_fd: int,
+    binding_fd: int,
+) -> int:
     try:
-        result = _supervise_provider(script_fd, payload_fd, repo_fd)
+        result = _supervise_provider(
+            script_fd,
+            payload_fd,
+            repo_fd,
+            project_fd,
+            retro_fd,
+            bindings_fd,
+            artifact_fd,
+            binding_fd,
+        )
         output = _canonical_json(result)
         return_code = 0
     except RetroError as error:
@@ -2946,7 +3468,16 @@ def _supervisor_main(script_fd: int, payload_fd: int, repo_fd: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "_supervise-provider":
-        return _supervisor_main(args.script_fd, args.payload_fd, args.repo_fd)
+        return _supervisor_main(
+            args.script_fd,
+            args.payload_fd,
+            args.repo_fd,
+            args.project_fd,
+            args.retro_fd,
+            args.bindings_fd,
+            args.artifact_fd,
+            args.binding_fd,
+        )
     try:
         repo_root = args.repo_root.resolve()
         if args.command == "prepare":

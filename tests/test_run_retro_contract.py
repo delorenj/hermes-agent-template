@@ -107,6 +107,18 @@ class RepoFixture:
     def __init__(self):
         self.temp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
         self.root = pathlib.Path(self.temp.name)
+        controller_bin = self.root / ".scripts" / "sentinel" / "bin"
+        controller_bin.mkdir(parents=True)
+        for path in (
+            self.root / ".scripts",
+            self.root / ".scripts" / "sentinel",
+            controller_bin,
+        ):
+            path.chmod(0o755)
+        self.controller = controller_bin / "run-retro.py"
+        shutil.copy2(HELPER_PATH, self.controller)
+        self.controller.chmod(0o755)
+        RETRO.__file__ = str(self.controller)
         (self.root / ".project.json").write_text(
             json.dumps(
                 {
@@ -957,7 +969,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
         intent_path.write_text(json.dumps(base_intent()), encoding="utf-8")
         command = [
             sys.executable,
-            str(HELPER_PATH),
+            str(self.repo.controller),
             "prepare",
             "--repo-root",
             str(self.repo.root),
@@ -2228,6 +2240,222 @@ class ProviderTrustBoundaryTests(unittest.TestCase):
         self.assertFalse(self.outside_effect.exists())
         self.assertEqual(self.Handler.calls, 0)
 
+    def _write_endpoint_only_provider(self):
+        self.provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                issue="$2"
+                python3 - "$issue" <<'PY'
+                import json
+                import os
+                import sys
+                import urllib.request
+
+                config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+                request = urllib.request.Request(
+                    config["test_endpoint"], data=b"{}", method="POST"
+                )
+                urllib.request.urlopen(request, timeout=2).read()
+                print(json.dumps({
+                    "provider": "plane",
+                    "status": "posted",
+                    "target_issue": sys.argv[1],
+                    "error_category": None,
+                    "error_summary": None,
+                }, separators=(",", ":")))
+                PY
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.provider.chmod(0o755)
+
+    def _artifact_and_binding(self):
+        artifact = self.repo.artifact(self.fingerprint)
+        binding = artifact.parent / ".bindings" / f"{self.fingerprint}.sha256"
+        return artifact, binding
+
+    def _forged_target_documents(self):
+        artifact, _ = self._artifact_and_binding()
+        forged = json.loads(artifact.read_text(encoding="utf-8"))
+        forged["source_issue"] = OTHER_ISSUE_ID
+        binding = RETRO._prepared_binding(forged)
+        return forged, binding
+
+    def _assert_delivery_was_blocked(self, result, error):
+        artifact, _ = self._artifact_and_binding()
+        self.assertIsNotNone(error)
+        self.assertIsNone(result)
+        try:
+            payload = artifact.read_text(encoding="utf-8")
+        except PermissionError:
+            readback = subprocess.run(
+                ["sudo", "-n", "cat", str(artifact)],
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            payload = readback.stdout
+        document = json.loads(payload)
+        self.assertNotEqual(document["routing"]["status"], "posted")
+        self.assertEqual(self.Handler.calls, 0)
+        self.assertFalse(self.controller_marker_effect.exists())
+        self.assertFalse(self.outside_effect.exists())
+
+    def test_writable_storage_forgery_cannot_redirect_provider_or_finalize(self):
+        self._write_endpoint_only_provider()
+        artifact, binding = self._artifact_and_binding()
+        forged, forged_binding = self._forged_target_documents()
+        artifact.write_bytes(RETRO._canonical_json(forged))
+        binding.write_bytes(RETRO._canonical_json(forged_binding))
+        artifact.parent.chmod(0o775)
+        binding.parent.chmod(0o775)
+        artifact.chmod(0o664)
+        binding.chmod(0o664)
+        result = None
+        error = None
+        try:
+            result = RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        except RETRO.RetroError as caught:
+            error = caught
+        self._assert_delivery_was_blocked(result, error)
+
+    def test_foreign_owned_artifact_and_binding_cannot_reach_provider(self):
+        if subprocess.run(
+            ["sudo", "-n", "true"],
+            check=False,
+            capture_output=True,
+        ).returncode:
+            self.skipTest("non-interactive sudo unavailable for foreign-owner probe")
+        self._write_endpoint_only_provider()
+        artifact, binding = self._artifact_and_binding()
+        subprocess.run(
+            [
+                "sudo",
+                "-n",
+                "chown",
+                "65534:65534",
+                str(artifact),
+                str(binding),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        result = None
+        error = None
+        try:
+            result = RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        except RETRO.RetroError as caught:
+            error = caught
+        self._assert_delivery_was_blocked(result, error)
+
+    def test_foreign_path_swap_after_read_cannot_redirect_provider(self):
+        if subprocess.run(
+            ["sudo", "-n", "true"],
+            check=False,
+            capture_output=True,
+        ).returncode:
+            self.skipTest("non-interactive sudo unavailable for foreign-swap probe")
+        self._write_endpoint_only_provider()
+        artifact, binding = self._artifact_and_binding()
+        forged, forged_binding = self._forged_target_documents()
+        forged_artifact = artifact.with_name(f".foreign-{artifact.name}")
+        forged_binding_path = binding.with_name(f".foreign-{binding.name}")
+        forged_artifact.write_bytes(RETRO._canonical_json(forged))
+        forged_binding_path.write_bytes(RETRO._canonical_json(forged_binding))
+        original_provider_context = RETRO._provider_script_fd
+
+        @contextlib.contextmanager
+        def swap_after_initial_read(*args, **kwargs):
+            with original_provider_context(*args, **kwargs) as descriptor:
+                subprocess.run(
+                    [
+                        "sudo",
+                        "-n",
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os,sys;"
+                            "pairs=((sys.argv[1],sys.argv[2]),"
+                            "(sys.argv[3],sys.argv[4]));"
+                            "[(os.chown(src,0,0),os.chmod(src,0o600),"
+                            "os.replace(src,dst)) for src,dst in pairs]"
+                        ),
+                        str(forged_artifact),
+                        str(artifact),
+                        str(forged_binding_path),
+                        str(binding),
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                yield descriptor
+
+        result = None
+        error = None
+        try:
+            with mock.patch.object(
+                RETRO,
+                "_provider_script_fd",
+                swap_after_initial_read,
+            ):
+                result = RETRO.deliver(
+                    self.repo.root,
+                    self.fingerprint,
+                    providers_dir=self.providers,
+                )
+        except RETRO.RetroError as caught:
+            error = caught
+        self._assert_delivery_was_blocked(result, error)
+
+    def test_project_configuration_descriptor_remains_bound_through_launch(self):
+        with RETRO._repository(self.repo.root) as repository:
+            self.assertGreaterEqual(repository.project_fd, 0)
+            metadata = os.fstat(repository.project_fd)
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(
+                (metadata.st_dev, metadata.st_ino),
+                repository.project_identity,
+            )
+            replacement = self.repo.root / ".project.json.replacement"
+            replacement.write_bytes((self.repo.root / ".project.json").read_bytes())
+            replacement.chmod(0o644)
+            os.replace(replacement, self.repo.root / ".project.json")
+            with self.assertRaisesRegex(
+                RETRO.RetroError,
+                "invalid_repository_identity|immutable_intent_mismatch",
+            ):
+                RETRO._assert_repository_inputs(repository)
+
+    def test_world_writable_controller_component_is_rejected(self):
+        controller_root = self.repo.root / "controller"
+        controller_bin = controller_root / "bin"
+        controller_bin.mkdir(parents=True)
+        controller = controller_bin / "run-retro.py"
+        shutil.copy2(HELPER_PATH, controller)
+        controller.chmod(0o755)
+        controller_root.chmod(0o777)
+        with RETRO._repository(self.repo.root) as repository:
+            with (
+                mock.patch.object(RETRO, "__file__", str(controller)),
+                self.assertRaisesRegex(
+                    RETRO.RetroError,
+                    "provider_containment_unavailable",
+                ),
+            ):
+                descriptor = RETRO._controller_source_fd(repository)
+                os.close(descriptor)
+
     def test_mode_0666_non_executable_provider_is_rejected_before_launch(self):
         self.provider.chmod(0o666)
         self._assert_rejected_before_launch()
@@ -2273,16 +2501,17 @@ class ProviderTrustBoundaryTests(unittest.TestCase):
         self.assertEqual(self.Handler.calls, 0)
 
     def test_controller_source_permissions_are_revalidated_before_launch(self):
-        original_mode = stat.S_IMODE(HELPER_PATH.stat().st_mode)
+        controller = pathlib.Path(RETRO.__file__)
+        original_mode = stat.S_IMODE(controller.stat().st_mode)
         try:
-            HELPER_PATH.chmod(0o666)
+            controller.chmod(0o666)
             result = RETRO.deliver(
                 self.repo.root,
                 self.fingerprint,
                 providers_dir=self.providers,
             )
         finally:
-            HELPER_PATH.chmod(original_mode)
+            controller.chmod(original_mode)
         stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
         self.assertEqual(result["status"], "failed")
         self.assertNotEqual(stored["routing"]["status"], "posted")
@@ -2593,7 +2822,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         )
         command = [
             sys.executable,
-            str(HELPER_PATH),
+            str(self.repo.controller),
             "deliver",
             "--repo-root",
             str(self.root),
@@ -2839,11 +3068,20 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             encoding="utf-8",
         )
         provider.chmod(0o755)
-        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
-        payload = RETRO._provider_supervisor_payload(
-            stored,
-            {"type": "plane", "containment_effect": str(effect)},
-        )
+        with RETRO._repository(self.root) as repository:
+            with RETRO._retro_store(repository, create=False) as store:
+                with RETRO._trusted_artifact_snapshot(
+                    store,
+                    self.fingerprint,
+                ) as snapshot:
+                    stored = snapshot.document
+                    payload = RETRO._provider_supervisor_payload(
+                        stored,
+                        {"type": "plane", "containment_effect": str(effect)},
+                        repository,
+                        store,
+                        snapshot,
+                    )
         payload["provider_timeout_seconds"] = 0.2
         script_fd = os.open(provider, os.O_RDONLY)
         started = time.monotonic()
@@ -3514,7 +3752,16 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         command = provider_calls[0].args[0]
         self.assertEqual(command[:3], [sys.executable, "-", "_supervise-provider"])
         self.assertIsInstance(provider_calls[0].kwargs["stdin"], int)
-        self.assertEqual(len(provider_calls[0].kwargs["pass_fds"]), 3)
+        self.assertEqual(len(provider_calls[0].kwargs["pass_fds"]), 8)
+        for descriptor_flag in (
+            "--repo-fd",
+            "--project-fd",
+            "--retro-fd",
+            "--bindings-fd",
+            "--artifact-fd",
+            "--binding-fd",
+        ):
+            self.assertIn(descriptor_flag, command)
 
 
 class PlanePaginationTests(unittest.TestCase):
@@ -4319,6 +4566,117 @@ class LinearDeliveryContractTests(unittest.TestCase):
         self.assertEqual(payload["error_category"], "lookup_failed")
 
 
+class CopierSecurityMetadataTests(unittest.TestCase):
+    def test_umask_002_render_normalizes_modes_and_delivers_with_rendered_controller(
+        self,
+    ):
+        copier = shutil.which("copier")
+        if copier is None:
+            self.skipTest("Copier is unavailable")
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = root / "output"
+
+            def umask_002():
+                os.umask(0o002)
+
+            render = subprocess.run(
+                [
+                    copier,
+                    "copy",
+                    str(ROOT),
+                    str(output),
+                    "--trust",
+                    "--skip-tasks",
+                    "--defaults",
+                    "--data",
+                    "target_repo=pjangler",
+                    "--data",
+                    "role=pm",
+                    "--data",
+                    "ticket_provider=plane",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                preexec_fn=umask_002,
+            )
+            self.assertEqual(render.returncode, 0, render.stderr)
+            project = output / ".project.json"
+            project.write_text(
+                json.dumps(
+                    {
+                        "project_name": "pjangler",
+                        "ticket_provider": {"type": "plane"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            project.chmod(0o664)
+            provider = output / ".scripts" / "providers" / "plane.sh"
+            provider.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env sh
+                    set -eu
+                    issue="$2"
+                    printf 'temporary\\n' > "$TMPDIR/provider-temp-probe"
+                    printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            provider.chmod(0o775)
+            security_modes = output / ".scripts" / "02-security-modes.sh"
+            self.assertTrue(
+                security_modes.is_file(),
+                "rendered security-mode provisioning task is required",
+            )
+            normalized = subprocess.run(
+                ["bash", str(security_modes), str(output)],
+                cwd=output,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(normalized.returncode, 0, normalized.stderr)
+            expected_modes = {
+                output: 0o755,
+                output / ".scripts": 0o755,
+                output / ".scripts" / "sentinel": 0o755,
+                output / ".scripts" / "sentinel" / "bin": 0o755,
+                output / ".scripts" / "providers": 0o755,
+                output / ".scripts" / "sentinel" / "bin" / "run-retro.py": 0o755,
+                provider: 0o755,
+                project: 0o644,
+            }
+            for path, expected in expected_modes.items():
+                with self.subTest(path=path):
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), expected)
+            rendered_helper = output / ".scripts" / "sentinel" / "bin" / "run-retro.py"
+            spec = importlib.util.spec_from_file_location(
+                "rendered_run_retro",
+                rendered_helper,
+            )
+            rendered_retro = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = rendered_retro
+            spec.loader.exec_module(rendered_retro)
+            prepared = rendered_retro.prepare(output, base_intent())
+            result = rendered_retro.deliver(
+                output,
+                prepared["artifact_fingerprint"],
+                providers_dir=output / ".scripts" / "providers",
+            )
+            self.assertEqual(result["status"], "posted")
+            document = rendered_retro.read_artifact(
+                output / prepared["artifact_path"],
+                require_final=True,
+            )
+            self.assertEqual(document["routing"]["status"], "posted")
+
+
 class ProtocolParityTests(unittest.TestCase):
     def test_portable_temp_contract_has_no_hard_coded_var_tmp(self):
         for path in (HELPER_PATH, PLANE_PATH, TRELLO_PATH):
@@ -4388,6 +4746,11 @@ class ProtocolParityTests(unittest.TestCase):
             "explicit environment allowlist",
             "`HERMES_PROVIDER_CONFIG_` namespace",
             "group/world",
+            "02-security-modes.sh",
+            "mode `& 0022 == 0`",
+            "artifact and binding descriptors",
+            "retained configuration",
+            "retained artifact/binding identities",
             "mounts `/` read-only",
             "prepared repository is writable",
             "valid existing final binding",

@@ -187,15 +187,22 @@ changed content returns `stalled` without overwrite or comment; distinct runs
 use distinct paths; identical cross-run improvements share one marker and body.
 
 `prepare`, delivery, and finalization use one descriptor-anchored repository
-lifetime: hold the parent and repository descriptors, read `.project.json`,
-then hold the exact retro and bindings directory descriptors, provider script,
-provider configuration, and locks through finalization without reopening
-configuration or executable content by pathname. Revalidate the bound
+lifetime: hold the parent and repository descriptors, open `.project.json`
+once and retain that exact validated descriptor, then hold the exact retro and
+bindings directory descriptors, artifact and binding descriptors, provider
+script, provider configuration, and locks through provider launch without
+reopening configuration or executable content by pathname. Revalidate the bound
 repository entry before every external
 effect; root replacement is `unsafe_artifact_path` and performs no board
 call. Traverse
 every `_bmad-output/implementation-artifacts/run-retros` component with
-descriptor-relative `O_NOFOLLOW` operations that reject symlinks. The
+descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Every storage
+directory, opened artifact, and opened binding must retain approved
+root/effective-UID ownership, directory/regular-file type, stable device/inode
+identity, and mode `& 0022 == 0` before reading and again immediately before
+provider launch. The detached supervisor inherits these descriptors and
+revalidates their path identities and byte digests after acquiring the comment
+lock but before starting Bubblewrap. The
 unprivileged threat model trusts same-OS-UID peer processes. It rejects
 symlinks, replacement path components or trees, stale identities detectable
 before mutation, and untrusted repository content. Revalidate the bound
@@ -250,16 +257,26 @@ provider. Repository copies, replacements, and distinct UIDs in the host
 network namespace therefore share exactly one exhaustive-lookup/at-most-once-post
 lock domain.
 
+Copier provisioning runs `.scripts/02-security-modes.sh` first. It rejects
+symlinks or foreign ownership and normalizes the repository/role and every
+required in-repository controller/provider directory to `0755`, `.project.json`
+and non-executable inputs to `0644`, executable controller/provider inputs to
+`0755`, and existing run-retro private directories/files to `0700/0600`;
+therefore a render created under umask `002` does not rely on source-checkout
+modes.
+
 The provider script and controller source are opened by descriptor, receive
 only the already-bound configuration, and execute from inherited descriptors
-through Python/shell stdin. Before launch, every provider-relative containing
-directory, the provider script, `.project.json`, and the controller source are
-revalidated from stable descriptors. Repository-origin files must be regular,
-the provider must be executable, the approved owner is root or the controller's
-effective UID, and none of these files or provider-relative directories may be
-group/world writable. The repository descriptor, current path identity,
-configuration device/inode plus byte digest, and provider descriptor are checked
-again immediately before launch; drift fails closed with no provider call.
+through Python/shell stdin. Before launch, every in-repository containing
+directory from the repository anchor to storage, provider, controller, or
+`.project.json`, plus every opened file, is revalidated from stable
+descriptors. Repository-origin files must be regular, executable inputs must
+remain executable, the approved owner is root or the controller's effective
+UID, and none of these files or directories may be group/world writable. The
+repository descriptor, current path identities, retained configuration
+device/inode plus byte digest, retained artifact/binding identities plus byte
+digests, and provider descriptor are checked again immediately before launch;
+drift fails closed with no provider call or routing finalization.
 
 The supervisor and provider receive an explicit environment allowlist rather
 than the controller environment. It contains only bounded execution/runtime
