@@ -267,7 +267,12 @@ which remains non-executable at `0644`. Required repository/role and
 controller/provider directories and executables become `0755`, `.project.json`
 and other non-executable inputs become `0644`, and existing run-retro private
 directories/files become `0700/0600`; therefore a render created under umask
-`002` does not rely on source-checkout modes.
+`002` does not rely on source-checkout modes. Ancestor repository normalization
+is selected only when the rendered output's canonical path is exactly
+`<candidate>/agents/hermes/<role>` and the descriptor-bound candidate
+`.project.json` contains a string `project_name` byte-equal to the Copier
+`target_repo`; otherwise provisioning normalizes only the output root and
+leaves the ancestor untouched.
 
 The provider script and controller source are opened by descriptor, receive
 only the already-bound configuration, and execute from inherited descriptors

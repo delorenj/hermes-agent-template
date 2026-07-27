@@ -18,6 +18,7 @@ import time
 import unittest
 from unittest import mock
 
+import jinja2
 import jsonschema
 import yaml
 
@@ -52,6 +53,19 @@ SYNTHETIC_SLACK_TOKEN = "".join(
 SYNTHETIC_GOOGLE_KEY = "".join(("AI", "za", "SyA", "123456789012345678901234567890123"))
 SYNTHETIC_STRIPE_SECRET = "".join(("sk", "_live_", "123456789012345678901234"))
 SYNTHETIC_AWS_ACCESS_KEY = "".join(("AK", "IA", "1234567890ABCDEF"))
+
+
+def rendered_copier_task(target_repo="pjangler", role="pm"):
+    config = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))
+    task_template = config["_tasks"][0]
+    environment = jinja2.Environment(
+        undefined=jinja2.StrictUndefined,
+        autoescape=False,
+    )
+    return environment.from_string(task_template).render(
+        target_repo=target_repo,
+        role=role,
+    )
 
 
 def load_helper():
@@ -4569,11 +4583,12 @@ class LinearDeliveryContractTests(unittest.TestCase):
 
 
 class CopierBootstrapTrustTests(unittest.TestCase):
-    def render(self, root):
+    def render(self, root, output=None):
         copier = shutil.which("copier")
         if copier is None:
             self.skipTest("Copier is unavailable")
-        output = root / "output"
+        output = output or root / "output"
+        output.parent.mkdir(parents=True, exist_ok=True)
 
         def umask_002():
             os.umask(0o002)
@@ -4603,8 +4618,7 @@ class CopierBootstrapTrustTests(unittest.TestCase):
         return output
 
     def run_first_task(self, output, marker):
-        config = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))
-        task = config["_tasks"][0]
+        task = rendered_copier_task()
         self.assertIsInstance(task, str)
         environment = dict(os.environ)
         environment["HERMES_BOOTSTRAP_TEST_MARKER"] = str(marker)
@@ -4628,6 +4642,96 @@ class CopierBootstrapTrustTests(unittest.TestCase):
             printf 'invoked\\n' > "$HERMES_BOOTSTRAP_TEST_MARKER"
             """
         )
+
+    def managed_ancestor(self, root, project_name):
+        repository = subprocess.run(
+            ["git", "init", "--quiet", str(root)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(repository.returncode, 0, repository.stderr)
+        project = root / ".project.json"
+        project.write_text(
+            json.dumps({"project_name": project_name}) + "\n",
+            encoding="utf-8",
+        )
+        implementation = root / "_bmad-output" / "implementation-artifacts"
+        retros = implementation / "run-retros"
+        retros.mkdir(parents=True)
+        private = retros / "existing-private.json"
+        private.write_text("{}\n", encoding="utf-8")
+        expected = {
+            root: 0o770,
+            project: 0o660,
+            root / "_bmad-output": 0o770,
+            implementation: 0o770,
+            retros: 0o770,
+            private: 0o660,
+        }
+        for path, mode in expected.items():
+            path.chmod(mode)
+        return expected
+
+    def assert_modes(self, expected):
+        for path, mode in expected.items():
+            with self.subTest(path=path):
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode)
+
+    def test_unrelated_managed_ancestor_identity_is_not_normalized(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root, root / "agents" / "hermes" / "pm")
+            expected = self.managed_ancestor(root, "unrelated-project")
+
+            result = self.run_first_task(output, root / "unexpected-marker")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_modes(expected)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+
+    def test_project_identity_without_canonical_role_path_is_not_normalized(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root, root / "standalone" / "output")
+            expected = self.managed_ancestor(root, "pjangler")
+
+            result = self.run_first_task(output, root / "unexpected-marker")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assert_modes(expected)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
+
+    def test_matching_managed_ancestor_at_canonical_role_path_is_normalized(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root, root / "agents" / "hermes" / "pm")
+            original = self.managed_ancestor(root, "pjangler")
+
+            result = self.run_first_task(output, root / "unexpected-marker")
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            expected = {
+                root: 0o755,
+                root / ".project.json": 0o644,
+                root / "_bmad-output": 0o755,
+                root / "_bmad-output" / "implementation-artifacts": 0o755,
+                root
+                / "_bmad-output"
+                / "implementation-artifacts"
+                / "run-retros": 0o700,
+                root
+                / "_bmad-output"
+                / "implementation-artifacts"
+                / "run-retros"
+                / "existing-private.json": 0o600,
+            }
+            self.assertEqual(set(original), set(expected))
+            self.assert_modes(expected)
+            self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o755)
 
     def test_bootstrap_file_symlink_is_rejected_without_chmod_or_execution(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
@@ -4707,9 +4811,7 @@ class CopierBootstrapTrustTests(unittest.TestCase):
             root.chmod(0o770)
 
             result = self.run_first_task(output, marker)
-            task = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))[
-                "_tasks"
-            ][0]
+            task = rendered_copier_task()
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(stat.S_IMODE(bootstrap.stat().st_mode), 0o644)
@@ -4792,9 +4894,8 @@ class CopierSecurityMetadataTests(unittest.TestCase):
                 security_modes.is_file(),
                 "rendered security-mode provisioning task is required",
             )
-            config = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))
             normalized = subprocess.run(
-                config["_tasks"][0],
+                rendered_copier_task(),
                 cwd=output,
                 shell=True,
                 executable="/bin/sh",
@@ -4911,6 +5012,9 @@ class ProtocolParityTests(unittest.TestCase):
             "02-security-modes.sh",
             "trusted inline logic from `copier.yml`",
             "never executes the rendered bootstrap entry",
+            "canonical path is exactly",
+            "`project_name` byte-equal",
+            "normalizes only the output root",
             "mode `& 0022 == 0`",
             "artifact and binding descriptors",
             "retained configuration",

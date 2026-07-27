@@ -134,6 +134,7 @@ _tasks:
   - |
     python3 - <<'PY'
     import contextlib
+    import json
     import os
     import shutil
     import stat
@@ -152,6 +153,9 @@ _tasks:
     )
     ALLOWED_OWNERS = {0, os.geteuid()}
     ERROR = "security mode bootstrap rejected an untrusted path"
+    EXPECTED_TARGET_REPO = {{ target_repo | tojson }}
+    EXPECTED_ROLE = {{ role | tojson }}
+    PROJECT_MANIFEST_LIMIT = 65536
 
 
     def validate(metadata, kind):
@@ -365,6 +369,107 @@ _tasks:
             os.close(descriptor)
 
 
+    def open_matching_repository(candidate, role_path):
+        expected_role_path = os.path.join(
+            candidate,
+            "agents",
+            "hermes",
+            EXPECTED_ROLE,
+        )
+        if role_path != expected_role_path:
+            return -1
+
+        candidate_fd = -1
+        project_fd = -1
+        try:
+            candidate_before = os.stat(candidate, follow_symlinks=False)
+            validate(candidate_before, "directory")
+            candidate_fd = os.open(candidate, DIRECTORY_FLAGS)
+            candidate_opened = os.fstat(candidate_fd)
+            validate(candidate_opened, "directory")
+            if identity(candidate_before) != identity(candidate_opened):
+                raise SystemExit(ERROR)
+
+            project_metadata = optional_metadata(
+                candidate_fd,
+                ".project.json",
+            )
+            if project_metadata is None:
+                return -1
+            validate(project_metadata, "file")
+            project_fd, project_identity = open_entry(
+                candidate_fd,
+                ".project.json",
+                "file",
+            )
+            opened_project = os.fstat(project_fd)
+            if (
+                opened_project.st_size < 0
+                or opened_project.st_size > PROJECT_MANIFEST_LIMIT
+            ):
+                project_document = None
+            else:
+                project_chunks = []
+                remaining = PROJECT_MANIFEST_LIMIT + 1
+                try:
+                    while remaining > 0:
+                        chunk = os.read(
+                            project_fd,
+                            min(65536, remaining),
+                        )
+                        if not chunk:
+                            break
+                        project_chunks.append(chunk)
+                        remaining -= len(chunk)
+                    project_bytes = b"".join(project_chunks)
+                    if len(project_bytes) > PROJECT_MANIFEST_LIMIT:
+                        project_document = None
+                    else:
+                        project_document = json.loads(
+                            project_bytes.decode("utf-8", "strict")
+                        )
+                except (
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                ):
+                    project_document = None
+            revalidate_entry(
+                candidate_fd,
+                ".project.json",
+                project_fd,
+                project_identity,
+                "file",
+            )
+            candidate_after = os.stat(candidate, follow_symlinks=False)
+            validate(candidate_after, "directory")
+            if (
+                identity(candidate_after) != identity(candidate_opened)
+                or identity(os.fstat(candidate_fd))
+                != identity(candidate_opened)
+            ):
+                raise SystemExit(ERROR)
+            if not (
+                isinstance(project_document, dict)
+                and type(project_document.get("project_name")) is str
+                and project_document["project_name"]
+                == EXPECTED_TARGET_REPO
+            ):
+                return -1
+            selected_fd = candidate_fd
+            candidate_fd = -1
+            return selected_fd
+        except FileNotFoundError:
+            return -1
+        except OSError:
+            raise SystemExit(ERROR) from None
+        finally:
+            if project_fd >= 0:
+                os.close(project_fd)
+            if candidate_fd >= 0:
+                os.close(candidate_fd)
+
+
     root_fd = -1
     scripts_fd = -1
     bootstrap_fd = -1
@@ -437,7 +542,6 @@ _tasks:
         normalize_optional_file(root_fd, "SOUL.md", 0o644)
 
         role_path = os.path.abspath(os.getcwd())
-        repo_path = role_path
         git = shutil.which("git", path="/usr/bin:/bin:/usr/local/bin")
         if (
             optional_metadata(root_fd, ".project.json") is None
@@ -461,30 +565,10 @@ _tasks:
                     and "\0" not in candidate
                     and os.path.realpath(candidate) == candidate
                 ):
-                    candidate_project = os.path.join(
-                        candidate,
-                        ".project.json",
-                    )
-                    try:
-                        candidate_metadata = os.stat(
-                            candidate_project,
-                            follow_symlinks=False,
-                        )
-                    except FileNotFoundError:
-                        candidate_metadata = None
-                    except OSError:
-                        raise SystemExit(ERROR) from None
-                    if candidate_metadata is not None:
-                        validate(candidate_metadata, "file")
-                        repo_path = candidate
+                    repo_fd = open_matching_repository(candidate, role_path)
 
-        if repo_path == role_path:
+        if repo_fd < 0:
             repo_fd = os.dup(root_fd)
-        else:
-            try:
-                repo_fd = os.open(repo_path, DIRECTORY_FLAGS)
-            except OSError:
-                raise SystemExit(ERROR) from None
         repo_metadata = os.fstat(repo_fd)
         validate(repo_metadata, "directory")
         try:
