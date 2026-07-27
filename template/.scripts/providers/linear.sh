@@ -77,8 +77,10 @@ PY
 
 canonical_uuid() {
   python3 - "$1" <<'PY'
-import sys,unicodedata,uuid
+import re,sys,unicodedata,uuid
 value=unicodedata.normalize("NFKC",sys.argv[1]).strip().casefold()
+if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value):
+    raise SystemExit(1)
 try:
     canonical=str(uuid.UUID(value))
 except ValueError:
@@ -221,18 +223,18 @@ marker=marker.rstrip("\n"); body=body.rstrip("\n")
 if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
  raise SystemExit(1)' || die "invalid comment marker/body"
     if linear_comment_marker_state "$ID" "$MARKER"; then
-      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      printf '{"provider":"linear","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
       exit 0
     else
       rc=$?
       if [ "$rc" -eq 2 ]; then
-        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        printf '{"provider":"linear","status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
         exit 0
       fi
     fi
     if ! RESPONSE="$(gql 'mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ comment{id} success } }' \
         "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"b":sys.argv[2]}))' "$ID" "$BODY")" 2>/dev/null)"; then
-      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      printf '{"provider":"linear","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
     RESULT="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
@@ -241,9 +243,9 @@ try:
  print("posted" if d.get("success") and (d.get("comment") or {}).get("id") else "failed")
 except Exception: print("unknown")')"
     case "$RESULT" in
-      posted) printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID" ;;
-      failed) printf '{"status":"failed","target_issue":"%s","error_category":"post_failed","error_summary":"provider rejected the comment"}\n' "$ID" ;;
-      *) printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID" ;;
+      posted) printf '{"provider":"linear","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID" ;;
+      failed) printf '{"provider":"linear","status":"failed","target_issue":"%s","error_category":"post_failed","error_summary":"provider rejected the comment"}\n' "$ID" ;;
+      *) printf '{"provider":"linear","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID" ;;
     esac
     ;;
 

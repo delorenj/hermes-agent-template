@@ -15,10 +15,11 @@
 #                                          state,state_type,comments:[...]}
 #   comment <id> <body>           -> prints comment id
 #   resolve_issue_id <reference>  -> canonical provider issue UUID/ID
-#   ensure_comment <id> <marker> <body>
-#                                  -> exhaustively checks then posts under a
-#                                     local cross-run lock; JSON {status,
-#                                     target_issue,error_category,error_summary}
+#   ensure_comment <artifact-fingerprint>
+#                                  -> run-retro.py loads the durable prepared
+#                                     provider/source/body, locks by immutable
+#                                     marker, exhaustively checks, posts at most
+#                                     once, and finalizes monotonically
 #   transition <id> <normalized>  -> moves issue; normalized in
 #                                     backlog|unstarted|started|in_review|completed
 #   create_board <name> <id> <d>  -> JSON {board_id, board_url}
@@ -26,7 +27,8 @@
 # Each provider reads its credentials from the environment (see providers/*.sh
 # headers) and the board binding from role.yaml under `ticket_provider:`.
 
-# Resolve the provider name: explicit env wins, then repo-root .project.json
+# Resolve the provider name for ordinary operations: explicit env wins, then
+# repo-root .project.json
 # (the SOT), then role.yaml (self-parsed so this works even when _lib.sh /
 # yaml_get is not loaded), then default.
 tp_provider_name() {
@@ -104,6 +106,25 @@ tp() {
   local op="${1:-}"; shift || true
   [ -n "$op" ] || { echo "tp: missing operation" >&2; return 2; }
 
+  if [ "$op" = "ensure_comment" ]; then
+    local fingerprint="${1:-}" repo_root helper providers_dir
+    [ -n "$fingerprint" ] && [ "$#" -eq 1 ] || {
+      echo "tp: usage: ensure_comment <artifact-fingerprint>" >&2
+      return 2
+    }
+    repo_root="$(tp_repo_root)" || {
+      printf '{"status":"stalled","error_category":"invalid_repository_identity"}\n'
+      return 3
+    }
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/sentinel/bin/run-retro.py"
+    providers_dir="$(tp_providers_dir)"
+    python3 "$helper" deliver \
+      --repo-root "$repo_root" \
+      --artifact-fingerprint "$fingerprint" \
+      --providers-dir "$providers_dir"
+    return $?
+  fi
+
   local name impl
   name="$(tp_provider_name)"
   impl="$(tp_providers_dir)/${name}.sh"
@@ -111,41 +132,6 @@ tp() {
   if [ ! -f "$impl" ]; then
     echo "tp: unknown ticket provider '$name' (no $impl)" >&2
     return 2
-  fi
-
-  if [ "$op" = "ensure_comment" ]; then
-    local issue_id="${1:-}" marker="${2:-}"
-    [ -n "$issue_id" ] && [ -n "$marker" ] || {
-      echo "tp: usage: ensure_comment <canonical-id> <marker> <body>" >&2
-      return 2
-    }
-    local lock_root lock_key lock_path
-    if [ -n "${TP_COMMENT_LOCK_ROOT:-}" ]; then
-      lock_root="$TP_COMMENT_LOCK_ROOT"
-    else
-      lock_root="$(tp_repo_root)/_bmad-output/implementation-artifacts/run-retros/.locks/comments" || {
-        printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"repository binding unavailable; no post attempted"}\n' "$issue_id"
-        return 0
-      }
-    fi
-    mkdir -p "$lock_root" 2>/dev/null || {
-      printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
-      return 0
-    }
-    lock_key="$(printf '%s\n%s\n%s\n' "$name" "$issue_id" "$marker" | sha256sum | awk '{print $1}')"
-    lock_path="$lock_root/$lock_key.lock"
-    : >> "$lock_path" 2>/dev/null || {
-      printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
-      return 0
-    }
-    (
-      flock -x 9 || {
-        printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
-        exit 0
-      }
-      TICKET_PROVIDER="$name" sh "$impl" "$op" "$@"
-    ) 9>"$lock_path"
-    return
   fi
 
   TICKET_PROVIDER="$name" sh "$impl" "$op" "$@"

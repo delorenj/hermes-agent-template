@@ -129,10 +129,52 @@ except Exception:
   done
 }
 
+# Plane's current work-item comment API documents limit/offset pagination,
+# unlike the cursor-paginated work-item collection.
+plane_comments_find() {
+  work_item_id="$1"; marker="$2"; limit=100; offset=0; page_count=0
+  while :; do
+    path="projects/$PROJ/work-items/$work_item_id/comments/?limit=$limit&offset=$offset"
+    if ! page="$(api GET "$path" 2>/dev/null)"; then
+      return 2
+    fi
+    state="$(printf '%s' "$page" | MARKER="$marker" LIMIT="$limit" OFFSET="$offset" python3 -c 'import json,os,sys
+try:
+ data=json.load(sys.stdin)
+except Exception:
+ print("invalid"); raise SystemExit(0)
+rows=data.get("results",[]) if isinstance(data,dict) else data if isinstance(data,list) else None
+if not isinstance(rows,list):
+ print("invalid"); raise SystemExit(0)
+marker=os.environ["MARKER"]; limit=int(os.environ["LIMIT"]); offset=int(os.environ["OFFSET"])
+if any(marker in str(row.get("comment_html","")) for row in rows if isinstance(row,dict)):
+ print("found")
+elif isinstance(data,dict) and isinstance(data.get("total_results"),int):
+ print("absent" if offset+len(rows)>=data["total_results"] else "more:"+str(offset+len(rows)))
+elif len(rows)<limit:
+ print("absent")
+else:
+ print("more:"+str(offset+len(rows)))')"
+    case "$state" in
+      found) return 0 ;;
+      absent) return 1 ;;
+      more:*)
+        next="${state#more:}"
+        [ -n "$next" ] && [ "$next" != "$offset" ] || return 2
+        offset="$next"; page_count=$((page_count + 1))
+        [ "$page_count" -lt 10000 ] || return 2
+        ;;
+      *) return 2 ;;
+    esac
+  done
+}
+
 canonical_uuid() {
   python3 - "$1" <<'PY'
-import sys, unicodedata, uuid
+import re, sys, unicodedata, uuid
 raw=unicodedata.normalize("NFKC",sys.argv[1]).strip().casefold()
+if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",raw):
+    raise SystemExit(1)
 try:
     value=str(uuid.UUID(raw))
 except ValueError:
@@ -249,16 +291,16 @@ print(value)
 PY
 )" || die "invalid issue reference"
     ID=""
-    if DIRECT="$(api GET "projects/$PROJ/issues/$NORMALIZED/" 2>/dev/null)"; then
+    if DIRECT="$(api GET "projects/$PROJ/work-items/$NORMALIZED/" 2>/dev/null)"; then
       ID="$(printf '%s' "$DIRECT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
     fi
     if [ -z "$ID" ]; then
       # The caller should normally pass the canonical id from list_issues. This
       # exhaustive fallback safely resolves sequence/key references.
-      if plane_pages_find "projects/$PROJ/issues/" issue "$NORMALIZED"; then
+      if plane_pages_find "projects/$PROJ/work-items/" issue "$NORMALIZED"; then
         cursor=""; page_count=0
         while :; do
-          path="projects/$PROJ/issues/?per_page=100"
+          path="projects/$PROJ/work-items/?per_page=100"
           [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
           PAGE="$(api GET "$path")" || die "issue lookup failed"
           ID="$(printf '%s' "$PAGE" | NEEDLE="$NORMALIZED" python3 -c 'import json,os,sys
@@ -297,13 +339,13 @@ marker,body=sys.stdin.read().split("\n",1)
 marker=marker.rstrip("\n"); body=body.rstrip("\n")
 if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
  raise SystemExit(1)' || die "invalid comment marker/body"
-    if plane_pages_find "projects/$PROJ/issues/$ID/comments/" comment "$MARKER"; then
-      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+    if plane_comments_find "$ID" "$MARKER"; then
+      printf '{"provider":"plane","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
       exit 0
     else
       rc=$?
       if [ "$rc" -eq 2 ]; then
-        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
         exit 0
       fi
     fi
@@ -313,17 +355,17 @@ body="<p>"+html.escape(sys.argv[1]).replace("\n","<br>")+"</p>"
 print(json.dumps({"comment_html":body},separators=(",",":")))
 PY
 )"
-    if ! RESPONSE="$(api POST "projects/$PROJ/issues/$ID/comments/" "$PAYLOAD" 2>/dev/null)"; then
-      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+    if ! RESPONSE="$(api POST "projects/$PROJ/work-items/$ID/comments/" "$PAYLOAD" 2>/dev/null)"; then
+      printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
     COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("id",""))
 except Exception: print("")')"
     if [ -z "$COMMENT_ID" ]; then
-      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
     else
-      printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
     fi
     ;;
 

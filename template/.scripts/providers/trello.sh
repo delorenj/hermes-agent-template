@@ -212,27 +212,27 @@ marker=marker.rstrip("\n"); body=body.rstrip("\n")
 if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
  raise SystemExit(1)' || die "invalid comment marker/body"
     if trello_comment_marker_state "$ID" "$MARKER"; then
-      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      printf '{"provider":"trello","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
       exit 0
     else
       rc=$?
       if [ "$rc" -eq 2 ]; then
-        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
         exit 0
       fi
     fi
     ENCODED="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$BODY")"
     if ! RESPONSE="$(api POST "cards/$ID/actions/comments" "text=$ENCODED" 2>/dev/null)"; then
-      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
     COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("id",""))
 except Exception: print("")')"
     if [ -z "$COMMENT_ID" ]; then
-      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      printf '{"provider":"trello","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
     else
-      printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      printf '{"provider":"trello","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
     fi
     ;;
 

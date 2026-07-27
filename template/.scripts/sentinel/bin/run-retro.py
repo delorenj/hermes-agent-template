@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable state machine for one Hermes sentinel post-loop retro."""
+"""Durable, idempotent state machine for one Hermes sentinel post-loop retro."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
+import subprocess
 import sys
 import unicodedata
 import uuid
@@ -19,11 +21,12 @@ from typing import Any, Iterator
 
 
 SCHEMA_NAME = "hermes.run-retro"
-SCHEMA_VERSION = 4
-COMMENT_FINGERPRINT_VERSION = 3
+SCHEMA_VERSION = 5
+COMMENT_FINGERPRINT_VERSION = 4
 ARTIFACT_DOMAIN = "hermes.run-retro.artifact"
 COMMENT_DOMAIN = "hermes.run-retro.comment"
 FINAL_STATUSES = {"posted", "already_present", "failed", "no_target_issue"}
+SUCCESS_STATUSES = {"posted", "already_present"}
 ALL_STATUSES = {"prepared", *FINAL_STATUSES}
 FAILURE_CATEGORIES = {
     "lookup_failed",
@@ -69,37 +72,69 @@ IMMUTABLE_FIELDS = (
     "decisions",
     "protected_evidence_refs",
     "sanitization",
+    "operator_action_required",
     "comment_fingerprint_marker",
+    "comment_body",
     "recorded_at",
 )
 INPUT_DERIVED_IMMUTABLE_FIELDS = tuple(
     field for field in IMMUTABLE_FIELDS if field != "recorded_at"
 )
 ROOT_FIELDS = {*IMMUTABLE_FIELDS, "routing"}
-ROUTING_FIELDS = {
-    "status",
-    "error_category",
-    "error_summary",
-    "operator_action_required",
-    "updated_at",
-}
+ROUTING_FIELDS = {"status", "error_category", "error_summary", "updated_at"}
 SAFE_REPO_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$")
 INVOCATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+RFC_UUID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-"
+    r"[0-9a-f]{12}$"
+)
 TRELLO_ID_RE = re.compile(r"^[0-9a-f]{24}$")
 SAFE_REF_RE = re.compile(
     r"^(?:evidence:[A-Za-z0-9._:-]+|[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-ABSOLUTE_PATH_RE = re.compile(r"(?:^|[\s(])(?:/[^/\s][^\s]*|~/|[A-Za-z]:[\\/])")
-SECRET_RE = re.compile(
+MARKER_RE = re.compile(r"^\[run-retro-comment:[0-9a-f]{64}\]$")
+PRIVATE_PATH_RE = re.compile(
     r"(?i)(?:"
-    r"bearer\s+[A-Za-z0-9._-]{12,}|"
-    r"(?:token|password|secret|api[_ -]?key)\s*[:=]\s*\S+|"
-    r"(?:sk|ghp|glpat)[_-]?[A-Za-z0-9_-]{16,}|"
-    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+    r"file:(?:/{1,3})|"
+    r"(?:^|[\s=:\"'(\[])~[/\\]|"
+    r"(?:^|[\s=:\"'(\[])[A-Z]:[\\/]|"
+    r"(?:^|[\s=:\"'(\[])\\\\[^\\\s]+\\|"
+    r"(?:^|[\s=:\"'(\[])/(?!/)"
     r")"
 )
+SECRET_RE = re.compile(
+    r"(?i)(?:"
+    r"bearer\s+[A-Za-z0-9._~+/-]{8,}|"
+    r"(?:token|password|passwd|secret|client[_ -]?secret|api[_ -]?key|"
+    r"access[_ -]?key|session|cookie)\s*[:=]\s*\S+|"
+    r"(?:sk|ghp|gho|ghu|ghs|github_pat|glpat)[_-]?[A-Za-z0-9_-]{16,}|"
+    r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|"
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r")"
+)
+AWS_ACCESS_KEY_RE = re.compile(
+    r"\b(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|ASCA)[A-Z0-9]{16}\b"
+)
 EMAIL_RE = re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b")
+SSN_RE = re.compile(r"\b(?:\d{3}[- ]\d{2}[- ]\d{4}|\d{9})\b")
+PHONE_RE = re.compile(r"(?<!\w)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\w)")
+PAYMENT_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+RAW_LOG_RE = re.compile(
+    r"(?i)(?:traceback \(most recent call last\)|"
+    r"\bat\s+\S+\s*\([^)]*:\d+(?::\d+)?\)|"
+    r"(?:^|\s)(?:debug|info|warn(?:ing)?|error|fatal)\s*[:\]])"
+)
+UNSAFE_SUMMARY_PATTERNS = (
+    PRIVATE_PATH_RE,
+    SECRET_RE,
+    AWS_ACCESS_KEY_RE,
+    EMAIL_RE,
+    SSN_RE,
+    PHONE_RE,
+    PAYMENT_CARD_RE,
+    RAW_LOG_RE,
+)
 
 
 class RetroError(Exception):
@@ -125,7 +160,7 @@ def _utc_now() -> str:
     )
 
 
-def _normalized_scalar(value: Any, *, field: str, max_length: int) -> str:
+def _normalized_scalar(value: Any, *, max_length: int) -> str:
     if not isinstance(value, str):
         raise RetroError("invalid_intent")
     normalized = unicodedata.normalize("NFKC", value).strip()
@@ -136,13 +171,43 @@ def _normalized_scalar(value: Any, *, field: str, max_length: int) -> str:
     return normalized
 
 
+def _read_utf8_json(path: Path, *, category: str) -> Any:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        path_metadata = os.lstat(path)
+        if stat.S_ISLNK(path_metadata.st_mode) or not stat.S_ISREG(
+            path_metadata.st_mode
+        ):
+            raise RetroError(category)
+        descriptor = os.open(path, flags)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or (metadata.st_dev, metadata.st_ino) != (
+            path_metadata.st_dev,
+            path_metadata.st_ino,
+        ):
+            raise RetroError(category)
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            payload = handle.read()
+        return json.loads(payload.decode("utf-8"))
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+        raise RetroError(category) from None
+    finally:
+        if "descriptor" in locals() and descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
 def canonical_repo_identity(repo_root: Path) -> str:
     """Read only .project.json.project_name and make one exact ASCII identity."""
-    project_file = repo_root / ".project.json"
+    document = _read_utf8_json(
+        repo_root / ".project.json", category="invalid_repository_identity"
+    )
     try:
-        document = json.loads(project_file.read_text(encoding="utf-8"))
         raw = document["project_name"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+    except (KeyError, TypeError):
         raise RetroError("invalid_repository_identity") from None
     if not isinstance(raw, str):
         raise RetroError("invalid_repository_identity")
@@ -157,11 +222,10 @@ def canonical_repo_identity(repo_root: Path) -> str:
 
 
 def canonical_provider(repo_root: Path) -> str:
-    project_file = repo_root / ".project.json"
+    document = _read_utf8_json(repo_root / ".project.json", category="invalid_provider")
     try:
-        document = json.loads(project_file.read_text(encoding="utf-8"))
         raw = document["ticket_provider"]["type"]
-    except (OSError, KeyError, TypeError, json.JSONDecodeError):
+    except (KeyError, TypeError):
         raise RetroError("invalid_provider") from None
     if not isinstance(raw, str):
         raise RetroError("invalid_provider")
@@ -171,8 +235,8 @@ def canonical_provider(repo_root: Path) -> str:
     return provider
 
 
-def canonical_invocation_id(value: Any, *, field: str) -> str:
-    normalized = _normalized_scalar(value, field=field, max_length=200)
+def canonical_invocation_id(value: Any) -> str:
+    normalized = _normalized_scalar(value, max_length=200)
     if not INVOCATION_RE.fullmatch(normalized):
         raise RetroError("invalid_intent")
     return normalized
@@ -181,10 +245,10 @@ def canonical_invocation_id(value: Any, *, field: str) -> str:
 def canonical_issue_id(provider: str, value: Any) -> str | None:
     if value is None:
         return None
-    normalized = _normalized_scalar(
-        value, field="source_issue", max_length=64
-    ).casefold()
+    normalized = _normalized_scalar(value, max_length=64).casefold()
     if provider in {"plane", "linear"}:
+        if not RFC_UUID_RE.fullmatch(normalized):
+            raise RetroError("invalid_issue_identity")
         try:
             canonical = str(uuid.UUID(normalized))
         except (ValueError, AttributeError):
@@ -200,11 +264,11 @@ def canonical_issue_id(provider: str, value: Any) -> str | None:
 def _safe_summary(value: Any) -> str:
     if isinstance(value, str) and any(character in value for character in "\r\n\t"):
         raise RetroError("unsafe_summary")
-    text = _normalized_scalar(value, field="summary", max_length=2000)
+    text = _normalized_scalar(value, max_length=2000)
     text = " ".join(text.split())
     if len(text) > 500:
         raise RetroError("unsafe_summary")
-    if ABSOLUTE_PATH_RE.search(text) or SECRET_RE.search(text) or EMAIL_RE.search(text):
+    if any(pattern.search(text) for pattern in UNSAFE_SUMMARY_PATTERNS):
         raise RetroError("unsafe_summary")
     return text
 
@@ -212,9 +276,7 @@ def _safe_summary(value: Any) -> str:
 def _categorized_summary(value: Any) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != {"category", "summary"}:
         raise RetroError("invalid_intent")
-    category = _normalized_scalar(
-        value["category"], field="category", max_length=40
-    ).casefold()
+    category = _normalized_scalar(value["category"], max_length=40).casefold()
     if category not in SUMMARY_CATEGORIES:
         raise RetroError("invalid_intent")
     return {"category": category, "summary": _safe_summary(value["summary"])}
@@ -225,7 +287,7 @@ def _protected_refs(value: Any) -> list[str]:
         raise RetroError("invalid_intent")
     refs: list[str] = []
     for item in value:
-        ref = _normalized_scalar(item, field="protected_evidence_refs", max_length=300)
+        ref = _normalized_scalar(item, max_length=300)
         if not SAFE_REF_RE.fullmatch(ref) or ".." in ref.split("/"):
             raise RetroError("unsafe_evidence_reference")
         refs.append(ref)
@@ -240,14 +302,12 @@ def _sanitization(value: Any) -> dict[str, Any]:
     if (
         value["status"] != "sanitized"
         or not isinstance(value["omitted_categories"], list)
-        or len(value["omitted_categories"]) > 6
+        or len(value["omitted_categories"]) > len(OMITTED_CATEGORIES)
     ):
         raise RetroError("invalid_intent")
     omitted = []
     for category in value["omitted_categories"]:
-        normalized = _normalized_scalar(
-            category, field="omitted_categories", max_length=40
-        ).casefold()
+        normalized = _normalized_scalar(category, max_length=40).casefold()
         if normalized not in OMITTED_CATEGORIES:
             raise RetroError("invalid_intent")
         omitted.append(normalized)
@@ -270,6 +330,7 @@ def comment_fingerprint(
     provider: str,
     source_issue: str | None,
     decisions: dict[str, Any],
+    operator_action_required: bool,
 ) -> str:
     hurt = decisions["what_hurt"]
     change = decisions["what_should_change"]
@@ -285,6 +346,29 @@ def comment_fingerprint(
             change["category"],
             change["summary"],
             decisions["fix_scope"],
+            "true" if operator_action_required else "false",
+        ]
+    )
+
+
+def _comment_body(
+    decisions: dict[str, Any], operator_action_required: bool, marker: str
+) -> str:
+    operator = "yes" if operator_action_required else "no"
+    return "\n".join(
+        [
+            "Post-loop improvement",
+            (
+                f"What hurt [{decisions['what_hurt']['category']}]: "
+                f"{decisions['what_hurt']['summary']}"
+            ),
+            (
+                f"What should change [{decisions['what_should_change']['category']}]: "
+                f"{decisions['what_should_change']['summary']}"
+            ),
+            f"Fix scope: {decisions['fix_scope']}",
+            f"Operator action required: {operator}",
+            marker,
         ]
     )
 
@@ -303,10 +387,8 @@ def _build_prepared(repo_root: Path, raw: dict[str, Any]) -> dict[str, Any]:
         raise RetroError("invalid_intent")
     repo = canonical_repo_identity(repo_root)
     provider = canonical_provider(repo_root)
-    run_id = canonical_invocation_id(raw["run_id"], field="run_id")
-    correlation_id = canonical_invocation_id(
-        raw["correlation_id"], field="correlation_id"
-    )
+    run_id = canonical_invocation_id(raw["run_id"])
+    correlation_id = canonical_invocation_id(raw["correlation_id"])
     source_issue = canonical_issue_id(provider, raw["source_issue"])
     local_ref = (
         None
@@ -320,9 +402,7 @@ def _build_prepared(repo_root: Path, raw: dict[str, Any]) -> dict[str, Any]:
         "fix_scope",
     }:
         raise RetroError("invalid_intent")
-    fix_scope = _normalized_scalar(
-        decisions_raw["fix_scope"], field="fix_scope", max_length=20
-    ).casefold()
+    fix_scope = _normalized_scalar(decisions_raw["fix_scope"], max_length=20).casefold()
     if fix_scope not in FIX_SCOPES:
         raise RetroError("invalid_intent")
     decisions = {
@@ -331,9 +411,12 @@ def _build_prepared(repo_root: Path, raw: dict[str, Any]) -> dict[str, Any]:
         "fix_scope": fix_scope,
     }
     fingerprint = artifact_fingerprint(repo, run_id)
-    comment_hash = comment_fingerprint(repo, provider, source_issue, decisions)
-    now = _utc_now()
     operator_required = source_issue is None or fix_scope != "repo-local"
+    comment_hash = comment_fingerprint(
+        repo, provider, source_issue, decisions, operator_required
+    )
+    marker = f"[run-retro-comment:{comment_hash}]"
+    now = _utc_now()
     document = {
         "schema": SCHEMA_NAME,
         "schema_version": SCHEMA_VERSION,
@@ -349,13 +432,14 @@ def _build_prepared(repo_root: Path, raw: dict[str, Any]) -> dict[str, Any]:
         "decisions": decisions,
         "protected_evidence_refs": _protected_refs(raw["protected_evidence_refs"]),
         "sanitization": _sanitization(raw["sanitization"]),
-        "comment_fingerprint_marker": f"[run-retro-comment:{comment_hash}]",
+        "operator_action_required": operator_required,
+        "comment_fingerprint_marker": marker,
+        "comment_body": _comment_body(decisions, operator_required, marker),
         "recorded_at": now,
         "routing": {
             "status": "prepared",
             "error_category": None,
             "error_summary": None,
-            "operator_action_required": operator_required,
             "updated_at": now,
         },
     }
@@ -368,7 +452,7 @@ def _valid_timestamp(value: Any) -> bool:
         return False
     try:
         dt.datetime.fromisoformat(value[:-1] + "+00:00")
-    except ValueError:
+    except (ValueError, OverflowError):
         return False
     return True
 
@@ -392,10 +476,16 @@ def validate_document(
     provider = document["provider"]
     if not isinstance(provider, str) or provider not in PROVIDERS:
         raise RetroError("invalid_artifact")
-    run_id = canonical_invocation_id(document["run_id"], field="run_id")
-    canonical_invocation_id(document["correlation_id"], field="correlation_id")
+    run_id = canonical_invocation_id(document["run_id"])
+    if run_id != document["run_id"]:
+        raise RetroError("invalid_artifact")
+    correlation_id = canonical_invocation_id(document["correlation_id"])
+    if correlation_id != document["correlation_id"]:
+        raise RetroError("invalid_artifact")
     source = canonical_issue_id(provider, document["source_issue"])
     target = canonical_issue_id(provider, document["target_issue"])
+    if source != document["source_issue"] or target != document["target_issue"]:
+        raise RetroError("invalid_artifact")
     if target != source:
         raise RetroError("wrong_comment_target")
     if document["artifact_fingerprint"] != artifact_fingerprint(repo, run_id):
@@ -418,13 +508,24 @@ def validate_document(
         or decisions["fix_scope"] not in FIX_SCOPES
     ):
         raise RetroError("invalid_artifact")
-    expected_comment = comment_fingerprint(repo, provider, source, decisions)
-    if document["comment_fingerprint"] != expected_comment:
+    operator = document["operator_action_required"]
+    if not isinstance(operator, bool):
         raise RetroError("invalid_artifact")
+    expected_operator = source is None or decisions["fix_scope"] != "repo-local"
+    if operator != expected_operator:
+        raise RetroError("invalid_artifact")
+    expected_comment = comment_fingerprint(
+        repo, provider, source, decisions, expected_operator
+    )
+    marker = f"[run-retro-comment:{expected_comment}]"
     if (
-        document["comment_fingerprint_marker"]
-        != f"[run-retro-comment:{expected_comment}]"
+        document["comment_fingerprint"] != expected_comment
+        or document["comment_fingerprint_marker"] != marker
+        or not MARKER_RE.fullmatch(document["comment_fingerprint_marker"])
     ):
+        raise RetroError("invalid_artifact")
+    expected_body = _comment_body(decisions, expected_operator, marker)
+    if document["comment_body"] != expected_body or expected_body.count(marker) != 1:
         raise RetroError("invalid_artifact")
     if document["local_tracking_reference"] is not None:
         if (
@@ -444,20 +545,18 @@ def validate_document(
     routing = document["routing"]
     if not isinstance(routing, dict) or set(routing) != ROUTING_FIELDS:
         raise RetroError("invalid_artifact")
-    status = routing["status"]
+    status_value = routing["status"]
     if (
-        not isinstance(status, str)
-        or status not in ALL_STATUSES
-        or (require_final and status not in FINAL_STATUSES)
+        not isinstance(status_value, str)
+        or status_value not in ALL_STATUSES
+        or (require_final and status_value not in FINAL_STATUSES)
     ):
         raise RetroError("invalid_artifact")
-    if not isinstance(
-        routing["operator_action_required"], bool
-    ) or not _valid_timestamp(routing["updated_at"]):
+    if not _valid_timestamp(routing["updated_at"]):
         raise RetroError("invalid_artifact")
     error_category = routing["error_category"]
     error_summary = routing["error_summary"]
-    if status == "failed":
+    if status_value == "failed":
         if (
             not isinstance(error_category, str)
             or error_category not in FAILURE_CATEGORIES
@@ -465,69 +564,110 @@ def validate_document(
             raise RetroError("invalid_artifact")
         if error_summary is not None and _safe_summary(error_summary) != error_summary:
             raise RetroError("invalid_artifact")
-        if not routing["operator_action_required"]:
-            raise RetroError("invalid_artifact")
     elif error_category is not None or error_summary is not None:
         raise RetroError("invalid_artifact")
     if source is None:
-        if status not in {"prepared", "no_target_issue"}:
+        if status_value not in {"prepared", "no_target_issue"}:
             raise RetroError("invalid_artifact")
-    elif status == "no_target_issue":
-        raise RetroError("invalid_artifact")
-    if (
-        source is None
-        or decisions["fix_scope"] in {"external", "template", "fleet"}
-        or status == "failed"
-    ) and not routing["operator_action_required"]:
+    elif status_value == "no_target_issue":
         raise RetroError("invalid_artifact")
     if path is not None and path.name != f"{document['artifact_fingerprint']}.json":
         raise RetroError("invalid_artifact")
 
 
-def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        raise RetroError("invalid_artifact") from None
+def _safe_read_artifact(path: Path) -> Any:
+    return _read_utf8_json(path, category="invalid_artifact")
 
 
 def read_artifact(path: Path, *, require_final: bool = False) -> dict[str, Any]:
-    document = _read_json(path)
+    document = _safe_read_artifact(path)
     validate_document(document, path=path, require_final=require_final)
     return document
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise RetroError("unsafe_artifact_path")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
 
 
-def _ensure_directory(path: Path) -> None:
-    existed = path.is_dir()
-    path.mkdir(parents=True, exist_ok=True)
-    _fsync_directory(path)
-    if not existed:
-        _fsync_directory(path.parent)
+def _lexists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def _require_real_directory(path: Path) -> None:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise RetroError("unsafe_artifact_path") from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise RetroError("unsafe_artifact_path")
+
+
+def _ensure_safe_directory(root: Path, relative: Path) -> Path:
+    _require_real_directory(root)
+    current = root
+    for part in relative.parts:
+        if part in {"", ".", ".."}:
+            raise RetroError("unsafe_artifact_path")
+        child = current / part
+        created = False
+        try:
+            os.mkdir(child, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        except OSError:
+            raise RetroError("durability_failed") from None
+        _require_real_directory(child)
+        if created:
+            _fsync_directory(current)
+        current = child
+    _fsync_directory(current)
+    return current
+
+
+def _safe_retro_dir(repo_root: Path, *, create: bool) -> Path:
+    relative = Path("_bmad-output/implementation-artifacts/run-retros")
+    if create:
+        return _ensure_safe_directory(repo_root, relative)
+    current = repo_root
+    _require_real_directory(current)
+    for part in relative.parts:
+        current /= part
+        _require_real_directory(current)
+    return current
 
 
 def _unique_temp(path: Path) -> Path:
-    return path.parent / (f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    return path.parent / f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
 
 
 def _write_exclusive_temp(path: Path, document: dict[str, Any]) -> Path:
     temporary = _unique_temp(path)
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(temporary, flags, 0o600)
     try:
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
             handle.write(_canonical_json(document))
             handle.flush()
             os.fsync(handle.fileno())
     except BaseException:
-        with contextlib.suppress(OSError):
-            os.close(descriptor)
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
         with contextlib.suppress(OSError):
             temporary.unlink()
         raise
@@ -535,13 +675,16 @@ def _write_exclusive_temp(path: Path, document: dict[str, Any]) -> Path:
 
 
 def _validate_temp(temporary: Path, final_path: Path) -> None:
-    document = _read_json(temporary)
+    document = _safe_read_artifact(temporary)
     validate_document(document, path=final_path)
 
 
 def _fsync_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
     try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RetroError("unsafe_artifact_path")
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
@@ -566,6 +709,11 @@ def _durable_create(path: Path, document: dict[str, Any]) -> None:
 
 
 def _durable_replace(path: Path, document: dict[str, Any]) -> None:
+    if not _lexists(path):
+        raise RetroError("invalid_artifact")
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise RetroError("unsafe_artifact_path")
     temporary = _write_exclusive_temp(path, document)
     try:
         _validate_temp(temporary, path)
@@ -579,21 +727,60 @@ def _durable_replace(path: Path, document: dict[str, Any]) -> None:
 
 
 @contextlib.contextmanager
-def _artifact_lock(retro_dir: Path, fingerprint: str) -> Iterator[None]:
-    locks = retro_dir / ".locks" / "artifacts"
-    _ensure_directory(locks)
-    lock_path = locks / f"{fingerprint}.lock"
-    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+def _safe_lock(directory: Path, name: str) -> Iterator[None]:
+    if not re.fullmatch(r"[0-9a-f]{64}\.lock", name):
+        raise RetroError("unsafe_artifact_path")
+    _require_real_directory(directory)
+    lock_path = directory / name
+    existed = _lexists(lock_path)
+    if existed:
+        metadata = os.lstat(lock_path)
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise RetroError("unsafe_artifact_path")
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
+        descriptor = os.open(lock_path, flags, 0o600)
+    except OSError:
+        raise RetroError("unsafe_artifact_path") from None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RetroError("unsafe_artifact_path")
+        if not existed:
+            os.fsync(descriptor)
+            _fsync_directory(directory)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
 
 
-def _retro_dir(repo_root: Path) -> Path:
-    return repo_root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+@contextlib.contextmanager
+def _artifact_lock(retro_dir: Path, fingerprint: str) -> Iterator[None]:
+    locks = _ensure_safe_directory(retro_dir, Path(".locks/artifacts"))
+    with _safe_lock(locks, f"{fingerprint}.lock"):
+        yield
+
+
+@contextlib.contextmanager
+def _comment_lock(retro_dir: Path, document: dict[str, Any]) -> Iterator[None]:
+    locks = _ensure_safe_directory(retro_dir, Path(".locks/comments"))
+    key = _sha256_lines(
+        [
+            document["provider"],
+            document["source_issue"] or "no_target_issue",
+            document["comment_fingerprint_marker"],
+        ]
+    )
+    with _safe_lock(locks, f"{key}.lock"):
+        yield
 
 
 def _immutable_view(
@@ -604,12 +791,11 @@ def _immutable_view(
 
 def prepare(repo_root: Path, intent: dict[str, Any]) -> dict[str, Any]:
     proposed = _build_prepared(repo_root, intent)
-    retro_dir = _retro_dir(repo_root)
-    _ensure_directory(retro_dir)
+    retro_dir = _safe_retro_dir(repo_root, create=True)
     fingerprint = proposed["artifact_fingerprint"]
     path = retro_dir / f"{fingerprint}.json"
     with _artifact_lock(retro_dir, fingerprint):
-        if path.exists():
+        if _lexists(path):
             stored = read_artifact(path)
             if _immutable_view(
                 stored, INPUT_DERIVED_IMMUTABLE_FIELDS
@@ -629,54 +815,75 @@ def prepare(repo_root: Path, intent: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def finalize(
-    repo_root: Path, fingerprint: str, result: dict[str, Any]
-) -> dict[str, Any]:
-    if not SHA256_RE.fullmatch(fingerprint):
-        raise RetroError("invalid_artifact")
+def _validated_result(stored: dict[str, Any], result: Any) -> dict[str, Any]:
     if not isinstance(result, dict) or set(result) != {
+        "provider",
         "status",
         "target_issue",
         "error_category",
         "error_summary",
     }:
         raise RetroError("invalid_routing_result")
-    retro_dir = _retro_dir(repo_root)
+    if result["provider"] != stored["provider"]:
+        raise RetroError("wrong_comment_provider")
+    target = canonical_issue_id(stored["provider"], result["target_issue"])
+    if (
+        target != result["target_issue"]
+        or target != stored["source_issue"]
+        or target != stored["target_issue"]
+    ):
+        raise RetroError("wrong_comment_target")
+    status_value = result["status"]
+    if not isinstance(status_value, str) or status_value not in FINAL_STATUSES:
+        raise RetroError("invalid_routing_result")
+    error_category = result["error_category"]
+    error_summary = result["error_summary"]
+    if status_value == "failed":
+        if (
+            not isinstance(error_category, str)
+            or error_category not in FAILURE_CATEGORIES
+        ):
+            raise RetroError("invalid_routing_result")
+        error_summary = None if error_summary is None else _safe_summary(error_summary)
+    elif error_category is not None or error_summary is not None:
+        raise RetroError("invalid_routing_result")
+    if stored["source_issue"] is None and status_value != "no_target_issue":
+        raise RetroError("wrong_comment_target")
+    if stored["source_issue"] is not None and status_value == "no_target_issue":
+        raise RetroError("wrong_comment_target")
+    return {
+        "provider": stored["provider"],
+        "status": status_value,
+        "target_issue": target,
+        "error_category": error_category,
+        "error_summary": error_summary,
+    }
+
+
+def finalize(
+    repo_root: Path, fingerprint: str, result: dict[str, Any]
+) -> dict[str, Any]:
+    if not SHA256_RE.fullmatch(fingerprint):
+        raise RetroError("invalid_artifact")
+    retro_dir = _safe_retro_dir(repo_root, create=False)
     path = retro_dir / f"{fingerprint}.json"
     with _artifact_lock(retro_dir, fingerprint):
         stored = read_artifact(path)
-        target = canonical_issue_id(stored["provider"], result["target_issue"])
-        if target != stored["source_issue"] or target != stored["target_issue"]:
-            raise RetroError("wrong_comment_target")
-        status = result["status"]
-        if not isinstance(status, str) or status not in FINAL_STATUSES:
-            raise RetroError("invalid_routing_result")
-        error_category = result["error_category"]
-        error_summary = result["error_summary"]
-        if status == "failed":
-            if (
-                not isinstance(error_category, str)
-                or error_category not in FAILURE_CATEGORIES
-            ):
-                raise RetroError("invalid_routing_result")
-            error_summary = (
-                None if error_summary is None else _safe_summary(error_summary)
-            )
-        elif error_category is not None or error_summary is not None:
-            raise RetroError("invalid_routing_result")
-        if stored["source_issue"] is None and status != "no_target_issue":
-            raise RetroError("wrong_comment_target")
-        if stored["source_issue"] is not None and status == "no_target_issue":
-            raise RetroError("wrong_comment_target")
+        normalized = _validated_result(stored, result)
+        stored_status = stored["routing"]["status"]
+        incoming_status = normalized["status"]
+        if stored_status in SUCCESS_STATUSES or stored_status == "no_target_issue":
+            return {
+                "status": stored_status,
+                "artifact_fingerprint": fingerprint,
+                "artifact_path": str(path.relative_to(repo_root)),
+                "transition": "preserved_terminal",
+            }
         updated = dict(stored)
         updated["routing"] = {
-            "status": status,
-            "error_category": error_category,
-            "error_summary": error_summary,
-            "operator_action_required": (
-                stored["decisions"]["fix_scope"] != "repo-local"
-                or status in {"failed", "no_target_issue"}
-            ),
+            "status": incoming_status,
+            "error_category": normalized["error_category"],
+            "error_summary": normalized["error_summary"],
             "updated_at": _utc_now(),
         }
         if _immutable_view(updated, IMMUTABLE_FIELDS) != _immutable_view(
@@ -687,41 +894,128 @@ def finalize(
         _durable_replace(path, updated)
         read_artifact(path, require_final=True)
     return {
-        "status": status,
+        "status": incoming_status,
         "artifact_fingerprint": fingerprint,
         "artifact_path": str(path.relative_to(repo_root)),
+        "transition": "updated",
     }
 
 
 def comment_body(document: dict[str, Any]) -> str:
     validate_document(document)
-    decisions = document["decisions"]
-    operator = "yes" if document["routing"]["operator_action_required"] else "no"
-    return "\n".join(
-        [
-            "Post-loop improvement",
-            (
-                f"What hurt [{decisions['what_hurt']['category']}]: "
-                f"{decisions['what_hurt']['summary']}"
-            ),
-            (
-                f"What should change [{decisions['what_should_change']['category']}]: "
-                f"{decisions['what_should_change']['summary']}"
-            ),
-            f"Fix scope: {decisions['fix_scope']}",
-            f"Operator action required: {operator}",
-            document["comment_fingerprint_marker"],
-        ]
-    )
+    return document["comment_body"]
+
+
+def _default_providers_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "providers"
+
+
+def _provider_failure(
+    stored: dict[str, Any], category: str, summary: str
+) -> dict[str, Any]:
+    return {
+        "provider": stored["provider"],
+        "status": "failed",
+        "target_issue": stored["source_issue"],
+        "error_category": category,
+        "error_summary": summary,
+    }
+
+
+def _invoke_provider(stored: dict[str, Any], providers_dir: Path) -> dict[str, Any]:
+    provider = stored["provider"]
+    implementation = providers_dir / f"{provider}.sh"
+    try:
+        metadata = os.stat(implementation, follow_symlinks=False)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError
+    except OSError:
+        return _provider_failure(
+            stored, "serialization_failed", "provider adapter unavailable"
+        )
+    environment = dict(os.environ)
+    environment["TICKET_PROVIDER"] = provider
+    try:
+        completed = subprocess.run(
+            [
+                "sh",
+                str(implementation),
+                "ensure_comment",
+                stored["source_issue"],
+                stored["comment_fingerprint_marker"],
+                stored["comment_body"],
+            ],
+            check=False,
+            capture_output=True,
+            text=False,
+            env=environment,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _provider_failure(
+            stored, "response_unknown", "provider response not confirmed"
+        )
+    if completed.returncode != 0:
+        return _provider_failure(
+            stored, "response_unknown", "provider response not confirmed"
+        )
+    try:
+        result = json.loads(completed.stdout.decode("utf-8"))
+        return _validated_result(stored, result)
+    except (UnicodeError, json.JSONDecodeError, RetroError, TypeError, ValueError):
+        return _provider_failure(
+            stored, "response_unknown", "provider response not confirmed"
+        )
+
+
+def deliver(
+    repo_root: Path, fingerprint: str, *, providers_dir: Path | None = None
+) -> dict[str, Any]:
+    """Deliver only the immutable provider/source/body bound by prepare."""
+    if not SHA256_RE.fullmatch(fingerprint):
+        raise RetroError("invalid_artifact")
+    retro_dir = _safe_retro_dir(repo_root, create=False)
+    path = retro_dir / f"{fingerprint}.json"
+    stored = read_artifact(path)
+    if stored["source_issue"] is None:
+        return finalize(
+            repo_root,
+            fingerprint,
+            {
+                "provider": stored["provider"],
+                "status": "no_target_issue",
+                "target_issue": None,
+                "error_category": None,
+                "error_summary": None,
+            },
+        )
+    with _comment_lock(retro_dir, stored):
+        current = read_artifact(path)
+        if _immutable_view(current, IMMUTABLE_FIELDS) != _immutable_view(
+            stored, IMMUTABLE_FIELDS
+        ):
+            raise RetroError("immutable_intent_mismatch")
+        if current["routing"]["status"] in SUCCESS_STATUSES:
+            return {
+                "status": current["routing"]["status"],
+                "artifact_fingerprint": fingerprint,
+                "artifact_path": str(path.relative_to(repo_root)),
+                "transition": "preserved_terminal",
+            }
+        result = _invoke_provider(current, providers_dir or _default_providers_dir())
+        return finalize(repo_root, fingerprint, result)
 
 
 def _load_input(path: str) -> dict[str, Any]:
     try:
         if path == "-":
-            value = json.load(sys.stdin)
+            payload = sys.stdin.buffer.read()
+            value = json.loads(payload.decode("utf-8"))
         else:
-            value = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+            value = _read_utf8_json(Path(path), category="invalid_input")
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
         raise RetroError("invalid_input") from None
     if not isinstance(value, dict):
         raise RetroError("invalid_input")
@@ -731,7 +1025,7 @@ def _load_input(path: str) -> dict[str, Any]:
 def _artifact_path(repo_root: Path, fingerprint: str) -> Path:
     if not SHA256_RE.fullmatch(fingerprint):
         raise RetroError("invalid_artifact")
-    return _retro_dir(repo_root) / f"{fingerprint}.json"
+    return _safe_retro_dir(repo_root, create=False) / f"{fingerprint}.json"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -744,6 +1038,10 @@ def _parser() -> argparse.ArgumentParser:
     finalize_parser.add_argument("--repo-root", required=True, type=Path)
     finalize_parser.add_argument("--artifact-fingerprint", required=True)
     finalize_parser.add_argument("--result", required=True)
+    deliver_parser = subparsers.add_parser("deliver")
+    deliver_parser.add_argument("--repo-root", required=True, type=Path)
+    deliver_parser.add_argument("--artifact-fingerprint", required=True)
+    deliver_parser.add_argument("--providers-dir", type=Path)
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--repo-root", required=True, type=Path)
     validate_parser.add_argument("--artifact-fingerprint", required=True)
@@ -766,6 +1064,13 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root,
                 args.artifact_fingerprint,
                 _load_input(args.result),
+            )
+            print(json.dumps(result, sort_keys=True))
+        elif args.command == "deliver":
+            result = deliver(
+                repo_root,
+                args.artifact_fingerprint,
+                providers_dir=args.providers_dir,
             )
             print(json.dumps(result, sort_keys=True))
         elif args.command == "validate":
@@ -792,7 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 3
-    except OSError:
+    except (OSError, UnicodeError, ValueError, TypeError):
         print(
             json.dumps(
                 {"status": "stalled", "error_category": "durability_failed"},

@@ -17,7 +17,7 @@ import jsonschema
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "template" / ".scripts" / "sentinel" / "bin" / "run-retro.py"
 SCHEMA_PATH = (
-    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v4.schema.json"
+    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v5.schema.json"
 )
 PROMPT_PATH = ROOT / "template" / ".scripts" / "sentinel.prompt.md.jinja"
 DOC_PATH = (
@@ -166,6 +166,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             self.repo.root,
             fingerprint,
             {
+                "provider": "plane",
                 "status": "failed",
                 "target_issue": ISSUE_ID,
                 "error_category": "response_unknown",
@@ -177,6 +178,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             self.repo.root,
             fingerprint,
             {
+                "provider": "plane",
                 "status": "already_present",
                 "target_issue": ISSUE_ID,
                 "error_category": None,
@@ -194,6 +196,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             self.repo.root,
             prepared["artifact_fingerprint"],
             {
+                "provider": "plane",
                 "status": "no_target_issue",
                 "target_issue": None,
                 "error_category": None,
@@ -205,7 +208,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             require_final=True,
         )
         self.assertIsNone(document["target_issue"])
-        self.assertTrue(document["routing"]["operator_action_required"])
+        self.assertTrue(document["operator_action_required"])
 
 
 class RunRetroDurabilityTests(unittest.TestCase):
@@ -282,6 +285,7 @@ class RunRetroDurabilityTests(unittest.TestCase):
                 self.repo.root,
                 prepared["artifact_fingerprint"],
                 {
+                    "provider": "plane",
                     "status": "posted",
                     "target_issue": OTHER_ISSUE_ID,
                     "error_category": None,
@@ -308,6 +312,43 @@ class RunRetroDurabilityTests(unittest.TestCase):
             set(schema["x-hermes-mutable-json-pointers"]),
             {f"/routing/{field}" for field in RETRO.ROUTING_FIELDS},
         )
+        self.assertEqual(
+            schema["x-hermes-unsafe-summary-python-patterns"],
+            [pattern.pattern for pattern in RETRO.UNSAFE_SUMMARY_PATTERNS],
+        )
+
+    def test_schema_and_runtime_share_uuid_and_null_source_rules(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        validator = jsonschema.Draft202012Validator(
+            schema, format_checker=jsonschema.FormatChecker()
+        )
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        document = RETRO.read_artifact(
+            self.repo.artifact(prepared["artifact_fingerprint"])
+        )
+        validator.validate(document)
+        RETRO.validate_document(document)
+
+        null_prepared = RETRO.prepare(
+            self.repo.root,
+            base_intent("00000000-0000-4000-8000-000000000002", source=None),
+        )
+        null_document = RETRO.read_artifact(
+            self.repo.artifact(null_prepared["artifact_fingerprint"])
+        )
+        validator.validate(null_document)
+        RETRO.validate_document(null_document)
+        invalid_null = json.loads(json.dumps(null_document))
+        invalid_null["operator_action_required"] = False
+        with self.assertRaises(jsonschema.ValidationError):
+            validator.validate(invalid_null)
+        with self.assertRaisesRegex(RETRO.RetroError, "invalid_artifact"):
+            RETRO.validate_document(invalid_null)
+
+        uuid_v7 = "0194697e-e7d7-7a2b-8e4c-0123456789ab"
+        self.assertEqual(RETRO.canonical_issue_id("plane", uuid_v7), uuid_v7)
+        with self.assertRaisesRegex(RETRO.RetroError, "invalid_issue_identity"):
+            RETRO.canonical_issue_id("plane", "00000000-0000-0000-0000-000000000000")
 
     def test_repository_and_issue_identity_normalization_is_exact(self):
         self.assertEqual(RETRO.canonical_repo_identity(self.repo.root), "pjangler")
@@ -326,15 +367,28 @@ class RunRetroDurabilityTests(unittest.TestCase):
         with self.assertRaisesRegex(RETRO.RetroError, "invalid_repository_identity"):
             RETRO.canonical_repo_identity(self.repo.root)
 
-    def test_private_material_is_rejected_before_artifact_creation(self):
-        unsafe = base_intent()
-        unsafe["decisions"]["what_hurt"]["summary"] = "Token=secret-value-123456"
-        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_summary"):
-            RETRO.prepare(self.repo.root, unsafe)
-        raw_log = base_intent()
-        raw_log["decisions"]["what_hurt"]["summary"] = "line one\nline two"
-        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_summary"):
-            RETRO.prepare(self.repo.root, raw_log)
+    def test_all_protected_material_shapes_fail_closed_before_artifact(self):
+        unsafe_values = [
+            "Token=secret-value-123456",
+            "Customer SSN 123-45-6789",
+            "Customer SSN 123 45 6789",
+            "Customer SSN 123456789",
+            "AWS access key AKIA1234567890ABCDEF",
+            "Evidence:/home/alice/private/customer.log",
+            "Contact alice@example.test",
+            "Call 212-555-0199",
+            "Card 4111 1111 1111 1111",
+            "ERROR: raw provider response",
+            "-----BEGIN PRIVATE KEY-----",
+            "Bearer abcdefghijklmnop",
+            "line one\nline two",
+        ]
+        for index, value in enumerate(unsafe_values):
+            unsafe = base_intent(f"00000000-0000-4000-8000-{index + 10:012d}")
+            unsafe["decisions"]["what_hurt"]["summary"] = value
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(RETRO.RetroError, "unsafe_summary"):
+                    RETRO.prepare(self.repo.root, unsafe)
         self.assertFalse(
             (
                 self.repo.root
@@ -344,17 +398,126 @@ class RunRetroDurabilityTests(unittest.TestCase):
             ).exists()
         )
 
+    def test_stored_issue_ids_must_be_canonical_and_byte_equal(self):
+        mixed_issue = "abcdef12-abcd-4abc-8abc-abcdef123456"
+        prepared = RETRO.prepare(
+            self.repo.root, base_intent(source=mixed_issue.upper())
+        )
+        path = self.repo.artifact(prepared["artifact_fingerprint"])
+        document = RETRO.read_artifact(path)
+        self.assertEqual(document["source_issue"], mixed_issue)
+        document["source_issue"] = mixed_issue.upper()
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(RETRO.RetroError, "invalid_artifact"):
+            RETRO.read_artifact(path)
+
+    def test_stale_failure_cannot_overwrite_terminal_success(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        fingerprint = prepared["artifact_fingerprint"]
+        success = {
+            "provider": "plane",
+            "status": "posted",
+            "target_issue": ISSUE_ID,
+            "error_category": None,
+            "error_summary": None,
+        }
+        stale = {
+            "provider": "plane",
+            "status": "failed",
+            "target_issue": ISSUE_ID,
+            "error_category": "response_unknown",
+            "error_summary": "Provider response not confirmed",
+        }
+        RETRO.finalize(self.repo.root, fingerprint, success)
+        result = RETRO.finalize(self.repo.root, fingerprint, stale)
+        self.assertEqual(result["status"], "posted")
+        self.assertEqual(result["transition"], "preserved_terminal")
+        document = RETRO.read_artifact(
+            self.repo.artifact(fingerprint), require_final=True
+        )
+        self.assertEqual(document["routing"]["status"], "posted")
+
+    def test_non_utf8_input_and_artifact_fail_with_sanitized_json(self):
+        bad_input = self.repo.root / "bad-input.json"
+        bad_input.write_bytes(b"\xff")
+        prepare = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "prepare",
+                "--repo-root",
+                str(self.repo.root),
+                "--intent",
+                str(bad_input),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(prepare.returncode, 3)
+        self.assertEqual(json.loads(prepare.stdout)["error_category"], "invalid_input")
+        self.assertEqual(prepare.stderr, "")
+        self.assertNotIn(str(self.repo.root), prepare.stdout)
+
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        self.repo.artifact(prepared["artifact_fingerprint"]).write_bytes(b"\xff")
+        validate = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "validate",
+                "--repo-root",
+                str(self.repo.root),
+                "--artifact-fingerprint",
+                prepared["artifact_fingerprint"],
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(validate.returncode, 3)
+        self.assertEqual(
+            json.loads(validate.stdout)["error_category"], "invalid_artifact"
+        )
+        self.assertEqual(validate.stderr, "")
+        self.assertNotIn(str(self.repo.root), validate.stdout)
+
+    def test_symlinked_artifact_directory_is_rejected_without_escape(self):
+        external = self.repo.root / "external"
+        external.mkdir()
+        artifacts = self.repo.root / "_bmad-output" / "implementation-artifacts"
+        artifacts.mkdir(parents=True)
+        (artifacts / "run-retros").symlink_to(external, target_is_directory=True)
+        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(list(external.iterdir()), [])
+
+    def test_symlinked_lock_is_rejected_without_truncating_target(self):
+        retro_dir = (
+            self.repo.root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+        )
+        locks = retro_dir / ".locks" / "artifacts"
+        locks.mkdir(parents=True)
+        fingerprint = RETRO.artifact_fingerprint("pjangler", base_intent()["run_id"])
+        victim = self.repo.root / "victim"
+        victim.write_text("DO NOT TRUNCATE\n", encoding="utf-8")
+        (locks / f"{fingerprint}.lock").symlink_to(victim)
+        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TRUNCATE\n")
+
 
 class AdapterEnsureCommentTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir="/var/tmp")
-        self.root = pathlib.Path(self.temp.name)
+        self.repo = RepoFixture()
+        self.root = self.repo.root
         self.providers = self.root / "providers"
         self.providers.mkdir()
         self.store = self.root / "comments"
         self.store.touch()
-        self.marker = "[run-retro-comment:" + ("a" * 64) + "]"
-        fake = self.providers / "fake.sh"
+        self.calls = self.root / "calls"
+        self.calls.touch()
+        fake = self.providers / "plane.sh"
         fake.write_text(
             textwrap.dedent(
                 """\
@@ -363,56 +526,94 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 op="$1"; shift
                 [ "$op" = ensure_comment ] || exit 2
                 issue="$1"; marker="$2"; body="$3"
+                printf '%s|%s|%s\\n' "${TICKET_PROVIDER:-unset}" "$issue" "$marker" >> "$FAKE_CALL_STORE"
                 if grep -Fq "$marker" "$FAKE_COMMENT_STORE"; then
-                  printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
+                  printf '{"provider":"plane","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                   exit 0
                 fi
                 sleep 0.1
-                printf '%s\\n' "$marker" >> "$FAKE_COMMENT_STORE"
+                printf '%s\\n' "$body" >> "$FAKE_COMMENT_STORE"
                 if [ "${FAKE_LOST_RESPONSE_ONCE:-0}" = 1 ] && [ ! -e "$FAKE_LOST_MARK" ]; then
                   : > "$FAKE_LOST_MARK"
-                  printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"response not confirmed"}\\n' "$issue"
+                  printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"response not confirmed"}\\n' "$issue"
                 else
-                  printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
+                  printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                 fi
                 """
             ),
             encoding="utf-8",
         )
         fake.chmod(0o755)
-        self.env = {
-            **os.environ,
-            "TICKET_PROVIDER": "fake",
-            "TP_PROVIDERS_DIR": str(self.providers),
-            "TP_COMMENT_LOCK_ROOT": str(self.root / "locks"),
-            "FAKE_COMMENT_STORE": str(self.store),
-        }
+        wrong_provider = self.providers / "trello.sh"
+        wrong_provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf 'WRONG_PROVIDER_CALLED\\n' >> "$FAKE_CALL_STORE"
+                exit 99
+                """
+            ),
+            encoding="utf-8",
+        )
+        wrong_provider.chmod(0o755)
+        self.prepared = RETRO.prepare(self.root, base_intent())
+        self.fingerprint = self.prepared["artifact_fingerprint"]
 
     def tearDown(self):
-        self.temp.cleanup()
+        self.repo.close()
 
-    def call_adapter(self, extra_env=None):
-        env = {**self.env, **(extra_env or {})}
-        script = (
-            f'source "{ADAPTER_PATH}"; '
-            f'tp ensure_comment "{ISSUE_ID}" "{self.marker}" '
-            f'"safe summary {self.marker}"'
-        )
-        return subprocess.run(
-            ["bash", "-c", script],
-            text=True,
-            capture_output=True,
-            env=env,
-            check=False,
-        )
+    def call_delivery(self, extra_env=None):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TICKET_PROVIDER": "trello",
+                "FAKE_COMMENT_STORE": str(self.store),
+                "FAKE_CALL_STORE": str(self.calls),
+                **(extra_env or {}),
+            },
+            clear=False,
+        ):
+            return RETRO.deliver(
+                self.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
 
     def test_concurrent_cross_run_identical_comments_post_once(self):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            results = list(executor.map(lambda _: self.call_adapter(), range(2)))
-        self.assertTrue(all(result.returncode == 0 for result in results))
-        statuses = [json.loads(result.stdout)["status"] for result in results]
+        second = RETRO.prepare(
+            self.root,
+            base_intent("00000000-0000-4000-8000-000000000002"),
+        )
+
+        def deliver(fingerprint):
+            return RETRO.deliver(self.root, fingerprint, providers_dir=self.providers)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TICKET_PROVIDER": "trello",
+                "FAKE_COMMENT_STORE": str(self.store),
+                "FAKE_CALL_STORE": str(self.calls),
+            },
+            clear=False,
+        ):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(
+                    executor.map(
+                        deliver,
+                        [self.fingerprint, second["artifact_fingerprint"]],
+                    )
+                )
+        statuses = [result["status"] for result in results]
         self.assertCountEqual(statuses, ["posted", "already_present"])
-        self.assertEqual(self.store.read_text(encoding="utf-8").count(self.marker), 1)
+        marker = self.prepared["comment_fingerprint_marker"]
+        self.assertEqual(self.store.read_text(encoding="utf-8").count(marker), 1)
+        self.assertTrue(
+            all(
+                line.startswith(f"plane|{ISSUE_ID}|")
+                for line in self.calls.read_text().splitlines()
+            )
+        )
 
     def test_crash_after_external_post_is_already_present_on_retry(self):
         lost_mark = self.root / "lost-once"
@@ -420,21 +621,120 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             "FAKE_LOST_RESPONSE_ONCE": "1",
             "FAKE_LOST_MARK": str(lost_mark),
         }
-        first = self.call_adapter(extra)
-        second = self.call_adapter(extra)
-        self.assertEqual(json.loads(first.stdout)["status"], "failed")
-        self.assertEqual(json.loads(second.stdout)["status"], "already_present")
-        self.assertEqual(self.store.read_text(encoding="utf-8").count(self.marker), 1)
+        first = self.call_delivery(extra)
+        second = self.call_delivery(extra)
+        self.assertEqual(first["status"], "failed")
+        self.assertEqual(second["status"], "already_present")
+        marker = self.prepared["comment_fingerprint_marker"]
+        self.assertEqual(self.store.read_text(encoding="utf-8").count(marker), 1)
 
-    def test_serialization_failure_is_safe_and_does_not_post(self):
-        unusable = self.root / "not-a-directory"
-        unusable.write_text("occupied\n", encoding="utf-8")
-        result = self.call_adapter({"TP_COMMENT_LOCK_ROOT": str(unusable)})
-        self.assertEqual(result.returncode, 0)
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "failed")
-        self.assertEqual(payload["error_category"], "serialization_failed")
-        self.assertEqual(self.store.read_text(encoding="utf-8"), "")
+    def test_provider_override_cannot_redirect_prepared_intent(self):
+        result = self.call_delivery()
+        self.assertEqual(result["status"], "posted")
+        self.assertEqual(
+            self.calls.read_text(encoding="utf-8").split("|", 2)[:2],
+            ["plane", ISSUE_ID],
+        )
+        self.assertNotIn(
+            "WRONG_PROVIDER_CALLED", self.calls.read_text(encoding="utf-8")
+        )
+
+    def test_same_marker_has_one_immutable_body_across_failure_and_retry(self):
+        path = self.repo.artifact(self.fingerprint)
+        before = RETRO.read_artifact(path)
+        body = before["comment_body"]
+        marker = before["comment_fingerprint_marker"]
+        self.call_delivery(
+            {
+                "FAKE_LOST_RESPONSE_ONCE": "1",
+                "FAKE_LOST_MARK": str(self.root / "lost"),
+            }
+        )
+        failed = RETRO.read_artifact(path)
+        self.assertEqual(failed["comment_body"], body)
+        self.assertEqual(failed["comment_fingerprint_marker"], marker)
+        self.assertEqual(failed["operator_action_required"], False)
+        self.call_delivery()
+        retried = RETRO.read_artifact(path)
+        self.assertEqual(retried["comment_body"], body)
+        self.assertEqual(retried["comment_fingerprint_marker"], marker)
+
+    def test_wrong_extra_issue_argument_is_rejected_before_provider_call(self):
+        fixture = self.root / "role"
+        lib = fixture / ".scripts" / "lib"
+        sentinel = fixture / ".scripts" / "sentinel" / "bin"
+        lib.mkdir(parents=True)
+        sentinel.mkdir(parents=True)
+        shutil.copy2(ADAPTER_PATH, lib / "ticket-provider.sh")
+        shutil.copy2(HELPER_PATH, sentinel / "run-retro.py")
+        script = (
+            f'source "{lib / "ticket-provider.sh"}"; '
+            f'tp ensure_comment "{self.fingerprint}" "{OTHER_ISSUE_ID}"'
+        )
+        result = subprocess.run(
+            ["bash", "-c", script],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **os.environ,
+                "TP_PROVIDERS_DIR": str(self.providers),
+                "FAKE_COMMENT_STORE": str(self.store),
+                "FAKE_CALL_STORE": str(self.calls),
+            },
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_wrong_prepared_target_is_rejected_before_provider_call(self):
+        path = self.repo.artifact(self.fingerprint)
+        document = RETRO.read_artifact(path)
+        document["target_issue"] = OTHER_ISSUE_ID
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(RETRO.RetroError, "wrong_comment_target"):
+            self.call_delivery()
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_wrong_prepared_provider_is_rejected_before_provider_call(self):
+        path = self.repo.artifact(self.fingerprint)
+        document = RETRO.read_artifact(path)
+        document["provider"] = "trello"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaisesRegex(RETRO.RetroError, "invalid_issue_identity"):
+            self.call_delivery()
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_no_source_delivery_finalizes_without_provider_call(self):
+        no_source = RETRO.prepare(
+            self.root,
+            base_intent("00000000-0000-4000-8000-000000000003", source=None),
+        )
+        result = RETRO.deliver(
+            self.root,
+            no_source["artifact_fingerprint"],
+            providers_dir=self.providers,
+        )
+        self.assertEqual(result["status"], "no_target_issue")
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_symlinked_comment_lock_fails_before_provider_without_truncation(self):
+        document = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        key = RETRO._sha256_lines(
+            [
+                document["provider"],
+                document["source_issue"],
+                document["comment_fingerprint_marker"],
+            ]
+        )
+        lock_dir = self.repo.artifact(self.fingerprint).parent / ".locks" / "comments"
+        lock_dir.mkdir(parents=True)
+        victim = self.root / "comment-lock-victim"
+        victim.write_text("DO NOT TRUNCATE\n", encoding="utf-8")
+        (lock_dir / f"{key}.lock").symlink_to(victim)
+        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"):
+            self.call_delivery()
+        self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TRUNCATE\n")
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
 
 
 class PlanePaginationTests(unittest.TestCase):
@@ -492,18 +792,18 @@ class PlanePaginationTests(unittest.TestCase):
             },
         )
 
-    def test_plane_comment_lookup_exhausts_cursor_pages(self):
+    def test_plane_comment_lookup_exhausts_limit_offset_pages(self):
         self.write_curl(
             textwrap.dedent(
                 """\
                 #!/usr/bin/env sh
                 printf '%s\\n' "$*" >> "$CURL_LOG"
                 case "$*" in
-                  *cursor=100%3A1%3A0*)
-                    printf '{"results":[{"comment_html":"safe %s"}],"next_page_results":false,"next_cursor":""}\\n' "$RETRO_MARKER"
+                  *offset=100*)
+                    printf '{"results":[{"comment_html":"safe %s"}],"total_results":101}\\n' "$RETRO_MARKER"
                     ;;
                   *)
-                    printf '{"results":[],"next_page_results":true,"next_cursor":"100:1:0"}\\n'
+                    python3 -c 'import json; print(json.dumps({"results":[{"comment_html":"safe"}]*100,"total_results":101}))'
                     ;;
                 esac
                 """
@@ -513,7 +813,9 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "already_present")
         log = self.log.read_text(encoding="utf-8")
-        self.assertIn("cursor=100%3A1%3A0", log)
+        self.assertIn("offset=100", log)
+        self.assertIn(f"/work-items/{ISSUE_ID}/comments/", log)
+        self.assertNotIn("/issues/", log)
         self.assertNotIn("-X POST", log)
 
     def test_plane_lookup_failure_is_safe_and_does_not_post(self):
@@ -533,6 +835,28 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertEqual(payload["error_category"], "lookup_failed")
         self.assertNotIn("-X POST", self.log.read_text(encoding="utf-8"))
 
+    def test_plane_post_uses_current_work_item_comment_endpoint(self):
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *"-X POST"*) printf '{"id":"33333333-3333-4333-8333-333333333333"}\\n' ;;
+                  *) printf '{"results":[],"total_results":0}\\n' ;;
+                esac
+                """
+            )
+        )
+        result = self.run_plane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["provider"], "plane")
+        self.assertEqual(payload["status"], "posted")
+        log = self.log.read_text(encoding="utf-8")
+        self.assertIn(f"/work-items/{ISSUE_ID}/comments/", log)
+        self.assertNotIn("/issues/", log)
+
 
 class ProtocolParityTests(unittest.TestCase):
     def test_prompt_docs_schema_and_helper_share_exact_contract(self):
@@ -542,7 +866,7 @@ class ProtocolParityTests(unittest.TestCase):
         required = [
             "hermes.run-retro.artifact",
             "hermes.run-retro.comment",
-            "run-retro.v4.schema.json",
+            "run-retro.v5.schema.json",
             "tp ensure_comment",
             "resolve_issue_id",
             "Unicode NFKC",
@@ -550,15 +874,18 @@ class ProtocolParityTests(unittest.TestCase):
             "parent-directory fsync",
             "lookup_failed",
             "response_unknown",
-            "wrong-target",
+            "TICKET_PROVIDER",
+            "limit`/`offset",
+            "symlinks",
+            "monotonic",
         ]
         for token in required:
             with self.subTest(token=token):
                 self.assertIn(token, prompt)
                 self.assertIn(token, docs)
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 4)
-        self.assertEqual(RETRO.SCHEMA_VERSION, 4)
-        self.assertEqual(RETRO.COMMENT_FINGERPRINT_VERSION, 3)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 5)
+        self.assertEqual(RETRO.SCHEMA_VERSION, 5)
+        self.assertEqual(RETRO.COMMENT_FINGERPRINT_VERSION, 4)
         self.assertNotIn("PJAN-", prompt)
         self.assertNotIn("PJAN-", docs)
         prompt_contract = (
