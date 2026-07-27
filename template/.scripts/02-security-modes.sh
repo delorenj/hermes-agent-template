@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Normalize repository-origin delivery inputs after Copier renders under a
-# permissive umask. This task performs no network or fleet mutation.
+# Manual normalization helper. Copier's trusted inline bootstrap validates and
+# normalizes the rendered tree directly; it never executes this rendered path.
+# This helper performs no network or fleet mutation.
 set -euo pipefail
 
 ROLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"

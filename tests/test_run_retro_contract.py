@@ -19,6 +19,7 @@ import unittest
 from unittest import mock
 
 import jsonschema
+import yaml
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -42,6 +43,7 @@ TRELLO_PATH = ROOT / "template" / ".scripts" / "providers" / "trello.sh"
 CLOSE_GATE_PATH = (
     ROOT / "template" / ".scripts" / "sentinel" / "bin" / "issue-close-gate.sh"
 )
+COPIER_CONFIG_PATH = ROOT / "copier.yml"
 ISSUE_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_ISSUE_ID = "22222222-2222-4222-8222-222222222222"
 SYNTHETIC_SLACK_TOKEN = "".join(
@@ -4566,6 +4568,153 @@ class LinearDeliveryContractTests(unittest.TestCase):
         self.assertEqual(payload["error_category"], "lookup_failed")
 
 
+class CopierBootstrapTrustTests(unittest.TestCase):
+    def render(self, root):
+        copier = shutil.which("copier")
+        if copier is None:
+            self.skipTest("Copier is unavailable")
+        output = root / "output"
+
+        def umask_002():
+            os.umask(0o002)
+
+        result = subprocess.run(
+            [
+                copier,
+                "copy",
+                str(ROOT),
+                str(output),
+                "--trust",
+                "--skip-tasks",
+                "--defaults",
+                "--data",
+                "target_repo=pjangler",
+                "--data",
+                "role=pm",
+                "--data",
+                "ticket_provider=plane",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            preexec_fn=umask_002,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return output
+
+    def run_first_task(self, output, marker):
+        config = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))
+        task = config["_tasks"][0]
+        self.assertIsInstance(task, str)
+        environment = dict(os.environ)
+        environment["HERMES_BOOTSTRAP_TEST_MARKER"] = str(marker)
+        return subprocess.run(
+            task,
+            cwd=output,
+            env=environment,
+            shell=True,
+            executable="/bin/sh",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def malicious_bootstrap():
+        return textwrap.dedent(
+            """\
+            #!/usr/bin/env sh
+            set -eu
+            printf 'invoked\\n' > "$HERMES_BOOTSTRAP_TEST_MARKER"
+            """
+        )
+
+    def test_bootstrap_file_symlink_is_rejected_without_chmod_or_execution(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root)
+            marker = root / "bootstrap-invoked"
+            outside = root / "outside-bootstrap.sh"
+            outside.write_text(self.malicious_bootstrap(), encoding="utf-8")
+            outside.chmod(0o644)
+            bootstrap = output / ".scripts" / "02-security-modes.sh"
+            bootstrap.unlink()
+            bootstrap.symlink_to(outside)
+
+            result = self.run_first_task(output, marker)
+
+            self.assertEqual(
+                {
+                    "accepted": result.returncode == 0,
+                    "outside_mode": stat.S_IMODE(outside.stat().st_mode),
+                    "executed": marker.exists(),
+                },
+                {
+                    "accepted": False,
+                    "outside_mode": 0o644,
+                    "executed": False,
+                },
+            )
+
+    def test_scripts_parent_symlink_is_rejected_without_external_effect(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root)
+            marker = root / "parent-bootstrap-invoked"
+            scripts = output / ".scripts"
+            scripts.rename(output / ".scripts.original")
+            outside = root / "outside-scripts"
+            outside.mkdir()
+            outside.chmod(0o755)
+            bootstrap = outside / "02-security-modes.sh"
+            bootstrap.write_text(self.malicious_bootstrap(), encoding="utf-8")
+            bootstrap.chmod(0o644)
+            scripts.symlink_to(outside, target_is_directory=True)
+
+            result = self.run_first_task(output, marker)
+
+            self.assertEqual(
+                {
+                    "accepted": result.returncode == 0,
+                    "outside_mode": stat.S_IMODE(bootstrap.stat().st_mode),
+                    "executed": marker.exists(),
+                },
+                {
+                    "accepted": False,
+                    "outside_mode": 0o644,
+                    "executed": False,
+                },
+            )
+
+    def test_bootstrap_content_is_normalized_but_never_executed(self):
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+            root = pathlib.Path(tmp)
+            root.chmod(0o755)
+            output = self.render(root)
+            marker = root / "regular-bootstrap-invoked"
+            bootstrap = output / ".scripts" / "02-security-modes.sh"
+            bootstrap.write_text(self.malicious_bootstrap(), encoding="utf-8")
+            bootstrap.chmod(0o664)
+
+            result = self.run_first_task(output, marker)
+            task = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))[
+                "_tasks"
+            ][0]
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(stat.S_IMODE(bootstrap.stat().st_mode), 0o644)
+            self.assertFalse(marker.exists())
+            self.assertNotIn(
+                "chmod 0755 .scripts/02-security-modes.sh",
+                task,
+            )
+            self.assertNotIn("./.scripts/02-security-modes.sh", task)
+            self.assertIn('"O_NOFOLLOW"', task)
+            self.assertIn("os.fchmod", task)
+
+
 class CopierSecurityMetadataTests(unittest.TestCase):
     def test_umask_002_render_normalizes_modes_and_delivers_with_rendered_controller(
         self,
@@ -4634,9 +4783,12 @@ class CopierSecurityMetadataTests(unittest.TestCase):
                 security_modes.is_file(),
                 "rendered security-mode provisioning task is required",
             )
+            config = yaml.safe_load(COPIER_CONFIG_PATH.read_text(encoding="utf-8"))
             normalized = subprocess.run(
-                ["bash", str(security_modes), str(output)],
+                config["_tasks"][0],
                 cwd=output,
+                shell=True,
+                executable="/bin/sh",
                 text=True,
                 capture_output=True,
                 check=False,
@@ -4651,6 +4803,7 @@ class CopierSecurityMetadataTests(unittest.TestCase):
                 output / ".scripts" / "sentinel" / "bin" / "run-retro.py": 0o755,
                 provider: 0o755,
                 project: 0o644,
+                security_modes: 0o644,
             }
             for path, expected in expected_modes.items():
                 with self.subTest(path=path):
@@ -4747,6 +4900,8 @@ class ProtocolParityTests(unittest.TestCase):
             "`HERMES_PROVIDER_CONFIG_` namespace",
             "group/world",
             "02-security-modes.sh",
+            "trusted inline logic from `copier.yml`",
+            "never executes the rendered bootstrap entry",
             "mode `& 0022 == 0`",
             "artifact and binding descriptors",
             "retained configuration",

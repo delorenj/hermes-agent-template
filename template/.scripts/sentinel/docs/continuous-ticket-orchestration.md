@@ -257,13 +257,17 @@ provider. Repository copies, replacements, and distinct UIDs in the host
 network namespace therefore share exactly one exhaustive-lookup/at-most-once-post
 lock domain.
 
-Copier provisioning runs `.scripts/02-security-modes.sh` first. It rejects
-symlinks or foreign ownership and normalizes the repository/role and every
-required in-repository controller/provider directory to `0755`, `.project.json`
-and non-executable inputs to `0644`, executable controller/provider inputs to
-`0755`, and existing run-retro private directories/files to `0700/0600`;
-therefore a render created under umask `002` does not rely on source-checkout
-modes.
+Copier provisioning begins with trusted inline logic from `copier.yml`, not a
+rendered executable. Before any rendered pathname is changed or run, it opens
+the output root, `.scripts`, and `.scripts/02-security-modes.sh` with
+descriptor-relative `O_NOFOLLOW`, validates owner, type, and path identity,
+normalizes through the held descriptors, and revalidates them. It performs the
+full normalization directly and never executes the rendered bootstrap entry,
+which remains non-executable at `0644`. Required repository/role and
+controller/provider directories and executables become `0755`, `.project.json`
+and other non-executable inputs become `0644`, and existing run-retro private
+directories/files become `0700/0600`; therefore a render created under umask
+`002` does not rely on source-checkout modes.
 
 The provider script and controller source are opened by descriptor, receive
 only the already-bound configuration, and execute from inherited descriptors

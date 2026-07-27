@@ -131,7 +131,444 @@ plane_workspace:
 # All scripts are idempotent — safe to re-run if a step fails.
 
 _tasks:
-  - "chmod 0755 .scripts/02-security-modes.sh && ./.scripts/02-security-modes.sh"
+  - |
+    python3 - <<'PY'
+    import contextlib
+    import os
+    import shutil
+    import stat
+    import subprocess
+
+    DIRECTORY_FLAGS = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    FILE_FLAGS = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    ALLOWED_OWNERS = {0, os.geteuid()}
+    ERROR = "security mode bootstrap rejected an untrusted path"
+
+
+    def validate(metadata, kind):
+        valid_kind = (
+            stat.S_ISDIR(metadata.st_mode)
+            if kind == "directory"
+            else stat.S_ISREG(metadata.st_mode)
+        )
+        if not valid_kind or metadata.st_uid not in ALLOWED_OWNERS:
+            raise SystemExit(ERROR)
+
+
+    def identity(metadata):
+        return metadata.st_dev, metadata.st_ino
+
+
+    def open_entry(parent_fd, name, kind):
+        descriptor = -1
+        try:
+            before = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            validate(before, kind)
+            descriptor = os.open(
+                name,
+                DIRECTORY_FLAGS if kind == "directory" else FILE_FLAGS,
+                dir_fd=parent_fd,
+            )
+            opened = os.fstat(descriptor)
+            validate(opened, kind)
+            if identity(before) != identity(opened):
+                raise SystemExit(ERROR)
+            return descriptor, identity(opened)
+        except SystemExit:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+        except OSError:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise SystemExit(ERROR) from None
+
+
+    def revalidate_entry(parent_fd, name, descriptor, expected, kind):
+        try:
+            current = os.stat(
+                name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            opened = os.fstat(descriptor)
+        except OSError:
+            raise SystemExit(ERROR) from None
+        validate(current, kind)
+        validate(opened, kind)
+        if identity(current) != expected or identity(opened) != expected:
+            raise SystemExit(ERROR)
+
+
+    def set_entry_mode(parent_fd, name, descriptor, expected, kind, mode):
+        revalidate_entry(parent_fd, name, descriptor, expected, kind)
+        try:
+            os.fchmod(descriptor, mode)
+        except OSError:
+            raise SystemExit(ERROR) from None
+        revalidate_entry(parent_fd, name, descriptor, expected, kind)
+        if stat.S_IMODE(os.fstat(descriptor).st_mode) != mode:
+            raise SystemExit(ERROR)
+
+
+    def revalidate_root(root_fd, expected):
+        try:
+            current = os.stat(".", follow_symlinks=False)
+            opened = os.fstat(root_fd)
+        except OSError:
+            raise SystemExit(ERROR) from None
+        validate(current, "directory")
+        validate(opened, "directory")
+        if identity(current) != expected or identity(opened) != expected:
+            raise SystemExit(ERROR)
+
+
+    def set_root_mode(root_fd, expected, mode):
+        revalidate_root(root_fd, expected)
+        try:
+            os.fchmod(root_fd, mode)
+        except OSError:
+            raise SystemExit(ERROR) from None
+        revalidate_root(root_fd, expected)
+        if stat.S_IMODE(os.fstat(root_fd).st_mode) != mode:
+            raise SystemExit(ERROR)
+
+
+    def optional_metadata(parent_fd, name):
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise SystemExit(ERROR) from None
+
+
+    def executable_script(relative):
+        return (
+            relative != ("02-security-modes.sh",)
+            and (
+                relative[-1].endswith(".sh")
+                or relative == ("sentinel", "bin", "run-retro.py")
+                or relative == ("momo-wip-lock.py",)
+            )
+        )
+
+
+    def normalize_tree(
+        directory_fd,
+        relative=(),
+        *,
+        directory_mode=0o755,
+        file_mode=None,
+        held_bootstrap=None,
+    ):
+        try:
+            names = sorted(os.listdir(directory_fd))
+        except OSError:
+            raise SystemExit(ERROR) from None
+        for name in names:
+            child_relative = (*relative, name)
+            metadata = optional_metadata(directory_fd, name)
+            if metadata is None:
+                raise SystemExit(ERROR)
+            if stat.S_ISDIR(metadata.st_mode):
+                child_fd, child_identity = open_entry(
+                    directory_fd,
+                    name,
+                    "directory",
+                )
+                try:
+                    set_entry_mode(
+                        directory_fd,
+                        name,
+                        child_fd,
+                        child_identity,
+                        "directory",
+                        directory_mode,
+                    )
+                    normalize_tree(
+                        child_fd,
+                        child_relative,
+                        directory_mode=directory_mode,
+                        file_mode=file_mode,
+                    )
+                    revalidate_entry(
+                        directory_fd,
+                        name,
+                        child_fd,
+                        child_identity,
+                        "directory",
+                    )
+                finally:
+                    os.close(child_fd)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SystemExit(ERROR)
+            if held_bootstrap is not None and child_relative == (
+                "02-security-modes.sh",
+            ):
+                child_fd, child_identity = held_bootstrap
+                close_child = False
+            else:
+                child_fd, child_identity = open_entry(
+                    directory_fd,
+                    name,
+                    "file",
+                )
+                close_child = True
+            try:
+                mode = (
+                    file_mode(child_relative)
+                    if file_mode is not None
+                    else 0o600
+                )
+                set_entry_mode(
+                    directory_fd,
+                    name,
+                    child_fd,
+                    child_identity,
+                    "file",
+                    mode,
+                )
+            finally:
+                if close_child:
+                    os.close(child_fd)
+
+
+    def normalize_optional_file(parent_fd, name, mode):
+        if optional_metadata(parent_fd, name) is None:
+            return
+        descriptor, expected = open_entry(parent_fd, name, "file")
+        try:
+            set_entry_mode(
+                parent_fd,
+                name,
+                descriptor,
+                expected,
+                "file",
+                mode,
+            )
+        finally:
+            os.close(descriptor)
+
+
+    root_fd = -1
+    scripts_fd = -1
+    bootstrap_fd = -1
+    repo_fd = -1
+    implementation_fd = -1
+    retro_fd = -1
+    try:
+        root_fd = os.open(".", DIRECTORY_FLAGS)
+        root_metadata = os.fstat(root_fd)
+        validate(root_metadata, "directory")
+        root_identity = identity(root_metadata)
+        revalidate_root(root_fd, root_identity)
+
+        scripts_fd, scripts_identity = open_entry(
+            root_fd,
+            ".scripts",
+            "directory",
+        )
+        bootstrap_fd, bootstrap_identity = open_entry(
+            scripts_fd,
+            "02-security-modes.sh",
+            "file",
+        )
+
+        # Nothing above mutates or executes a rendered pathname. Normalize only
+        # through the three held descriptors, then prove the entries still
+        # resolve to those exact objects.
+        set_root_mode(root_fd, root_identity, 0o755)
+        set_entry_mode(
+            root_fd,
+            ".scripts",
+            scripts_fd,
+            scripts_identity,
+            "directory",
+            0o755,
+        )
+        set_entry_mode(
+            scripts_fd,
+            "02-security-modes.sh",
+            bootstrap_fd,
+            bootstrap_identity,
+            "file",
+            0o644,
+        )
+        revalidate_root(root_fd, root_identity)
+        revalidate_entry(
+            root_fd,
+            ".scripts",
+            scripts_fd,
+            scripts_identity,
+            "directory",
+        )
+        revalidate_entry(
+            scripts_fd,
+            "02-security-modes.sh",
+            bootstrap_fd,
+            bootstrap_identity,
+            "file",
+        )
+
+        normalize_tree(
+            scripts_fd,
+            file_mode=lambda relative: (
+                0o755 if executable_script(relative) else 0o644
+            ),
+            held_bootstrap=(bootstrap_fd, bootstrap_identity),
+        )
+        normalize_optional_file(root_fd, "hermes", 0o755)
+        normalize_optional_file(root_fd, "role.yaml", 0o644)
+        normalize_optional_file(root_fd, "SOUL.md", 0o644)
+
+        role_path = os.path.abspath(os.getcwd())
+        repo_path = role_path
+        git = shutil.which("git", path="/usr/bin:/bin:/usr/local/bin")
+        if (
+            optional_metadata(root_fd, ".project.json") is None
+            and git is not None
+        ):
+            try:
+                resolved = subprocess.run(
+                    [git, "-C", role_path, "rev-parse", "--show-toplevel"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    env={"LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/local/bin"},
+                )
+            except (OSError, subprocess.SubprocessError):
+                resolved = None
+            if resolved is not None and resolved.returncode == 0:
+                candidate = resolved.stdout.strip()
+                if (
+                    candidate.startswith("/")
+                    and "\0" not in candidate
+                    and os.path.realpath(candidate) == candidate
+                ):
+                    repo_path = candidate
+
+        if repo_path == role_path:
+            repo_fd = os.dup(root_fd)
+        else:
+            try:
+                repo_fd = os.open(repo_path, DIRECTORY_FLAGS)
+            except OSError:
+                raise SystemExit(ERROR) from None
+        repo_metadata = os.fstat(repo_fd)
+        validate(repo_metadata, "directory")
+        try:
+            os.fchmod(repo_fd, 0o755)
+        except OSError:
+            raise SystemExit(ERROR) from None
+        validate(os.fstat(repo_fd), "directory")
+        if stat.S_IMODE(os.fstat(repo_fd).st_mode) != 0o755:
+            raise SystemExit(ERROR)
+
+        normalize_optional_file(repo_fd, ".project.json", 0o644)
+        if optional_metadata(repo_fd, "_bmad-output") is not None:
+            artifacts_parent_fd, artifacts_parent_identity = open_entry(
+                repo_fd,
+                "_bmad-output",
+                "directory",
+            )
+            try:
+                set_entry_mode(
+                    repo_fd,
+                    "_bmad-output",
+                    artifacts_parent_fd,
+                    artifacts_parent_identity,
+                    "directory",
+                    0o755,
+                )
+                if (
+                    optional_metadata(
+                        artifacts_parent_fd,
+                        "implementation-artifacts",
+                    )
+                    is not None
+                ):
+                    implementation_fd, implementation_identity = open_entry(
+                        artifacts_parent_fd,
+                        "implementation-artifacts",
+                        "directory",
+                    )
+                    set_entry_mode(
+                        artifacts_parent_fd,
+                        "implementation-artifacts",
+                        implementation_fd,
+                        implementation_identity,
+                        "directory",
+                        0o755,
+                    )
+                    if (
+                        optional_metadata(implementation_fd, "run-retros")
+                        is not None
+                    ):
+                        retro_fd, retro_identity = open_entry(
+                            implementation_fd,
+                            "run-retros",
+                            "directory",
+                        )
+                        set_entry_mode(
+                            implementation_fd,
+                            "run-retros",
+                            retro_fd,
+                            retro_identity,
+                            "directory",
+                            0o700,
+                        )
+                        normalize_tree(
+                            retro_fd,
+                            directory_mode=0o700,
+                            file_mode=lambda _relative: 0o600,
+                        )
+            finally:
+                os.close(artifacts_parent_fd)
+
+        revalidate_root(root_fd, root_identity)
+        revalidate_entry(
+            root_fd,
+            ".scripts",
+            scripts_fd,
+            scripts_identity,
+            "directory",
+        )
+        revalidate_entry(
+            scripts_fd,
+            "02-security-modes.sh",
+            bootstrap_fd,
+            bootstrap_identity,
+            "file",
+        )
+    finally:
+        for descriptor in (
+            retro_fd,
+            implementation_fd,
+            repo_fd,
+            bootstrap_fd,
+            scripts_fd,
+            root_fd,
+        ):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+    PY
   - "./.scripts/00-banner.sh"
   - "./.scripts/01-config.sh"
   - "./.scripts/05-fleet-env.sh"
