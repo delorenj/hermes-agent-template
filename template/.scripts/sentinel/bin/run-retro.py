@@ -160,6 +160,34 @@ SUPERVISOR_SHUTDOWN_SECONDS = 2.0
 MAX_EPOCH_US = 253402300799999999
 GLOBAL_COMMENT_LOCK_NAMESPACE = b"\0hermes.run-retro.comment-lock.v1."
 LINUX_CONTAINMENT_CANDIDATES = (Path("/usr/bin/bwrap"), Path("/bin/bwrap"))
+PROVIDER_RUNTIME_ENV = {
+    "CURL_CA_BUNDLE",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "LANG",
+    "LC_ALL",
+    "NO_PROXY",
+    "PATH",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+    "TZ",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+}
+PROVIDER_SECRET_ENV = {
+    "linear": {"LINEAR_API_KEY", "LINEAR_API_URL"},
+    "plane": {"PLANE_API_KEY", "PLANE_BASE", "PLANE_WORKSPACE"},
+    "trello": {"TRELLO_API_URL", "TRELLO_KEY", "TRELLO_TOKEN"},
+}
+PROVIDER_BOUND_ENV = {
+    "HERMES_BOUND_PROVIDER_CONFIG",
+    "HERMES_BOUND_TICKET_PROVIDER_JSON",
+    "TICKET_PROVIDER",
+}
+PROVIDER_CONFIG_ENV_PREFIX = "HERMES_PROVIDER_CONFIG_"
+PROVIDER_CONFIG_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,62}$(?![\s\S])")
 
 
 class RetroError(Exception):
@@ -672,6 +700,52 @@ def _directory_flags() -> int:
     )
 
 
+def _trusted_owner(user_id: int) -> bool:
+    return user_id in {0, os.geteuid()}
+
+
+def _validate_trusted_metadata(
+    metadata: os.stat_result,
+    *,
+    kind: str,
+    executable: bool = False,
+    category: str,
+) -> None:
+    valid_kind = (
+        stat.S_ISDIR(metadata.st_mode)
+        if kind == "directory"
+        else stat.S_ISREG(metadata.st_mode)
+    )
+    permissions = stat.S_IMODE(metadata.st_mode)
+    if (
+        not valid_kind
+        or not _trusted_owner(metadata.st_uid)
+        or permissions & 0o022
+        or (executable and permissions & 0o111 == 0)
+    ):
+        raise RetroError(category)
+
+
+def _validate_trusted_descriptor(
+    descriptor: int,
+    *,
+    kind: str,
+    executable: bool = False,
+    category: str,
+) -> os.stat_result:
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError:
+        raise RetroError(category) from None
+    _validate_trusted_metadata(
+        metadata,
+        kind=kind,
+        executable=executable,
+        category=category,
+    )
+    return metadata
+
+
 def _open_directory_component(parent_fd: int, name: str, *, create: bool) -> int:
     if not name or "/" in name or name in {".", ".."}:
         raise RetroError("unsafe_artifact_path")
@@ -713,6 +787,30 @@ def _walk_directories(parent_fd: int, parts: tuple[str, ...], *, create: bool) -
         raise
 
 
+def _walk_trusted_directories(
+    parent_fd: int,
+    parts: tuple[str, ...],
+    *,
+    category: str,
+) -> int:
+    current = os.dup(parent_fd)
+    try:
+        for part in parts:
+            child = _open_directory_component(current, part, create=False)
+            _validate_trusted_descriptor(
+                child,
+                kind="directory",
+                category=category,
+            )
+            os.close(current)
+            current = child
+        return current
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(current)
+        raise
+
+
 @dataclass
 class RepositorySession:
     repo_root: Path
@@ -720,6 +818,8 @@ class RepositorySession:
     repo_name: str
     repo_fd: int
     repo_identity: tuple[int, int]
+    project_identity: tuple[int, int]
+    project_sha256: str
     repo: str
     provider: str
     provider_config: dict[str, Any]
@@ -818,6 +918,30 @@ def _assert_repository_path(repository: RepositorySession | RetroStore) -> None:
             os.close(current)
 
 
+def _assert_repository_inputs(repository: RepositorySession) -> None:
+    _assert_repository_path(repository)
+    metadata = os.fstat(repository.repo_fd)
+    _validate_trusted_metadata(
+        metadata,
+        kind="directory",
+        category="unsafe_artifact_path",
+    )
+    if (metadata.st_dev, metadata.st_ino) != repository.repo_identity:
+        raise RetroError("unsafe_artifact_path")
+    project, project_identity, project_sha256 = _read_trusted_project_at(
+        repository.repo_fd,
+        require_trusted_permissions=True,
+    )
+    if (
+        project_identity != repository.project_identity
+        or not hmac.compare_digest(project_sha256, repository.project_sha256)
+        or _canonical_repo_from_project(project) != repository.repo
+        or _canonical_provider_from_project(project) != repository.provider
+        or project.get("ticket_provider") != repository.provider_config
+    ):
+        raise RetroError("immutable_intent_mismatch")
+
+
 def _assert_store_path(store: RetroStore) -> None:
     _assert_repository_path(store)
     current = _walk_directories(store.repo_fd, RETRO_PARTS, create=False)
@@ -881,6 +1005,52 @@ def _read_utf8_json_at(
                 os.close(descriptor)
 
 
+def _read_trusted_project_at(
+    repo_fd: int,
+    *,
+    require_trusted_permissions: bool,
+) -> tuple[dict[str, Any], tuple[int, int], str]:
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            ".project.json",
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=repo_fd,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RetroError("invalid_repository_identity")
+        if require_trusted_permissions:
+            _validate_trusted_metadata(
+                metadata,
+                kind="file",
+                category="invalid_repository_identity",
+            )
+        with os.fdopen(descriptor, "rb", closefd=True) as handle:
+            descriptor = -1
+            payload = _read_bounded(
+                handle,
+                MAX_INPUT_BYTES,
+                overflow_category="configuration_too_large",
+            )
+        document = json.loads(payload.decode("utf-8"))
+        if not isinstance(document, dict):
+            raise RetroError("invalid_repository_identity")
+        return (
+            document,
+            (metadata.st_dev, metadata.st_ino),
+            hashlib.sha256(payload).hexdigest(),
+        )
+    except RetroError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise RetroError("invalid_repository_identity") from None
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+
+
 @contextlib.contextmanager
 def _repository(repo_root: Path) -> Iterator[RepositorySession]:
     repo_root = Path(os.path.abspath(repo_root))
@@ -895,14 +1065,11 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
         raise RetroError("unsafe_artifact_path") from None
     try:
         metadata = os.fstat(repo_fd)
-        if not stat.S_ISDIR(metadata.st_mode):
+        if not stat.S_ISDIR(metadata.st_mode) or not _trusted_owner(metadata.st_uid):
             raise RetroError("unsafe_artifact_path")
-        project = _read_utf8_json_at(
+        project, project_identity, project_sha256 = _read_trusted_project_at(
             repo_fd,
-            ".project.json",
-            category="invalid_repository_identity",
-            max_bytes=MAX_INPUT_BYTES,
-            overflow_category="configuration_too_large",
+            require_trusted_permissions=False,
         )
         try:
             provider_config = project["ticket_provider"]
@@ -916,6 +1083,8 @@ def _repository(repo_root: Path) -> Iterator[RepositorySession]:
             repo_name=repo_root.name,
             repo_fd=repo_fd,
             repo_identity=(metadata.st_dev, metadata.st_ino),
+            project_identity=project_identity,
+            project_sha256=project_sha256,
             repo=_canonical_repo_from_project(project),
             provider=_canonical_provider_from_project(project),
             provider_config=provider_config,
@@ -1773,19 +1942,23 @@ def _provider_script_fd(
             raise RetroError("provider_unavailable") from None
         if not relative.parts:
             raise RetroError("provider_unavailable")
-        directory_fd = _walk_directories(
+        directory_fd = _walk_trusted_directories(
             repository.repo_fd,
             tuple(relative.parts),
-            create=False,
+            category="provider_unavailable",
         )
         script_fd = os.open(
             f"{provider}.sh",
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
             dir_fd=directory_fd,
         )
-        if not stat.S_ISREG(os.fstat(script_fd).st_mode):
-            raise OSError
-        _assert_repository_path(repository)
+        _validate_trusted_descriptor(
+            script_fd,
+            kind="file",
+            executable=True,
+            category="provider_unavailable",
+        )
+        _assert_repository_inputs(repository)
         yield script_fd
     except RetroError:
         raise
@@ -1841,9 +2014,11 @@ def _contained_provider_command(
     *,
     info_fd: int,
     block_fd: int,
+    provider_tmp: str,
+    repo_root: str | None,
 ) -> list[str]:
     executable = _containment_executable()
-    return [
+    command = [
         str(executable),
         "--unshare-pid",
         "--as-pid-1",
@@ -1852,19 +2027,31 @@ def _contained_provider_command(
         str(info_fd),
         "--block-fd",
         str(block_fd),
-        "--dev-bind",
+        "--ro-bind",
         "/",
         "/",
-        "--proc",
-        "/proc",
-        "--",
-        "sh",
-        "-s",
-        "ensure_comment",
-        source_issue,
-        marker,
-        body,
     ]
+    if repo_root is not None:
+        command.extend(("--bind", repo_root, repo_root))
+    command.extend(
+        (
+            "--bind",
+            provider_tmp,
+            provider_tmp,
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--",
+            "sh",
+            "-s",
+            "ensure_comment",
+            source_issue,
+            marker,
+            body,
+        )
+    )
+    return command
 
 
 def _terminate_supervisor(process: subprocess.Popen[bytes]) -> None:
@@ -2068,9 +2255,106 @@ def _bounded_provider_output(
                     stream.close()
 
 
+def _runtime_environment(*, include_tmpdir: bool) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for name in PROVIDER_RUNTIME_ENV:
+        if name == "PATH":
+            continue
+        value = os.environ.get(name)
+        if value is not None and "\0" not in value:
+            environment[name] = value
+    environment["PATH"] = os.defpath
+    if include_tmpdir:
+        value = os.environ.get("TMPDIR")
+        if value is not None and value and "\0" not in value:
+            environment["TMPDIR"] = value
+    return environment
+
+
+def _provider_environment(
+    provider: str,
+    provider_config: dict[str, Any],
+) -> dict[str, str]:
+    if provider not in PROVIDERS or not isinstance(provider_config, dict):
+        raise RetroError("invalid_provider")
+    environment = _runtime_environment(include_tmpdir=False)
+    for name in PROVIDER_SECRET_ENV[provider]:
+        value = os.environ.get(name)
+        if value is not None and "\0" not in value:
+            environment[name] = value
+    environment["TICKET_PROVIDER"] = provider
+    environment["HERMES_BOUND_PROVIDER_CONFIG"] = "1"
+    environment["HERMES_BOUND_TICKET_PROVIDER_JSON"] = json.dumps(
+        provider_config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    for key, value in provider_config.items():
+        if (
+            isinstance(key, str)
+            and PROVIDER_CONFIG_KEY_RE.fullmatch(key)
+            and isinstance(value, (str, int, float, bool))
+            and not isinstance(value, complex)
+        ):
+            rendered = str(value).lower() if isinstance(value, bool) else str(value)
+            if "\0" not in rendered:
+                environment[f"{PROVIDER_CONFIG_ENV_PREFIX}{key.upper()}"] = rendered
+    if len(_canonical_json(environment)) > MAX_INPUT_BYTES:
+        raise RetroError("configuration_too_large")
+    return environment
+
+
+def _validated_provider_environment(
+    provider: str,
+    provider_config: dict[str, Any],
+    value: Any,
+) -> dict[str, str]:
+    expected_config_environment = {
+        key: item
+        for key, item in _provider_environment(provider, provider_config).items()
+        if key.startswith(PROVIDER_CONFIG_ENV_PREFIX)
+    }
+    allowed = (
+        PROVIDER_RUNTIME_ENV
+        | PROVIDER_SECRET_ENV[provider]
+        | PROVIDER_BOUND_ENV
+        | set(expected_config_environment)
+    )
+    if (
+        not isinstance(value, dict)
+        or not set(value).issubset(allowed)
+        or not all(
+            isinstance(key, str)
+            and isinstance(item, str)
+            and "\0" not in key
+            and "\0" not in item
+            for key, item in value.items()
+        )
+    ):
+        raise RetroError("invalid_input")
+    expected_config = json.dumps(
+        provider_config,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if (
+        value.get("TICKET_PROVIDER") != provider
+        or value.get("HERMES_BOUND_PROVIDER_CONFIG") != "1"
+        or value.get("HERMES_BOUND_TICKET_PROVIDER_JSON") != expected_config
+        or any(
+            value.get(key) != item for key, item in expected_config_environment.items()
+        )
+    ):
+        raise RetroError("invalid_input")
+    return dict(value)
+
+
 def _provider_supervisor_payload(
     stored: dict[str, Any],
     provider_config: dict[str, Any],
+    repo_root: Path | None = None,
 ) -> dict[str, Any]:
     return {
         "provider": stored["provider"],
@@ -2078,6 +2362,13 @@ def _provider_supervisor_payload(
         "marker": comment_marker(stored),
         "body": comment_body(stored),
         "provider_config": provider_config,
+        "provider_environment": _provider_environment(
+            stored["provider"],
+            provider_config,
+        ),
+        "repo_root": (
+            str(Path(os.path.abspath(repo_root))) if repo_root is not None else None
+        ),
         "provider_timeout_seconds": _bounded_seconds(
             PROVIDER_TIMEOUT_SECONDS,
             category="provider_timeout",
@@ -2094,6 +2385,8 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
         "marker",
         "body",
         "provider_config",
+        "provider_environment",
+        "repo_root",
         "provider_timeout_seconds",
         "lock_timeout_seconds",
     }
@@ -2113,6 +2406,20 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
     provider_config = value["provider_config"]
     if not isinstance(provider_config, dict):
         raise RetroError("invalid_input")
+    provider_environment = _validated_provider_environment(
+        provider,
+        provider_config,
+        value["provider_environment"],
+    )
+    repo_root = value["repo_root"]
+    if repo_root is not None and (
+        not isinstance(repo_root, str)
+        or not repo_root.startswith("/")
+        or "\0" in repo_root
+        or len(repo_root.encode("utf-8")) > 4096
+        or str(Path(repo_root)) != repo_root
+    ):
+        raise RetroError("invalid_input")
     provider_timeout = _bounded_seconds(
         value["provider_timeout_seconds"],
         category="provider_timeout",
@@ -2129,6 +2436,8 @@ def _validated_supervisor_payload(value: Any) -> dict[str, Any]:
         "marker": marker,
         "body": body,
         "provider_config": provider_config,
+        "provider_environment": provider_environment,
+        "repo_root": repo_root,
         "provider_timeout_seconds": provider_timeout,
         "lock_timeout_seconds": lock_timeout,
     }
@@ -2149,21 +2458,43 @@ def _read_supervisor_payload(descriptor: int) -> dict[str, Any]:
         raise RetroError("invalid_input") from None
 
 
+def _assert_supervisor_repository(repo_fd: int, repo_root: str) -> None:
+    metadata = os.fstat(repo_fd)
+    if not stat.S_ISDIR(metadata.st_mode) or not _trusted_owner(metadata.st_uid):
+        raise RetroError("provider_containment_unavailable")
+    path = Path(repo_root)
+    parent_fd = -1
+    current_fd = -1
+    try:
+        parent_fd = os.open(path.parent, _directory_flags())
+        current_fd = os.open(path.name, _directory_flags(), dir_fd=parent_fd)
+        current = os.fstat(current_fd)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise RetroError("provider_containment_unavailable")
+    except RetroError:
+        raise
+    except OSError:
+        raise RetroError("provider_containment_unavailable") from None
+    finally:
+        for descriptor in (current_fd, parent_fd):
+            if descriptor >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(descriptor)
+
+
 def _run_contained_provider(
     payload: dict[str, Any],
     script_fd: int,
+    repo_fd: int = -1,
 ) -> dict[str, Any]:
     provider = payload["provider"]
     source_issue = payload["source_issue"]
-    environment = dict(os.environ)
-    environment["TICKET_PROVIDER"] = provider
-    environment["HERMES_BOUND_PROVIDER_CONFIG"] = "1"
-    environment["HERMES_BOUND_TICKET_PROVIDER_JSON"] = json.dumps(
-        payload["provider_config"],
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
+    environment = dict(payload["provider_environment"])
+    repo_root = payload["repo_root"]
+    if repo_root is not None:
+        if repo_fd < 0:
+            raise RetroError("provider_containment_unavailable")
+        _assert_supervisor_repository(repo_fd, repo_root)
     stored_identity = {"provider": provider, "source_issue": source_issue}
     process: subprocess.Popen[bytes] | None = None
     info_read_fd = -1
@@ -2188,6 +2519,8 @@ def _run_contained_provider(
                     payload["body"],
                     info_fd=info_write_fd,
                     block_fd=block_read_fd,
+                    provider_tmp=provider_tmp,
+                    repo_root=repo_root,
                 ),
                 stdin=script_fd,
                 stdout=subprocess.PIPE,
@@ -2246,18 +2579,28 @@ def _run_contained_provider(
         )
 
 
-def _supervise_provider(script_fd: int, payload_fd: int) -> dict[str, Any]:
+def _supervise_provider(
+    script_fd: int,
+    payload_fd: int,
+    repo_fd: int = -1,
+) -> dict[str, Any]:
     try:
-        if not stat.S_ISREG(os.fstat(script_fd).st_mode):
-            raise RetroError("provider_unavailable")
+        _validate_trusted_descriptor(
+            script_fd,
+            kind="file",
+            executable=True,
+            category="provider_unavailable",
+        )
     except OSError:
         raise RetroError("provider_unavailable") from None
     payload = _read_supervisor_payload(payload_fd)
+    if payload["repo_root"] is not None:
+        _assert_supervisor_repository(repo_fd, payload["repo_root"])
     with _global_comment_lock(
         payload["marker"],
         timeout_seconds=payload["lock_timeout_seconds"],
     ):
-        return _run_contained_provider(payload, script_fd)
+        return _run_contained_provider(payload, script_fd, repo_fd)
 
 
 def _controller_source_fd() -> int:
@@ -2269,8 +2612,13 @@ def _controller_source_fd() -> int:
             path,
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
         )
-        metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or (
+        metadata = _validate_trusted_descriptor(
+            descriptor,
+            kind="file",
+            executable=True,
+            category="provider_containment_unavailable",
+        )
+        if (
             metadata.st_dev,
             metadata.st_ino,
         ) != (
@@ -2305,7 +2653,13 @@ def _invoke_provider(
     script_fd: int,
     provider_config: dict[str, Any],
 ) -> _TrustedTransition:
-    _assert_repository_path(repository)
+    _assert_repository_inputs(repository)
+    _validate_trusted_descriptor(
+        script_fd,
+        kind="file",
+        executable=True,
+        category="provider_unavailable",
+    )
     try:
         _containment_executable()
     except RetroError as error:
@@ -2320,7 +2674,13 @@ def _invoke_provider(
                 "provider response not confirmed",
             ),
         )
-    payload = _canonical_json(_provider_supervisor_payload(stored, provider_config))
+    payload = _canonical_json(
+        _provider_supervisor_payload(
+            stored,
+            provider_config,
+            repository.repo_root,
+        )
+    )
     source_fd = -1
     payload_read_fd = -1
     payload_write_fd = -1
@@ -2337,13 +2697,15 @@ def _invoke_provider(
                 str(script_fd),
                 "--payload-fd",
                 str(payload_read_fd),
+                "--repo-fd",
+                str(repository.repo_fd),
             ],
             stdin=source_fd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            pass_fds=(script_fd, payload_read_fd),
+            pass_fds=(script_fd, payload_read_fd, repository.repo_fd),
             start_new_session=True,
-            env=dict(os.environ),
+            env=_runtime_environment(include_tmpdir=True),
         )
         os.close(payload_read_fd)
         payload_read_fd = -1
@@ -2555,12 +2917,13 @@ def _parser() -> argparse.ArgumentParser:
     supervisor_parser = subparsers.add_parser("_supervise-provider")
     supervisor_parser.add_argument("--script-fd", required=True, type=int)
     supervisor_parser.add_argument("--payload-fd", required=True, type=int)
+    supervisor_parser.add_argument("--repo-fd", required=True, type=int)
     return parser
 
 
-def _supervisor_main(script_fd: int, payload_fd: int) -> int:
+def _supervisor_main(script_fd: int, payload_fd: int, repo_fd: int) -> int:
     try:
-        result = _supervise_provider(script_fd, payload_fd)
+        result = _supervise_provider(script_fd, payload_fd, repo_fd)
         output = _canonical_json(result)
         return_code = 0
     except RetroError as error:
@@ -2583,7 +2946,7 @@ def _supervisor_main(script_fd: int, payload_fd: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "_supervise-provider":
-        return _supervisor_main(args.script_fd, args.payload_fd)
+        return _supervisor_main(args.script_fd, args.payload_fd, args.repo_fd)
     try:
         repo_root = args.repo_root.resolve()
         if args.command == "prepare":

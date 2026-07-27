@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -116,6 +117,7 @@ class RepoFixture:
             + "\n",
             encoding="utf-8",
         )
+        (self.root / ".project.json").chmod(0o644)
 
     def close(self):
         self.temp.cleanup()
@@ -2100,16 +2102,334 @@ class RunRetroDurabilityTests(unittest.TestCase):
         self.assertEqual(validate.stderr, "")
 
 
+class ProviderTrustBoundaryTests(unittest.TestCase):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        calls = 0
+        delayed_calls = 0
+        payloads = []
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            request = self.rfile.read(length)
+            if self.path == "/delayed":
+                type(self).delayed_calls += 1
+            else:
+                type(self).calls += 1
+                type(self).payloads.append(json.loads(request or b"{}"))
+            payload = b'{"ok":true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, _format, *_args):
+            return
+
+    def setUp(self):
+        self.repo = RepoFixture()
+        self.providers = self.repo.root / "providers"
+        self.providers.mkdir()
+        self.provider = self.providers / "plane.sh"
+        self.controller_marker_effect = (
+            self.repo.root.parent / f"{self.repo.root.name}-controller-marker"
+        )
+        self.outside_effect = (
+            self.repo.root.parent / f"{self.repo.root.name}-outside-effect"
+        )
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.Handler)
+        self.Handler.calls = 0
+        self.Handler.delayed_calls = 0
+        self.Handler.payloads = []
+        self.server_thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.server_thread.start()
+        project = json.loads((self.repo.root / ".project.json").read_text())
+        project["ticket_provider"].update(
+            {
+                "test_endpoint": (
+                    f"http://127.0.0.1:{self.server.server_port}/provider"
+                ),
+                "controller_marker_effect": str(self.controller_marker_effect),
+                "outside_effect": str(self.outside_effect),
+            }
+        )
+        (self.repo.root / ".project.json").write_text(
+            json.dumps(project) + "\n",
+            encoding="utf-8",
+        )
+        (self.repo.root / ".project.json").chmod(0o644)
+        self.providers.chmod(0o755)
+        self.provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                issue="$2"
+                python3 - "$issue" <<'PY'
+                import json
+                import os
+                import pathlib
+                import sys
+                import urllib.request
+
+                config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+                marker = os.environ.get("PJAN21_CONTROLLER_ONLY_MARKER")
+                if marker:
+                    pathlib.Path(config["controller_marker_effect"]).write_text(marker)
+                pathlib.Path(config["outside_effect"]).write_text("outside")
+                request = urllib.request.Request(
+                    config["test_endpoint"], data=b"{}", method="POST"
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    response.read()
+                print(json.dumps({
+                    "provider": "plane",
+                    "status": "posted",
+                    "target_issue": sys.argv[1],
+                    "error_category": None,
+                    "error_summary": None,
+                }, separators=(",", ":")))
+                PY
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.provider.chmod(0o755)
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        self.fingerprint = prepared["artifact_fingerprint"]
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.server_thread.join(timeout=2)
+        for path in (self.controller_marker_effect, self.outside_effect):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        self.repo.close()
+
+    def _assert_rejected_before_launch(self):
+        with mock.patch.dict(
+            os.environ,
+            {"PJAN21_CONTROLLER_ONLY_MARKER": "synthetic-controller-only"},
+            clear=False,
+        ):
+            result = RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        self.assertEqual(result["status"], "failed")
+        self.assertNotEqual(stored["routing"]["status"], "posted")
+        self.assertFalse(self.controller_marker_effect.exists())
+        self.assertFalse(self.outside_effect.exists())
+        self.assertEqual(self.Handler.calls, 0)
+
+    def test_mode_0666_non_executable_provider_is_rejected_before_launch(self):
+        self.provider.chmod(0o666)
+        self._assert_rejected_before_launch()
+
+    def test_world_writable_provider_component_is_rejected_before_launch(self):
+        self.providers.chmod(0o777)
+        self._assert_rejected_before_launch()
+
+    def test_world_writable_repository_anchor_is_rejected_before_launch(self):
+        self.repo.root.chmod(0o777)
+        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"):
+            RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        self.assertNotEqual(stored["routing"]["status"], "posted")
+        self.assertFalse(self.controller_marker_effect.exists())
+        self.assertFalse(self.outside_effect.exists())
+        self.assertEqual(self.Handler.calls, 0)
+
+    def test_group_writable_project_configuration_is_rejected_before_launch(self):
+        (self.repo.root / ".project.json").chmod(0o664)
+        with mock.patch.dict(
+            os.environ,
+            {"PJAN21_CONTROLLER_ONLY_MARKER": "synthetic-controller-only"},
+            clear=False,
+        ):
+            with self.assertRaisesRegex(
+                RETRO.RetroError,
+                "invalid_repository_identity",
+            ):
+                RETRO.deliver(
+                    self.repo.root,
+                    self.fingerprint,
+                    providers_dir=self.providers,
+                )
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        self.assertNotEqual(stored["routing"]["status"], "posted")
+        self.assertFalse(self.controller_marker_effect.exists())
+        self.assertFalse(self.outside_effect.exists())
+        self.assertEqual(self.Handler.calls, 0)
+
+    def test_controller_source_permissions_are_revalidated_before_launch(self):
+        original_mode = stat.S_IMODE(HELPER_PATH.stat().st_mode)
+        try:
+            HELPER_PATH.chmod(0o666)
+            result = RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        finally:
+            HELPER_PATH.chmod(original_mode)
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        self.assertEqual(result["status"], "failed")
+        self.assertNotEqual(stored["routing"]["status"], "posted")
+        self.assertEqual(self.Handler.calls, 0)
+
+    def test_provider_environment_is_provider_specific_and_controller_marker_free(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/synthetic/controller/path",
+                "TMPDIR": str(self.repo.root),
+                "PLANE_API_KEY": "synthetic-plane-value",
+                "LINEAR_API_KEY": "synthetic-linear-value",
+                "TRELLO_KEY": "synthetic-trello-key",
+                "TRELLO_TOKEN": "synthetic-trello-value",
+                "PJAN21_CONTROLLER_ONLY_MARKER": "synthetic-controller-only",
+            },
+            clear=True,
+        ):
+            environments = {
+                provider: RETRO._provider_environment(
+                    provider,
+                    {"type": provider},
+                )
+                for provider in ("linear", "plane", "trello")
+            }
+        expected = {
+            "linear": {"LINEAR_API_KEY"},
+            "plane": {"PLANE_API_KEY"},
+            "trello": {"TRELLO_KEY", "TRELLO_TOKEN"},
+        }
+        all_secrets = set().union(*expected.values())
+        for provider, environment in environments.items():
+            with self.subTest(provider=provider):
+                self.assertTrue(expected[provider].issubset(environment))
+                self.assertFalse(
+                    (all_secrets - expected[provider]) & environment.keys()
+                )
+                self.assertNotIn("PJAN21_CONTROLLER_ONLY_MARKER", environment)
+                self.assertNotIn("TMPDIR", environment)
+                self.assertEqual(environment["TICKET_PROVIDER"], provider)
+                self.assertEqual(environment["PATH"], os.defpath)
+
+    def test_read_only_root_uses_ephemeral_temp_and_cleans_provider_subtree(self):
+        self.provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                issue="$2"
+                (
+                  sleep 0.6
+                  python3 - <<'PY'
+                import json
+                import os
+                import urllib.request
+                config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+                request = urllib.request.Request(
+                    config["test_endpoint"].replace("/provider", "/delayed"),
+                    data=b"{}",
+                    method="POST",
+                )
+                urllib.request.urlopen(request, timeout=2).read()
+                PY
+                ) &
+                python3 - "$issue" <<'PY'
+                import json
+                import os
+                import pathlib
+                import sys
+                import urllib.request
+
+                config = json.loads(os.environ["HERMES_BOUND_TICKET_PROVIDER_JSON"])
+                temp_path = pathlib.Path(os.environ["TMPDIR"])
+                temp_probe = temp_path / "provider-temp-probe"
+                temp_probe.write_text("temporary")
+                outside_blocked = False
+                try:
+                    pathlib.Path(config["outside_effect"]).write_text("outside")
+                except OSError:
+                    outside_blocked = True
+                observation = {
+                    "controller_marker_absent": (
+                        "PJAN21_CONTROLLER_ONLY_MARKER" not in os.environ
+                    ),
+                    "outside_blocked": outside_blocked,
+                    "temp_path": str(temp_path),
+                    "temp_write": temp_probe.read_text() == "temporary",
+                }
+                request = urllib.request.Request(
+                    config["test_endpoint"],
+                    data=json.dumps(observation).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=2) as response:
+                    response.read()
+                print(json.dumps({
+                    "provider": "plane",
+                    "status": "posted",
+                    "target_issue": sys.argv[1],
+                    "error_category": None,
+                    "error_summary": None,
+                }, separators=(",", ":")))
+                PY
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.provider.chmod(0o755)
+        with mock.patch.dict(
+            os.environ,
+            {"PJAN21_CONTROLLER_ONLY_MARKER": "synthetic-controller-only"},
+            clear=False,
+        ):
+            result = RETRO.deliver(
+                self.repo.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+        self.assertEqual(result["status"], "posted")
+        self.assertEqual(self.Handler.calls, 1)
+        observation = self.Handler.payloads[0]
+        self.assertTrue(observation["controller_marker_absent"])
+        self.assertTrue(observation["outside_blocked"])
+        self.assertTrue(observation["temp_write"])
+        self.assertFalse(pathlib.Path(observation["temp_path"]).exists())
+        time.sleep(0.8)
+        self.assertEqual(self.Handler.delayed_calls, 0)
+        self.assertFalse(self.outside_effect.exists())
+
+
 class AdapterEnsureCommentTests(unittest.TestCase):
     def setUp(self):
         self.repo = RepoFixture()
         self.root = self.repo.root
         self.providers = self.root / "providers"
         self.providers.mkdir()
+        self.providers.chmod(0o755)
         self.store = self.root / "comments"
         self.store.touch()
         self.calls = self.root / "calls"
         self.calls.touch()
+        self._configure_provider(
+            FAKE_COMMENT_STORE=str(self.store),
+            FAKE_CALL_STORE=str(self.calls),
+        )
         fake = self.providers / "plane.sh"
         fake.write_text(
             textwrap.dedent(
@@ -2119,15 +2439,15 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 op="$1"; shift
                 [ "$op" = ensure_comment ] || exit 2
                 issue="$1"; marker="$2"; body="$3"
-                printf '%s|%s|%s\\n' "${TICKET_PROVIDER:-unset}" "$issue" "$marker" >> "$FAKE_CALL_STORE"
-                if grep -Fq "$marker" "$FAKE_COMMENT_STORE"; then
+                printf '%s|%s|%s\\n' "${TICKET_PROVIDER:-unset}" "$issue" "$marker" >> "$HERMES_PROVIDER_CONFIG_FAKE_CALL_STORE"
+                if grep -Fq "$marker" "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"; then
                   printf '{"provider":"plane","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                   exit 0
                 fi
                 sleep 0.1
-                printf '%s\\n' "$body" >> "$FAKE_COMMENT_STORE"
-                if [ "${FAKE_LOST_RESPONSE_ONCE:-0}" = 1 ] && [ ! -e "$FAKE_LOST_MARK" ]; then
-                  : > "$FAKE_LOST_MARK"
+                printf '%s\\n' "$body" >> "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"
+                if [ "${HERMES_PROVIDER_CONFIG_FAKE_LOST_RESPONSE_ONCE:-0}" = 1 ] && [ ! -e "$HERMES_PROVIDER_CONFIG_FAKE_LOST_MARK" ]; then
+                  : > "$HERMES_PROVIDER_CONFIG_FAKE_LOST_MARK"
                   printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"response not confirmed"}\\n' "$issue"
                 else
                   printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
@@ -2142,7 +2462,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             textwrap.dedent(
                 """\
                 #!/usr/bin/env sh
-                printf 'WRONG_PROVIDER_CALLED\\n' >> "$FAKE_CALL_STORE"
+                printf 'WRONG_PROVIDER_CALLED\\n' >> "$HERMES_PROVIDER_CONFIG_FAKE_CALL_STORE"
                 exit 99
                 """
             ),
@@ -2155,14 +2475,24 @@ class AdapterEnsureCommentTests(unittest.TestCase):
     def tearDown(self):
         self.repo.close()
 
+    def _configure_provider(self, **values):
+        project_path = self.root / ".project.json"
+        project = json.loads(project_path.read_text(encoding="utf-8"))
+        project["ticket_provider"].update(
+            {name.casefold(): value for name, value in values.items()}
+        )
+        project_path.write_text(
+            json.dumps(project) + "\n",
+            encoding="utf-8",
+        )
+        project_path.chmod(0o644)
+
     def call_delivery(self, extra_env=None):
+        self._configure_provider(**(extra_env or {}))
         with mock.patch.dict(
             os.environ,
             {
                 "TICKET_PROVIDER": "trello",
-                "FAKE_COMMENT_STORE": str(self.store),
-                "FAKE_CALL_STORE": str(self.calls),
-                **(extra_env or {}),
             },
             clear=False,
         ):
@@ -2235,26 +2565,32 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 op="$1"; shift
                 [ "$op" = ensure_comment ] || exit 2
                 issue="$1"; marker="$2"; body="$3"
-                if grep -Fq "$marker" "$FAKE_COMMENT_STORE"; then
+                if grep -Fq "$marker" "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"; then
                   printf '{"provider":"plane","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                   exit 0
                 fi
-                if mkdir "$FAKE_FIRST_CLAIM" 2>/dev/null; then
-                  : > "$FAKE_PROVIDER_STARTED"
+                if mkdir "$HERMES_PROVIDER_CONFIG_FAKE_FIRST_CLAIM" 2>/dev/null; then
+                  : > "$HERMES_PROVIDER_CONFIG_FAKE_PROVIDER_STARTED"
                   sleep 1.5
-                  printf '%s\\n' "$body" >> "$FAKE_COMMENT_STORE"
-                  printf 'post\\n' >> "$FAKE_POST_STORE"
+                  printf '%s\\n' "$body" >> "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"
+                  printf 'post\\n' >> "$HERMES_PROVIDER_CONFIG_FAKE_POST_STORE"
                   printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                   exit 0
                 fi
-                printf 'duplicate-post-attempt\\n' >> "$FAKE_POST_STORE"
-                printf '%s\\n' "$body" >> "$FAKE_COMMENT_STORE"
+                printf 'duplicate-post-attempt\\n' >> "$HERMES_PROVIDER_CONFIG_FAKE_POST_STORE"
+                printf '%s\\n' "$body" >> "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"
                 printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                 """
             ),
             encoding="utf-8",
         )
         provider.chmod(0o755)
+        self._configure_provider(
+            FAKE_COMMENT_STORE=str(self.store),
+            FAKE_PROVIDER_STARTED=str(started),
+            FAKE_FIRST_CLAIM=str(first_claim),
+            FAKE_POST_STORE=str(posts),
+        )
         command = [
             sys.executable,
             str(HELPER_PATH),
@@ -2269,10 +2605,6 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         environment = {
             **os.environ,
             "PYTHONDONTWRITEBYTECODE": "1",
-            "FAKE_COMMENT_STORE": str(self.store),
-            "FAKE_PROVIDER_STARTED": str(started),
-            "FAKE_FIRST_CLAIM": str(first_claim),
-            "FAKE_POST_STORE": str(posts),
         }
         controller = subprocess.Popen(
             command,
@@ -2423,7 +2755,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env sh
                 set -eu
-                python3 - "$DESCENDANT_PID" "$DESCENDANT_READY" "$DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
+                python3 - "$HERMES_PROVIDER_CONFIG_DESCENDANT_PID" "$HERMES_PROVIDER_CONFIG_DESCENDANT_READY" "$HERMES_PROVIDER_CONFIG_DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
                 import os, pathlib, resource, signal, sys, time
                 child = os.fork()
                 if child:
@@ -2448,27 +2780,24 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 time.sleep(10)
                 PY
                 deadline=200
-                while [ ! -e "$DESCENDANT_READY" ] && [ "$deadline" -gt 0 ]; do
+                while [ ! -e "$HERMES_PROVIDER_CONFIG_DESCENDANT_READY" ] && [ "$deadline" -gt 0 ]; do
                   sleep 0.01
                   deadline=$((deadline - 1))
                 done
-                [ -e "$DESCENDANT_READY" ] || exit 91
+                [ -e "$HERMES_PROVIDER_CONFIG_DESCENDANT_READY" ] || exit 91
                 printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$2"
                 """
             ),
             encoding="utf-8",
         )
         provider.chmod(0o755)
-        with mock.patch.dict(
-            os.environ,
+        result = self.call_delivery(
             {
                 "DESCENDANT_PID": str(descendant_pid),
                 "DESCENDANT_READY": str(ready),
                 "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
-            },
-            clear=False,
-        ):
-            result = self.call_delivery()
+            }
+        )
         self.assertEqual(result["status"], "posted")
         self.assertTrue(descendant_pid.exists())
         self.assertGreater(int(descendant_pid.read_text(encoding="utf-8")), 1)
@@ -2503,7 +2832,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env sh
                 set -eu
-                ( sleep 0.7; printf 'escaped\\n' > "$CONTAINMENT_EFFECT" ) &
+                ( sleep 0.7; printf 'escaped\\n' > "$HERMES_PROVIDER_CONFIG_CONTAINMENT_EFFECT" ) &
                 sleep 10
                 """
             ),
@@ -2513,21 +2842,14 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
         payload = RETRO._provider_supervisor_payload(
             stored,
-            {"type": "plane"},
+            {"type": "plane", "containment_effect": str(effect)},
         )
         payload["provider_timeout_seconds"] = 0.2
         script_fd = os.open(provider, os.O_RDONLY)
         started = time.monotonic()
         try:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {
-                        "CONTAINMENT_EFFECT": str(effect),
-                        "TMPDIR": str(self.root),
-                    },
-                    clear=False,
-                ),
+                mock.patch.dict(os.environ, {"TMPDIR": str(self.root)}, clear=False),
                 mock.patch.object(
                     RETRO,
                     failing_symbol,
@@ -2830,7 +3152,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 textwrap.dedent(
                     """\
                     #!/usr/bin/env sh
-                    printf 'replacement\\n' > "$REPLACEMENT_MARK"
+                    printf 'replacement\\n' > "$HERMES_PROVIDER_CONFIG_REPLACEMENT_MARK"
                     printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$2"
                     """
                 ),
@@ -2882,26 +3204,22 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 #!/usr/bin/env sh
                 set -eu
                 issue="$2"; marker="$3"; body="$4"
-                printf 'started\\n' >> "$PROVIDER_STARTED"
-                if grep -Fq "$marker" "$FAKE_COMMENT_STORE"; then
+                printf 'started\\n' >> "$HERMES_PROVIDER_CONFIG_PROVIDER_STARTED"
+                if grep -Fq "$marker" "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"; then
                   printf '{"provider":"plane","status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                   exit 0
                 fi
                 sleep 0.6
-                printf '%s\\n' "$body" >> "$FAKE_COMMENT_STORE"
+                printf '%s\\n' "$body" >> "$HERMES_PROVIDER_CONFIG_FAKE_COMMENT_STORE"
                 printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$issue"
                 """
             ),
             encoding="utf-8",
         )
         provider.chmod(0o755)
+        self._configure_provider(PROVIDER_STARTED=str(started))
         held_root = self.root.with_name(f"{self.root.name}-copy-held")
         self.addCleanup(shutil.rmtree, held_root, True)
-        environment = {
-            "PROVIDER_STARTED": str(started),
-            "FAKE_COMMENT_STORE": str(self.store),
-            "FAKE_CALL_STORE": str(self.calls),
-        }
 
         def deliver(fingerprint):
             try:
@@ -2912,7 +3230,6 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 return error.category
 
         with (
-            mock.patch.dict(os.environ, environment, clear=False),
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor,
         ):
             first = executor.submit(deliver, self.fingerprint)
@@ -2929,8 +3246,8 @@ class AdapterEnsureCommentTests(unittest.TestCase):
 
         marker = self.prepared["comment_fingerprint_marker"]
         self.assertEqual(self.store.read_text(encoding="utf-8").count(marker), 1)
-        self.assertIn("already_present", [first_result, second_result])
         self.assertIn("unsafe_artifact_path", [first_result, second_result])
+        self.assertTrue({"posted", "already_present"} & {first_result, second_result})
 
     def test_provider_execution_uses_bound_config_through_containment_supervisor(self):
         provider = self.providers / "plane.sh"
@@ -2997,15 +3314,19 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 (
                   trap 'exit 0' TERM INT
                   sleep 0.8
-                  printf 'escaped\\n' >> "$DELAYED_SIDE_EFFECT"
+                  printf 'escaped\\n' >> "$HERMES_PROVIDER_CONFIG_DELAYED_SIDE_EFFECT"
                 ) >/dev/null 2>&1 &
-                printf '%s\\n' "$!" > "$DESCENDANT_PID"
+                printf '%s\\n' "$!" > "$HERMES_PROVIDER_CONFIG_DESCENDANT_PID"
                 sleep 10
                 """
             ),
             encoding="utf-8",
         )
         provider.chmod(0o755)
+        self._configure_provider(
+            DESCENDANT_PID=str(descendant_pid),
+            DELAYED_SIDE_EFFECT=str(delayed_side_effect),
+        )
         original_run = RETRO.subprocess.run
 
         def short_run(*args, **kwargs):
@@ -3015,14 +3336,6 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         with (
             mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2, create=True),
             mock.patch.object(RETRO.subprocess, "run", side_effect=short_run),
-            mock.patch.dict(
-                os.environ,
-                {
-                    "DESCENDANT_PID": str(descendant_pid),
-                    "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
-                },
-                clear=False,
-            ),
         ):
             started = time.monotonic()
             result = RETRO.deliver(
@@ -3047,7 +3360,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env sh
                 set -eu
-                python3 - "$DESCENDANT_PID" "$DELAYED_SIDE_EFFECT" <<'PY' &
+                python3 - "$HERMES_PROVIDER_CONFIG_DESCENDANT_PID" "$HERMES_PROVIDER_CONFIG_DELAYED_SIDE_EFFECT" <<'PY' &
                 import os, pathlib, signal, sys, time
                 os.setsid()
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -3061,18 +3374,13 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             encoding="utf-8",
         )
         provider.chmod(0o755)
-        with (
-            mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2),
-            mock.patch.dict(
-                os.environ,
+        with mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2):
+            result = self.call_delivery(
                 {
                     "DESCENDANT_PID": str(descendant_pid),
                     "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
-                },
-                clear=False,
-            ),
-        ):
-            result = self.call_delivery()
+                }
+            )
         self.assertEqual(result["status"], "failed")
         time.sleep(1.0)
         self.assertFalse(delayed_side_effect.exists())
@@ -3087,7 +3395,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env sh
                 set -eu
-                python3 - "$DESCENDANT_PID" "$DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
+                python3 - "$HERMES_PROVIDER_CONFIG_DESCENDANT_PID" "$HERMES_PROVIDER_CONFIG_DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
                 import os, pathlib, sys, time
                 os.setsid()
                 pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
@@ -3101,15 +3409,12 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             encoding="utf-8",
         )
         provider.chmod(0o755)
-        with mock.patch.dict(
-            os.environ,
+        result = self.call_delivery(
             {
                 "DESCENDANT_PID": str(descendant_pid),
                 "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
-            },
-            clear=False,
-        ):
-            result = self.call_delivery()
+            }
+        )
         self.assertEqual(result["status"], "posted")
         time.sleep(1.0)
         self.assertFalse(delayed_side_effect.exists())
@@ -3125,7 +3430,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
                 """\
                 #!/usr/bin/env sh
                 set -eu
-                setsid python3 - "$DESCENDANT_PID" "$DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
+                setsid python3 - "$HERMES_PROVIDER_CONFIG_DESCENDANT_PID" "$HERMES_PROVIDER_CONFIG_DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
                 import os, pathlib, signal, sys, time
                 child = os.fork()
                 if child:
@@ -3143,18 +3448,13 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             encoding="utf-8",
         )
         provider.chmod(0o755)
-        with (
-            mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2),
-            mock.patch.dict(
-                os.environ,
+        with mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2):
+            result = self.call_delivery(
                 {
                     "DESCENDANT_PID": str(descendant_pid),
                     "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
-                },
-                clear=False,
-            ),
-        ):
-            result = self.call_delivery()
+                }
+            )
         self.assertEqual(result["status"], "failed")
         self.assertTrue(descendant_pid.exists())
         self.assertGreater(int(descendant_pid.read_text(encoding="utf-8")), 1)
@@ -3214,7 +3514,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         command = provider_calls[0].args[0]
         self.assertEqual(command[:3], [sys.executable, "-", "_supervise-provider"])
         self.assertIsInstance(provider_calls[0].kwargs["stdin"], int)
-        self.assertEqual(len(provider_calls[0].kwargs["pass_fds"]), 2)
+        self.assertEqual(len(provider_calls[0].kwargs["pass_fds"]), 3)
 
 
 class PlanePaginationTests(unittest.TestCase):
@@ -4085,6 +4385,11 @@ class ProtocolParityTests(unittest.TestCase):
             "final syscall window",
             "immutable/mount helpers",
             "trusted mutation daemons",
+            "explicit environment allowlist",
+            "`HERMES_PROVIDER_CONFIG_` namespace",
+            "group/world",
+            "mounts `/` read-only",
+            "prepared repository is writable",
             "valid existing final binding",
             "zero-byte final-name poison",
             "`next_page_results=false`",

@@ -289,9 +289,33 @@ comment / transition per the lifecycle) before the general reconcile below.
 
     The provider script and controller source are opened by descriptor, receive
     only the already-bound configuration, and execute from inherited
-    descriptors through Python/shell stdin. A detached trusted supervisor—not
-    the delivery controller—owns the keyed socket for the complete provider
-    lifetime, so controller `SIGKILL` cannot release exclusion. On Linux it
+    descriptors through Python/shell stdin. Before launch, every
+    provider-relative containing directory, the provider script,
+    `.project.json`, and the controller source are revalidated from stable
+    descriptors. Repository-origin files must be regular, the provider must be
+    executable, the approved owner is root or the controller's effective UID,
+    and none of these files or provider-relative directories may be group/world
+    writable. The repository descriptor, current path identity, configuration
+    device/inode plus byte digest, and provider descriptor are checked again
+    immediately before launch; drift fails closed with no provider call.
+
+    The supervisor and provider receive an explicit environment allowlist
+    rather than the controller environment. It contains only bounded
+    execution/runtime fields with a fixed system `PATH`, credentials and
+    endpoints for the prepared provider, the complete descriptor-bound
+    provider configuration, and scalar
+    configuration values under the `HERMES_PROVIDER_CONFIG_` namespace. A
+    controller-only environment field is never inherited, credentials are
+    never printed, and `TICKET_PROVIDER` remains the prepared provider.
+    Bubblewrap mounts `/` read-only, then mounts only the identity-checked
+    prepared repository and one fresh dedicated temporary directory writable.
+    `TMPDIR` names that temporary directory; it is removed only after the
+    complete provider subtree is terminated and reaped. No persistent path
+    outside the prepared repository is writable.
+
+    A detached trusted supervisor—not the delivery controller—owns the keyed
+    socket for the complete provider lifetime, so controller `SIGKILL` cannot
+    release exclusion. On Linux it
     accepts only a root-owned, non-group/world-writable Bubblewrap executable,
     creates a private PID namespace with `--unshare-pid --as-pid-1`, and blocks
     the adapter before execution until a bounded typed `--info-fd` response has
