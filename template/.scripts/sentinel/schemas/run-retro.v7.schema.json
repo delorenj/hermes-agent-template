@@ -1,28 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://hermes.delo.sh/schemas/run-retro.v6.schema.json",
+  "$id": "https://hermes.delo.sh/schemas/run-retro.v7.schema.json",
   "title": "Hermes durable post-loop retro artifact",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "schema",
     "schema_version",
-    "artifact_fingerprint",
-    "comment_fingerprint",
     "run_id",
     "correlation_id",
     "repo",
     "provider",
     "source_issue",
-    "target_issue",
     "local_tracking_reference",
     "decisions",
     "protected_evidence_refs",
     "sanitization",
     "operator_action_required",
-    "comment_fingerprint_marker",
-    "comment_body",
-    "recorded_at",
     "routing"
   ],
   "properties": {
@@ -30,19 +24,13 @@
       "const": "hermes.run-retro"
     },
     "schema_version": {
-      "const": 6
-    },
-    "artifact_fingerprint": {
-      "$ref": "#/$defs/sha256"
-    },
-    "comment_fingerprint": {
-      "$ref": "#/$defs/sha256"
+      "const": 7
     },
     "run_id": {
-      "$ref": "#/$defs/invocation"
+      "$ref": "#/$defs/rfcUuid"
     },
     "correlation_id": {
-      "$ref": "#/$defs/invocation"
+      "$ref": "#/$defs/rfcUuid"
     },
     "repo": {
       "type": "string",
@@ -68,24 +56,13 @@
         }
       ]
     },
-    "target_issue": {
+    "local_tracking_reference": {
       "oneOf": [
         {
           "$ref": "#/$defs/rfcUuid"
         },
         {
           "$ref": "#/$defs/trelloId"
-        },
-        {
-          "type": "null"
-        }
-      ]
-    },
-    "local_tracking_reference": {
-      "oneOf": [
-        {
-          "type": "string",
-          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
         },
         {
           "type": "null"
@@ -122,9 +99,7 @@
       "maxItems": 32,
       "uniqueItems": true,
       "items": {
-        "type": "string",
-        "maxLength": 300,
-        "pattern": "^(?!\\.\\.(?:/|$))(?!.*\\/\\.\\.(?:/|$))(?:evidence:[A-Za-z0-9._:-]+|[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)$"
+        "$ref": "#/$defs/evidenceRef"
       }
     },
     "sanitization": {
@@ -158,27 +133,13 @@
     "operator_action_required": {
       "type": "boolean"
     },
-    "comment_fingerprint_marker": {
-      "type": "string",
-      "pattern": "^\\[run-retro-comment:[0-9a-f]{64}\\]$"
-    },
-    "comment_body": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 4096,
-      "pattern": "\\n\\[run-retro-comment:[0-9a-f]{64}\\]$"
-    },
-    "recorded_at": {
-      "$ref": "#/$defs/utcTimestamp"
-    },
     "routing": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "status",
         "error_category",
-        "error_summary",
-        "updated_at"
+        "updated_at_epoch_us"
       ],
       "properties": {
         "status": {
@@ -205,23 +166,8 @@
             }
           ]
         },
-        "error_summary": {
-          "oneOf": [
-            {
-              "enum": [
-                "comment lookup failed; no post attempted",
-                "comment post failed; retry ensure_comment",
-                "provider response not confirmed",
-                "provider adapter unavailable"
-              ]
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "updated_at": {
-          "$ref": "#/$defs/utcTimestamp"
+        "updated_at_epoch_us": {
+          "$ref": "#/$defs/epochMicroseconds"
         }
       }
     }
@@ -253,7 +199,7 @@
               }
             ]
           },
-          "target_issue": {
+          "local_tracking_reference": {
             "oneOf": [
               {
                 "$ref": "#/$defs/rfcUuid"
@@ -277,7 +223,7 @@
               }
             ]
           },
-          "target_issue": {
+          "local_tracking_reference": {
             "oneOf": [
               {
                 "$ref": "#/$defs/trelloId"
@@ -303,9 +249,6 @@
       },
       "then": {
         "properties": {
-          "target_issue": {
-            "type": "null"
-          },
           "operator_action_required": {
             "const": true
           },
@@ -323,11 +266,6 @@
       },
       "else": {
         "properties": {
-          "target_issue": {
-            "not": {
-              "type": "null"
-            }
-          },
           "routing": {
             "properties": {
               "status": {
@@ -417,48 +355,16 @@
       "then": {
         "properties": {
           "routing": {
-            "oneOf": [
-              {
-                "properties": {
-                  "error_category": {
-                    "const": "lookup_failed"
-                  },
-                  "error_summary": {
-                    "const": "comment lookup failed; no post attempted"
-                  }
-                }
-              },
-              {
-                "properties": {
-                  "error_category": {
-                    "const": "post_failed"
-                  },
-                  "error_summary": {
-                    "const": "comment post failed; retry ensure_comment"
-                  }
-                }
-              },
-              {
-                "properties": {
-                  "error_category": {
-                    "const": "response_unknown"
-                  },
-                  "error_summary": {
-                    "const": "provider response not confirmed"
-                  }
-                }
-              },
-              {
-                "properties": {
-                  "error_category": {
-                    "const": "serialization_failed"
-                  },
-                  "error_summary": {
-                    "const": "provider adapter unavailable"
-                  }
-                }
+            "properties": {
+              "error_category": {
+                "enum": [
+                  "lookup_failed",
+                  "post_failed",
+                  "response_unknown",
+                  "serialization_failed"
+                ]
               }
-            ]
+            }
           }
         }
       },
@@ -468,9 +374,6 @@
             "properties": {
               "error_category": {
                 "type": "null"
-              },
-              "error_summary": {
-                "type": "null"
               }
             }
           }
@@ -479,16 +382,6 @@
     }
   ],
   "$defs": {
-    "sha256": {
-      "type": "string",
-      "pattern": "^[0-9a-f]{64}$"
-    },
-    "invocation": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 200,
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$"
-    },
     "rfcUuid": {
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
@@ -497,10 +390,14 @@
       "type": "string",
       "pattern": "^[0-9a-f]{24}$"
     },
-    "utcTimestamp": {
+    "evidenceRef": {
       "type": "string",
-      "format": "date-time",
-      "pattern": "^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{6}Z$"
+      "pattern": "^evidence:[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "epochMicroseconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 253402300799999999
     },
     "safeSummary": {
       "type": "string",
@@ -534,45 +431,5 @@
         }
       }
     }
-  },
-  "x-hermes-cross-field-invariants": [
-    "source_issue and target_issue are byte-equal canonical IDs or both null",
-    "artifact_fingerprint is the documented LF-terminated artifact preimage digest",
-    "comment_fingerprint and marker are the documented LF-terminated comment preimage digest",
-    "comment_body is the exact immutable body computed from decisions, operator_action_required, and marker",
-    "only routing status, error_category, error_summary, and updated_at may change",
-    "posted, already_present, and no_target_issue are terminal and cannot regress"
-  ],
-  "x-hermes-normalization": {
-    "scalar": "Unicode NFKC, trim, reject control characters",
-    "summary": "byte-equal closed ASCII signal/action vocabulary; arbitrary text is forbidden",
-    "repository": "NFKC, trim, casefold, ASCII, then the repo pattern",
-    "provider_issue_id": "NFKC, trim, casefold, provider pattern, then byte-equal canonical storage"
-  },
-  "x-hermes-immutable-json-pointers": [
-    "/schema",
-    "/schema_version",
-    "/artifact_fingerprint",
-    "/comment_fingerprint",
-    "/run_id",
-    "/correlation_id",
-    "/repo",
-    "/provider",
-    "/source_issue",
-    "/target_issue",
-    "/local_tracking_reference",
-    "/decisions",
-    "/protected_evidence_refs",
-    "/sanitization",
-    "/operator_action_required",
-    "/comment_fingerprint_marker",
-    "/comment_body",
-    "/recorded_at"
-  ],
-  "x-hermes-mutable-json-pointers": [
-    "/routing/status",
-    "/routing/error_category",
-    "/routing/error_summary",
-    "/routing/updated_at"
-  ]
+  }
 }

@@ -21,7 +21,7 @@ import jsonschema
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "template" / ".scripts" / "sentinel" / "bin" / "run-retro.py"
 SCHEMA_PATH = (
-    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v6.schema.json"
+    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v7.schema.json"
 )
 PROMPT_PATH = ROOT / "template" / ".scripts" / "sentinel.prompt.md.jinja"
 DOC_PATH = (
@@ -72,7 +72,7 @@ def base_intent(run_id="00000000-0000-4000-8000-000000000001", source=ISSUE_ID):
             },
             "fix_scope": "repo-local",
         },
-        "protected_evidence_refs": ["evidence:retro-1"],
+        "protected_evidence_refs": ["evidence:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
         "sanitization": {
             "status": "sanitized",
             "omitted_categories": ["raw_logs"],
@@ -224,7 +224,7 @@ class RunRetroSerialContractTests(unittest.TestCase):
             self.repo.artifact(prepared["artifact_fingerprint"]),
             require_final=True,
         )
-        self.assertIsNone(document["target_issue"])
+        self.assertIsNone(document["source_issue"])
         self.assertTrue(document["operator_action_required"])
 
 
@@ -293,6 +293,25 @@ class RunRetroDurabilityTests(unittest.TestCase):
         path = self.repo.artifact(prepared["artifact_fingerprint"])
         self.assertFalse(list(path.parent.glob(f".{path.name}.tmp.*")))
 
+    def test_crash_after_immutable_binding_retries_without_content_drift(self):
+        with (
+            mock.patch.object(
+                RETRO,
+                "_durable_create",
+                side_effect=RuntimeError("simulated crash after binding"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(prepared["status"], "prepared")
+        changed = base_intent()
+        changed["decisions"]["what_hurt"]["summary"] = (
+            "signal=review_rework; action=tighten_review"
+        )
+        with self.assertRaisesRegex(RETRO.RetroError, "immutable_intent_mismatch"):
+            RETRO.prepare(self.repo.root, changed)
+
     def test_wrong_target_is_rejected_without_mutation(self):
         prepared = RETRO.prepare(self.repo.root, base_intent())
         path = self.repo.artifact(prepared["artifact_fingerprint"])
@@ -322,25 +341,34 @@ class RunRetroDurabilityTests(unittest.TestCase):
             schema, format_checker=jsonschema.FormatChecker()
         ).validate(document)
         self.assertEqual(
-            schema["x-hermes-immutable-json-pointers"],
-            [f"/{field}" for field in RETRO.IMMUTABLE_FIELDS],
+            set(schema["properties"]),
+            RETRO.ROOT_FIELDS,
         )
         self.assertEqual(
-            set(schema["x-hermes-mutable-json-pointers"]),
-            {f"/routing/{field}" for field in RETRO.ROUTING_FIELDS},
+            set(schema["properties"]["routing"]["properties"]),
+            RETRO.ROUTING_FIELDS,
         )
+        self.assertFalse(any(key.startswith("x-hermes") for key in schema))
         self.assertEqual(
             schema["$defs"]["safeSummary"]["pattern"],
             RETRO.SAFE_SUMMARY_RE.pattern,
         )
         self.assertEqual(
-            schema["properties"]["protected_evidence_refs"]["items"]["pattern"],
+            schema["$defs"]["evidenceRef"]["pattern"],
             RETRO.SAFE_REF_RE.pattern,
         )
         self.assertEqual(
-            schema["$defs"]["utcTimestamp"]["pattern"],
-            RETRO.UTC_TIMESTAMP_RE.pattern,
+            schema["$defs"]["epochMicroseconds"]["maximum"],
+            RETRO.MAX_EPOCH_US,
         )
+        duplicated_computed_fields = {
+            "artifact_fingerprint",
+            "comment_fingerprint",
+            "target_issue",
+            "comment_fingerprint_marker",
+            "comment_body",
+        }
+        self.assertTrue(duplicated_computed_fields.isdisjoint(document))
 
     def test_schema_and_runtime_share_exact_representable_acceptance_rules(self):
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
@@ -376,12 +404,18 @@ class RunRetroDurabilityTests(unittest.TestCase):
             RETRO.canonical_issue_id("plane", "00000000-0000-0000-0000-000000000000")
 
         adversarial = {
-            "offset_timestamp": ("recorded_at", "2026-07-27T00:00:00+00:00"),
+            "string_timestamp": (
+                "routing.updated_at_epoch_us",
+                "2026-07-27T00:00:00+00:00",
+            ),
             "arbitrary_summary": (
                 "decisions.what_hurt.summary",
                 f"Slack {SYNTHETIC_SLACK_TOKEN}",
             ),
-            "dotdot_reference": ("protected_evidence_refs", ["a/../b"]),
+            "path_reference": (
+                "protected_evidence_refs",
+                ["home/alice/private/customer.log"],
+            ),
         }
         for label, (pointer, value) in adversarial.items():
             mutated = json.loads(json.dumps(document))
@@ -395,6 +429,34 @@ class RunRetroDurabilityTests(unittest.TestCase):
                     validator.validate(mutated)
                 with self.assertRaises(RETRO.RetroError):
                     RETRO.validate_document(mutated)
+
+    def test_standard_schema_rejects_every_runtime_rejected_serialized_document(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        self.assertFalse(any(key.startswith("x-hermes") for key in schema))
+        validator = jsonschema.Draft202012Validator(
+            schema, format_checker=jsonschema.FormatChecker()
+        )
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        document = RETRO.read_artifact(
+            self.repo.artifact(prepared["artifact_fingerprint"])
+        )
+        mutations = {
+            "wrong_issue_shape": ("source_issue", "PJAN-21"),
+            "unsafe_reference": (
+                "protected_evidence_refs",
+                ["evidence:password:correct-horse-battery-staple"],
+            ),
+            "wrong_schema_version_type": ("schema_version", True),
+            "operator_mismatch": ("operator_action_required", True),
+        }
+        for label, (field, value) in mutations.items():
+            mutated = json.loads(json.dumps(document))
+            mutated[field] = value
+            with self.subTest(label=label):
+                with self.assertRaises(RETRO.RetroError):
+                    RETRO.validate_document(mutated)
+                with self.assertRaises(jsonschema.ValidationError):
+                    validator.validate(mutated)
 
     def test_repository_and_issue_identity_normalization_is_exact(self):
         self.assertEqual(RETRO.canonical_repo_identity(self.repo.root), "pjangler")
@@ -622,6 +684,216 @@ class RunRetroDurabilityTests(unittest.TestCase):
         )
         self.assertEqual(list(external.iterdir()), [])
 
+    def test_relocated_store_is_rejected_before_any_new_artifact_write(self):
+        relocated = self.repo.root.parent / f"{self.repo.root.name}-relocated-retros"
+        self.addCleanup(shutil.rmtree, relocated, True)
+        original_writer = RETRO._write_exclusive_temp
+        original_open = RETRO.os.open
+        create_attempts = []
+        swapped = False
+
+        def swap_then_write(*args, **kwargs):
+            nonlocal swapped
+            retro = (
+                self.repo.root
+                / "_bmad-output"
+                / "implementation-artifacts"
+                / "run-retros"
+            )
+            retro.rename(relocated)
+            swapped = True
+            return original_writer(*args, **kwargs)
+
+        def observe_open(path, flags, *args, **kwargs):
+            if swapped and flags & RETRO.os.O_CREAT:
+                create_attempts.append(str(path))
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                RETRO, "_write_exclusive_temp", side_effect=swap_then_write
+            ),
+            mock.patch.object(RETRO.os, "open", side_effect=observe_open),
+            self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(create_attempts, [])
+
+    def test_relocated_store_is_rejected_before_immutable_binding_write(self):
+        relocated = self.repo.root.parent / f"{self.repo.root.name}-relocated-binding"
+        self.addCleanup(shutil.rmtree, relocated, True)
+        original_binding = RETRO._ensure_binding
+        original_open = RETRO.os.open
+        create_attempts = []
+        swapped = False
+
+        def swap_then_bind(*args, **kwargs):
+            nonlocal swapped
+            retro = (
+                self.repo.root
+                / "_bmad-output"
+                / "implementation-artifacts"
+                / "run-retros"
+            )
+            retro.rename(relocated)
+            swapped = True
+            return original_binding(*args, **kwargs)
+
+        def observe_open(path, flags, *args, **kwargs):
+            if swapped and flags & RETRO.os.O_CREAT:
+                create_attempts.append(str(path))
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(RETRO, "_ensure_binding", side_effect=swap_then_bind),
+            mock.patch.object(RETRO.os, "open", side_effect=observe_open),
+            self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(create_attempts, [])
+
+    def test_relocated_store_is_rejected_before_any_new_lock_write(self):
+        relocated = self.repo.root.parent / f"{self.repo.root.name}-relocated-locks"
+        self.addCleanup(shutil.rmtree, relocated, True)
+        retro = (
+            self.repo.root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+        )
+        retro.mkdir(parents=True)
+        original_lock = RETRO._artifact_lock
+        original_open = RETRO.os.open
+        create_attempts = []
+        swapped = False
+
+        @contextlib.contextmanager
+        def swap_then_lock(*args, **kwargs):
+            nonlocal swapped
+            retro.rename(relocated)
+            swapped = True
+            with original_lock(*args, **kwargs):
+                yield
+
+        def observe_open(path, flags, *args, **kwargs):
+            if swapped and flags & RETRO.os.O_CREAT:
+                create_attempts.append(str(path))
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(RETRO, "_artifact_lock", swap_then_lock),
+            mock.patch.object(RETRO.os, "open", side_effect=observe_open),
+            self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
+        ):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(create_attempts, [])
+
+    def test_symlinked_immutable_binding_is_rejected_without_truncation(self):
+        retro = (
+            self.repo.root / "_bmad-output" / "implementation-artifacts" / "run-retros"
+        )
+        bindings = retro / ".bindings"
+        bindings.mkdir(parents=True)
+        fingerprint = RETRO.artifact_fingerprint("pjangler", base_intent()["run_id"])
+        victim = self.repo.root / "binding-victim"
+        victim.write_text("DO NOT TRUNCATE\n", encoding="utf-8")
+        (bindings / f"{fingerprint}.sha256").symlink_to(victim)
+        with self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"):
+            RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TRUNCATE\n")
+
+    def test_every_persisted_reference_shape_is_closed_and_opaque(self):
+        unsafe_fields = {
+            "run_id": SYNTHETIC_AWS_ACCESS_KEY,
+            "correlation_id": "123-45-6789",
+            "local_tracking_reference": SYNTHETIC_STRIPE_SECRET,
+            "protected_evidence_refs": [
+                "evidence:password:correct-horse-battery-staple"
+            ],
+        }
+        for field, value in unsafe_fields.items():
+            intent = base_intent()
+            intent[field] = value
+            with self.subTest(field=field), self.assertRaises(RETRO.RetroError):
+                RETRO.prepare(self.repo.root, intent)
+
+    def test_repository_configuration_is_read_through_the_held_descriptor(self):
+        with mock.patch.object(
+            RETRO,
+            "_read_utf8_json",
+            side_effect=AssertionError("pathname configuration reopen"),
+        ):
+            prepared = RETRO.prepare(self.repo.root, base_intent())
+        self.assertEqual(prepared["status"], "prepared")
+
+    def test_cli_input_and_artifact_reads_are_bounded(self):
+        input_limit = getattr(RETRO, "MAX_INPUT_BYTES", 64 * 1024)
+        artifact_limit = getattr(RETRO, "MAX_ARTIFACT_BYTES", 64 * 1024)
+        oversized_input = self.repo.root / "oversized-input.json"
+        oversized_input.write_bytes(b"{" + (b" " * input_limit) + b"}")
+        prepare = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "prepare",
+                "--repo-root",
+                str(self.repo.root),
+                "--intent",
+                str(oversized_input),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(prepare.returncode, 3)
+        self.assertEqual(
+            json.loads(prepare.stdout)["error_category"], "input_too_large"
+        )
+        self.assertEqual(prepare.stderr, "")
+        stdin_prepare = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "prepare",
+                "--repo-root",
+                str(self.repo.root),
+                "--intent",
+                "-",
+            ],
+            input=b"{" + (b" " * input_limit) + b"}",
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(stdin_prepare.returncode, 3)
+        self.assertEqual(
+            json.loads(stdin_prepare.stdout.decode("utf-8"))["error_category"],
+            "input_too_large",
+        )
+        self.assertEqual(stdin_prepare.stderr, b"")
+
+        prepared = RETRO.prepare(
+            self.repo.root,
+            base_intent("00000000-0000-4000-8000-000000000099"),
+        )
+        artifact = self.repo.artifact(prepared["artifact_fingerprint"])
+        artifact.write_bytes(b"{" + (b" " * artifact_limit) + b"}")
+        validate = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "validate",
+                "--repo-root",
+                str(self.repo.root),
+                "--artifact-fingerprint",
+                prepared["artifact_fingerprint"],
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(validate.returncode, 3)
+        self.assertEqual(
+            json.loads(validate.stdout)["error_category"], "artifact_too_large"
+        )
+        self.assertEqual(validate.stderr, "")
+
 
 class AdapterEnsureCommentTests(unittest.TestCase):
     def setUp(self):
@@ -841,8 +1113,8 @@ class AdapterEnsureCommentTests(unittest.TestCase):
     def test_same_marker_has_one_immutable_body_across_failure_and_retry(self):
         path = self.repo.artifact(self.fingerprint)
         before = RETRO.read_artifact(path)
-        body = before["comment_body"]
-        marker = before["comment_fingerprint_marker"]
+        body = RETRO.comment_body(before)
+        marker = RETRO.comment_marker(before)
         self.call_delivery(
             {
                 "FAKE_LOST_RESPONSE_ONCE": "1",
@@ -850,13 +1122,13 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             }
         )
         failed = RETRO.read_artifact(path)
-        self.assertEqual(failed["comment_body"], body)
-        self.assertEqual(failed["comment_fingerprint_marker"], marker)
+        self.assertEqual(RETRO.comment_body(failed), body)
+        self.assertEqual(RETRO.comment_marker(failed), marker)
         self.assertEqual(failed["operator_action_required"], False)
         self.call_delivery()
         retried = RETRO.read_artifact(path)
-        self.assertEqual(retried["comment_body"], body)
-        self.assertEqual(retried["comment_fingerprint_marker"], marker)
+        self.assertEqual(RETRO.comment_body(retried), body)
+        self.assertEqual(RETRO.comment_marker(retried), marker)
 
     def test_wrong_extra_issue_argument_is_rejected_before_provider_call(self):
         fixture = self.root / "role"
@@ -885,12 +1157,12 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
 
-    def test_wrong_prepared_target_is_rejected_before_provider_call(self):
+    def test_tampered_prepared_source_is_rejected_before_provider_call(self):
         path = self.repo.artifact(self.fingerprint)
         document = RETRO.read_artifact(path)
-        document["target_issue"] = OTHER_ISSUE_ID
+        document["source_issue"] = OTHER_ISSUE_ID
         path.write_text(json.dumps(document), encoding="utf-8")
-        with self.assertRaisesRegex(RETRO.RetroError, "wrong_comment_target"):
+        with self.assertRaisesRegex(RETRO.RetroError, "immutable_intent_mismatch"):
             self.call_delivery()
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
 
@@ -922,7 +1194,7 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             [
                 document["provider"],
                 document["source_issue"],
-                document["comment_fingerprint_marker"],
+                RETRO.comment_marker(document),
             ]
         )
         lock_dir = self.repo.artifact(self.fingerprint).parent / ".locks" / "comments"
@@ -934,6 +1206,158 @@ class AdapterEnsureCommentTests(unittest.TestCase):
             self.call_delivery()
         self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TRUNCATE\n")
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_delivery_finalizes_through_the_held_store_without_path_reopen(self):
+        with mock.patch.object(
+            RETRO,
+            "finalize",
+            side_effect=AssertionError("deliver reopened the repository"),
+        ):
+            result = self.call_delivery()
+        self.assertEqual(result["status"], "posted")
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        self.assertEqual(stored["routing"]["status"], "posted")
+
+    def test_repository_path_replacement_cannot_split_provider_and_finalization(self):
+        held_root = self.root.with_name(f"{self.root.name}-held")
+        original_invoke = RETRO._invoke_provider
+        swapped = False
+
+        def replace_root_then_invoke(*args, **kwargs):
+            nonlocal swapped
+            self.root.rename(held_root)
+            shutil.copytree(held_root, self.root, symlinks=True)
+            swapped = True
+            return original_invoke(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                RETRO,
+                "_invoke_provider",
+                side_effect=replace_root_then_invoke,
+            ):
+                result = self.call_delivery()
+            self.assertEqual(result["status"], "posted")
+            held_artifact = (
+                held_root
+                / "_bmad-output"
+                / "implementation-artifacts"
+                / "run-retros"
+                / f"{self.fingerprint}.json"
+            )
+            replacement_artifact = self.repo.artifact(self.fingerprint)
+            self.assertEqual(
+                RETRO.read_artifact(held_artifact)["routing"]["status"],
+                "posted",
+            )
+            self.assertEqual(
+                RETRO.read_artifact(replacement_artifact)["routing"]["status"],
+                "prepared",
+            )
+        finally:
+            if swapped:
+                shutil.rmtree(self.root)
+                held_root.rename(self.root)
+
+    def test_timeout_terminates_and_reaps_the_entire_provider_process_group(self):
+        provider = self.providers / "plane.sh"
+        descendant_pid = self.root / "descendant.pid"
+        delayed_side_effect = self.root / "delayed-side-effect"
+        provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                (
+                  trap 'exit 0' TERM INT
+                  sleep 0.8
+                  printf 'escaped\\n' >> "$DELAYED_SIDE_EFFECT"
+                ) >/dev/null 2>&1 &
+                printf '%s\\n' "$!" > "$DESCENDANT_PID"
+                sleep 10
+                """
+            ),
+            encoding="utf-8",
+        )
+        provider.chmod(0o755)
+        original_run = RETRO.subprocess.run
+
+        def short_run(*args, **kwargs):
+            kwargs["timeout"] = 0.2
+            return original_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2, create=True),
+            mock.patch.object(RETRO.subprocess, "run", side_effect=short_run),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "DESCENDANT_PID": str(descendant_pid),
+                    "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
+                },
+                clear=False,
+            ),
+        ):
+            started = time.monotonic()
+            result = RETRO.deliver(
+                self.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["transition"], "updated")
+        self.assertLess(elapsed, 1.0)
+        time.sleep(1.0)
+        self.assertFalse(delayed_side_effect.exists())
+        pid = int(descendant_pid.read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_provider_output_is_bounded_and_terminates_the_process_group(self):
+        provider = self.providers / "plane.sh"
+        provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                while :; do
+                  printf '0123456789abcdef0123456789abcdef'
+                  printf '0123456789abcdef0123456789abcdef' >&2
+                done
+                """
+            ),
+            encoding="utf-8",
+        )
+        provider.chmod(0o755)
+        original_run = RETRO.subprocess.run
+
+        def short_run(*args, **kwargs):
+            kwargs["timeout"] = 0.5
+            return original_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 2.0, create=True),
+            mock.patch.object(RETRO.subprocess, "run", side_effect=short_run),
+        ):
+            started = time.monotonic()
+            result = RETRO.deliver(
+                self.root,
+                self.fingerprint,
+                providers_dir=self.providers,
+            )
+            elapsed = time.monotonic() - started
+        self.assertEqual(result["status"], "failed")
+        self.assertLess(elapsed, 0.5)
+
+    def test_provider_script_is_bound_by_descriptor_before_execution(self):
+        with mock.patch.object(
+            RETRO.os,
+            "stat",
+            side_effect=AssertionError("provider reopened by pathname"),
+        ):
+            result = self.call_delivery()
+        self.assertEqual(result["status"], "posted")
 
 
 class PlanePaginationTests(unittest.TestCase):
@@ -991,18 +1415,18 @@ class PlanePaginationTests(unittest.TestCase):
             },
         )
 
-    def test_plane_comment_lookup_exhausts_limit_offset_pages(self):
+    def test_plane_comment_lookup_exhausts_current_cursor_pages(self):
         self.write_curl(
             textwrap.dedent(
                 """\
                 #!/usr/bin/env sh
                 printf '%s\\n' "$*" >> "$CURL_LOG"
                 case "$*" in
-                  *offset=100*)
-                    printf '{"results":[{"comment_html":"safe %s"}],"total_results":101}\\n' "$RETRO_MARKER"
+                  *cursor=next-1*)
+                    printf '{"results":[{"id":"33333333-3333-4333-8333-333333333333","comment_html":"safe %s"}],"count":1,"total_results":2,"next_page_results":false,"next_cursor":null}\\n' "$RETRO_MARKER"
                     ;;
                   *)
-                    python3 -c 'import json; print(json.dumps({"results":[{"comment_html":"safe"}]*100,"total_results":101}))'
+                    printf '{"results":[{"id":"22222222-2222-4222-8222-222222222222","comment_html":"safe"}],"count":1,"total_results":2,"next_page_results":true,"next_cursor":"next-1"}\\n'
                     ;;
                 esac
                 """
@@ -1012,10 +1436,36 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["status"], "already_present")
         log = self.log.read_text(encoding="utf-8")
-        self.assertIn("offset=100", log)
+        self.assertIn("per_page=100", log)
+        self.assertIn("cursor=next-1", log)
+        self.assertNotIn("offset=", log)
         self.assertIn(f"/work-items/{ISSUE_ID}/comments/", log)
         self.assertNotIn("/issues/", log)
         self.assertNotIn("-X POST", log)
+
+    def test_plane_collection_snapshot_drift_fails_closed_without_post(self):
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *cursor=next-1*)
+                    printf '{"results":[{"id":"33333333-3333-4333-8333-333333333333","comment_html":"safe"}],"count":1,"total_results":1,"next_page_results":false,"next_cursor":null}\\n'
+                    ;;
+                  *)
+                    printf '{"results":[{"id":"22222222-2222-4222-8222-222222222222","comment_html":"safe"}],"count":1,"total_results":2,"next_page_results":true,"next_cursor":"next-1"}\\n'
+                    ;;
+                esac
+                """
+            )
+        )
+        result = self.run_plane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["error_category"], "lookup_failed")
+        self.assertNotIn("-X POST", self.log.read_text(encoding="utf-8"))
 
     def test_plane_lookup_failure_is_safe_and_does_not_post(self):
         self.write_curl(
@@ -1037,16 +1487,20 @@ class PlanePaginationTests(unittest.TestCase):
     def test_plane_malformed_success_envelopes_fail_closed_without_post(self):
         malformed_pages = [
             '{"detail":"temporary backend envelope"}',
-            '{"results":"not-a-list","total_results":0}',
-            '{"results":[]}',
-            '{"results":[],"total_results":"0"}',
-            '{"results":[],"total_results":true}',
-            '{"results":[],"total_results":-1}',
-            '{"results":[null],"total_results":1}',
-            '{"results":[{}],"total_results":1}',
-            '{"results":[{"comment_html":null}],"total_results":1}',
-            '{"results":[],"total_results":1}',
-            '{"results":[{"comment_html":"safe"}],"total_results":0}',
+            '{"results":"not-a-list","count":0,"total_results":0,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":"0","next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":true,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":-1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":true,"total_results":0,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":1,"total_results":0,"next_page_results":false,"next_cursor":null}',
+            '{"results":[null],"count":1,"total_results":1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[{}],"count":1,"total_results":1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[{"id":42,"comment_html":"safe"}],"count":1,"total_results":1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[{"id":"22222222-2222-4222-8222-222222222222","comment_html":null}],"count":1,"total_results":1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":1,"next_page_results":false,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":1,"next_page_results":true,"next_cursor":null}',
+            '{"results":[],"count":0,"total_results":1,"next_page_results":true,"next_cursor":"same"}',
+            '{"results":[],"count":0,"total_results":2001,"next_page_results":false,"next_cursor":null}',
         ]
         for index, page in enumerate(malformed_pages):
             with self.subTest(index=index, page=page):
@@ -1075,7 +1529,7 @@ class PlanePaginationTests(unittest.TestCase):
                 printf '%s\\n' "$*" >> "$CURL_LOG"
                 case "$*" in
                   *"-X POST"*) printf '{"id":"33333333-3333-4333-8333-333333333333"}\\n' ;;
-                  *) printf '{"results":[],"total_results":0}\\n' ;;
+                  *) printf '{"results":[],"count":0,"total_results":0,"next_page_results":false,"next_cursor":null}\\n' ;;
                 esac
                 """
             )
@@ -1089,6 +1543,51 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertIn(f"/work-items/{ISSUE_ID}/comments/", log)
         self.assertNotIn("/issues/", log)
 
+    def test_plane_post_requires_a_canonical_string_uuid(self):
+        malformed_responses = [
+            '{"id":null}',
+            '{"id":42}',
+            '{"id":"not-a-uuid"}',
+            '{"id":"33333333-3333-4333-0333-333333333333"}',
+            "null",
+        ]
+        for index, response in enumerate(malformed_responses):
+            with self.subTest(index=index, response=response):
+                self.log.write_text("", encoding="utf-8")
+                self.write_curl(
+                    textwrap.dedent(
+                        f"""\
+                        #!/usr/bin/env sh
+                        printf '%s\\n' "$*" >> "$CURL_LOG"
+                        case "$*" in
+                          *"-X POST"*) printf '%s\\n' '{response}' ;;
+                          *) printf '{{"results":[],"count":0,"total_results":0,"next_page_results":false,"next_cursor":null}}\\n' ;;
+                        esac
+                        """
+                    )
+                )
+                result = self.run_plane()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload["status"], "failed")
+                self.assertEqual(payload["error_category"], "response_unknown")
+
+    def test_plane_http_reads_are_bounded(self):
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                printf '{"results":[],"count":0,"total_results":0,"next_page_results":false,"next_cursor":null}\\n'
+                """
+            )
+        )
+        result = self.run_plane()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log = self.log.read_text(encoding="utf-8")
+        self.assertIn("--max-filesize", log)
+        self.assertIn("--max-time", log)
+
 
 class ProtocolParityTests(unittest.TestCase):
     def test_prompt_docs_schema_and_helper_share_exact_contract(self):
@@ -1098,7 +1597,7 @@ class ProtocolParityTests(unittest.TestCase):
         required = [
             "hermes.run-retro.artifact",
             "hermes.run-retro.comment",
-            "run-retro.v6.schema.json",
+            "run-retro.v7.schema.json",
             "tp ensure_comment",
             "resolve_issue_id",
             "Unicode NFKC",
@@ -1106,11 +1605,14 @@ class ProtocolParityTests(unittest.TestCase):
             "no-replace",
             "parent-directory fsync",
             "descriptor-relative",
-            "provider subtree",
+            "process group",
             "lookup_failed",
             "response_unknown",
             "TICKET_PROVIDER",
-            "limit`/`offset",
+            "per_page=100",
+            "`cursor`",
+            "fixed byte limits",
+            ".bindings/",
             "symlinks",
             "monotonic",
         ]
@@ -1118,9 +1620,9 @@ class ProtocolParityTests(unittest.TestCase):
             with self.subTest(token=token):
                 self.assertIn(token, prompt)
                 self.assertIn(token, docs)
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 6)
-        self.assertEqual(RETRO.SCHEMA_VERSION, 6)
-        self.assertEqual(RETRO.COMMENT_FINGERPRINT_VERSION, 5)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 7)
+        self.assertEqual(RETRO.SCHEMA_VERSION, 7)
+        self.assertEqual(RETRO.COMMENT_FINGERPRINT_VERSION, 6)
         self.assertNotIn("PJAN-", prompt)
         self.assertNotIn("PJAN-", docs)
         prompt_contract = (

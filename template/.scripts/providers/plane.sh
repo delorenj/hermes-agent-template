@@ -60,17 +60,22 @@ PROJ="$(pj_cfg board_id)"; [ -n "$PROJ" ] || PROJ="$(tp_cfg project)"
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
 SM_DONE="$(tp_cfg completed)"; SM_DONE="${SM_DONE:-Done}"
 API="$BASE/api/v1/workspaces/$WS"
+HTTP_MAX_BYTES=131072
+HTTP_TIMEOUT_SECONDS=120
+COMMENT_SNAPSHOT_MAX=2000
 
 # api METHOD PATH [JSON_BODY] — call Plane REST, print response body.
 api() {
   need_key
   method="$1"; path="$2"; body="${3:-}"
   if [ -n "$body" ]; then
-    curl -fsS -X "$method" "$API/$path" \
+    curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+      -X "$method" "$API/$path" \
       -H "X-API-Key: $PLANE_API_KEY" -H "Content-Type: application/json" \
       -d "$body"
   else
-    curl -fsS -X "$method" "$API/$path" -H "X-API-Key: $PLANE_API_KEY"
+    curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+      -X "$method" "$API/$path" -H "X-API-Key: $PLANE_API_KEY"
   fi
 }
 
@@ -129,45 +134,88 @@ except Exception:
   done
 }
 
-# Plane's current work-item comment API documents limit/offset pagination,
-# unlike the cursor-paginated work-item collection.
+# Plane's current work-item comment API uses per_page/cursor pagination.
+# Pin the collection size from page one and reject changing totals, duplicate
+# item IDs, repeated cursors, malformed fields, and incomplete final pages.
 plane_comments_find() {
-  work_item_id="$1"; marker="$2"; limit=100; offset=0; page_count=0
+  work_item_id="$1"; marker="$2"; cursor=""; snapshot_total=""; page_count=0
+  seen_count=0; seen_ids=""; seen_cursors=""
   while :; do
-    path="projects/$PROJ/work-items/$work_item_id/comments/?limit=$limit&offset=$offset"
+    path="projects/$PROJ/work-items/$work_item_id/comments/?per_page=100"
+    [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
     if ! page="$(api GET "$path" 2>/dev/null)"; then
       return 2
     fi
-    state="$(printf '%s' "$page" | MARKER="$marker" LIMIT="$limit" OFFSET="$offset" python3 -c 'import json,os,sys
+    state="$(printf '%s' "$page" | MARKER="$marker" CURRENT_CURSOR="$cursor" SNAPSHOT_TOTAL="$snapshot_total" SEEN_COUNT="$seen_count" SEEN_IDS="$seen_ids" SEEN_CURSORS="$seen_cursors" SNAPSHOT_MAX="$COMMENT_SNAPSHOT_MAX" python3 -c 'import json,os,re,sys,uuid
 try:
  data=json.load(sys.stdin)
 except Exception:
  print("invalid"); raise SystemExit(0)
-if not isinstance(data,dict) or "results" not in data or "total_results" not in data:
+required={"results","count","total_results","next_page_results","next_cursor"}
+if not isinstance(data,dict) or not required.issubset(data):
  print("invalid"); raise SystemExit(0)
-rows=data["results"]; total=data["total_results"]
-if (not isinstance(rows,list) or not isinstance(total,int) or isinstance(total,bool)
-    or total<0):
+rows=data["results"]; count=data["count"]; total=data["total_results"]
+has_next=data["next_page_results"]; next_cursor=data["next_cursor"]
+if (not isinstance(rows,list) or not isinstance(count,int) or isinstance(count,bool)
+    or count != len(rows) or count > 100
+    or not isinstance(total,int) or isinstance(total,bool)
+    or total<0 or total>int(os.environ["SNAPSHOT_MAX"])
+    or not isinstance(has_next,bool)):
  print("invalid"); raise SystemExit(0)
-marker=os.environ["MARKER"]; limit=int(os.environ["LIMIT"]); offset=int(os.environ["OFFSET"])
-if (len(rows)>limit or offset<0 or offset>total or offset+len(rows)>total
-    or (offset<total and not rows)
-    or any(not isinstance(row,dict) or not isinstance(row.get("comment_html"),str)
-           for row in rows)):
+snapshot=os.environ["SNAPSHOT_TOTAL"]
+if snapshot and total != int(snapshot):
  print("invalid"); raise SystemExit(0)
-if any(marker in row["comment_html"] for row in rows):
- print("found")
-elif offset+len(rows)==total:
- print("absent")
+uuid_re=re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
+ids=[]
+for row in rows:
+ if not isinstance(row,dict) or not isinstance(row.get("id"),str) or not isinstance(row.get("comment_html"),str):
+  print("invalid"); raise SystemExit(0)
+ item=row["id"]
+ try: canonical=str(uuid.UUID(item))
+ except ValueError:
+  print("invalid"); raise SystemExit(0)
+ if canonical != item or not uuid_re.fullmatch(item):
+  print("invalid"); raise SystemExit(0)
+ ids.append(item)
+seen_ids=set(filter(None,os.environ["SEEN_IDS"].split(",")))
+if len(ids) != len(set(ids)) or any(item in seen_ids for item in ids):
+ print("invalid"); raise SystemExit(0)
+seen_count=int(os.environ["SEEN_COUNT"]); cumulative=seen_count+count
+if cumulative > total:
+ print("invalid"); raise SystemExit(0)
+current=os.environ["CURRENT_CURSOR"]
+seen_cursors=set(filter(None,os.environ["SEEN_CURSORS"].split(",")))
+if has_next:
+ if (not rows or not isinstance(next_cursor,str)
+     or not re.fullmatch(r"[A-Za-z0-9._~:-]{1,512}",next_cursor)
+     or next_cursor == current or next_cursor in seen_cursors
+     or cumulative >= total):
+  print("invalid"); raise SystemExit(0)
+ state="more"
 else:
- print("more:"+str(offset+len(rows)))')"
-    case "$state" in
+ if next_cursor not in (None,"") or cumulative != total:
+  print("invalid"); raise SystemExit(0)
+ state="absent"
+if any(os.environ["MARKER"] in row["comment_html"] for row in rows):
+ state="found"
+print("\t".join((state,str(total),next_cursor or "",",".join(ids))))')"
+    tab="$(printf '\t')"
+    IFS="$tab" read -r disposition total next page_ids <<EOF
+$state
+EOF
+    case "$disposition" in
       found) return 0 ;;
       absent) return 1 ;;
-      more:*)
-        next="${state#more:}"
-        [ -n "$next" ] && [ "$next" != "$offset" ] || return 2
-        offset="$next"; page_count=$((page_count + 1))
+      more)
+        [ -n "$next" ] || return 2
+        [ -z "$snapshot_total" ] && snapshot_total="$total"
+        seen_count=$((seen_count + $(printf '%s' "$page_ids" | awk -F, '{print NF}')))
+        [ -z "$seen_ids" ] || seen_ids="${seen_ids},"
+        seen_ids="${seen_ids}${page_ids}"
+        [ -z "$seen_cursors" ] || seen_cursors="${seen_cursors},"
+        seen_cursors="${seen_cursors}${next}"
+        cursor="$next"
+        page_count=$((page_count + 1))
         [ "$page_count" -lt 10000 ] || return 2
         ;;
       *) return 2 ;;
@@ -280,7 +328,7 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
 
   comment)
     ID="${1:?usage: comment <id> <body>}"; BODY="${2:?}"
-    api POST "projects/$PROJ/issues/$ID/comments/" \
+    api POST "projects/$PROJ/work-items/$ID/comments/" \
       "$(python3 -c 'import json,sys; print(json.dumps({"comment_html":"<p>"+sys.argv[1]+"</p>"}))' "$BODY")" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
     ;;
@@ -365,9 +413,15 @@ PY
       printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
       exit 0
     fi
-    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
-try: print(json.load(sys.stdin).get("id",""))
-except Exception: print("")')"
+    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,re,sys,uuid
+try:
+ data=json.load(sys.stdin); value=data.get("id") if isinstance(data,dict) else None
+ if not isinstance(value,str) or not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",value):
+  raise ValueError
+ canonical=str(uuid.UUID(value))
+ print(value if canonical==value else "")
+except Exception:
+ print("")')"
     if [ -z "$COMMENT_ID" ]; then
       printf '{"provider":"plane","status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
     else

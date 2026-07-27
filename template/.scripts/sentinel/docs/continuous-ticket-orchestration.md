@@ -86,28 +86,29 @@ decisions:
 3. Is the fix repo-local or external/template/fleet?
 
 Each of the first two answers is one sanitized `category` plus `summary`; the
-third is `repo-local|external|template|fleet`. Normalize repository and
-identifier inputs with Unicode NFKC. The closed safe-summary vocabulary is the
-exact ASCII template
+third is `repo-local|external|template|fleet`. The closed safe-summary vocabulary
+is the exact ASCII template
 `signal=<safe-signal>; action=<safe-action>`. Safe signals are
 `slow_feedback|manual_rework|flaky_validation|unclear_contract|missing_capability|dependency_delay|coordination_gap|environment_drift|documentation_gap|review_rework|no_material_friction|other_process_friction`.
 Safe actions are
 `automate_check|clarify_contract|add_test|improve_tooling|update_documentation|isolate_dependency|tighten_review|improve_coordination|stabilize_environment|retain_current_process|operator_followup`.
-No arbitrary text is accepted in a summary or routing error. Never copy tokens,
-credentials, raw logs, customer/PII, private paths, or other protected material
-into an artifact or comment; select only the closest safe signal/action and
-reference protected evidence with an opaque `evidence:<id>` or repo-relative
-reference without `..` segments.
+No arbitrary text is accepted in any persisted field, summary, routing error,
+or comment. Never copy tokens, credentials, raw logs, customer/PII, private
+paths, or other protected material into an artifact or comment; select only the
+closest safe signal/action. Reference protected evidence only by an opaque
+`evidence:<canonical-rfc-uuid>` token whose value contains no evidence text,
+path, log content, or customer data.
 
 Set `source_issue` to the single issue whose work produced the improvement,
 not a related issue. Use the canonical `id` from `tp list_issues`, or resolve a
 provider reference with `tp resolve_issue_id <reference>` before preparing the
 intent. Plane and Linear IDs are lowercase RFC UUID text with version 1-8 and
-variant `[89ab]`; Trello IDs are lowercase 24-hex. Inputs are Unicode
-NFKC-normalized, trimmed, control-free, provider-validated, then stored in
-canonical form. Stored `source_issue` and `target_issue` must themselves be
-canonical and byte-equal. If no single source exists, both are null; never
-invent or substitute a target.
+variant `[89ab]`; Trello IDs are lowercase 24-hex. Inputs use Unicode NFKC
+normalization, trimming, control rejection, and provider validation before storage in
+canonical form. Persist `source_issue` once. It is the only allowed target:
+every provider result must return that byte-equal value. If no single source
+exists, it is null; never invent or substitute a target. `run_id` and
+`correlation_id` are canonical lowercase RFC UUIDs.
 
 Persist the complete immutable prepared intent **before any board side
 effect** with:
@@ -125,23 +126,27 @@ NFKC, trim, casefold, ASCII, then
 and reuse it only for that invocation's retry; use the event correlation ID or
 `run_id` for `correlation_id`.
 
-The exact Draft 2020-12 contract is
-`.scripts/sentinel/schemas/run-retro.v6.schema.json`, schema
-`hermes.run-retro` version `6`. Immutable fields include canonical
-repository/provider/source/target identity, decisions,
-`operator_action_required`, marker, and exact `comment_body`. Only
-`routing.status`, `routing.error_category`, `routing.error_summary`, and
-`routing.updated_at` are mutable. The immutable operator flag is true for a
-null source or external/template/fleet scope and false only for a source-bound
-repo-local improvement. No create-issue operation is available;
-`local_tracking_reference` names only an existing local ticket or is null.
+The exact standard Draft 2020-12 contract is
+`.scripts/sentinel/schemas/run-retro.v7.schema.json`, schema
+`hermes.run-retro` version `7`. It uses no custom assertion keywords: standard
+validation and runtime validation accept the same serialized JSON documents.
+The JSON stores only canonical closed-shape intent plus routing; duplicated
+target, fingerprints, marker, and body are not serialized because their
+computed equality cannot be expressed portably in Draft 2020-12.
+`routing.updated_at_epoch_us` is a bounded integer epoch-microsecond value. Only
+`routing.status`, `routing.error_category`, and
+`routing.updated_at_epoch_us` are mutable. The immutable operator flag is true
+for a null source or external/template/fleet scope and false only for a
+source-bound repo-local improvement. No create-issue operation is available;
+`local_tracking_reference` is a canonical provider issue ID naming only an
+existing local ticket, or null.
 
 Fingerprint preimages are exact UTF-8 lines with one LF after every line,
 including the last, and no other separators:
 
-- `artifact_fingerprint`: SHA-256 of `hermes.run-retro.artifact`, `6`,
+- `artifact_fingerprint`: SHA-256 of `hermes.run-retro.artifact`, `7`,
   canonical `repo`, `run_id`.
-- `comment_fingerprint`: SHA-256 of `hermes.run-retro.comment`, `5`, canonical
+- `comment_fingerprint`: SHA-256 of `hermes.run-retro.comment`, `6`, canonical
   `repo`, canonical `provider`, canonical `source_issue` or `no_target_issue`,
   `what_hurt.category`, `what_hurt.summary`, `what_should_change.category`,
   `what_should_change.summary`, `fix_scope`, and lowercase `true|false` for
@@ -149,25 +154,28 @@ including the last, and no other separators:
 - The marker is `[run-retro-comment:<comment_fingerprint>]`.
 
 Artifact identity is run-scoped and independent of mutable/content-derived
-values. Comment identity is content-scoped and independent of run,
-correlation, timestamps, and routing results. One marker therefore maps to
-exactly one immutable body in every retry state. Same run plus same immutable
-content reuses one path; same run plus changed content returns `stalled`
-without overwrite or comment; distinct runs use distinct paths; identical
-cross-run improvements share one marker and body.
+values. Comment identity and the exact comment body are derived only from
+immutable closed-shape intent, so one marker maps to one body in every retry
+state. An adjacent no-replace `.bindings/<artifact_fingerprint>.sha256` record
+binds the immutable serialized intent without adding a nonportable computed JSON
+field. Same run plus same immutable content reuses one path; same run plus
+changed content returns `stalled` without overwrite or comment; distinct runs
+use distinct paths; identical cross-run improvements share one marker and body.
 
-`prepare` and retry finalization serialize per artifact with advisory locks
-opened without truncation. Open the repository once and traverse every
-`_bmad-output/implementation-artifacts/run-retros` component with
-descriptor-relative `O_NOFOLLOW` operations that reject symlinks; create files,
-locks, links, replaces, unlinks, and fsyncs only relative to those anchored
-descriptors, and
-revalidate the bound directory identity after lock acquisition. A new artifact
-uses a unique `O_EXCL` temp, file fsync, validation, no-replace link, final-file
-fsync, parent-directory fsync, and parse/read-back. Updates use a unique
-exclusive temp, file fsync, atomic replace, final-file and directory fsync, and
-read-back. Never overwrite corrupt or mismatched immutable content, and never
-follow or race a path outside the repository.
+`prepare`, delivery, and finalization use one descriptor-anchored repository
+lifetime: read `.project.json`, bind the store and provider script, hold the
+locks, and finalize without reopening the repository by pathname. Traverse
+every `_bmad-output/implementation-artifacts/run-retros` component with
+descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Revalidate the
+bound directory before every create and after opening an empty `O_EXCL` temp but
+before writing data; if any component was relocated, create no new artifact or
+lock entry and return only `unsafe_artifact_path`. A new artifact uses file
+fsync, validation, no-replace link, final-file fsync, parent-directory fsync,
+and parse/read-back. Updates use a unique exclusive temp, file fsync, atomic
+replace, final-file and directory fsync, and read-back. Never overwrite corrupt
+or mismatched immutable content. Stdin, input JSON, artifact JSON, provider
+stdout/stderr, and HTTP bodies have fixed byte limits; overflow returns a
+sanitized declared failure.
 
 Only after durable `prepared|reused`, call exactly:
 
@@ -176,31 +184,38 @@ tp ensure_comment <artifact-fingerprint>
 ```
 
 This operation accepts no provider, issue, marker, or body argument. It reloads
-the artifact and binds the exact prepared provider, source/target, marker, and
+the artifact and derives the exact prepared provider, source/target, marker, and
 body before any external side effect; `TICKET_PROVIDER` cannot redirect it.
 Null source records `no_target_issue` with no board call. Otherwise a safe
 cross-run lock keyed by provider, source, and marker covers exhaustive lookup
-plus at-most-once post. The provider subtree inherits that lock descriptor, so
-controller death cannot release exclusivity while a provider is still posting.
-Plane uses the supported
-`/work-items/{id}/comments/` list/create endpoints and exhausts documented
-`limit`/`offset` pages. Every successful lookup page must have exact typed
-`results` and `total_results` fields, string `comment_html` values, and
-consistent nonnegative pagination bounds; any malformed or ambiguous 200 is
-`failed|lookup_failed` with no post. Lost response records
-`failed|response_unknown`; retry
-rescans and records `already_present` if the
+plus at-most-once post. The provider script is opened by descriptor before
+execution. Its process starts a new session/process group, inherits the lock
+descriptor for controller-SIGKILL safety, and on timeout or output overflow the
+controller terminates and reaps the full group before releasing the lock.
+
+Plane uses the supported `/work-items/{id}/comments/` list/create endpoints and
+exhausts `per_page=100` plus `cursor` pages. Every HTTP-200 lookup envelope must
+have typed `results`, `count`, `total_results`, `next_page_results`, and
+`next_cursor`; each result has a canonical string UUID `id` and string
+`comment_html`. Pin `total_results` from page one, require
+count/cumulative-total agreement, unique item IDs, and a new typed cursor on
+every continuing page, with a 2,000-comment safety bound. Collection drift,
+duplicate IDs/cursors, malformed or oversized envelopes, and incomplete final
+pages are `failed|lookup_failed` with no post. A successful POST must return a
+canonical string UUID `id`; null,
+numeric, malformed, oversized, or noncanonical responses are
+`failed|response_unknown`. Retry rescans and records `already_present` if the
 marker landed. Provider and target in every result must exactly match the
-prepared values. Terminal `posted|already_present|no_target_issue` is
-monotonic: delayed failure finalization cannot overwrite it.
+prepared values. Terminal `posted|already_present|no_target_issue` is monotonic:
+delayed failure finalization cannot overwrite it.
 
 ## Final retro checkpoint
 
 Do not finish or go idle until
 `run-retro.py validate --repo-root "$REPO_ROOT" --artifact-fingerprint
-<fingerprint> --final` succeeds after parse/read-back validation of schema,
-filename, canonical identities, both fingerprints, immutable agreement, closed
-summary grammar, strict six-digit UTC `Z` timestamps, sanitization, target/source
-equality, and final routing status. A write, fsync,
-lookup, validation, corrupt-artifact, wrong-target, or immutable-input failure
-makes the pass `stalled`; record only its safe category.
+<fingerprint> --final` succeeds after bounded parse/read-back validation of the
+standard schema, filename, immutable binding, canonical identities, derived
+fingerprints/body, closed summary grammar, epoch-microsecond bounds,
+sanitization, target/source result equality, and final routing status. A write,
+fsync, lookup, validation, corrupt-artifact, wrong-target, timeout, overflow, or
+immutable-input failure makes the pass `stalled`; record only its safe category.
