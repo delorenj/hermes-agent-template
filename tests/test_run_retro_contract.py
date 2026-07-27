@@ -8,6 +8,7 @@ import os
 import pathlib
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -528,6 +529,35 @@ class RunRetroDurabilityTests(unittest.TestCase):
             SYNTHETIC_STRIPE_SECRET,
             SYNTHETIC_AWS_ACCESS_KEY,
             "".join(("gh", "p_", "1234567890abcdefghijklmnopqrstuvwxyz")),
+        ]
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        repo_validator = jsonschema.Draft202012Validator(
+            {"type": "string", "pattern": schema["properties"]["repo"]["pattern"]}
+        )
+        for value in protected:
+            (self.repo.root / ".project.json").write_text(
+                json.dumps(
+                    {
+                        "project_name": value,
+                        "ticket_provider": {"type": "plane"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    RETRO.RetroError, "invalid_repository_identity"
+                ):
+                    RETRO.canonical_repo_identity(self.repo.root)
+                self.assertFalse(repo_validator.is_valid(value.casefold()))
+
+    def test_repository_identity_rejects_embedded_protected_credential_shapes(self):
+        protected = [
+            f"repo-{SYNTHETIC_SLACK_TOKEN}",
+            f"label-{SYNTHETIC_GOOGLE_KEY}",
+            f"service-{SYNTHETIC_STRIPE_SECRET}",
+            f"account-{SYNTHETIC_AWS_ACCESS_KEY}",
+            "mirror-" + "".join(("gh", "p_", "1234567890abcdefghijklmnopqrstuvwxyz")),
         ]
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
         repo_validator = jsonschema.Draft202012Validator(
@@ -1368,27 +1398,79 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
 
     def test_symlinked_comment_lock_fails_before_provider_without_truncation(self):
-        document = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
-        key = RETRO._sha256_lines(
-            [
-                document["repo"],
-                document["provider"],
-                document["source_issue"],
-                RETRO.comment_marker(document),
-            ]
-        )
-        lock_dir = self.root / "global-comment-locks"
-        lock_dir.mkdir(mode=0o700)
         victim = self.root / "comment-lock-victim"
         victim.write_text("DO NOT TRUNCATE\n", encoding="utf-8")
-        (lock_dir / f"{key}.lock").symlink_to(victim)
+        lock_anchor = self.root / "comment-lock-anchor"
+        lock_anchor.symlink_to(victim)
         with (
-            mock.patch.object(RETRO, "GLOBAL_COMMENT_LOCK_ROOT", lock_dir),
+            mock.patch.object(RETRO, "GLOBAL_COMMENT_LOCK_ANCHOR", lock_anchor),
             self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
         ):
             self.call_delivery()
         self.assertEqual(victim.read_text(encoding="utf-8"), "DO NOT TRUNCATE\n")
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
+    def test_host_global_lock_is_cross_user_and_has_no_predictable_namespace(self):
+        self.assertEqual(RETRO.GLOBAL_COMMENT_LOCK_ANCHOR, pathlib.Path("/dev/null"))
+        self.assertFalse(hasattr(RETRO, "GLOBAL_COMMENT_LOCK_ROOT"))
+        metadata = os.stat(RETRO.GLOBAL_COMMENT_LOCK_ANCHOR, follow_symlinks=False)
+        self.assertTrue(stat.S_ISCHR(metadata.st_mode))
+        self.assertEqual(stat.S_IMODE(metadata.st_mode) & 0o006, 0o006)
+
+        with (
+            mock.patch.object(RETRO.os, "getuid", return_value=1000),
+            RETRO._global_comment_lock(),
+        ):
+            contender = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import fcntl,os,sys;"
+                        "fd=os.open('/dev/null',os.O_RDWR);"
+                        "\ntry:"
+                        " fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)"
+                        "\nexcept BlockingIOError: sys.exit(23)"
+                        "\nsys.exit(0)"
+                    ),
+                ],
+                check=False,
+            )
+        self.assertEqual(contender.returncode, 23)
+
+        released = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl,os;"
+                    "fd=os.open('/dev/null',os.O_RDWR);"
+                    "fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)"
+                ),
+            ],
+            check=False,
+        )
+        self.assertEqual(released.returncode, 0)
+
+    def test_foreign_legacy_namespace_precreation_cannot_dos_comment_lock(self):
+        hostile_root = self.root / "hermes-run-retro-comment-locks-1000"
+        hostile_root.mkdir(mode=0o700)
+        victim = self.root / "foreign-victim"
+        victim.write_text("foreign\n", encoding="utf-8")
+        (hostile_root / "redirect.lock").symlink_to(victim)
+        before = sorted(path.name for path in hostile_root.iterdir())
+
+        with (
+            mock.patch.object(RETRO.os, "getuid", return_value=1001),
+            RETRO._global_comment_lock(),
+        ):
+            pass
+
+        self.assertEqual(
+            sorted(path.name for path in hostile_root.iterdir()),
+            before,
+        )
+        self.assertEqual(victim.read_text(encoding="utf-8"), "foreign\n")
 
     def test_delivery_finalizes_through_the_held_store_without_path_reopen(self):
         with mock.patch.object(
@@ -1694,6 +1776,115 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
 
+    def test_success_terminates_setsid_descendants_before_lock_release(self):
+        provider = self.providers / "plane.sh"
+        descendant_pid = self.root / "success-setsid-descendant.pid"
+        delayed_side_effect = self.root / "success-setsid-delayed-side-effect"
+        provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                python3 - "$DESCENDANT_PID" "$DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
+                import os, pathlib, sys, time
+                os.setsid()
+                pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+                time.sleep(0.8)
+                pathlib.Path(sys.argv[2]).write_text("escaped")
+                time.sleep(10)
+                PY
+                printf '{"provider":"plane","status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\\n' "$2"
+                """
+            ),
+            encoding="utf-8",
+        )
+        provider.chmod(0o755)
+        pid = None
+        try:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "DESCENDANT_PID": str(descendant_pid),
+                        "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
+                    },
+                    clear=False,
+                ),
+            ):
+                result = self.call_delivery()
+            self.assertEqual(result["status"], "posted")
+            deadline = time.monotonic() + 1.0
+            while not descendant_pid.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(descendant_pid.exists())
+            pid = int(descendant_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            time.sleep(1.0)
+            self.assertFalse(delayed_side_effect.exists())
+        finally:
+            if pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError, ProcessLookupError):
+                    os.waitpid(pid, 0)
+
+    def test_timeout_terminates_reparented_double_fork_before_lock_release(self):
+        provider = self.providers / "plane.sh"
+        descendant_pid = self.root / "double-fork-descendant.pid"
+        delayed_side_effect = self.root / "double-fork-delayed-side-effect"
+        provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                setsid python3 - "$DESCENDANT_PID" "$DELAYED_SIDE_EFFECT" <<'PY' >/dev/null 2>&1 &
+                import os, pathlib, signal, sys, time
+                child = os.fork()
+                if child:
+                    os._exit(0)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))
+                time.sleep(0.8)
+                pathlib.Path(sys.argv[2]).write_text("escaped")
+                time.sleep(10)
+                PY
+                sleep 10
+                """
+            ),
+            encoding="utf-8",
+        )
+        provider.chmod(0o755)
+        pid = None
+        try:
+            with (
+                mock.patch.object(RETRO, "PROVIDER_TIMEOUT_SECONDS", 0.2),
+                mock.patch.object(RETRO, "PROVIDER_TERMINATION_GRACE_SECONDS", 0.1),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "DESCENDANT_PID": str(descendant_pid),
+                        "DELAYED_SIDE_EFFECT": str(delayed_side_effect),
+                    },
+                    clear=False,
+                ),
+            ):
+                result = self.call_delivery()
+            self.assertEqual(result["status"], "failed")
+            self.assertTrue(descendant_pid.exists())
+            pid = int(descendant_pid.read_text(encoding="utf-8"))
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+            time.sleep(1.0)
+            self.assertFalse(delayed_side_effect.exists())
+        finally:
+            if pid is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                with contextlib.suppress(ChildProcessError, ProcessLookupError):
+                    os.waitpid(pid, 0)
+
     def test_provider_output_is_bounded_and_terminates_the_process_group(self):
         provider = self.providers / "plane.sh"
         provider.write_text(
@@ -1732,12 +1923,21 @@ class AdapterEnsureCommentTests(unittest.TestCase):
 
     def test_provider_script_is_bound_by_descriptor_before_execution(self):
         with mock.patch.object(
-            RETRO.os,
-            "stat",
-            side_effect=AssertionError("provider reopened by pathname"),
-        ):
+            RETRO.subprocess,
+            "Popen",
+            wraps=RETRO.subprocess.Popen,
+        ) as popen:
             result = self.call_delivery()
         self.assertEqual(result["status"], "posted")
+        provider_calls = [
+            call
+            for call in popen.call_args_list
+            if call.args and call.args[0][:2] == ["sh", "-s"]
+        ]
+        self.assertEqual(len(provider_calls), 1)
+        command = provider_calls[0].args[0]
+        self.assertEqual(command[:2], ["sh", "-s"])
+        self.assertIsInstance(provider_calls[0].kwargs["stdin"], int)
 
 
 class PlanePaginationTests(unittest.TestCase):

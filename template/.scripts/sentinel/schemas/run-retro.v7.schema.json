@@ -34,7 +34,7 @@
     },
     "repo": {
       "type": "string",
-      "pattern": "^(?!(?:xox[a-z]?)-)(?!(?:sk|pk|rk)_(?:live|test)_)(?!aiza)(?!(?:akia|asia)[a-z0-9])(?!(?:gh[pousr])_)[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$(?![\\s\\S])"
+      "pattern": "^(?![a-z0-9._-]*(?:(?:xox[a-z]?)-|(?:sk|pk|rk)_(?:live|test)_|aiza|(?:akia|asia)[a-z0-9]|(?:gh[pousr])_))[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$(?![\\s\\S])"
     },
     "provider": {
       "enum": [

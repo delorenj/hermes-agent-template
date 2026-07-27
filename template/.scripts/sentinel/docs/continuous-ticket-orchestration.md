@@ -120,8 +120,9 @@ effect** with:
 Repository identity comes only from `.project.json.project_name`: Unicode
 NFKC, trim, casefold, ASCII, then
 `[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?`, with credential-shaped
-prefixes (`xox*`, live/test payment keys, Google/AWS access keys, and GitHub
-tokens) rejected before fingerprinting. Provider and its complete bound
+substrings anywhere in the normalized identity (`xox*`, live/test payment
+keys, Google/AWS access keys, and GitHub tokens) rejected before
+fingerprinting. Provider and its complete bound
 configuration come only from `.project.json.ticket_provider`. Input has exactly `run_id`,
 `correlation_id`, `source_issue`, `local_tracking_reference`, `decisions`,
 `protected_evidence_refs`, and `sanitization`. Set `run_id` once per invocation
@@ -201,16 +202,21 @@ This operation accepts no provider, issue, marker, or body argument. It reloads
 the artifact and derives the exact prepared provider, source/target, marker, and
 body before any external side effect; `TICKET_PROVIDER` cannot redirect it.
 Null source records `no_target_issue` with no board call. Otherwise a
-permission-checked host-global cross-run lock under
-`/var/tmp/hermes-run-retro-comment-locks-<uid>` is keyed by repository,
-provider, source, and marker; repository copies and replacements therefore
-cannot fork the exhaustive-lookup/at-most-once-post lock domain. The provider
-script is opened by descriptor, receives only the already-bound configuration,
-and executes portably from its descriptor through shell stdin. Its process
-starts a new session/process group and inherits the lock descriptor for
-controller-SIGKILL safety. On timeout or output overflow, portable descendant
-enumeration plus process-group signaling terminates and reaps the full tree,
-including descendants that call `setsid`, before releasing the lock.
+cross-user host-global cross-run lock is a whole-device `flock` on the
+root-owned `/dev/null` character device. It creates no predictable directory or
+key file, persists no repository, credential, source, marker, or protected
+value, safely serializes hash collisions, and releases stale ownership only
+when the final inherited descriptor closes. Repository copies, replacements,
+and distinct UIDs therefore cannot fork the exhaustive-lookup/at-most-once-post
+lock domain. The provider script is opened by descriptor, receives only the
+already-bound configuration, and executes portably from its descriptor through
+shell stdin. Its process starts a new session/process group and inherits both
+the lock descriptor and a private containment descriptor for
+controller-SIGKILL safety. On every success, failure, timeout, or output
+overflow, bounded portable open-file holder enumeration plus process-group
+signaling terminates and reaps the full tree, including `setsid` and reparented
+double-fork descendants, before finalization and before the lock descriptor
+closes.
 
 Plane uses the supported `/work-items/{id}/comments/` list/create endpoints and
 exhausts `per_page=100` plus `cursor` pages. Every HTTP-200 lookup envelope must
