@@ -73,3 +73,19 @@ The loop never ends a pass with work parked waiting on the operator.
    prerequisite of the dependent and record the rollback.
 
 Board status is not proof. Repository evidence and the close gate are proof.
+
+## Post-loop improvement (end-of-batch retro)
+
+Immediately after the final board-status report, make exactly these three
+decisions:
+
+1. What hurt this batch?
+2. What should change?
+3. Is the fix repo-local or external/template/fleet?
+
+Always record the reflection and all three answers as a run artifact/evidence.
+For an external/template/fleet improvement, also post the reflection to the
+relevant issue with `tp comment` and include the explicit operator flag
+`operator_action_required: true` in both the artifact and comment. The adapter
+has no create-issue operation; PJAN-23 tracks that gap. Do not imply that a
+follow-up issue was created, and do not silently drop the improvement.
