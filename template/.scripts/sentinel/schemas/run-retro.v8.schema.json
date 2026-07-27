@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://hermes.delo.sh/schemas/run-retro.v7.schema.json",
+  "$id": "https://hermes.delo.sh/schemas/run-retro.v8.schema.json",
   "title": "Hermes durable post-loop retro artifact",
   "type": "object",
   "additionalProperties": false,
@@ -24,7 +24,7 @@
       "const": "hermes.run-retro"
     },
     "schema_version": {
-      "const": 7
+      "const": 8
     },
     "run_id": {
       "$ref": "#/$defs/rfcUuid"
@@ -139,7 +139,8 @@
       "required": [
         "status",
         "error_category",
-        "updated_at_epoch_us"
+        "updated_at_epoch_us",
+        "proof"
       ],
       "properties": {
         "status": {
@@ -168,6 +169,32 @@
         },
         "updated_at_epoch_us": {
           "$ref": "#/$defs/epochMicroseconds"
+        },
+        "proof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "status",
+            "transition_id"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "unverified",
+                "verified"
+              ]
+            },
+            "transition_id": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/rfcUuid"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
         }
       }
     }
@@ -374,6 +401,65 @@
             "properties": {
               "error_category": {
                 "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "posted",
+                  "already_present",
+                  "no_target_issue"
+                ]
+              }
+            },
+            "required": [
+              "status"
+            ]
+          }
+        },
+        "required": [
+          "routing"
+        ]
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "proof": {
+                "properties": {
+                  "status": {
+                    "const": "verified"
+                  },
+                  "transition_id": {
+                    "$ref": "#/$defs/rfcUuid"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "proof": {
+                "properties": {
+                  "status": {
+                    "const": "unverified"
+                  },
+                  "transition_id": {
+                    "type": "null"
+                  }
+                }
               }
             }
           }

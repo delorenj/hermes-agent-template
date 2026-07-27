@@ -28,7 +28,7 @@ from typing import Any, Iterator
 
 
 SCHEMA_NAME = "hermes.run-retro"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 COMMENT_FINGERPRINT_VERSION = 6
 ARTIFACT_DOMAIN = "hermes.run-retro.artifact"
 COMMENT_DOMAIN = "hermes.run-retro.comment"
@@ -81,7 +81,17 @@ IMMUTABLE_FIELDS = (
 )
 INPUT_DERIVED_IMMUTABLE_FIELDS = IMMUTABLE_FIELDS
 ROOT_FIELDS = {*IMMUTABLE_FIELDS, "routing"}
-ROUTING_FIELDS = {"status", "error_category", "updated_at_epoch_us"}
+ROUTING_FIELDS = {"status", "error_category", "updated_at_epoch_us", "proof"}
+DELIVERY_PROOF_FIELDS = {"status", "transition_id"}
+BINDING_FIELDS = {
+    "schema",
+    "schema_version",
+    "immutable_sha256",
+    "final_document_sha256",
+    "transition_id",
+}
+BINDING_SCHEMA = "hermes.run-retro.binding"
+BINDING_SCHEMA_VERSION = 1
 SAFE_REPO_RE = re.compile(
     r"^(?![a-z0-9._-]*(?:(?:xox[a-z]?)-|(?:sk|pk|rk)_(?:live|test)_|"
     r"aiza|(?:akia|asia)[a-z0-9]|(?:gh[pousr])_))"
@@ -526,6 +536,10 @@ def _build_prepared(
             "status": "prepared",
             "error_category": None,
             "updated_at_epoch_us": now,
+            "proof": {
+                "status": "unverified",
+                "transition_id": None,
+            },
         },
     }
     validate_document(document)
@@ -628,6 +642,17 @@ def validate_document(
             raise RetroError("invalid_artifact")
     elif error_category is not None:
         raise RetroError("invalid_artifact")
+    proof = routing["proof"]
+    if not isinstance(proof, dict) or set(proof) != DELIVERY_PROOF_FIELDS:
+        raise RetroError("invalid_artifact")
+    if status_value in CHECKPOINT_STATUSES:
+        if proof["status"] != "verified":
+            raise RetroError("invalid_artifact")
+        transition_id = canonical_invocation_id(proof["transition_id"])
+        if transition_id != proof["transition_id"]:
+            raise RetroError("invalid_artifact")
+    elif proof != {"status": "unverified", "transition_id": None}:
+        raise RetroError("invalid_artifact")
     if source is None:
         if status_value not in {"prepared", "no_target_issue"}:
             raise RetroError("invalid_artifact")
@@ -717,7 +742,7 @@ class RetroStore:
     def relative_path(self, fingerprint: str) -> str:
         return "/".join((*RETRO_PARTS, self.artifact_name(fingerprint)))
 
-    def parent_relative(self, name: str) -> str:
+    def repo_relative(self, name: str) -> str:
         if (
             not name
             or name in {".", ".."}
@@ -725,7 +750,7 @@ class RetroStore:
             or any(part in {".", ".."} for part in Path(name).parts)
         ):
             raise RetroError("unsafe_artifact_path")
-        return "/".join((self.repo_name, *RETRO_PARTS, name))
+        return "/".join((*RETRO_PARTS, name))
 
 
 @contextlib.contextmanager
@@ -909,7 +934,12 @@ def _read_artifact_at(
         path=Path(name),
         require_final=require_final,
     )
-    _validate_binding(store, fingerprint, document)
+    _validate_binding(
+        store,
+        fingerprint,
+        document,
+        require_final=require_final,
+    )
     return document
 
 
@@ -926,7 +956,12 @@ def read_artifact(path: Path, *, require_final: bool = False) -> dict[str, Any]:
         fingerprint = path.name.removesuffix(".json")
         bindings_fd = _walk_directories(directory_fd, (".bindings",), create=False)
         try:
-            _validate_binding_at(bindings_fd, fingerprint, document)
+            _validate_binding_at(
+                bindings_fd,
+                fingerprint,
+                document,
+                require_final=require_final,
+            )
         finally:
             os.close(bindings_fd)
         return document
@@ -964,51 +999,106 @@ def _immutable_digest(document: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _document_digest(document: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json(document)).hexdigest()
+
+
+def _prepared_binding(document: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema": BINDING_SCHEMA,
+        "schema_version": BINDING_SCHEMA_VERSION,
+        "immutable_sha256": _immutable_digest(document),
+        "final_document_sha256": None,
+        "transition_id": None,
+    }
+
+
+def _final_binding(document: dict[str, Any]) -> dict[str, Any]:
+    transition_id = document["routing"]["proof"]["transition_id"]
+    if not isinstance(transition_id, str):
+        raise RetroError("invalid_artifact")
+    return {
+        "schema": BINDING_SCHEMA,
+        "schema_version": BINDING_SCHEMA_VERSION,
+        "immutable_sha256": _immutable_digest(document),
+        "final_document_sha256": _document_digest(document),
+        "transition_id": transition_id,
+    }
+
+
+def _validate_binding_value(
+    value: Any,
+    document: dict[str, Any],
+    *,
+    require_final: bool,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != BINDING_FIELDS:
+        raise RetroError("invalid_artifact")
+    if (
+        value["schema"] != BINDING_SCHEMA
+        or value["schema_version"] != BINDING_SCHEMA_VERSION
+        or not isinstance(value["immutable_sha256"], str)
+        or not SHA256_RE.fullmatch(value["immutable_sha256"])
+        or value["immutable_sha256"] != _immutable_digest(document)
+    ):
+        raise RetroError("immutable_intent_mismatch")
+    final_digest = value["final_document_sha256"]
+    transition_id = value["transition_id"]
+    if final_digest is None and transition_id is None:
+        if require_final:
+            raise RetroError("invalid_artifact")
+        return value
+    if (
+        not isinstance(final_digest, str)
+        or not SHA256_RE.fullmatch(final_digest)
+        or not isinstance(transition_id, str)
+    ):
+        raise RetroError("invalid_artifact")
+    canonical_transition = canonical_invocation_id(transition_id)
+    if (
+        canonical_transition != transition_id
+        or document["routing"]["proof"]
+        != {"status": "verified", "transition_id": transition_id}
+        or final_digest != _document_digest(document)
+    ):
+        raise RetroError("invalid_artifact")
+    return value
+
+
 def _validate_binding_at(
     bindings_fd: int,
     fingerprint: str,
     document: dict[str, Any],
+    *,
+    require_final: bool = False,
 ) -> None:
     name = f"{fingerprint}.sha256"
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            name,
-            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=bindings_fd,
-        )
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise RetroError("unsafe_artifact_path")
-        with os.fdopen(descriptor, "rb", closefd=True) as handle:
-            descriptor = -1
-            payload = _read_bounded(
-                handle,
-                65,
-                overflow_category="invalid_artifact",
-            )
-        if payload != f"{_immutable_digest(document)}\n".encode("ascii"):
-            raise RetroError("immutable_intent_mismatch")
-    except FileNotFoundError:
-        raise RetroError("invalid_artifact") from None
-    except RetroError:
-        raise
-    except OSError:
-        raise RetroError("unsafe_artifact_path") from None
-    finally:
-        if descriptor >= 0:
-            with contextlib.suppress(OSError):
-                os.close(descriptor)
+    value = _read_utf8_json_at(
+        bindings_fd,
+        name,
+        category="invalid_artifact",
+        max_bytes=1024,
+        overflow_category="invalid_artifact",
+    )
+    _validate_binding_value(value, document, require_final=require_final)
 
 
 def _validate_binding(
     store: RetroStore,
     fingerprint: str,
     document: dict[str, Any],
+    *,
+    require_final: bool = False,
 ) -> None:
     _assert_store_path(store)
     bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=False)
     try:
-        _validate_binding_at(bindings_fd, fingerprint, document)
+        _validate_binding_at(
+            bindings_fd,
+            fingerprint,
+            document,
+            require_final=require_final,
+        )
     finally:
         os.close(bindings_fd)
 
@@ -1021,20 +1111,20 @@ def _ensure_binding(
     _assert_store_path(store)
     bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=True)
     name = f"{fingerprint}.sha256"
-    payload = f"{_immutable_digest(document)}\n".encode("ascii")
+    payload = _canonical_json(_prepared_binding(document))
     descriptor = -1
     try:
         _assert_store_path(store)
         try:
             descriptor = os.open(
-                store.parent_relative(f".bindings/{name}"),
+                store.repo_relative(f".bindings/{name}"),
                 os.O_WRONLY
                 | os.O_CREAT
                 | os.O_EXCL
                 | getattr(os, "O_CLOEXEC", 0)
                 | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
-                dir_fd=store.parent_fd,
+                dir_fd=store.repo_fd,
             )
         except FileExistsError:
             _validate_binding_at(bindings_fd, fingerprint, document)
@@ -1058,6 +1148,81 @@ def _ensure_binding(
         os.close(bindings_fd)
 
 
+def _finalize_binding(
+    store: RetroStore,
+    fingerprint: str,
+    document: dict[str, Any],
+) -> None:
+    _assert_store_path(store)
+    bindings_fd = _walk_directories(store.retro_fd, (".bindings",), create=False)
+    name = f"{fingerprint}.sha256"
+    temporary = _unique_temp_name(name)
+    descriptor = -1
+    try:
+        current = _read_utf8_json_at(
+            bindings_fd,
+            name,
+            category="invalid_artifact",
+            max_bytes=1024,
+            overflow_category="invalid_artifact",
+        )
+        _validate_binding_value(current, document, require_final=False)
+        if current["final_document_sha256"] is not None:
+            _validate_binding_value(current, document, require_final=True)
+            return
+        final_value = _final_binding(document)
+        descriptor = os.open(
+            store.repo_relative(f".bindings/{temporary}"),
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=store.repo_fd,
+        )
+        _assert_store_path(store)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            descriptor = -1
+            handle.write(_canonical_json(final_value))
+            handle.flush()
+            os.fsync(handle.fileno())
+        value = _read_utf8_json_at(
+            bindings_fd,
+            temporary,
+            category="invalid_artifact",
+            max_bytes=1024,
+            overflow_category="invalid_artifact",
+        )
+        _validate_binding_value(value, document, require_final=True)
+        _assert_store_path(store)
+        os.replace(
+            store.repo_relative(f".bindings/{temporary}"),
+            store.repo_relative(f".bindings/{name}"),
+            src_dir_fd=store.repo_fd,
+            dst_dir_fd=store.repo_fd,
+        )
+        _fsync_file(bindings_fd, name)
+        _fsync_directory(bindings_fd)
+        _validate_binding_at(
+            bindings_fd,
+            fingerprint,
+            document,
+            require_final=True,
+        )
+    except RetroError:
+        raise
+    except OSError:
+        raise RetroError("unsafe_artifact_path") from None
+    finally:
+        if descriptor >= 0:
+            with contextlib.suppress(OSError):
+                os.close(descriptor)
+        with contextlib.suppress(OSError):
+            os.unlink(temporary, dir_fd=bindings_fd)
+        os.close(bindings_fd)
+
+
 def _write_exclusive_temp(
     store: RetroStore, final_name: str, document: dict[str, Any]
 ) -> str:
@@ -1074,10 +1239,10 @@ def _write_exclusive_temp(
     descriptor = -1
     try:
         descriptor = os.open(
-            store.parent_relative(temporary),
+            store.repo_relative(temporary),
             flags,
             0o600,
-            dir_fd=store.parent_fd,
+            dir_fd=store.repo_fd,
         )
         _assert_store_path(store)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
@@ -1118,10 +1283,10 @@ def _durable_create(
         _assert_store_path(store)
         try:
             os.link(
-                store.parent_relative(temporary),
-                store.parent_relative(name),
-                src_dir_fd=store.parent_fd,
-                dst_dir_fd=store.parent_fd,
+                store.repo_relative(temporary),
+                store.repo_relative(name),
+                src_dir_fd=store.repo_fd,
+                dst_dir_fd=store.repo_fd,
                 follow_symlinks=False,
             )
         except FileExistsError:
@@ -1150,10 +1315,10 @@ def _durable_replace(
         _assert_store_path(store)
         try:
             os.replace(
-                store.parent_relative(temporary),
-                store.parent_relative(name),
-                src_dir_fd=store.parent_fd,
-                dst_dir_fd=store.parent_fd,
+                store.repo_relative(temporary),
+                store.repo_relative(name),
+                src_dir_fd=store.repo_fd,
+                dst_dir_fd=store.repo_fd,
             )
         except OSError:
             raise RetroError("unsafe_artifact_path") from None
@@ -1348,17 +1513,39 @@ def _finalize_at(
         stored_status = stored["routing"]["status"]
         incoming_status = normalized["status"]
         if stored_status in SUCCESS_STATUSES or stored_status == "no_target_issue":
-            return {
-                "status": stored_status,
-                "artifact_fingerprint": fingerprint,
-                "artifact_path": store.relative_path(fingerprint),
-                "transition": "preserved_terminal",
-            }
+            try:
+                _validate_binding(
+                    store,
+                    fingerprint,
+                    stored,
+                    require_final=True,
+                )
+            except RetroError as error:
+                if error.category != "invalid_artifact":
+                    raise
+            else:
+                return {
+                    "status": stored_status,
+                    "artifact_fingerprint": fingerprint,
+                    "artifact_path": store.relative_path(fingerprint),
+                    "transition": "preserved_terminal",
+                }
         updated = dict(stored)
         updated["routing"] = {
             "status": incoming_status,
             "error_category": normalized["error_category"],
             "updated_at_epoch_us": _epoch_us_now(),
+            "proof": (
+                {
+                    "status": "verified",
+                    "transition_id": str(uuid.uuid4()),
+                }
+                if incoming_status in CHECKPOINT_STATUSES
+                else {
+                    "status": "unverified",
+                    "transition_id": None,
+                }
+            ),
         }
         if _immutable_view(updated, IMMUTABLE_FIELDS) != _immutable_view(
             stored, IMMUTABLE_FIELDS
@@ -1369,7 +1556,11 @@ def _finalize_at(
             path=Path(store.artifact_name(fingerprint)),
         )
         _durable_replace(store, fingerprint, updated)
-        _read_artifact_at(store, fingerprint)
+        if incoming_status in CHECKPOINT_STATUSES:
+            _finalize_binding(store, fingerprint, updated)
+            _read_artifact_at(store, fingerprint, require_final=True)
+        else:
+            _read_artifact_at(store, fingerprint)
     return {
         "status": incoming_status,
         "artifact_fingerprint": fingerprint,
@@ -1647,9 +1838,15 @@ def _terminate_contained_provider(
     process: subprocess.Popen[bytes],
     pidfd: int,
 ) -> None:
+    group_fallback = process.poll() is None and pidfd < 0
     if process.poll() is None and pidfd >= 0:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             _signal_pidfd(pidfd, signal.SIGKILL)
+        except (ProcessLookupError, OSError, RetroError):
+            group_fallback = True
+    if group_fallback and process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
     try:
         process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
     except subprocess.TimeoutExpired:
@@ -1658,7 +1855,12 @@ def _terminate_contained_provider(
         try:
             process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
         except subprocess.TimeoutExpired:
-            raise RetroError("provider_containment_unavailable") from None
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            try:
+                process.wait(timeout=SUPERVISOR_SHUTDOWN_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise RetroError("provider_containment_unavailable") from None
 
 
 def _bounded_provider_output(
@@ -1935,6 +2137,15 @@ def _controller_source_fd() -> int:
         raise RetroError("provider_containment_unavailable") from None
 
 
+def _controller_timeout_seconds() -> float:
+    return (
+        _lock_timeout_seconds()
+        + PROVIDER_TIMEOUT_SECONDS
+        + (4 * SUPERVISOR_SHUTDOWN_SECONDS)
+        + 0.5
+    )
+
+
 def _invoke_provider(
     repository: RepositorySession,
     stored: dict[str, Any],
@@ -1982,14 +2193,9 @@ def _invoke_provider(
         with os.fdopen(payload_write_fd, "wb", closefd=True) as handle:
             payload_write_fd = -1
             handle.write(payload)
-        total_timeout = (
-            _lock_timeout_seconds()
-            + PROVIDER_TIMEOUT_SECONDS
-            + SUPERVISOR_SHUTDOWN_SECONDS
-        )
         stdout, _ = _bounded_provider_output(
             process,
-            timeout_seconds=total_timeout,
+            timeout_seconds=_controller_timeout_seconds(),
         )
     except (OSError, RetroError):
         return _provider_failure(
@@ -2067,12 +2273,23 @@ def deliver(
                     ):
                         raise RetroError("immutable_intent_mismatch")
                     if current["routing"]["status"] in SUCCESS_STATUSES:
-                        return {
-                            "status": current["routing"]["status"],
-                            "artifact_fingerprint": fingerprint,
-                            "artifact_path": store.relative_path(fingerprint),
-                            "transition": "preserved_terminal",
-                        }
+                        try:
+                            _validate_binding(
+                                store,
+                                fingerprint,
+                                current,
+                                require_final=True,
+                            )
+                        except RetroError as error:
+                            if error.category != "invalid_artifact":
+                                raise
+                        else:
+                            return {
+                                "status": current["routing"]["status"],
+                                "artifact_fingerprint": fingerprint,
+                                "artifact_path": store.relative_path(fingerprint),
+                                "transition": "preserved_terminal",
+                            }
                     result = _invoke_provider(
                         repository,
                         current,

@@ -95,17 +95,100 @@ cleanup_http_files() {
 }
 trap cleanup_http_files EXIT HUP INT TERM
 
+# Independently enforce byte and time bounds even when curl predates reliable
+# --max-filesize handling for chunked or unknown-length responses.
+bounded_curl() {
+  python3 - "$HTTP_MAX_BYTES" "$HTTP_TIMEOUT_SECONDS" "$@" <<'PY'
+import contextlib
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    limit = int(sys.argv[1])
+    per_request = float(sys.argv[2])
+    command = sys.argv[3:]
+    if limit <= 0 or per_request <= 0 or not command:
+        raise ValueError
+    deadline = time.monotonic() + per_request
+    operation_ns = os.environ.get("HERMES_HTTP_DEADLINE_NS")
+    if operation_ns:
+        deadline = min(deadline, int(operation_ns) / 1_000_000_000)
+    if deadline <= time.monotonic():
+        raise TimeoutError
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        if stream is None:
+            raise OSError
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            events = selector.select(min(remaining, 0.05))
+            if not events and process.poll() is not None:
+                events = [
+                    (key, selectors.EVENT_READ)
+                    for key in list(selector.get_map().values())
+                ]
+            for key, _ in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer = streams[stream]
+                buffer.extend(chunk)
+                stream_limit = limit if stream is process.stdout else 8192
+                if len(buffer) > stream_limit:
+                    raise OverflowError
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        if process.returncode != 0:
+            raise OSError
+        sys.stdout.buffer.write(bytes(streams[process.stdout]))
+    finally:
+        selector.close()
+        for stream in streams:
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
+    if "process" in locals() and process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+    raise SystemExit(22)
+PY
+}
+
 # api METHOD PATH [JSON_BODY] — call Plane REST, print response body.
 api() {
   need_key
   method="$1"; path="$2"; body="${3:-}"
   if [ -n "$body" ]; then
-    curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+    bounded_curl curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
       -X "$method" "$API/$path" \
       -H "X-API-Key: $PLANE_API_KEY" -H "Content-Type: application/json" \
       -d "$body"
   else
-    curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+    bounded_curl curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
       -X "$method" "$API/$path" -H "X-API-Key: $PLANE_API_KEY"
   fi
 }
@@ -379,6 +462,20 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
 
   resolve_issue_id)
     REF="${1:?usage: resolve_issue_id <reference>}"
+    RESOLVE_TIMEOUT="$(python3 - "${HERMES_RESOLVE_TIMEOUT_SECONDS:-120}" <<'PY'
+import math,sys
+try: value=float(sys.argv[1])
+except (TypeError,ValueError,OverflowError): raise SystemExit(1)
+if not math.isfinite(value) or value <= 0 or value > 300: raise SystemExit(1)
+print(value)
+PY
+)" || die "invalid issue lookup deadline"
+    HERMES_HTTP_DEADLINE_NS="$(python3 - "$RESOLVE_TIMEOUT" <<'PY'
+import sys,time
+print(time.monotonic_ns()+int(float(sys.argv[1])*1_000_000_000))
+PY
+)"
+    export HERMES_HTTP_DEADLINE_NS
     NORMALIZED="$(python3 - "$REF" <<'PY'
 import re,sys,unicodedata
 value=unicodedata.normalize("NFKC",sys.argv[1]).strip()
@@ -415,7 +512,7 @@ PY
     if [ -z "$ID" ]; then
       # The caller should normally pass the canonical id from list_issues. This
       # exhaustive fallback safely resolves sequence/key references.
-      cursor=""; page_count=0
+      cursor=""; page_count=0; seen_cursors=""
       while :; do
         path="projects/$PROJ/work-items/?per_page=100"
         [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
@@ -469,6 +566,11 @@ PY
           more:*)
             next="${state#more:}"
             [ "$next" != "$cursor" ] || die "issue pagination failed"
+            case ",$seen_cursors," in
+              *",$next,"*) die "issue pagination failed" ;;
+            esac
+            [ -z "$seen_cursors" ] || seen_cursors="${seen_cursors},"
+            seen_cursors="${seen_cursors}${next}"
             cursor="$next"
             page_count=$((page_count + 1))
             [ "$page_count" -lt 10000 ] || die "issue pagination failed"

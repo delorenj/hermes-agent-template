@@ -23,7 +23,7 @@ import jsonschema
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HELPER_PATH = ROOT / "template" / ".scripts" / "sentinel" / "bin" / "run-retro.py"
 SCHEMA_PATH = (
-    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v7.schema.json"
+    ROOT / "template" / ".scripts" / "sentinel" / "schemas" / "run-retro.v8.schema.json"
 )
 PROMPT_PATH = ROOT / "template" / ".scripts" / "sentinel.prompt.md.jinja"
 DOC_PATH = (
@@ -38,6 +38,9 @@ ADAPTER_PATH = ROOT / "template" / ".scripts" / "lib" / "ticket-provider.sh"
 PLANE_PATH = ROOT / "template" / ".scripts" / "providers" / "plane.sh"
 LINEAR_PATH = ROOT / "template" / ".scripts" / "providers" / "linear.sh"
 TRELLO_PATH = ROOT / "template" / ".scripts" / "providers" / "trello.sh"
+CLOSE_GATE_PATH = (
+    ROOT / "template" / ".scripts" / "sentinel" / "bin" / "issue-close-gate.sh"
+)
 ISSUE_ID = "11111111-1111-4111-8111-111111111111"
 OTHER_ISSUE_ID = "22222222-2222-4222-8222-222222222222"
 SYNTHETIC_SLACK_TOKEN = "".join(
@@ -358,6 +361,10 @@ class RunRetroDurabilityTests(unittest.TestCase):
             set(schema["properties"]["routing"]["properties"]),
             RETRO.ROUTING_FIELDS,
         )
+        self.assertEqual(
+            set(schema["properties"]["routing"]["properties"]["proof"]["properties"]),
+            RETRO.DELIVERY_PROOF_FIELDS,
+        )
         self.assertFalse(any(key.startswith("x-hermes") for key in schema))
         self.assertEqual(
             schema["$defs"]["safeSummary"]["pattern"],
@@ -509,6 +516,49 @@ class RunRetroDurabilityTests(unittest.TestCase):
                 self.assertFalse(validator.is_valid(mutated))
                 with self.assertRaisesRegex(RETRO.RetroError, "invalid_artifact"):
                     RETRO.validate_document(mutated)
+
+    def test_schema_runtime_parity_for_closed_finalization_proof(self):
+        schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        validator = jsonschema.Draft202012Validator(schema)
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        document = RETRO.read_artifact(
+            self.repo.artifact(prepared["artifact_fingerprint"])
+        )
+        transition_id = "33333333-3333-4333-8333-333333333333"
+        cases = []
+
+        valid_terminal = json.loads(json.dumps(document))
+        valid_terminal["routing"]["status"] = "posted"
+        valid_terminal["routing"]["proof"] = {
+            "status": "verified",
+            "transition_id": transition_id,
+        }
+        cases.append(("valid_terminal", valid_terminal, True))
+
+        unproved_terminal = json.loads(json.dumps(valid_terminal))
+        unproved_terminal["routing"]["proof"] = {
+            "status": "unverified",
+            "transition_id": None,
+        }
+        cases.append(("unproved_terminal", unproved_terminal, False))
+
+        proved_prepared = json.loads(json.dumps(document))
+        proved_prepared["routing"]["proof"] = {
+            "status": "verified",
+            "transition_id": transition_id,
+        }
+        cases.append(("proved_prepared", proved_prepared, False))
+
+        for label, candidate, expected in cases:
+            with self.subTest(label=label):
+                self.assertEqual(validator.is_valid(candidate), expected)
+                try:
+                    RETRO.validate_document(candidate)
+                except RETRO.RetroError:
+                    runtime_valid = False
+                else:
+                    runtime_valid = True
+                self.assertEqual(runtime_valid, expected)
 
     def test_repository_and_issue_identity_normalization_is_exact(self):
         self.assertEqual(RETRO.canonical_repo_identity(self.repo.root), "pjangler")
@@ -695,6 +745,131 @@ class RunRetroDurabilityTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 3)
         self.assertEqual(json.loads(result.stdout)["status"], "stalled")
+
+    def test_final_checkpoint_rejects_forged_terminal_status_without_transition(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        artifact = self.repo.artifact(prepared["artifact_fingerprint"])
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+        document["routing"] = {
+            "status": "posted",
+            "error_category": None,
+            "updated_at_epoch_us": document["routing"]["updated_at_epoch_us"] + 1,
+            "proof": {
+                "status": "verified",
+                "transition_id": "33333333-3333-4333-8333-333333333333",
+            },
+        }
+        artifact.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RETRO.RetroError, "invalid_artifact"):
+            RETRO.read_artifact(artifact, require_final=True)
+
+    def test_close_gate_rejects_forged_terminal_status_without_transition(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        artifact = self.repo.artifact(prepared["artifact_fingerprint"])
+        document = json.loads(artifact.read_text(encoding="utf-8"))
+        document["routing"]["status"] = "posted"
+        document["routing"]["updated_at_epoch_us"] += 1
+        document["routing"]["proof"] = {
+            "status": "verified",
+            "transition_id": "33333333-3333-4333-8333-333333333333",
+        }
+        artifact.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        evidence = (
+            self.repo.root
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "issue-evidence"
+            / "PJAN-21.md"
+        )
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(
+            textwrap.dedent(
+                """\
+                ## Issue
+                PJAN-21
+                ## Acceptance Criteria
+                Locked.
+                ## Repo Changes
+                Scoped.
+                ## Verification
+                Verified.
+                ## Ledger Update
+                Ledger updated: yes
+                ## Known Gaps
+                None material.
+                ## Close Recommendation
+                Close recommendation: ready
+                """
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["sh", str(CLOSE_GATE_PATH), "PJAN-21", str(self.repo.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "TMPDIR": str(self.repo.root)},
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Retro finalization proof failed.", result.stderr)
+
+    def test_close_gate_accepts_provider_finalized_bound_transition(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        RETRO.finalize(
+            self.repo.root,
+            prepared["artifact_fingerprint"],
+            {
+                "provider": "plane",
+                "status": "posted",
+                "target_issue": ISSUE_ID,
+                "error_category": None,
+                "error_summary": None,
+            },
+        )
+        evidence = (
+            self.repo.root
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "issue-evidence"
+            / "PJAN-21.md"
+        )
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text(
+            textwrap.dedent(
+                """\
+                ## Issue
+                PJAN-21
+                ## Acceptance Criteria
+                Locked.
+                ## Repo Changes
+                Scoped.
+                ## Verification
+                Verified.
+                ## Ledger Update
+                Ledger updated: yes
+                ## Known Gaps
+                None material.
+                ## Close Recommendation
+                Close recommendation: ready
+                """
+            ),
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            ["sh", str(CLOSE_GATE_PATH), "PJAN-21", str(self.repo.root)],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**os.environ, "TMPDIR": str(self.repo.root)},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CLOSE GATE: PASS for PJAN-21", result.stdout)
 
     def test_non_utf8_input_and_artifact_fail_with_sanitized_json(self):
         bad_input = self.repo.root / "bad-input.json"
@@ -965,6 +1140,99 @@ class RunRetroDurabilityTests(unittest.TestCase):
         ):
             RETRO.prepare(self.repo.root, base_intent())
         self.assertEqual(create_attempts, [])
+
+    def test_repository_root_replacement_cannot_redirect_binding_creation(self):
+        root = self.repo.root
+        held_root = root.with_name(f"{root.name}-held-binding-root")
+        original_open = RETRO.os.open
+        swapped = False
+
+        def replace_root_at_binding_create(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if (
+                not swapped
+                and flags & RETRO.os.O_CREAT
+                and str(path).endswith(".sha256")
+            ):
+                root.rename(held_root)
+                root.mkdir()
+                shutil.copy2(held_root / ".project.json", root / ".project.json")
+                (
+                    root
+                    / "_bmad-output"
+                    / "implementation-artifacts"
+                    / "run-retros"
+                    / ".bindings"
+                ).mkdir(parents=True)
+                swapped = True
+            return original_open(path, flags, *args, **kwargs)
+
+        with (
+            mock.patch.object(
+                RETRO.os,
+                "open",
+                side_effect=replace_root_at_binding_create,
+            ),
+            self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
+        ):
+            RETRO.prepare(root, base_intent())
+
+        self.assertTrue(swapped)
+        replacement_bindings = (
+            root
+            / "_bmad-output"
+            / "implementation-artifacts"
+            / "run-retros"
+            / ".bindings"
+        )
+        self.assertEqual(list(replacement_bindings.iterdir()), [])
+
+    def test_repository_root_replacement_cannot_redirect_durable_replace(self):
+        prepared = RETRO.prepare(self.repo.root, base_intent())
+        root = self.repo.root
+        held_root = root.with_name(f"{root.name}-held-replace-root")
+        original_replace = RETRO.os.replace
+        swapped = False
+
+        def replace_root_at_durable_replace(*args, **kwargs):
+            nonlocal swapped
+            if not swapped:
+                root.rename(held_root)
+                root.mkdir()
+                shutil.copy2(held_root / ".project.json", root / ".project.json")
+                shutil.copytree(
+                    held_root / "_bmad-output",
+                    root / "_bmad-output",
+                )
+                swapped = True
+            return original_replace(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                RETRO.os,
+                "replace",
+                side_effect=replace_root_at_durable_replace,
+            ),
+            self.assertRaisesRegex(RETRO.RetroError, "unsafe_artifact_path"),
+        ):
+            RETRO.finalize(
+                root,
+                prepared["artifact_fingerprint"],
+                {
+                    "provider": "plane",
+                    "status": "posted",
+                    "target_issue": ISSUE_ID,
+                    "error_category": None,
+                    "error_summary": None,
+                },
+            )
+
+        self.assertTrue(swapped)
+        replacement = self.repo.artifact(prepared["artifact_fingerprint"])
+        self.assertEqual(
+            json.loads(replacement.read_text(encoding="utf-8"))["routing"]["status"],
+            "prepared",
+        )
 
     def test_relocated_store_is_rejected_before_any_new_lock_write(self):
         relocated = self.repo.root.parent / f"{self.repo.root.name}-relocated-locks"
@@ -1484,68 +1752,108 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         time.sleep(1.0)
         self.assertFalse(delayed_side_effect.exists())
 
-    def test_post_launch_inventory_failure_is_bounded_and_fail_closed(self):
-        script = textwrap.dedent(
-            f"""\
-            import contextlib
-            import importlib.util
-            import os
-            import pathlib
-            import sys
-            from unittest import mock
-
-            helper = pathlib.Path({str(HELPER_PATH)!r})
-            spec = importlib.util.spec_from_file_location("retro_inventory_probe", helper)
-            retro = importlib.util.module_from_spec(spec)
-            sys.modules[spec.name] = retro
-            spec.loader.exec_module(retro)
-            calls = 0
-
-            def inventory(_path):
-                global calls
-                calls += 1
-                if calls == 1:
-                    return {{os.getpid()}}
-                raise retro.RetroError("provider_containment_unavailable")
-
-            patcher = (
-                mock.patch.object(retro, "_provider_holder_pids", side_effect=inventory)
-                if hasattr(retro, "_provider_holder_pids")
-                else contextlib.nullcontext()
-            )
-            with patcher:
-                result = retro.deliver(
-                    pathlib.Path(sys.argv[1]),
-                    sys.argv[2],
-                    providers_dir=pathlib.Path(sys.argv[3]),
-                )
-            print(result["status"])
-            """
-        )
+    def test_containment_info_failure_is_bounded_and_fail_closed(self):
+        read_fd, write_fd = os.pipe()
+        os.close(write_fd)
         started = time.monotonic()
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                script,
-                str(self.root),
-                self.fingerprint,
-                str(self.providers),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=2,
-            env={
-                **os.environ,
-                "FAKE_COMMENT_STORE": str(self.store),
-                "FAKE_CALL_STORE": str(self.calls),
-                "TMPDIR": str(self.root),
-            },
+        try:
+            with self.assertRaisesRegex(
+                RETRO.RetroError,
+                "provider_containment_unavailable",
+            ):
+                RETRO._read_containment_info(read_fd)
+        finally:
+            os.close(read_fd)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def _run_actual_containment_failure_probe(self, failing_symbol):
+        if sys.platform != "linux":
+            self.skipTest("Bubblewrap PID containment is a Linux guarantee")
+        try:
+            RETRO._containment_executable()
+        except RETRO.RetroError:
+            self.skipTest("trusted Bubblewrap is unavailable")
+        effect = self.root / f"{failing_symbol}-delayed-effect"
+        provider = self.providers / "plane.sh"
+        provider.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                set -eu
+                ( sleep 0.7; printf 'escaped\\n' > "$CONTAINMENT_EFFECT" ) &
+                sleep 10
+                """
+            ),
+            encoding="utf-8",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(result.stdout.strip(), {"posted", "failed"})
-        self.assertLess(time.monotonic() - started, 1.5)
+        provider.chmod(0o755)
+        stored = RETRO.read_artifact(self.repo.artifact(self.fingerprint))
+        payload = RETRO._provider_supervisor_payload(
+            stored,
+            {"type": "plane"},
+        )
+        payload["provider_timeout_seconds"] = 0.2
+        script_fd = os.open(provider, os.O_RDONLY)
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CONTAINMENT_EFFECT": str(effect),
+                        "TMPDIR": str(self.root),
+                    },
+                    clear=False,
+                ),
+                mock.patch.object(
+                    RETRO,
+                    failing_symbol,
+                    side_effect=RETRO.RetroError("provider_containment_unavailable"),
+                ),
+            ):
+                result = RETRO._run_contained_provider(payload, script_fd)
+        finally:
+            os.close(script_fd)
+        self.assertEqual(result["status"], "failed")
+        self.assertLess(time.monotonic() - started, 2.5)
+        time.sleep(0.9)
+        self.assertFalse(effect.exists())
+
+    def test_actual_containment_info_failure_never_releases_provider(self):
+        self._run_actual_containment_failure_probe("_read_containment_info")
+
+    def test_actual_pidfd_open_failure_never_releases_provider(self):
+        self._run_actual_containment_failure_probe("_open_pidfd")
+
+    def test_actual_pidfd_signal_failure_reaps_before_delayed_effect(self):
+        self._run_actual_containment_failure_probe("_signal_pidfd")
+
+    def test_pidfd_signal_failure_falls_through_to_bounded_group_reap(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.pid = 424242
+        process.wait.side_effect = [subprocess.TimeoutExpired("provider", 0.01), 0]
+        with (
+            mock.patch.object(
+                RETRO,
+                "_signal_pidfd",
+                side_effect=RETRO.RetroError("provider_containment_unavailable"),
+            ),
+            mock.patch.object(RETRO.os, "killpg") as killpg,
+        ):
+            RETRO._terminate_contained_provider(process, 99)
+        killpg.assert_called_with(process.pid, signal.SIGKILL)
+        self.assertEqual(process.wait.call_count, 2)
+
+    def test_controller_budget_includes_info_and_both_shutdown_windows(self):
+        with mock.patch.object(RETRO, "_lock_timeout_seconds", return_value=0.5):
+            budget = RETRO._controller_timeout_seconds()
+        self.assertGreaterEqual(
+            budget,
+            0.5
+            + RETRO.PROVIDER_TIMEOUT_SECONDS
+            + (4 * RETRO.SUPERVISOR_SHUTDOWN_SECONDS),
+        )
 
     def test_provider_override_cannot_redirect_prepared_intent(self):
         result = self.call_delivery()
@@ -1939,6 +2247,21 @@ class AdapterEnsureCommentTests(unittest.TestCase):
         popen.assert_not_called()
         self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
 
+    def test_non_linux_platform_explicitly_fails_before_provider_start(self):
+        with (
+            mock.patch.object(RETRO.sys, "platform", "darwin"),
+            mock.patch.object(
+                RETRO.subprocess,
+                "Popen",
+                wraps=RETRO.subprocess.Popen,
+            ) as popen,
+        ):
+            result = self.call_delivery()
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["transition"], "updated")
+        popen.assert_not_called()
+        self.assertEqual(self.calls.read_text(encoding="utf-8"), "")
+
     def test_timeout_terminates_and_reaps_the_entire_provider_process_group(self):
         provider = self.providers / "plane.sh"
         descendant_pid = self.root / "descendant.pid"
@@ -2226,7 +2549,7 @@ class PlanePaginationTests(unittest.TestCase):
             },
         )
 
-    def run_plane_resolve(self, reference=ISSUE_ID):
+    def run_plane_resolve(self, reference=ISSUE_ID, *, extra_env=None, timeout=5):
         return subprocess.run(
             [
                 "sh",
@@ -2244,7 +2567,9 @@ class PlanePaginationTests(unittest.TestCase):
                 "PLANE_BASE": "https://plane.invalid",
                 "CURL_LOG": str(self.log),
                 "TMPDIR": str(self.root),
+                **(extra_env or {}),
             },
+            timeout=timeout,
         )
 
     def test_plane_resolve_preserves_nul_bytes_before_strict_validation(self):
@@ -2285,6 +2610,71 @@ class PlanePaginationTests(unittest.TestCase):
         log = self.log.read_text(encoding="utf-8")
         self.assertEqual(log.count("work-items/"), 1)
         self.assertNotIn("per_page=100", log)
+
+    def test_plane_issue_resolution_rejects_a_b_a_cursor_cycles(self):
+        counter = self.root / "cursor-count"
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *"work-items/PJAN-21/"*) exit 22 ;;
+                esac
+                count=0
+                [ ! -f "$CURSOR_COUNT" ] || count="$(cat "$CURSOR_COUNT")"
+                count=$((count + 1))
+                printf '%s\\n' "$count" > "$CURSOR_COUNT"
+                case "$count" in
+                  1) next=A ;;
+                  2) next=B ;;
+                  *) next=A ;;
+                esac
+                printf '{"results":[],"count":0,"total_results":1,"next_page_results":true,"next_cursor":"%s"}\\n' "$next"
+                """
+            )
+        )
+        started = time.monotonic()
+        result = self.run_plane_resolve(
+            "PJAN-21",
+            extra_env={"CURSOR_COUNT": str(counter)},
+            timeout=2,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertLessEqual(int(counter.read_text(encoding="utf-8")), 3)
+
+    def test_plane_issue_resolution_has_one_operation_wide_deadline(self):
+        counter = self.root / "deadline-count"
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env sh
+                printf '%s\\n' "$*" >> "$CURL_LOG"
+                case "$*" in
+                  *"work-items/PJAN-21/"*) exit 22 ;;
+                esac
+                count=0
+                [ ! -f "$CURSOR_COUNT" ] || count="$(cat "$CURSOR_COUNT")"
+                count=$((count + 1))
+                printf '%s\\n' "$count" > "$CURSOR_COUNT"
+                sleep 0.18
+                printf '{"results":[],"count":0,"total_results":100,"next_page_results":true,"next_cursor":"cursor-%s"}\\n' "$count"
+                """
+            )
+        )
+        started = time.monotonic()
+        result = self.run_plane_resolve(
+            "PJAN-21",
+            extra_env={
+                "CURSOR_COUNT": str(counter),
+                "HERMES_RESOLVE_TIMEOUT_SECONDS": "0.25",
+            },
+            timeout=2,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.0)
+        self.assertLessEqual(int(counter.read_text(encoding="utf-8")), 2)
 
     def test_plane_comment_lookup_exhausts_current_cursor_pages(self):
         self.write_curl(
@@ -2484,6 +2874,28 @@ class PlanePaginationTests(unittest.TestCase):
         self.assertIn("--max-filesize", log)
         self.assertIn("--max-time", log)
 
+    def test_plane_response_bound_does_not_depend_on_curl_max_filesize(self):
+        self.write_curl(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import sys
+                import time
+
+                with open(os.environ["CURL_LOG"], "a", encoding="utf-8") as log:
+                    log.write(" ".join(sys.argv[1:]) + "\\n")
+                sys.stdout.buffer.write(b"x" * 262144)
+                sys.stdout.buffer.flush()
+                time.sleep(10)
+                """
+            )
+        )
+        started = time.monotonic()
+        result = self.run_plane_resolve(timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+
 
 class TrelloDeliveryContractTests(unittest.TestCase):
     CARD_ID = "a" * 24
@@ -2529,7 +2941,7 @@ class TrelloDeliveryContractTests(unittest.TestCase):
             },
         )
 
-    def run_trello_resolve(self, reference=None):
+    def run_trello_resolve(self, reference=None, *, extra_env=None, timeout=5):
         return subprocess.run(
             [
                 "sh",
@@ -2547,7 +2959,9 @@ class TrelloDeliveryContractTests(unittest.TestCase):
                 "TRELLO_TOKEN": "test-token",
                 "CURL_LOG": str(self.log),
                 "TMPDIR": str(self.root),
+                **(extra_env or {}),
             },
+            timeout=timeout,
         )
 
     def test_trello_resolve_preserves_nul_bytes_before_strict_validation(self):
@@ -2612,6 +3026,31 @@ class TrelloDeliveryContractTests(unittest.TestCase):
         self.assertEqual(payload["status"], "failed")
         self.assertEqual(payload["error_category"], "lookup_failed")
         self.assertNotIn("-X POST", self.log.read_text(encoding="utf-8"))
+
+    def test_trello_response_bound_does_not_depend_on_curl_max_filesize(self):
+        curl = self.bin / "curl"
+        curl.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import sys
+                import time
+
+                with open(os.environ["CURL_LOG"], "a", encoding="utf-8") as log:
+                    log.write(" ".join(sys.argv[1:]) + "\\n")
+                sys.stdout.buffer.write(b"x" * 262144)
+                sys.stdout.buffer.flush()
+                time.sleep(10)
+                """
+            ),
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+        started = time.monotonic()
+        result = self.run_trello_resolve(timeout=2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
 
 
 class LinearDeliveryContractTests(unittest.TestCase):
@@ -2758,7 +3197,7 @@ class ProtocolParityTests(unittest.TestCase):
         required = [
             "hermes.run-retro.artifact",
             "hermes.run-retro.comment",
-            "run-retro.v7.schema.json",
+            "run-retro.v8.schema.json",
             "tp ensure_comment",
             "resolve_issue_id",
             "Unicode NFKC",
@@ -2791,13 +3230,22 @@ class ProtocolParityTests(unittest.TestCase):
             "`setsid`",
             "Linear and Trello",
             "`--final`; only",
+            "`routing.proof.transition_id`",
+            "`final_document_sha256`",
+            "operation-wide deadline",
+            "A-B-A",
+            "curl predates",
+            "process-group",
+            "controller deadline",
+            "repository descriptor",
+            "issue close gate",
         ]
         for token in required:
             with self.subTest(token=token):
                 self.assertIn(token, prompt)
                 self.assertIn(token, docs)
-        self.assertEqual(schema["properties"]["schema_version"]["const"], 7)
-        self.assertEqual(RETRO.SCHEMA_VERSION, 7)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], 8)
+        self.assertEqual(RETRO.SCHEMA_VERSION, 8)
         self.assertEqual(RETRO.COMMENT_FINGERPRINT_VERSION, 6)
         self.assertNotIn("PJAN-", prompt)
         self.assertNotIn("PJAN-", docs)

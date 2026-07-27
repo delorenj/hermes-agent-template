@@ -98,13 +98,91 @@ list_name_for() {
   esac
 }
 
+# Independently enforce byte and time bounds even when curl predates reliable
+# --max-filesize handling for chunked or unknown-length responses.
+bounded_curl() {
+  python3 - "$HTTP_MAX_BYTES" "$HTTP_TIMEOUT_SECONDS" "$@" <<'PY'
+import contextlib
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import time
+
+try:
+    limit = int(sys.argv[1])
+    per_request = float(sys.argv[2])
+    command = sys.argv[3:]
+    if limit <= 0 or per_request <= 0 or not command:
+        raise ValueError
+    deadline = time.monotonic() + per_request
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    selector = selectors.DefaultSelector()
+    for stream in streams:
+        if stream is None:
+            raise OSError
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            events = selector.select(min(remaining, 0.05))
+            if not events and process.poll() is not None:
+                events = [
+                    (key, selectors.EVENT_READ)
+                    for key in list(selector.get_map().values())
+                ]
+            for key, _ in events:
+                stream = key.fileobj
+                try:
+                    chunk = os.read(stream.fileno(), 8192)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer = streams[stream]
+                buffer.extend(chunk)
+                stream_limit = limit if stream is process.stdout else 8192
+                if len(buffer) > stream_limit:
+                    raise OverflowError
+        process.wait(timeout=max(0.0, deadline - time.monotonic()))
+        if process.returncode != 0:
+            raise OSError
+        sys.stdout.buffer.write(bytes(streams[process.stdout]))
+    finally:
+        selector.close()
+        for stream in streams:
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+except (OSError, OverflowError, TimeoutError, ValueError, subprocess.SubprocessError):
+    if "process" in locals() and process.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=1)
+    raise SystemExit(22)
+PY
+}
+
 # api METHOD PATH [extra-query] — call Trello, auth appended, print body.
 api() {
   need_key
   method="$1"; path="$2"; extra="${3:-}"
   sep="?"; case "$path" in *\?*) sep="&" ;; esac
   url="$API/$path${sep}key=$TRELLO_KEY&token=$TRELLO_TOKEN${extra:+&$extra}"
-  curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
+  bounded_curl curl -fsS --max-filesize "$HTTP_MAX_BYTES" --max-time "$HTTP_TIMEOUT_SECONDS" \
     -X "$method" "$url"
 }
 

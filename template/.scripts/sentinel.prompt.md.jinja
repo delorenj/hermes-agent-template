@@ -165,8 +165,8 @@ comment / transition per the lifecycle) before the general reconcile below.
     correlation ID or `run_id` for `correlation_id`.
 
     The exact standard Draft 2020-12 contract is
-    `.scripts/sentinel/schemas/run-retro.v7.schema.json`, schema
-    `hermes.run-retro` version `7`. It uses no custom assertion keywords:
+    `.scripts/sentinel/schemas/run-retro.v8.schema.json`, schema
+    `hermes.run-retro` version `8`. It uses no custom assertion keywords:
     standard validation and runtime validation accept the same serialized JSON
     documents. The JSON stores only canonical closed-shape intent plus routing;
     duplicated target, fingerprints, marker, and body are not serialized because
@@ -176,8 +176,11 @@ comment / transition per the lifecycle) before the general reconcile below.
     `routing.updated_at_epoch_us` values use integer notation and remain bounded.
     Every schema/runtime string pattern uses the ECMAScript actual-end guard
     `$(?![\s\S])`, so a final newline is rejected identically.
-    Only `routing.status`, `routing.error_category`, and
-    `routing.updated_at_epoch_us` are mutable. The immutable operator flag is
+    Only the closed `routing` result is mutable:
+    `status`, `error_category`, `updated_at_epoch_us`, and the closed
+    `proof.{status,transition_id}` shape. Prepared or failed routing requires
+    `unverified|null`; `posted|already_present|no_target_issue` requires
+    `verified|<canonical-rfc-uuid>`. The immutable operator flag is
     true for a null source or external/template/fleet scope and false only for a
     source-bound repo-local improvement. No create-issue operation is available;
     `local_tracking_reference` is a canonical provider issue ID naming only an
@@ -186,7 +189,7 @@ comment / transition per the lifecycle) before the general reconcile below.
     Fingerprint preimages are exact UTF-8 lines with one LF after every line,
     including the last, and no other separators:
 
-    - `artifact_fingerprint`: SHA-256 of `hermes.run-retro.artifact`, `7`,
+    - `artifact_fingerprint`: SHA-256 of `hermes.run-retro.artifact`, `8`,
       canonical `repo`, `run_id`.
     - `comment_fingerprint`: SHA-256 of `hermes.run-retro.comment`, `6`,
       canonical `repo`, canonical `provider`, canonical `source_issue` or
@@ -199,8 +202,15 @@ comment / transition per the lifecycle) before the general reconcile below.
     values. Comment identity and the exact comment body are derived only from
     immutable closed-shape intent, so one marker maps to one body in every retry
     state. An adjacent no-replace `.bindings/<artifact_fingerprint>.sha256`
-    record binds the immutable serialized intent without adding a nonportable
-    computed JSON field. Same run plus same immutable content reuses one path;
+    record is closed JSON: it first binds the immutable digest with null final
+    digest/transition, then atomically binds the full canonical final-document
+    digest and byte-equal `routing.proof.transition_id`. Thus a hand-edited
+    terminal status or proof cannot satisfy `--final`. Its exact fields are
+    `schema=hermes.run-retro.binding`, `schema_version=1`,
+    `immutable_sha256`, `final_document_sha256`, and `transition_id`.
+    `immutable_sha256` hashes canonical UTF-8 JSON plus one final LF for the
+    immutable artifact view; `final_document_sha256` hashes the same canonical
+    encoding of the complete finalized artifact. Same run plus same immutable content reuses one path;
     same run plus changed content returns `stalled` without overwrite or
     comment; distinct runs use distinct paths; identical cross-run improvements
     share one marker and body.
@@ -216,7 +226,10 @@ comment / transition per the lifecycle) before the general reconcile below.
     descriptor-relative `O_NOFOLLOW` operations that reject symlinks. Revalidate
     the bound directory before every create and after opening an empty `O_EXCL`
     temp but before writing data. Mutation targets are addressed from the held
-    repository-parent descriptor through the bound repository name, so a store
+    repository descriptor through
+    `_bmad-output/implementation-artifacts/run-retros`, never through the
+    replaceable root pathname, so root replacement updates neither a binding
+    nor an artifact in the replacement tree, and a store
     relocation at temp creation or durable replacement cannot redirect a
     transient or durable write outside the repository; return only
     `unsafe_artifact_path`. A new
@@ -266,22 +279,32 @@ comment / transition per the lifecycle) before the general reconcile below.
     descendants—before finalization and before the keyed socket closes.
     Missing/invalid containment or pre-launch inventory fails closed on a finite
     deadline with no provider launch. After launch, the already-held pidfd is
-    used for bounded terminal cleanup, and failure to prove containment
+    used for bounded terminal cleanup. If pidfd signaling itself fails after
+    `pidfd_open`, cleanup falls through to bounded Bubblewrap process-group
+    termination and confirmed reap; it never returns while that provider
+    subtree can still act. The controller deadline budgets lock acquisition,
+    provider execution, containment-info acquisition, and every shutdown/reap
+    window. Failure to prove containment
     completion fails closed before finalization or socket release. Unsupported
     platforms perform no board side effect. Provider temporary storage honors
     `TMPDIR`; artifact and comment lock acquisition are both bounded.
 
-    Plane and Trello `resolve_issue_id` HTTP bodies go first to bounded private
+    Plane and Trello `resolve_issue_id` HTTP bodies go through an independent
+    streaming byte limiter before bounded private
     `TMPDIR` files and undergo strict UTF-8/JSON/type/canonical-ID validation
     before any shell variable can normalize bytes; NUL, malformed, oversized,
-    null, or numeric identities fail closed. Plane uses the supported
+    null, or numeric identities fail closed even when curl predates reliable
+    `--max-filesize` enforcement for chunked or unknown-length responses.
+    Plane uses the supported
     `/work-items/{id}/comments/` list/create endpoints
     and exhausts `per_page=100` plus `cursor` pages. Every HTTP-200 lookup
     envelope must have typed `results`, `count`, `total_results`,
     `next_page_results`, and `next_cursor`; each result has a canonical string
     UUID `id` and string `comment_html`. Pin `total_results` from page one,
     require count/cumulative-total agreement, unique item IDs, and a new typed
-    cursor on every continuing page, with a 2,000-comment safety bound.
+    cursor on every continuing page, with a 2,000-comment safety bound. Plane
+    issue resolution has one operation-wide deadline across the direct lookup
+    and all pages, and rejects any repeated cursor cycle, including A-B-A.
     Collection drift, duplicate IDs/cursors,
     malformed or oversized envelopes, and incomplete final pages are
     `failed|lookup_failed` with no post. A successful POST must return a
@@ -298,11 +321,14 @@ comment / transition per the lifecycle) before the general reconcile below.
     <fingerprint> --final` succeeds after bounded parse/read-back validation of
     the standard schema, filename, immutable binding, canonical identities,
     derived fingerprints/body, closed summary grammar, epoch-microsecond bounds,
-    sanitization, target/source result equality, and final routing status. A
+    sanitization, target/source result equality, the closed routing proof, and
+    the full-document digest/transition bound by the finalized binding. A
     write, fsync, lookup, validation, corrupt-artifact, wrong-target, timeout,
     overflow, or immutable-input failure makes the pass `stalled`; record only
     its safe category. A stored `failed` delivery remains retryable evidence but
     never satisfies `--final`; only `posted|already_present|no_target_issue`
-    passes this checkpoint.
+    passes this checkpoint. The issue close gate applies the same helper to
+    every run-retro artifact and requires `--final` for each one, so
+    editing a status/proof without the bound final transition blocks closure.
 
 Do not rely on a hard-coded seed ticket. Query the board every pass.
