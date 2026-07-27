@@ -74,6 +74,50 @@ api() {
   curl -fsS -X "$method" "$url"
 }
 
+canonical_card_id() {
+  python3 - "$1" <<'PY'
+import re,sys,unicodedata
+value=unicodedata.normalize("NFKC",sys.argv[1]).strip().casefold()
+if not re.fullmatch(r"[0-9a-f]{24}",value):
+    raise SystemExit(1)
+print(value)
+PY
+}
+
+# Exhaust Trello comment actions in 1000-row pages. Return 0 when found, 1
+# after an exhaustive miss, and 2 when lookup/pagination is not trustworthy.
+trello_comment_marker_state() {
+  card_id="$1"; marker="$2"; before=""; pages=0
+  while :; do
+    query="filter=commentCard&limit=1000"
+    [ -z "$before" ] || query="$query&before=$before"
+    if ! actions="$(api GET "cards/$card_id/actions" "$query" 2>/dev/null)"; then
+      return 2
+    fi
+    state="$(printf '%s' "$actions" | MARKER="$marker" python3 -c 'import json,os,sys
+try: rows=json.load(sys.stdin)
+except Exception: print("invalid"); raise SystemExit(0)
+if not isinstance(rows,list): print("invalid"); raise SystemExit(0)
+marker=os.environ["MARKER"]
+if any(marker in str((row.get("data") or {}).get("text","")) for row in rows):
+ print("found")
+elif len(rows)<1000:
+ print("absent")
+else:
+ print("more:"+str(rows[-1].get("id","")))')"
+    case "$state" in
+      found) return 0 ;;
+      absent) return 1 ;;
+      more:*)
+        next="${state#more:}"
+        [ -n "$next" ] && [ "$next" != "$before" ] || return 2
+        before="$next"; pages=$((pages + 1)); [ "$pages" -lt 10000 ] || return 2
+        ;;
+      *) return 2 ;;
+    esac
+  done
+}
+
 # Resolve a list id on the board by (normalized) state.
 list_id_for() {
   [ -n "$BOARD" ] || die "ticket_provider.board not set"
@@ -133,6 +177,63 @@ print(json.dumps({"id":c.get("id",""),"key":c.get("id",""),"title":c.get("name",
     ID="${1:?usage: comment <id> <body>}"; BODY="${2:?}"
     api POST "cards/$ID/actions/comments" "text=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$BODY")" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
+    ;;
+
+  resolve_issue_id)
+    REF="${1:?usage: resolve_issue_id <reference>}"
+    NORMALIZED="$(python3 - "$REF" <<'PY'
+import re,sys,unicodedata
+value=unicodedata.normalize("NFKC",sys.argv[1]).strip()
+if not re.fullmatch(r"[A-Za-z0-9]+",value):
+    raise SystemExit(1)
+print(value)
+PY
+)" || die "invalid issue reference"
+    if ! CARD="$(api GET "cards/$NORMALIZED" "fields=id" 2>/dev/null)"; then
+      die "issue lookup failed"
+    fi
+    ID="$(printf '%s' "$CARD" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("id",""))
+except Exception: print("")')"
+    CANONICAL="$(canonical_card_id "$ID" 2>/dev/null || true)"
+    [ -n "$CANONICAL" ] || die "issue not found or provider returned a non-canonical card id"
+    printf '%s\n' "$CANONICAL"
+    ;;
+
+  ensure_comment)
+    ID="${1:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    MARKER="${2:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    BODY="${3:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    CANONICAL="$(canonical_card_id "$ID" 2>/dev/null || true)"
+    [ "$CANONICAL" = "$ID" ] || die "ensure_comment requires a canonical Trello card id"
+    printf '%s\n%s\n' "$MARKER" "$BODY" | python3 -c 'import re,sys
+marker,body=sys.stdin.read().split("\n",1)
+marker=marker.rstrip("\n"); body=body.rstrip("\n")
+if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
+ raise SystemExit(1)' || die "invalid comment marker/body"
+    if trello_comment_marker_state "$ID" "$MARKER"; then
+      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      exit 0
+    else
+      rc=$?
+      if [ "$rc" -eq 2 ]; then
+        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        exit 0
+      fi
+    fi
+    ENCODED="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$BODY")"
+    if ! RESPONSE="$(api POST "cards/$ID/actions/comments" "text=$ENCODED" 2>/dev/null)"; then
+      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      exit 0
+    fi
+    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("id",""))
+except Exception: print("")')"
+    if [ -z "$COMMENT_ID" ]; then
+      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+    else
+      printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+    fi
     ;;
 
   transition)

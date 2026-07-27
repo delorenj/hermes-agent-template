@@ -75,6 +75,55 @@ print(json.dumps(body.get("data") or {}))
 PY
 }
 
+canonical_uuid() {
+  python3 - "$1" <<'PY'
+import sys,unicodedata,uuid
+value=unicodedata.normalize("NFKC",sys.argv[1]).strip().casefold()
+try:
+    canonical=str(uuid.UUID(value))
+except ValueError:
+    raise SystemExit(1)
+if canonical != value:
+    raise SystemExit(1)
+print(canonical)
+PY
+}
+
+# Exhaust Linear's cursor-paginated comment connection. Return 0 when found, 1
+# after a complete miss, and 2 when lookup/pagination is not trustworthy.
+linear_comment_marker_state() {
+  issue_id="$1"; marker="$2"; after=""; pages=0
+  while :; do
+    variables="$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"after":sys.argv[2] or None}))' "$issue_id" "$after")"
+    if ! page="$(gql 'query($id:String!,$after:String){ issue(id:$id){ comments(first:100,after:$after){ nodes{id body} pageInfo{hasNextPage endCursor} } } }' "$variables" 2>/dev/null)"; then
+      return 2
+    fi
+    state="$(printf '%s' "$page" | MARKER="$marker" python3 -c 'import json,os,sys
+try: data=json.load(sys.stdin)
+except Exception: print("invalid"); raise SystemExit(0)
+issue=data.get("issue")
+if not isinstance(issue,dict): print("invalid"); raise SystemExit(0)
+comments=(issue.get("comments") or {})
+rows=comments.get("nodes") or []; marker=os.environ["MARKER"]
+if any(marker in str(row.get("body","")) for row in rows):
+ print("found")
+elif (comments.get("pageInfo") or {}).get("hasNextPage"):
+ print("more:"+str((comments.get("pageInfo") or {}).get("endCursor","")))
+else:
+ print("absent")')"
+    case "$state" in
+      found) return 0 ;;
+      absent) return 1 ;;
+      more:*)
+        next="${state#more:}"
+        [ -n "$next" ] && [ "$next" != "$after" ] || return 2
+        after="$next"; pages=$((pages + 1)); [ "$pages" -lt 10000 ] || return 2
+        ;;
+      *) return 2 ;;
+    esac
+  done
+}
+
 TEAM="$(pj_cfg team)"; [ -n "$TEAM" ] || TEAM="$(tp_cfg team)"
 PROJECT="$(pj_cfg project)"; [ -n "$PROJECT" ] || PROJECT="$(tp_cfg project)"
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
@@ -136,6 +185,66 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("identifier",""),"title":i.get
     gql 'mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ comment{id} success } }' \
         "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"b":sys.argv[2]}))' "$ID" "$BODY")" \
       | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("commentCreate",{}).get("comment") or {}).get("id",""))'
+    ;;
+
+  resolve_issue_id)
+    REF="${1:?usage: resolve_issue_id <reference>}"
+    NORMALIZED="$(python3 - "$REF" <<'PY'
+import re,sys,unicodedata
+value=unicodedata.normalize("NFKC",sys.argv[1]).strip()
+if not re.fullmatch(r"[A-Za-z0-9-]+",value):
+    raise SystemExit(1)
+print(value)
+PY
+)" || die "invalid issue reference"
+    if ! ISSUE="$(gql 'query($id:String!){ issue(id:$id){ id } }' \
+        "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1]}))' "$NORMALIZED")" 2>/dev/null)"; then
+      die "issue lookup failed"
+    fi
+    ID="$(printf '%s' "$ISSUE" | python3 -c 'import json,sys
+try: print((json.load(sys.stdin).get("issue") or {}).get("id",""))
+except Exception: print("")')"
+    CANONICAL="$(canonical_uuid "$ID" 2>/dev/null || true)"
+    [ -n "$CANONICAL" ] || die "issue not found or provider returned a non-canonical UUID"
+    printf '%s\n' "$CANONICAL"
+    ;;
+
+  ensure_comment)
+    ID="${1:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    MARKER="${2:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    BODY="${3:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    CANONICAL="$(canonical_uuid "$ID" 2>/dev/null || true)"
+    [ "$CANONICAL" = "$ID" ] || die "ensure_comment requires a canonical Linear issue UUID"
+    printf '%s\n%s\n' "$MARKER" "$BODY" | python3 -c 'import re,sys
+marker,body=sys.stdin.read().split("\n",1)
+marker=marker.rstrip("\n"); body=body.rstrip("\n")
+if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
+ raise SystemExit(1)' || die "invalid comment marker/body"
+    if linear_comment_marker_state "$ID" "$MARKER"; then
+      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      exit 0
+    else
+      rc=$?
+      if [ "$rc" -eq 2 ]; then
+        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        exit 0
+      fi
+    fi
+    if ! RESPONSE="$(gql 'mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ comment{id} success } }' \
+        "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"b":sys.argv[2]}))' "$ID" "$BODY")" 2>/dev/null)"; then
+      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      exit 0
+    fi
+    RESULT="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin).get("commentCreate") or {}
+ print("posted" if d.get("success") and (d.get("comment") or {}).get("id") else "failed")
+except Exception: print("unknown")')"
+    case "$RESULT" in
+      posted) printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID" ;;
+      failed) printf '{"status":"failed","target_issue":"%s","error_category":"post_failed","error_summary":"provider rejected the comment"}\n' "$ID" ;;
+      *) printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID" ;;
+    esac
     ;;
 
   transition)

@@ -74,6 +74,75 @@ api() {
   fi
 }
 
+urlencode() {
+  python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+# plane_pages_find PATH MODE NEEDLE
+# Exhaust every cursor page. Return 0 when MODE finds NEEDLE, 1 when the full
+# collection was read and no match exists, and 2 on lookup/pagination failure.
+plane_pages_find() {
+  path="$1"; mode="$2"; needle="$3"; cursor=""; page_count=0
+  while :; do
+    request_path="$path"
+    case "$request_path" in *\?*) request_path="${request_path}&per_page=100" ;; *) request_path="${request_path}?per_page=100" ;; esac
+    [ -z "$cursor" ] || request_path="${request_path}&cursor=$(urlencode "$cursor")"
+    if ! page="$(api GET "$request_path" 2>/dev/null)"; then
+      return 2
+    fi
+    match="$(printf '%s' "$page" | MODE="$mode" NEEDLE="$needle" python3 -c 'import json,os,sys
+try:
+    data=json.load(sys.stdin)
+except Exception:
+    print("invalid"); raise SystemExit(0)
+rows=data.get("results",[]) if isinstance(data,dict) else data if isinstance(data,list) else []
+mode=os.environ["MODE"]; needle=os.environ["NEEDLE"]
+if mode=="comment":
+    found=any(needle in str(row.get("comment_html","")) for row in rows)
+else:
+    def refs(row):
+        values=[str(row.get("id","")),str(row.get("sequence_id",""))]
+        ident=str(row.get("identifier",""))
+        if ident: values.append(ident)
+        project_identifier=str(row.get("project_identifier",""))
+        if project_identifier and row.get("sequence_id") is not None:
+            values.append(project_identifier+"-"+str(row["sequence_id"]))
+        return values
+    lookup=needle.rsplit("-",1)[-1] if "-" in needle and needle.rsplit("-",1)[-1].isdigit() else needle
+    found=any(lookup.casefold() in [v.casefold() for v in refs(row)] for row in rows)
+print("found" if found else "absent")')"
+    [ "$match" != "invalid" ] || return 2
+    [ "$match" != "found" ] || return 0
+    next="$(printf '%s' "$page" | python3 -c 'import json,sys
+try:
+ d=json.load(sys.stdin)
+ if not isinstance(d,dict): print("__done__")
+ elif not d.get("next_page_results",False): print("__done__")
+ else: print(d.get("next_cursor","") or "__invalid__")
+except Exception:
+ print("__invalid__")')"
+    [ "$next" != "__invalid__" ] || return 2
+    [ "$next" != "__done__" ] || return 1
+    [ "$next" != "$cursor" ] || return 2
+    cursor="$next"; page_count=$((page_count + 1))
+    [ "$page_count" -lt 10000 ] || return 2
+  done
+}
+
+canonical_uuid() {
+  python3 - "$1" <<'PY'
+import sys, unicodedata, uuid
+raw=unicodedata.normalize("NFKC",sys.argv[1]).strip().casefold()
+try:
+    value=str(uuid.UUID(raw))
+except ValueError:
+    raise SystemExit(1)
+if raw != value:
+    raise SystemExit(1)
+print(value)
+PY
+}
+
 # Map a normalized state -> a concrete Plane state id in this project.
 resolve_state_id() {
   want="$1"
@@ -166,6 +235,96 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
     api POST "projects/$PROJ/issues/$ID/comments/" \
       "$(python3 -c 'import json,sys; print(json.dumps({"comment_html":"<p>"+sys.argv[1]+"</p>"}))' "$BODY")" \
       | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
+    ;;
+
+  resolve_issue_id)
+    REF="${1:?usage: resolve_issue_id <reference>}"
+    NORMALIZED="$(python3 - "$REF" <<'PY'
+import re,sys,unicodedata
+value=unicodedata.normalize("NFKC",sys.argv[1]).strip()
+if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}",value)
+        or any(unicodedata.category(c).startswith("C") for c in value)):
+    raise SystemExit(1)
+print(value)
+PY
+)" || die "invalid issue reference"
+    ID=""
+    if DIRECT="$(api GET "projects/$PROJ/issues/$NORMALIZED/" 2>/dev/null)"; then
+      ID="$(printf '%s' "$DIRECT" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+    fi
+    if [ -z "$ID" ]; then
+      # The caller should normally pass the canonical id from list_issues. This
+      # exhaustive fallback safely resolves sequence/key references.
+      if plane_pages_find "projects/$PROJ/issues/" issue "$NORMALIZED"; then
+        cursor=""; page_count=0
+        while :; do
+          path="projects/$PROJ/issues/?per_page=100"
+          [ -z "$cursor" ] || path="${path}&cursor=$(urlencode "$cursor")"
+          PAGE="$(api GET "$path")" || die "issue lookup failed"
+          ID="$(printf '%s' "$PAGE" | NEEDLE="$NORMALIZED" python3 -c 'import json,os,sys
+d=json.load(sys.stdin); rows=d.get("results",[]) if isinstance(d,dict) else d if isinstance(d,list) else []
+n=os.environ["NEEDLE"].casefold()
+lookup=n.rsplit("-",1)[-1] if "-" in n and n.rsplit("-",1)[-1].isdigit() else n
+for row in rows:
+ vals=[str(row.get("id","")),str(row.get("sequence_id","")),str(row.get("identifier",""))]
+ p=str(row.get("project_identifier",""))
+ if p and row.get("sequence_id") is not None: vals.append(p+"-"+str(row["sequence_id"]))
+ if lookup in [v.casefold() for v in vals if v]:
+  print(row.get("id","")); break')"
+          [ -z "$ID" ] || break
+          cursor="$(printf '%s' "$PAGE" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("next_cursor","") if d.get("next_page_results",False) else "")')"
+          [ -n "$cursor" ] || break
+          page_count=$((page_count + 1)); [ "$page_count" -lt 10000 ] || die "issue pagination failed"
+        done
+      else
+        rc=$?
+        [ "$rc" -eq 1 ] || die "issue lookup failed"
+      fi
+    fi
+    CANONICAL="$(canonical_uuid "$ID" 2>/dev/null || true)"
+    [ -n "$CANONICAL" ] || die "issue not found or provider returned a non-canonical UUID"
+    printf '%s\n' "$CANONICAL"
+    ;;
+
+  ensure_comment)
+    ID="${1:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    MARKER="${2:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    BODY="${3:?usage: ensure_comment <canonical-id> <marker> <body>}"
+    CANONICAL="$(canonical_uuid "$ID" 2>/dev/null || true)"
+    [ "$CANONICAL" = "$ID" ] || die "ensure_comment requires a canonical Plane issue UUID"
+    printf '%s\n%s\n' "$MARKER" "$BODY" | python3 -c 'import re,sys
+marker,body=sys.stdin.read().split("\n",1)
+marker=marker.rstrip("\n"); body=body.rstrip("\n")
+if not re.fullmatch(r"\[run-retro-comment:[0-9a-f]{64}\]",marker) or body.count(marker)!=1:
+ raise SystemExit(1)' || die "invalid comment marker/body"
+    if plane_pages_find "projects/$PROJ/issues/$ID/comments/" comment "$MARKER"; then
+      printf '{"status":"already_present","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+      exit 0
+    else
+      rc=$?
+      if [ "$rc" -eq 2 ]; then
+        printf '{"status":"failed","target_issue":"%s","error_category":"lookup_failed","error_summary":"comment lookup failed; no post attempted"}\n' "$ID"
+        exit 0
+      fi
+    fi
+    PAYLOAD="$(python3 - "$BODY" <<'PY'
+import html,json,sys
+body="<p>"+html.escape(sys.argv[1]).replace("\n","<br>")+"</p>"
+print(json.dumps({"comment_html":body},separators=(",",":")))
+PY
+)"
+    if ! RESPONSE="$(api POST "projects/$PROJ/issues/$ID/comments/" "$PAYLOAD" 2>/dev/null)"; then
+      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+      exit 0
+    fi
+    COMMENT_ID="$(printf '%s' "$RESPONSE" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("id",""))
+except Exception: print("")')"
+    if [ -z "$COMMENT_ID" ]; then
+      printf '{"status":"failed","target_issue":"%s","error_category":"response_unknown","error_summary":"comment post response was not confirmed; retry ensure_comment"}\n' "$ID"
+    else
+      printf '{"status":"posted","target_issue":"%s","error_category":null,"error_summary":null}\n' "$ID"
+    fi
     ;;
 
   transition)

@@ -14,6 +14,11 @@
 #   get_issue <id>                -> JSON {id,key,title,description,acceptance,
 #                                          state,state_type,comments:[...]}
 #   comment <id> <body>           -> prints comment id
+#   resolve_issue_id <reference>  -> canonical provider issue UUID/ID
+#   ensure_comment <id> <marker> <body>
+#                                  -> exhaustively checks then posts under a
+#                                     local cross-run lock; JSON {status,
+#                                     target_issue,error_category,error_summary}
 #   transition <id> <normalized>  -> moves issue; normalized in
 #                                     backlog|unstarted|started|in_review|completed
 #   create_board <name> <id> <d>  -> JSON {board_id, board_url}
@@ -69,9 +74,29 @@ PY
 
 # Directory holding provider implementations (sibling of this lib).
 tp_providers_dir() {
+  if [ -n "${TP_PROVIDERS_DIR:-}" ]; then
+    printf '%s\n' "$TP_PROVIDERS_DIR"
+    return 0
+  fi
   local here
   here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   printf '%s/../providers\n' "$here"
+}
+
+# Find the installing repo root from the role directory. The exact repository
+# identity is still read from .project.json.project_name by run-retro.py.
+tp_repo_root() {
+  local role_dir
+  role_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
+  python3 - "$role_dir" <<'PY'
+import pathlib, sys
+start = pathlib.Path(sys.argv[1]).resolve()
+for parent in (start, *start.parents):
+    if (parent / ".project.json").is_file():
+        print(parent)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 # Dispatch one operation to the active provider.
@@ -86,6 +111,41 @@ tp() {
   if [ ! -f "$impl" ]; then
     echo "tp: unknown ticket provider '$name' (no $impl)" >&2
     return 2
+  fi
+
+  if [ "$op" = "ensure_comment" ]; then
+    local issue_id="${1:-}" marker="${2:-}"
+    [ -n "$issue_id" ] && [ -n "$marker" ] || {
+      echo "tp: usage: ensure_comment <canonical-id> <marker> <body>" >&2
+      return 2
+    }
+    local lock_root lock_key lock_path
+    if [ -n "${TP_COMMENT_LOCK_ROOT:-}" ]; then
+      lock_root="$TP_COMMENT_LOCK_ROOT"
+    else
+      lock_root="$(tp_repo_root)/_bmad-output/implementation-artifacts/run-retros/.locks/comments" || {
+        printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"repository binding unavailable; no post attempted"}\n' "$issue_id"
+        return 0
+      }
+    fi
+    mkdir -p "$lock_root" 2>/dev/null || {
+      printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
+      return 0
+    }
+    lock_key="$(printf '%s\n%s\n%s\n' "$name" "$issue_id" "$marker" | sha256sum | awk '{print $1}')"
+    lock_path="$lock_root/$lock_key.lock"
+    : >> "$lock_path" 2>/dev/null || {
+      printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
+      return 0
+    }
+    (
+      flock -x 9 || {
+        printf '{"status":"failed","target_issue":"%s","error_category":"serialization_failed","error_summary":"comment lock unavailable; no post attempted"}\n' "$issue_id"
+        exit 0
+      }
+      TICKET_PROVIDER="$name" sh "$impl" "$op" "$@"
+    ) 9>"$lock_path"
+    return
   fi
 
   TICKET_PROVIDER="$name" sh "$impl" "$op" "$@"

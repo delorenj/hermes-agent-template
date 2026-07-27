@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes.delo.sh/schemas/run-retro.v4.schema.json",
+  "title": "Hermes run retro prepared intent and routing result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "schema_version",
+    "artifact_fingerprint",
+    "comment_fingerprint",
+    "run_id",
+    "correlation_id",
+    "repo",
+    "provider",
+    "source_issue",
+    "target_issue",
+    "local_tracking_reference",
+    "decisions",
+    "protected_evidence_refs",
+    "sanitization",
+    "comment_fingerprint_marker",
+    "recorded_at",
+    "routing"
+  ],
+  "properties": {
+    "schema": {
+      "const": "hermes.run-retro"
+    },
+    "schema_version": {
+      "const": 4
+    },
+    "artifact_fingerprint": {
+      "$ref": "#/$defs/sha256"
+    },
+    "comment_fingerprint": {
+      "$ref": "#/$defs/sha256"
+    },
+    "run_id": {
+      "$ref": "#/$defs/invocation_id"
+    },
+    "correlation_id": {
+      "$ref": "#/$defs/invocation_id"
+    },
+    "repo": {
+      "type": "string",
+      "pattern": "^[a-z0-9](?:[a-z0-9._-]{0,126}[a-z0-9])?$"
+    },
+    "provider": {
+      "enum": [
+        "linear",
+        "plane",
+        "trello"
+      ]
+    },
+    "source_issue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/provider_issue_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target_issue": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/provider_issue_id"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "local_tracking_reference": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/safe_summary"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "decisions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "what_hurt",
+        "what_should_change",
+        "fix_scope"
+      ],
+      "properties": {
+        "what_hurt": {
+          "$ref": "#/$defs/categorized_summary"
+        },
+        "what_should_change": {
+          "$ref": "#/$defs/categorized_summary"
+        },
+        "fix_scope": {
+          "enum": [
+            "repo-local",
+            "external",
+            "template",
+            "fleet"
+          ]
+        }
+      }
+    },
+    "protected_evidence_refs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/protected_ref"
+      },
+      "uniqueItems": true,
+      "maxItems": 32
+    },
+    "sanitization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "omitted_categories"
+      ],
+      "properties": {
+        "status": {
+          "const": "sanitized"
+        },
+        "omitted_categories": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "credentials",
+              "tokens",
+              "raw_logs",
+              "customer_or_pii",
+              "private_paths",
+              "other_protected"
+            ]
+          },
+          "uniqueItems": true,
+          "maxItems": 6
+        }
+      }
+    },
+    "comment_fingerprint_marker": {
+      "type": "string",
+      "pattern": "^\\[run-retro-comment:[0-9a-f]{64}\\]$"
+    },
+    "recorded_at": {
+      "$ref": "#/$defs/rfc3339_utc"
+    },
+    "routing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "error_category",
+        "error_summary",
+        "operator_action_required",
+        "updated_at"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "prepared",
+            "posted",
+            "already_present",
+            "failed",
+            "no_target_issue"
+          ]
+        },
+        "error_category": {
+          "oneOf": [
+            {
+              "enum": [
+                "lookup_failed",
+                "post_failed",
+                "response_unknown",
+                "serialization_failed"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error_summary": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/safe_summary"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "operator_action_required": {
+          "type": "boolean"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/rfc3339_utc"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "source_issue": {
+            "type": "null"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "target_issue": {
+            "type": "null"
+          },
+          "routing": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "prepared",
+                  "no_target_issue"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "target_issue": {
+            "$ref": "#/$defs/provider_issue_id"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "status": {
+                "enum": [
+                  "prepared",
+                  "posted",
+                  "already_present",
+                  "no_target_issue"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "error_category": {
+                "type": "null"
+              },
+              "error_summary": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "status": {
+                "const": "failed"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "error_category": {
+                "enum": [
+                  "lookup_failed",
+                  "post_failed",
+                  "response_unknown",
+                  "serialization_failed"
+                ]
+              },
+              "operator_action_required": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "status": {
+                "const": "no_target_issue"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "operator_action_required": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "provider": {
+            "enum": [
+              "plane",
+              "linear"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "source_issue": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/canonical_uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target_issue": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/canonical_uuid"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "source_issue": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/trello_card_id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "target_issue": {
+            "oneOf": [
+              {
+                "$ref": "#/$defs/trello_card_id"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "decisions": {
+            "properties": {
+              "fix_scope": {
+                "enum": [
+                  "external",
+                  "template",
+                  "fleet"
+                ]
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "routing": {
+            "properties": {
+              "operator_action_required": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "invocation_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "provider_issue_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f-]+$"
+    },
+    "canonical_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "trello_card_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{24}$"
+    },
+    "safe_summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "pattern": "^[^\\r\\n\\t\\u0000-\\u001f\\u007f]*$"
+    },
+    "categorized_summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "category",
+        "summary"
+      ],
+      "properties": {
+        "category": {
+          "enum": [
+            "process",
+            "tooling",
+            "dependency",
+            "review",
+            "testing",
+            "coordination",
+            "environment",
+            "documentation",
+            "automation",
+            "external_dependency",
+            "other"
+          ]
+        },
+        "summary": {
+          "$ref": "#/$defs/safe_summary"
+        }
+      }
+    },
+    "protected_ref": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300,
+      "pattern": "^(?:evidence:[A-Za-z0-9._:-]+|[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*)$"
+    },
+    "rfc3339_utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    }
+  },
+  "x-hermes-immutable-json-pointers": [
+    "/schema",
+    "/schema_version",
+    "/artifact_fingerprint",
+    "/comment_fingerprint",
+    "/run_id",
+    "/correlation_id",
+    "/repo",
+    "/provider",
+    "/source_issue",
+    "/target_issue",
+    "/local_tracking_reference",
+    "/decisions",
+    "/protected_evidence_refs",
+    "/sanitization",
+    "/comment_fingerprint_marker",
+    "/recorded_at"
+  ],
+  "x-hermes-mutable-json-pointers": [
+    "/routing/status",
+    "/routing/error_category",
+    "/routing/error_summary",
+    "/routing/operator_action_required",
+    "/routing/updated_at"
+  ],
+  "x-hermes-invariants": [
+    "target_issue is null exactly when source_issue is null",
+    "when target_issue is not null, target_issue equals source_issue byte-for-byte",
+    "source_issue and target_issue are canonical IDs for provider",
+    "artifact_fingerprint equals SHA-256 of the specified artifact preimage",
+    "comment_fingerprint and comment_fingerprint_marker equal their specified comment preimage derivatives",
+    "the artifact filename is artifact_fingerprint plus .json",
+    "a retry may change only the pointers listed in x-hermes-mutable-json-pointers"
+  ]
+}
