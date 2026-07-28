@@ -20,7 +20,8 @@ log "[60] installing bloodbank consumer for $AGENT_ID"
 # placeholders. If $RUNTIME/bloodbank-consumer.py was ever lost (runtime
 # submodule wiped, manual rm, etc.) and then someone restored it by
 # copying from $RUNTIME_SCAFFOLD_DIR, they'd end up with an un-rendered
-# consumer subscribing to literal `bloodbank.evt.v1.repo.{{repo}}.>`.
+# consumer whose envelope routing filter compares against literal `{{repo}}`
+# and `{{agent_id}}` values.
 # This block handles both failure modes idempotently.
 CONSUMER="$RUNTIME/bloodbank-consumer.py"
 SCAFFOLD_CONSUMER="$RUNTIME_SCAFFOLD_DIR/bloodbank-consumer.py"

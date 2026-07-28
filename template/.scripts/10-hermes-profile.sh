@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Create the per-agent Hermes profile (clones from default ~/.hermes).
+# Stage the per-agent runtime config/secrets via a TRANSIENT Hermes profile.
+# HERMES_HOME is the ./runtime submodule; this profile dir is a staging area
+# (cred-stripped .env + SOUL) that 20-runtime-repo.sh folds into the runtime and
+# then replaces with a symlink ~/.hermes/profiles/<name> -> ./runtime. That
+# symlink is load-bearing: hermes resolves `--profile <name>` invocations
+# through it (recreating it wrongly if it goes missing).
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env

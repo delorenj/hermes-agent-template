@@ -18,13 +18,16 @@ runs second (for each agent role you want) to drop agents into it.
 
 ## Roles
 
-The template provisions several roles. The `pm` role handles project management
-and triage. The `scrum-master` role runs a provider-agnostic ticket sentinel
-(Linear, Plane, or Trello) with an autonomous adversarial review (act, do not
-wait).
+The template provisions a single Hermes role per invocation. The `pm` role
+handles project management and triage, and also runs the continuous ticket
+sentinel out-of-band: a provider-agnostic board-reconciliation pass (Linear,
+Plane, or Trello) with an autonomous adversarial review (act, do not wait). The
+sentinel runs as the PM's **heartbeat** — a fused systemd timer tick that does
+the reconciliation pass and then a gated runtime checkpoint. (There is no
+separate `scrum-master` role; its duties folded into the PM heartbeat.)
 
-To work on or extend the Scrum Master, start with the [Scrum Master handoff
-guide](docs/scrum-master/README.md).
+To work on or extend the heartbeat sentinel, start with the [sentinel handoff
+guide](docs/sentinel/README.md).
 
 ## Quickstart
 
@@ -45,7 +48,7 @@ The template will:
 6. Add it as a git submodule at `agents/hermes/pm/runtime/` (== HERMES_HOME)
 7. Prompt for a BotFather token, store it in `runtime/.env`
 8. Create a Plane project in your configured workspace
-9. Install systemd `--user` units: gateway, consumer, hourly checkpoint timer
+9. Install systemd `--user` units: gateway, consumer, heartbeat timer (reconcile + checkpoint)
 10. Append the agent to `~/.hermes/agents-registry.yaml`
 
 ## Configuration
@@ -99,7 +102,7 @@ github.com/delorenj/agent-hm-<repo>-pm/     ← new private repo, this agent's s
 
 ~/.hermes/agents-registry.yaml              ← fleet roster
 ~/.hermes/fleet.env                          ← shared Hermes binary/repo pointer
-~/.config/systemd/user/                     ← gateway, consumer, checkpoint timer
+~/.config/systemd/user/                     ← gateway, consumer, heartbeat timer
 ```
 
 ## Fleet single source-of-truth

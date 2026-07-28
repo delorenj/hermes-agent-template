@@ -14,7 +14,7 @@
 #   3. Submodules it at agents/hermes/<role>/runtime/  (this is HERMES_HOME)
 #   4. Creates a Plane project in 33god workspace
 #   6. Prompts for a BotFather Telegram token, stores in runtime/.env
-#   7. Installs a Bloodbank consumer + hourly checkpoint timer
+#   7. Installs a Bloodbank consumer + heartbeat timer (reconcile + checkpoint)
 #   8. Appends to ~/.hermes/agents-registry.yaml
 #
 # Environment-specific defaults (Hermes binary path, runtime repo owner, Plane
@@ -48,7 +48,6 @@ role:
   default: pm
   choices:
     "Project Manager (pm)": pm
-    "Scrum Master — continuous ticket sentinel (scrum-master)": scrum-master
     "Developer (dev)": dev
     "Reviewer (review)": review
     "Ops (ops)": ops
@@ -64,16 +63,10 @@ ticket_provider:
     "Plane": plane
     "Trello": trello
 
-with_scrum_master:
-  type: bool
-  help: "Also provision a paired Scrum Master (continuous ticket sentinel) for this repo?"
-  default: false
-  when: "{{ role == 'pm' }}"
-
 agent_purpose:
   type: str
   help: "One-line description of what this agent does in this repo"
-  default: "{% if role == 'scrum-master' %}Continuous ticket sentinel and delegated review{% else %}Project management and triage{% endif %}"
+  default: "Project management, triage, and continuous board reconciliation"
 
 model_provider:
   type: str
@@ -138,7 +131,7 @@ plane_workspace:
 # All scripts are idempotent — safe to re-run if a step fails.
 
 _tasks:
-  - "chmod +x .scripts/*.sh hermes 2>/dev/null || true"
+  - "chmod +x .scripts/*.sh .scripts/sentinel/bin/*.sh hermes 2>/dev/null || true"
   - "./.scripts/00-banner.sh"
   - "./.scripts/01-config.sh"
   - "./.scripts/05-fleet-env.sh"
@@ -148,12 +141,8 @@ _tasks:
   - "./.scripts/42-ticket-provider.sh"
   - "./.scripts/60-bloodbank.sh"
   - "./.scripts/70-systemd.sh"
-  - command: "./.scripts/75-scrum-master.sh"
-    when: "{{ role == 'scrum-master' }}"
   - "./.scripts/80-registry.sh"
   - "./.scripts/99-summary.sh"
-  - command: "./.scripts/90-chain-scrum-master.sh"
-    when: "{{ role == 'pm' and with_scrum_master }}"
 
 _skip_if_exists:
   - hermes

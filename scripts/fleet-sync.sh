@@ -191,7 +191,10 @@ while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit consumer_uni
     DRIFT=$((DRIFT + 1))
   fi
 
-  # 3. Registry symlink ~/.hermes/profiles/<profile_name> -> runtime.
+  # 3. Profile symlink ~/.hermes/profiles/<profile_name> -> runtime.
+  # LOAD-BEARING: hermes resolves agents launched as `hermes --profile <name>`
+  # through this path (and recreates it as a fresh standalone dir if missing,
+  # disconnecting the agent from its runtime) — so it MUST point at the runtime.
   link="$PROFILES_DIR/$profile_name"
   if [[ -L "$link" ]]; then
     if [[ "$(readlink -f "$link")" != "$(readlink -f "$runtime")" ]]; then
@@ -315,15 +318,17 @@ voice = 'rick' if 'voice: rick' in text else 'other'
 print(f'{provider}|{plugin}|{voice}')
 PYEOF
 )"
-    if [[ "$APPLY" -eq 1 ]]; then
-      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
-      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.provider voxxy >/dev/null 2>&1 || true
-      HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.voice rick >/dev/null 2>&1 || true
-      note "$agent_id" FIXED "runtime TTS config enforced -> voxxy/rick"
-      changed=1; FIXED=$((FIXED + 1))
-    elif [[ "$config_status" != "voxxy|yes|rick" ]]; then
-      note "$agent_id" DRIFT "runtime Voxxy config missing from config.yaml"
-      DRIFT=$((DRIFT + 1))
+    if [[ "$config_status" != "voxxy|yes|rick" ]]; then
+      if [[ "$APPLY" -eq 1 ]]; then
+        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
+        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.provider voxxy >/dev/null 2>&1 || true
+        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.voice rick >/dev/null 2>&1 || true
+        note "$agent_id" FIXED "runtime TTS config enforced -> voxxy/rick"
+        changed=1; FIXED=$((FIXED + 1))
+      else
+        note "$agent_id" DRIFT "runtime Voxxy config missing from config.yaml"
+        DRIFT=$((DRIFT + 1))
+      fi
     fi
   fi
 

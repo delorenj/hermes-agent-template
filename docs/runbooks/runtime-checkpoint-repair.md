@@ -2,20 +2,24 @@
 
 Status: Active operations runbook
 Applies to: every Hermes agent whose `runtime/` is a git submodule checkpointed
-by a `hermes-<agent>-<role>-checkpoint.service` systemd unit.
+by its `hermes-<agent>-heartbeat.service` systemd unit (the heartbeat runner
+calls `.scripts/checkpoint.sh` to commit+push the runtime).
 
-This runbook fixes the failure where the hourly checkpoint service dies with
-**exit 128** and the agent's runtime "brain" stops being backed up. It is
-written so any agent or operator can copy it to another repo and apply it
-safely. First captured 2026-06-01 fixing the Drumjangler PM checkpoint; the same
-fault was present on other agents in the fleet.
+This runbook fixes the failure where the runtime checkpoint dies with
+**exit 128** and the agent's runtime "brain" stops being backed up. The
+checkpoint now runs inside the fused heartbeat tick (board-reconciliation
+sentinel pass + gated checkpoint), so the failing unit is the agent's
+`heartbeat.service`. It is written so any agent or operator can copy it to
+another repo and apply it safely. First captured 2026-06-01 fixing the
+Drumjangler PM checkpoint; the same fault was present on other agents in the
+fleet.
 
 ## Symptom
 
 ```bash
-systemctl --user status hermes-<agent>-<role>-checkpoint.service
+systemctl --user status hermes-<agent>-heartbeat.service
 #   Active: failed (Result: exit-code) ... status=128/n/a
-#   ExecStart=.../agents/hermes/<role>/.scripts/checkpoint.sh
+#   the heartbeat invokes .../agents/hermes/<role>/.scripts/checkpoint.sh
 ```
 
 `checkpoint.sh` is just `cd runtime && git add -A && commit && push`. Run it by
@@ -123,9 +127,9 @@ git add -A --dry-run | awk '{print $2}' | while read -r f; do
 
 ```bash
 bash agents/hermes/<role>/.scripts/checkpoint.sh        # exits 0, pushes brain
-systemctl --user reset-failed hermes-<agent>-<role>-checkpoint.service
-systemctl --user start       hermes-<agent>-<role>-checkpoint.service
-systemctl --user show hermes-<agent>-<role>-checkpoint.service -p Result -p ExecMainStatus
+systemctl --user reset-failed hermes-<agent>-heartbeat.service
+systemctl --user start       hermes-<agent>-heartbeat.service
+systemctl --user show hermes-<agent>-heartbeat.service -p Result -p ExecMainStatus
 #   Result=success  ExecMainStatus=0
 ```
 
@@ -147,7 +151,7 @@ systemctl --user reset-failed <svc> && systemctl --user start <svc>
 ## Fleet sweep — this is rarely just one repo
 
 ```bash
-systemctl --user list-units --all '*-checkpoint.service' | grep -i failed
+systemctl --user list-units --all '*-heartbeat.service' | grep -i failed
 # for each failing agent, locate its runtime and run the repair script.
 ```
 

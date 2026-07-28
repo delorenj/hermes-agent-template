@@ -1,10 +1,10 @@
 # Autonomous adversarial review (act, do not wait)
 
-Status: Scrum Master engine protocol (provider-agnostic)
+Status: sentinel engine protocol (provider-agnostic)
 
 ## Purpose
 
-When a ticket reaches the review lane, the Scrum Master sentinel runs an
+When a ticket reaches the review lane, the sentinel runs an
 **independent adversarial review** of the work against the operator's locked
 intent and acts on the verdict autonomously. This is the **normal per-pass
 path** for review-lane tickets — not a deliberately narrow escape hatch, and not
@@ -55,8 +55,8 @@ exactly as before:
    the implementer recorded in the evidence (`Worker:` / `Implemented by:`) and
    from the delegating PM. An implementer NEVER clears their own work.
 
-There is no mandatory grace window. `scrum_master.grace_hours` (role.yaml;
-override env `DRUMJANGLER_AUTO_REVIEW_GRACE_HOURS`) defaults to `0` and is an
+There is no mandatory grace window. `reconcile.grace_hours` (role.yaml;
+override env `RECONCILE_GRACE_HOURS`) defaults to `0` and is an
 optional operator knob only — set `>0` to reintroduce a wait. The reviewer does
 not wait for the operator's first right of refusal; it reviews and acts.
 
@@ -84,7 +84,7 @@ Only `none`/`minor` with no unresolved critical/high findings may be accepted.
 Run from the role's bin (couples gate + drift + event + acceptance):
 
 ```bash
-.scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT>
+.scripts/sentinel/bin/issue-autonomous-review.sh <ISSUE> <REPORT>
 ```
 
 - **accepted** — independent adversarial review cleared it (drift `none|minor`,
@@ -109,7 +109,7 @@ operator's deferred-QA queue — and is NOT auto-transitioned to `completed`.
 loop:
 
 ```bash
-.scripts/scrum-master/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
+.scripts/sentinel/bin/issue-autonomous-review.sh <ISSUE> <REPORT> --close
 ```
 
 ## Decision event
@@ -162,7 +162,7 @@ Write `<ISSUE>.review.md`; the script validates it:
 
 ## Operator override
 
-`scrum_master.auto_review: false` (role.yaml) or `SCRUM_MASTER_AUTO_REVIEW=off`
+`reconcile.auto_review: false` (role.yaml) or `RECONCILE_AUTO_REVIEW=off`
 disables autonomous acceptance. Autonomous acceptances are fully traceable via
 the decision events in
 `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`.

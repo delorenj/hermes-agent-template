@@ -19,6 +19,13 @@ honcho.json
 sandboxes/
 bloodbank-inbox/
 
+# Heartbeat / sentinel ephemeral state — local to this runtime, never checkpointed.
+# (Keeps the fused checkpoint a true no-op on a clean tree.)
+continuous-ticket-sentinel-state.json
+continuous-ticket-sentinel.lock
+continuous-ticket-sentinel.lock.d/
+.last-checkpoint
+
 # Runtime logs (we want the LFS-tracked summary.log if we add one, not the noise)
 logs/*.log
 logs/*.systemd.log

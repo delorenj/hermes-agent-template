@@ -179,10 +179,16 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
   create_board)
     NAME="${1:?usage: create_board <name> <ident> <desc>}"; IDENT="${2:-}"; DESC="${3:-}"
     [ -n "$WS" ] || die "workspace not set"
-    EXIST="$(api GET "projects/?per_page=200" | IDENT="$IDENT" python3 -c 'import sys,json,os
+    EXIST="$(api GET "projects/?per_page=200" | NAME="$NAME" IDENT="$IDENT" python3 -c 'import sys,json,os
 d=json.load(sys.stdin); rows=d.get("results", d if isinstance(d,list) else [])
-ident=os.environ["IDENT"].upper()
-print(next((p["id"] for p in rows if (p.get("identifier") or "").upper()==ident), ""))')"
+name=os.environ["NAME"].strip().lower(); ident=os.environ["IDENT"].upper()
+# Repo NAME is the primary key — links an existing repo board even if its
+# identifier differs (Plane does not enforce unique names, so this prevents
+# duplicate boards). Fall back to identifier match; empty -> create new.
+pid=next((p["id"] for p in rows if str(p.get("name","")).strip().lower()==name), "")
+if not pid and ident:
+    pid=next((p["id"] for p in rows if (p.get("identifier") or "").upper()==ident), "")
+print(pid)')"
     if [ -n "$EXIST" ]; then PID="$EXIST"; else
       PID="$(api POST "projects/" \
         "$(python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[1],"identifier":sys.argv[2],"description":sys.argv[3]}))' "$NAME" "$IDENT" "$DESC")" \

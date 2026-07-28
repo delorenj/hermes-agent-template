@@ -13,7 +13,7 @@ and recoverable on failure.
 | `memories/MEMORY.md` | yes | The condensed mental-model summary loaded each session |
 | `memories/USER.md` | yes | The operator's persona (Jarad DeLorenzo, ...) |
 | `sessions/sessions.db` | yes (LFS) | SQLite store of every conversation |
-| `bloodbank-consumer.py` | yes | NATS subscriber for repo-scoped events |
+| `bloodbank-consumer.py` | yes | NATS subscriber using canonical subjects plus envelope routing data |
 | `decisions/` | yes | Agent-emitted decisions, one file per important call |
 | `.env` | **no** | API keys + Telegram bot token (per-machine secret) |
 | `auth.json` | **no** | Deprecated local OAuth store; fleet auth defaults to `HERMES_OAUTH_FILE=~/.hermes/auth.json` |
@@ -23,11 +23,14 @@ and recoverable on failure.
 
 ## Checkpoint cadence
 
-- Hourly: systemd `--user` timer `hermes-{{agent_id}}-checkpoint.timer`
+- Heartbeat: systemd `--user` timer `hermes-{{agent_id}}-heartbeat.timer`. Each
+  tick reconciles the ticket board (the PM's sentinel pass) and then, gated to
+  at most once an hour, checkpoints this runtime.
 - On session end: hermes Stop hook (TODO: hook script in `~/.hermes/hooks/`)
 
-The checkpoint script lives in the parent's `.scripts/checkpoint.sh`. It
-`git add -A`, commits only if dirty, and pushes to `origin`.
+The heartbeat runner lives in the parent's `.scripts/heartbeat.sh`; it calls
+`.scripts/checkpoint.sh` internally, which `git add -A`, commits only if dirty,
+and pushes to `origin`.
 
 ## Restoring on a new machine
 

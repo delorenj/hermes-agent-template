@@ -31,7 +31,7 @@ invocations).
 | 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Install consumer (renders from scaffold w/ agent values), health-check NATS, install nats-py via uv if missing | `SKIP_BLOODBANK=1` |
-| 70 systemd | Install user units: gateway, consumer, hourly checkpoint timer | `SKIP_SYSTEMD=1` |
+| 70 systemd | Install user units: gateway, consumer, heartbeat timer (board-reconciliation sentinel pass + gated runtime checkpoint, one tick) | `SKIP_SYSTEMD=1` |
 | 80 registry | Append entry to ~/.hermes/agents-registry.yaml | n/a |
 | 99 summary | Print summary | n/a |
 
@@ -105,7 +105,7 @@ cd /home/delorenj/code/hermes-agent-template
 ```bash
 AGENT=bloodbank-pm
 systemctl --user start hermes-${AGENT}-consumer.service
-systemctl --user start hermes-${AGENT}-checkpoint.timer
+systemctl --user start hermes-${AGENT}-heartbeat.timer
 
 # Gateway will fail to start until Telegram is wired up (no other platforms
 # configured). After running .scripts/30-telegram.sh:
@@ -118,7 +118,7 @@ systemctl --user start hermes-${AGENT}-gateway.service
 | --- | --- |
 | Telegram | DM `@<repo>_<role>_bot` (once Telegram is wired) |
 | Local CLI | `./agents/hermes/<role>/hermes chat "..."` |
-| Bloodbank | Publish to subject `bloodbank.cmd.v1.agent.<agent_id>.<verb>.requested` |
+| Bloodbank | Publish to `bloodbank.cmd.v1.agent.task.assign` with `data.target_agent_id = <agent_id>` |
 
 ## Inspect fleet state
 
@@ -170,9 +170,9 @@ ln -sfn $PWD/agents/hermes/<role>/runtime ~/.hermes/profiles/<repo>-<role>
 
 # Re-enable systemd units
 systemctl --user enable hermes-<repo>-<role>-{gateway,consumer}.service
-systemctl --user enable hermes-<repo>-<role>-checkpoint.timer
+systemctl --user enable hermes-<repo>-<role>-heartbeat.timer
 systemctl --user start  hermes-<repo>-<role>-{consumer}.service
-systemctl --user start  hermes-<repo>-<role>-checkpoint.timer
+systemctl --user start  hermes-<repo>-<role>-heartbeat.timer
 ```
 
 ## Retire an agent (manual, until v1.1 ships retire.sh)
@@ -181,7 +181,7 @@ systemctl --user start  hermes-<repo>-<role>-checkpoint.timer
 AGENT=bloodbank-dev
 # 1. Stop daemons
 systemctl --user disable --now hermes-${AGENT}-{gateway,consumer}.service
-systemctl --user disable --now hermes-${AGENT}-checkpoint.timer
+systemctl --user disable --now hermes-${AGENT}-heartbeat.timer
 
 # 2. Delete hermes profile (cascades to symlinked runtime — make sure
 #    that's what you want!)
@@ -219,12 +219,16 @@ rm -rf agents/hermes/<role>
 ### Consumer not seeing events
 - Verify NATS is up: `docker compose -f ~/code/33GOD/bloodbank/compose/docker-compose.yml ps`
 - Tail consumer: `journalctl --user -fu hermes-<agent>-consumer.service`
-- Make sure something is actually publishing to `bloodbank.evt.v1.repo.<repo>.*`
+- Make sure something is publishing canonical repo events such as
+  `bloodbank.evt.v1.repo.issue.updated` with `data.repo = <repo>`
 
-### Checkpoint timer not pushing
-- Look at the most recent checkpoint log: `tail ~/.hermes/profiles/<agent>/logs/checkpoint.log`
+### Heartbeat not checkpointing (runtime not pushing)
+The checkpoint runs inside the heartbeat tick (after the board-reconciliation
+sentinel pass), gated to at most once an hour.
+- Look at the most recent heartbeat log: `tail <role>/runtime/logs/heartbeat.log`
 - Verify the submodule's git remote is reachable: `cd ...runtime && git push origin HEAD`
 - If LFS items fail to push: `git lfs push origin HEAD --all`
+- Force a checkpoint out-of-band: `bash agents/hermes/<role>/.scripts/checkpoint.sh`
 
 ### Profile dir contains nested `profiles/profiles/...`
 - That was a `--clone-all` bug; we switched to `--clone`. If you see it, just `rm -rf` the nested tree. The template's 10-hermes-profile.sh also has a belt-and-suspenders rm.

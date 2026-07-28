@@ -17,7 +17,7 @@
 # ticket-provider adapter (tp transition <id> completed), so the same logic works
 # on Linear | Plane | Trello.
 #
-# Protocol: .scripts/scrum-master/docs/autonomous-delegated-review.md
+# Protocol: .scripts/sentinel/docs/autonomous-delegated-review.md
 #
 # Usage: issue-autonomous-review.sh ISSUE_ID REPORT_FILE [--close]
 #
@@ -33,7 +33,7 @@ ISSUE="$1"; REPORT="$2"; CLOSE=0
 case "$ISSUE" in *[!A-Za-z0-9_-]*) printf 'Invalid issue id: %s\n' "$ISSUE" >&2; exit 2 ;; esac
 
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ENGINE_DIR="$(cd "$BIN_DIR/.." && pwd)"          # .scripts/scrum-master
+ENGINE_DIR="$(cd "$BIN_DIR/.." && pwd)"          # .scripts/sentinel
 SCRIPTS_DIR="$(cd "$ENGINE_DIR/.." && pwd)"      # .scripts
 ROLE_DIR="$(cd "$SCRIPTS_DIR/.." && pwd)"
 ROLE_YAML="$ROLE_DIR/role.yaml"
@@ -48,12 +48,12 @@ yget() { sed -n "s/^[[:space:]]*$1:[[:space:]]*//p" "$ROLE_YAML" 2>/dev/null | h
 REPO="$(yget repo)"; REPO="${REPO:-unknown}"
 # Informational only: recorded in the decision event/comment, never a blocking
 # wait. Default 0 (no grace); an operator may set grace_hours>0 to reintroduce one.
-GRACE_HOURS="${DRUMJANGLER_AUTO_REVIEW_GRACE_HOURS:-$(yget grace_hours)}"; GRACE_HOURS="${GRACE_HOURS:-0}"
+GRACE_HOURS="${RECONCILE_GRACE_HOURS:-$(yget grace_hours)}"; GRACE_HOURS="${GRACE_HOURS:-0}"
 AUTO="$(yget auto_review)"; AUTO="${AUTO:-true}"
 EVT="bloodbank.v1.repo.$REPO.issue.autonomous_review.decided"
 
-if [[ "${SCRUM_MASTER_AUTO_REVIEW:-$AUTO}" == "false" || "${SCRUM_MASTER_AUTO_REVIEW:-}" == "off" ]]; then
-  printf 'Autonomous review is disabled (scrum_master.auto_review=false).\n' >&2; exit 3
+if [[ "${RECONCILE_AUTO_REVIEW:-$AUTO}" == "false" || "${RECONCILE_AUTO_REVIEW:-}" == "off" ]]; then
+  printf 'Autonomous review is disabled (reconcile.auto_review=false).\n' >&2; exit 3
 fi
 [[ -f "$REPORT" ]]   || { printf 'Missing review report file: %s\n' "$REPORT" >&2; exit 2; }
 [[ -f "$EVIDENCE" ]] || { printf 'Missing issue evidence file: %s\n' "$EVIDENCE" >&2; exit 2; }
@@ -86,7 +86,7 @@ if sh "$CLOSE_GATE" "$ISSUE" "$ROOT" >/dev/null 2>&1 </dev/null; then GATE=pass;
 if [[ -n "$HOLD" ]]; then DECISION=held; else DECISION=accepted; fi
 
 python3 "$EMIT" "$EVT" --root "$ROOT" \
-  --source "repo://scrum-master/bin/issue-autonomous-review.sh" --actor-id "$REVIEWER" \
+  --source "repo://sentinel/bin/issue-autonomous-review.sh" --actor-id "$REVIEWER" \
   --field issue="$ISSUE" --field decision="$DECISION" --field drift="$DRIFT" \
   --field close_gate="$GATE" --field reviewer_agent="$REVIEWER" \
   --field evidence_file="$EVIDENCE" --field report_file="$REPORT" \

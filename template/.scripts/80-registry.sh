@@ -25,7 +25,7 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$PLANE_WORKSPACE" "$PLANE_PROJECT_ID" "$(yaml_get plane.identifier)" \
   "$RUNTIME_REPO" "$HERMES_BIN" "$HERMES_AGENT_REPO" "$FLEET_ENV" \
   "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-consumer.service" \
-  "hermes-${AGENT_ID}-checkpoint.timer" <<'PYEOF'
+  "hermes-${AGENT_ID}-heartbeat.timer" <<'PYEOF'
 import sys, pathlib, datetime
 try:
     import yaml  # type: ignore
@@ -44,7 +44,7 @@ data.setdefault("agents", {})[agent_id] = {
   "plane": {"workspace": plane_ws, "project_id": plane_id, "identifier": plane_ident},
   "runtime_repo": runtime_repo,
   "hermes": {"bin": hermes_bin, "repo": hermes_repo, "fleet_env": fleet_env},
-  "systemd": {"gateway_unit": gw, "consumer_unit": csm, "checkpoint_timer": ckpt},
+  "systemd": {"gateway_unit": gw, "consumer_unit": csm, "heartbeat_timer": ckpt},
   "provisioned_at": datetime.datetime.utcnow().isoformat() + "Z",
 }
 p.write_text(yaml.safe_dump(data, sort_keys=False))

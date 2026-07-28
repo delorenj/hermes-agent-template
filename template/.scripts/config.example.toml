@@ -30,6 +30,10 @@ canonical_skills_dir = "/home/delorenj/.agents/skills"
 # Voxxy plugin + service defaults for Hermes PM agents.
 voxxy_plugin_dir = "~/code/voxxy/plugins/tts/voxxy"
 vox_url = "https://vox.delo.sh"
+# Canonical PM config.yaml the provisioner seeds each runtime's config.yaml from.
+# This is the fleet-wide Hermes inference/skill config (model, toolsets, etc.)
+# every agent runtime starts from. ~ is expanded.
+# canonical_pm_config = "~/.hermes/config.yaml"
 # Skills symlinked into every agent's runtime skills root.
 symlinked_runtime_skills = [
   "delonet-conventions",
