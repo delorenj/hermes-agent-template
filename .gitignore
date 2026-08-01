@@ -4,3 +4,7 @@ __pycache__/
 
 # Local provisioning state (per-developer)
 .scratch/
+
+# Host-local tool runtime state
+.codegraph/daemon.pid
+.omo/run-continuation/
