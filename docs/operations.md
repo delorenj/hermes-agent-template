@@ -28,7 +28,7 @@ invocations).
 | 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
 | 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills`; PM roles also seed `VOX_URL` in profile `.env` | n/a |
 | 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from role-local `.runtime-scaffold/`, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime; PM roles also link the Voxxy plugin and set `tts.provider: voxxy` | `SKIP_RUNTIME_REPO=1` |
-| 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
+| 30 telegram | Verify an invocation-supplied, profile-dedicated BotFather token; reject fleet reuse; write only to runtime/.env | `SKIP_TELEGRAM=1` |
 | 31 slack | Disabled/deferred by default; verify a dedicated app+bot pair with `auth.test` and write it only to runtime/.env when explicitly enabled | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Compatibility checkpoint for fleet-shared routing; installs no files, dependencies, or services | `SKIP_BLOODBANK=1` remains a no-op |
@@ -147,9 +147,18 @@ python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpa
    ```bash
    cd <project>/agents/hermes/<role>
    rm .scripts/.done-30-telegram
-   SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
+   TELEGRAM_BOT_TOKEN='<bot-id>:<secret>' \
+     TELEGRAM_ALLOWED_USERS='<your-user-id>' \
+     SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
    systemctl --user restart hermes-<agent-id>-gateway.service
    ```
+
+The token is captured before shared fleet configuration is loaded, verified
+through Telegram `getMe`, checked against local token and bot-identity owners,
+and atomically written only to the profile's gitignored `runtime/.env` with
+mode `0600`. `~/.hermes/fleet.env` and `~/.hermes/.env` must not contain
+`TELEGRAM_BOT_TOKEN`; the manifest and registry store only verified bot
+identity metadata. `TELEGRAM_ALLOWED_USERS` is non-secret and may be shared.
 
 ### Slack app and bot (opt-in)
 

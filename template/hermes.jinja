@@ -12,6 +12,9 @@ if [[ -f "$FLEET_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$FLEET_ENV"
 fi
+# Never pass an identity-bearing chat credential from shared fleet state into
+# a profile process. Hermes loads the profile's own runtime/.env itself.
+unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
 CONFIG="${HERMES_TEMPLATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hermes-agent-template/config.toml}"
 config_get() {

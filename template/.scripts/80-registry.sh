@@ -21,7 +21,7 @@ log "[80] appending to fleet registry: $REGISTRY_FILE"
 
 python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$PROJECT_PATH" "$ROLE_DIR" "$PROFILE_NAME" \
-  "$BOT_HANDLE" \
+  "$(yaml_get telegram.provisioning_status)" "$BOT_HANDLE" "$(yaml_get telegram.bot_id)" \
   "$(yaml_get slack.provisioning_status)" "$(yaml_get slack.team_id)" \
   "$(yaml_get slack.team_name)" "$(yaml_get slack.bot_user_id)" \
   "$(yaml_get slack.bot_id)" "$(yaml_get slack.bot_username)" \
@@ -34,18 +34,23 @@ try:
     import yaml  # type: ignore
 except ImportError:
     sys.exit("PyYAML required; pip install pyyaml")
-(path, agent_id, repo, role, display, project, role_dir, profile, bot,
+(path, agent_id, repo, role, display, project, role_dir, profile,
+ telegram_status, bot, telegram_bot_id,
  slack_status, slack_team_id, slack_team_name, slack_user_id, slack_bot_id,
  slack_username, bloodbank_scope, bloodbank_target, plane_ws, plane_id,
  plane_ident, runtime_repo, hermes_bin, hermes_repo, fleet_env, gw,
- heartbeat) = sys.argv[1:27]
+ heartbeat) = sys.argv[1:29]
 p = pathlib.Path(path)
 data = yaml.safe_load(p.read_text()) or {"schema_version": 1, "agents": {}}
 data.setdefault("agents", {})[agent_id] = {
   "repo": repo, "role": role, "display_name": display,
   "project_path": project, "role_dir": role_dir,
   "profile_name": profile,
-  "telegram": {"bot_username": bot},
+  "telegram": {
+    "provisioning_status": telegram_status,
+    "bot_username": bot,
+    "bot_id": telegram_bot_id,
+  },
   "slack": {
     "provisioning_status": slack_status,
     "team_id": slack_team_id,

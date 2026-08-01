@@ -19,7 +19,9 @@ profile: {{ agent_id }}
 
 # Telegram bot identity (one bot per agent — see docs/architecture.md).
 telegram:
+  provisioning_status: "deferred"
   bot_username: "{{ bot_handle }}"
+  bot_id: ""
 
 # Slack is opt-in. Credentials live only in runtime/.env; this block records
 # safe provisioning state and the verified auth.test identity.

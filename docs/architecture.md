@@ -85,11 +85,13 @@ They're in `.gitignore` and live only on the host machine.
 ## One bot per agent (Telegram)
 
 Each agent gets its own BotFather bot and runs its own gateway daemon.
-Hermes' `gateway/status.py:acquire_scoped_lock(scope="telegram", identity=<token>)`
-already enforces "one token per gateway process" — so even if two profiles
-happen to share a token, the second one's startup fails fast. The N×M cost
-(N BotFather sessions per fleet) is the price we accept for zero custom
-routing code.
+The BotFather token is an invocation-only provisioning input: shared
+`fleet.env` may carry the non-secret allow-list policy but is never allowed to
+supply `TELEGRAM_BOT_TOKEN`. Provisioning verifies `getMe`, rejects a token or
+bot identity already owned anywhere in the local fleet, atomically writes the
+credential only to the profile's mode-`0600` `runtime/.env`, and records only
+safe identity metadata in `role.yaml` and the registry. Hermes' scoped runtime
+lock remains a second line of defense against duplicate pollers.
 
 ## One app and bot per Slack-enabled agent
 
@@ -133,3 +135,15 @@ Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
 contract is owned by Bloodbank (`~/code/33GOD/bloodbank/docs/event-naming.md`).
 Repo and agent identifiers belong in envelope data, actor, or source fields,
 never in type or subject tokens.
+
+The gateway uses the canonical lifecycle already defined by those schemas:
+
+- `bloodbank.v1.conversation.turn.started`
+- `bloodbank.v1.agent.invocation.started`
+- one terminal invocation event: `bloodbank.v1.agent.invocation.completed` or
+  `bloodbank.v1.agent.invocation.failed`
+- `bloodbank.v1.conversation.turn.completed`
+
+There are no separate `received` or `accepted` lifecycle events. A JetStream
+command is acknowledged only after Hermes processing completion and terminal
+event publication.

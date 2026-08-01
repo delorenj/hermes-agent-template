@@ -145,6 +145,10 @@ if [[ -f "$FLEET_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$FLEET_ENV"
 fi
+# Identity-bearing chat credentials are never fleet-scoped. Platform wiring
+# steps capture explicit invocation values before sourcing this library and
+# restore only those values afterward; all other provisioning steps stay clean.
+unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
 # Tools we expect on the host
 HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}}"

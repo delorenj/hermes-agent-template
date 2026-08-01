@@ -30,7 +30,9 @@ agent_id: demo-pm
 display_name: "Demo PM"
 profile: demo-pm
 telegram:
+  provisioning_status: "deferred"
   bot_username: "demo_pm_bot"
+  bot_id: ""
 slack:
   provisioning_status: "deferred"
   team_id: ""
@@ -172,3 +174,18 @@ def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
     assert "SKIP_BLOODBANK accepted as a compatibility no-op" in step
     for legacy in ("/dev/tcp", "uv pip install", "bloodbank-consumer.py"):
         assert legacy not in step
+
+
+def test_documented_gateway_lifecycle_matches_canonical_bloodbank_contract() -> None:
+    architecture = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
+
+    for event_type in (
+        "bloodbank.v1.conversation.turn.started",
+        "bloodbank.v1.agent.invocation.started",
+        "bloodbank.v1.agent.invocation.completed",
+        "bloodbank.v1.agent.invocation.failed",
+        "bloodbank.v1.conversation.turn.completed",
+    ):
+        assert event_type in architecture
+    assert "There are no separate `received` or `accepted` lifecycle events" in architecture
+    assert "acknowledged only after Hermes processing completion" in architecture

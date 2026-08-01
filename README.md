@@ -46,7 +46,7 @@ The template will:
 4. Create a new private GitHub repo `<owner>/agent-hm-<repo>-pm` for the runtime
 5. Populate it with the runtime scaffold (config.yaml, SOUL.md, memories)
 6. Add it as a git submodule at `agents/hermes/pm/runtime/` (== HERMES_HOME)
-7. Prompt for a BotFather token, store it in `runtime/.env`
+7. Verify a profile-dedicated BotFather token and store it only in `runtime/.env`
 8. Defer Slack by default, or verify and store an explicitly supplied dedicated Slack app+bot pair in `runtime/.env`
 9. Create a Plane project in your configured workspace
 10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
@@ -125,9 +125,11 @@ agent wrapper picks it up automatically. `HERMES_FLEET_OAUTH_FILE` is the
 shared Hermes provider OAuth store, including `openai-codex`; `HERMES_FLEET_CODEX_HOME`
 is the shared Codex CLI/app-server config/auth home.
 
-Slack bot and app tokens are deliberately excluded from this shared layer.
-They belong only in the enabled agent's `runtime/.env`; fleet config may carry
-the non-secret `SLACK_ALLOWED_USERS` policy as a convenience.
+Telegram bot tokens and Slack bot/app tokens are deliberately excluded from
+this shared layer. They belong only in the enabled agent's `runtime/.env` and
+are checked for local profile ownership during provisioning; fleet config may
+carry the non-secret `TELEGRAM_ALLOWED_USERS` and `SLACK_ALLOWED_USERS`
+policies as a convenience.
 
 To retrofit existing wrappers and user systemd units:
 
