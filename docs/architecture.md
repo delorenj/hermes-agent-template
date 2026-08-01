@@ -1,6 +1,6 @@
 # Architecture
 
-## Two-artifact split
+## Tracked role and local runtime split
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -20,67 +20,53 @@
                   │     ├── SOUL.md                 │
                   │     ├── hermes (launcher)       │
                   │     ├── .scripts/               │
-                  │     └── runtime/    ────────────┼─── git submodule
-                  └────────────────────────────────┘     │
-                                                          ▼
-                  ┌────────────────────────────────────────┐
-                  │  gh:delorenj/agent-hm-<project>-<role> │ ← NEW repo per agent
-                  │  ───────────────────────────────────── │   private
-                  │     ├── config.yaml                    │
-                  │     ├── SOUL.md (evolving)             │
-                  │     ├── memories/                      │   auto-checkpointed
-                  │     ├── sessions/sessions.db  (LFS)    │   by the heartbeat
-                  │     └── decisions/                     │   + on session end
-                  └────────────────────────────────────────┘
+                  │     └── runtime/                        │ ← ignored local HERMES_HOME
+                  │          ├── config.yaml                │
+                  │          ├── memories/                  │
+                  │          ├── sessions/                  │
+                  │          └── .env                       │
+                  └─────────────────────────────────────────┘
 ```
 
-## Why two artifacts, not one
+## Why tracked role and local state are separate
 
 The **template** is the contract / the bootstrap recipe — it doesn't change
-when an agent learns something. The **runtime** is the agent's accumulating
-state — it changes every conversation. Bundling them would mean every memory
-update churns the template's commit log; separating them means:
+when an agent learns something. The ignored **runtime directory** is the
+agent's accumulating local state — it changes every conversation. Separating
+them means:
 
 - The template repo is small, stable, easy to update fleet-wide
-- The runtime repo is per-agent, fast-moving, auditable in isolation
-- You can fork an agent (branch the runtime repo) without touching others
-- You can wipe an agent (delete the runtime repo) without affecting the template
+- Project commits cannot accidentally publish runtime credentials or sessions
+- Each profile has an isolated HERMES_HOME without project-index churn
+- Provisioning can refresh tracked launchers and scaffolds without overwriting
+  existing local state
 
 A third file ties the fleet together: `~/.hermes/fleet.env`.
 It is the single source-of-truth pointer for the shared Hermes executable/repo
 that every generated launcher uses.
 
-## Why git-tracked runtime
+## Durability boundary
 
-The runtime is the agent's "subjective experience" — its memory of every
-conversation, the SOUL refinements it has absorbed, the decisions it has
-emitted. Putting it in git gives:
+Ignored local state is not automatically durable. The operator must configure
+an encrypted filesystem backup or snapshot for each exact runtime path. A
+project clone restores only tracked role files and the empty scaffold.
+Hindsight retains only memories/events explicitly written to its bank, while a
+secret manager retains only credentials explicitly stored there; neither is a
+complete runtime backup. See [Operations](operations.md#back-up-and-restore-an-agent).
 
-- **Durability**: nothing lost when the host dies. `git clone` restores it.
-- **Auditability**: `git log` is a full trace of how the agent evolved.
-- **Reversibility**: if the agent develops bad habits, `git revert` rolls back.
-- **Forkability**: experiment with a copy on a branch, merge if it works out.
-- **Cross-machine**: same agent state on big-chungus and on the laptop.
-
-## Heartbeat cadence (reconcile + checkpoint)
+## Heartbeat cadence
 
 A systemd `--user` timer runs `.scripts/heartbeat.sh` frequently (about once a
-minute). Each tick fuses two jobs into one:
+minute). For a pure-local runtime, each tick performs one job:
 
 1. **Board-reconciliation sentinel pass** — the PM's continuous ticket sentinel.
    The runner's own cooldown/lock logic decides whether a full, LLM-backed
    reconciliation pass is worth running (it rate-limits the expensive Hermes
    call); see [the sentinel docs](sentinel/README.md).
-2. **Gated runtime checkpoint** — after the sentinel decision, the runner calls
-   `.scripts/checkpoint.sh`, gated to at most once an hour. The checkpoint:
-   `cd`s into the runtime submodule, `git add -A`, commits only if dirty (exits
-   clean otherwise), and pushes to `origin`.
-
-On session end, a hermes hook (TBD path) checkpoints immediately so nothing
-in-flight is lost between heartbeat ticks.
-
-Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters git.
-They're in `.gitignore` and live only on the host machine.
+Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters project Git.
+It lives only in ignored local storage unless the operator separately places a
+credential in the secret manager or includes the runtime in an encrypted
+filesystem backup.
 
 ## One bot per agent (Telegram)
 

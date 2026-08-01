@@ -127,8 +127,8 @@ The script:
 5. binds the PM to the existing board (it never creates one — it scrubs the
    provider key from Copier's environment so `42-ticket-provider.sh` skips board
    creation),
-6. installs the PM's heartbeat timer (board-reconciliation sentinel pass + gated
-   runtime checkpoint) as a `launchd` agent on macOS or a `systemd` timer on
+6. installs the PM's board-reconciliation heartbeat timer as a `launchd` agent
+   on macOS or a `systemd` timer on
    Linux,
 7. smoke-tests the board connection through the adapter.
 
@@ -171,7 +171,7 @@ script checks its flag and skips cleanly.
 | Flag | Skips |
 | --- | --- |
 | `SKIP_TELEGRAM` | The interactive BotFather token step. |
-| `SKIP_RUNTIME_REPO` | Creating the GitHub runtime repo. |
+| `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile linking. No remote storage is created. |
 | `SKIP_PLANE` | Creating a Plane project. |
 | `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
 | `SKIP_SYSTEMD` | Installing `systemd` units (profile gateway and heartbeat timer). |
@@ -191,9 +191,8 @@ on Linux through a `systemd` `EnvironmentFile` (for example
 `~/.hermes/<agent_id>.env`); on macOS the `launchd` agent sources that same
 per-agent env file, so write the key there.
 
-`SKIP_SYSTEMD` gates the profile gateway and the fused `heartbeat` timer in
-`70-systemd.sh`. The heartbeat timer is what drives the sentinel pass and the
-gated checkpoint, so a local install that wants the sentinel running must leave
+`SKIP_SYSTEMD` gates the profile gateway and `heartbeat` timer in
+`70-systemd.sh`. A local install that wants the sentinel running must leave
 `SKIP_SYSTEMD` unset (or install the timer afterward).
 
 ## Propagating changes
@@ -219,12 +218,9 @@ The sentinel began as a bespoke loop on the `pm` role, was briefly extracted int
 a standalone `scrum-master` role with its own `continuous-ticket-sentinel` timer,
 and has now been folded back into the unified PM. Today there is exactly one
 role (`pm`), one engine (under `.scripts/sentinel/`), and one timer
-(`hermes-<agent>-heartbeat.timer`) that fuses the board-reconciliation sentinel
-pass with a gated runtime checkpoint. The old per-agent
-`hermes-<agent>-continuous-ticket-sentinel.timer` and the separate
-`hermes-<agent>-checkpoint.timer` are gone; both are replaced by the single
-`heartbeat` timer. The earlier standalone-role design is recoverable from Git
-history if you ever need to compare.
+(`hermes-<agent>-heartbeat.timer`) for board reconciliation. The earlier
+standalone-role design is recoverable from Git history if you ever need to
+compare.
 
 ## Known gotchas
 

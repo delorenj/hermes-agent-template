@@ -20,9 +20,9 @@ and emits a decision event. A real finding is `held` and the ticket goes back to
 active.
 
 There is no longer a separate `scrum-master` role; the sentinel folded into the
-PM and now runs as part of the PM's **heartbeat** — a fused systemd-timer tick
-that does the board-reconciliation pass and then a gated runtime checkpoint
-(`.scripts/heartbeat.sh`). The engine itself lives under the PM at
+PM and now runs as the PM's **heartbeat** systemd-timer tick
+(`.scripts/heartbeat.sh`). Under the pure-local runtime contract this timer
+performs board reconciliation only. The engine itself lives under the PM at
 `.scripts/sentinel/`.
 
 It talks to the ticket board through a pluggable adapter, so the same engine
@@ -50,8 +50,8 @@ The following is true as of June 1, 2026.
 
 ## Quick local install
 
-For a local, single-machine install (no GitHub runtime repo, no Telegram, no
-NATS), use the one-command bootstrap. From inside the target project:
+For a local, single-machine install (no Telegram and no NATS), use the
+one-command bootstrap. From inside the target project:
 
 ```bash
 export PLANE_API_KEY=<key>   # or LINEAR_API_KEY / TRELLO_KEY + TRELLO_TOKEN
@@ -65,9 +65,9 @@ macOS). See [Development guide: local install](development.md#local-install-one-
 
 <!-- prettier-ignore -->
 > [!IMPORTANT]
-> Full (non-local) provisioning is outward-facing. It can create a GitHub
-> runtime repo, a Telegram bot, and a Plane project, and the Telegram step is
-> interactive. Use `install-local.sh` or the `SKIP_*` flags described in
+> Full provisioning is outward-facing. It can configure a Telegram bot and a
+> Plane project, and the Telegram step is interactive. Use `install-local.sh`
+> or the `SKIP_*` flags described in
 > [Development guide:
 > provisioning](development.md#provisioning-the-pm-manual) for local or lean
 > installs.
@@ -83,9 +83,9 @@ All paths are relative to the repository root.
 | `template/.scripts/lib/ticket-provider.sh` | The adapter dispatcher (`tp`). The engine's only seam to a ticket system. |
 | `template/.scripts/providers/{linear,plane,trello}.sh` | The provider adapters. |
 | `template/.scripts/42-ticket-provider.sh` | Provisioning step that resolves or creates the board. |
-| `template/.scripts/70-systemd.sh` | Provisioning step that installs the profile gateway and fused `heartbeat` timer (board-reconciliation sentinel pass + gated runtime checkpoint). |
+| `template/.scripts/70-systemd.sh` | Provisioning step that installs the profile gateway and board-reconciliation `heartbeat` timer. |
 | `install-local.sh` | One-command local install (no cloud, macOS + Linux). |
-| `template/.scripts/heartbeat.sh` | The heartbeat runner: the sentinel full-pass dispatch (with its own cooldown/lock) plus the gated runtime checkpoint, fused into one tick. |
+| `template/.scripts/heartbeat.sh` | The heartbeat runner: sentinel full-pass dispatch with its own cooldown and lock. |
 | `template/.scripts/sentinel.prompt.md.jinja` | The prompt the runner feeds to Hermes for a full reconciliation pass (rendered to `.scripts/sentinel.prompt.md`). |
 | `template/.scripts/sentinel/bin/` | Enforcement tools: `issue-autonomous-review.sh`, `issue-close-gate.sh`, `emit-event.py`. |
 | `template/.scripts/sentinel/docs/` | Runtime protocol docs shipped to each deployment. |

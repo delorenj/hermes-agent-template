@@ -22,12 +22,11 @@ provisioning](development.md#provisioning-the-pm-manual).
 ## The heartbeat loop
 
 A scheduler (`systemd` timer on Linux, `launchd` agent on macOS) fires the
-runner, `template/.scripts/heartbeat.sh`, about once a minute. Each tick fuses
-two jobs: a board-reconciliation **sentinel pass** and a **gated runtime
-checkpoint**. The sentinel pass is a cheap heartbeat that decides whether a
-full, LLM-backed reconciliation pass is worth running; the checkpoint
-(commit+push of the runtime submodule) is gated to at most once an hour. This
-keeps cost low while staying responsive.
+runner, `template/.scripts/heartbeat.sh`, about once a minute. For a pure-local
+runtime, each tick performs a board-reconciliation **sentinel pass**. The cheap
+heartbeat decides whether a full, LLM-backed reconciliation pass is worth
+running. This keeps cost low while staying responsive; runtime backup remains
+an operator-managed filesystem concern outside the sentinel.
 
 The sentinel reads the work-state file,
 `runtime/continuous-ticket-sentinel-state.json`, and chooses one of these
@@ -193,8 +192,7 @@ A full pass moves through these components in order:
    which render an `accepted` or `held` verdict and emit a decision event; the
    loop acts on the verdict (treat as done and unblock dependents, or send the
    ticket back to active) without waiting on the operator.
-6. The runner writes the outcome to the state file for the next tick, then
-   opportunistically checkpoints the runtime (gated to ~hourly) before exiting.
+6. The runner writes the outcome to the state file for the next tick and exits.
 
 ## Read next
 

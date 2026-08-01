@@ -32,7 +32,7 @@ invocations).
 | 31 slack | Disabled/deferred by default; verify a dedicated app+bot pair with `auth.test` and write it only to runtime/.env when explicitly enabled | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Compatibility checkpoint for fleet-shared routing; installs no files, dependencies, or services | `SKIP_BLOODBANK=1` remains a no-op |
-| 70 systemd | Install user units: profile gateway and heartbeat timer (board-reconciliation sentinel pass + gated runtime checkpoint, one tick) | `SKIP_SYSTEMD=1` |
+| 70 systemd | Install user units: profile gateway and board-reconciliation heartbeat timer | `SKIP_SYSTEMD=1` |
 | 80 registry | Append entry to ~/.hermes/agents-registry.yaml | n/a |
 | 99 summary | Print summary | n/a |
 
@@ -64,18 +64,14 @@ canonical_skills_dir = "/path/to/.agents/skills"
 voxxy_plugin_dir = "~/code/voxxy/plugins/tts/voxxy"
 vox_url = "https://vox.delo.sh"
 
-[github]
-runtime_repo_owner = "your-gh-owner"
-
 [plane]
 base = "https://plane.example.com"
 workspace = "your-workspace"
 ```
 
-`role.yaml` stores an empty `runtime.github_owner` and `plane.workspace` for
-freshly provisioned agents; the shell layer fills them from `config.toml` at
-runtime (older manifests that baked `owner/name` into `runtime.github_repo`
-still work unchanged).
+`role.yaml` stores compatibility metadata for older generated roles, but the
+current local-runtime provisioner does not use it for storage. Plane workspace
+defaults are still filled from `config.toml`.
 
 ## Fleet source-of-truth
 
@@ -220,59 +216,101 @@ They must never be placed in `~/.hermes/.env` or `~/.hermes/fleet.env`.
 `SLACK_ALLOWED_USERS` is non-secret and may instead be set in `fleet.env` as a
 shared policy. An empty allow-list is safe but denies all inbound Slack users.
 
-## Restore an agent on a new machine
+## Back up and restore an agent
+
+The template does **not** ship automatic backup for the ignored
+`agents/hermes/<role>/runtime/` directory. A project clone recreates the
+tracked role and its empty scaffold, not accumulated local state. Configure an
+encrypted filesystem backup or snapshot that includes the exact runtime path
+before treating the agent as recoverable.
+
+For a manual transfer, create a private archive, copy it to operator-managed
+encrypted storage, and verify both the checksum and readable member list:
 
 ```bash
-cd /path/to/the/project-repo
-git submodule update --init --recursive
-git -C agents/hermes/<role>/runtime lfs pull
-
-# Restore secrets that were excluded from git:
-op read 'op://DeLoSecrets/agent-hm-<repo>-<role>/.env' > agents/hermes/<role>/runtime/.env
-# (or copy from a backup machine)
-
-# Symlink the profile dir
-ln -sfn $PWD/agents/hermes/<role>/runtime ~/.hermes/profiles/<repo>-<role>
-
-# Re-enable systemd units
-systemctl --user enable hermes-<repo>-<role>-gateway.service
-systemctl --user enable hermes-<repo>-<role>-heartbeat.timer
-systemctl --user start  hermes-<repo>-<role>-heartbeat.timer
+PROJECT=/absolute/path/to/project
+ROLE=pm
+BACKUP_DIR="$HOME/.local/state/hermes-runtime-backups"
+mkdir -p -m 0700 "$BACKUP_DIR"
+BACKUP="$BACKUP_DIR/$(basename "$PROJECT")-${ROLE}-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+tar -C "$PROJECT" -czf "$BACKUP" "agents/hermes/${ROLE}/runtime"
+chmod 0600 "$BACKUP"
+sha256sum "$BACKUP" > "${BACKUP}.sha256"
+sha256sum -c "${BACKUP}.sha256"
+tar -tzf "$BACKUP" >/dev/null
 ```
 
-## Retire an agent (manual, until v1.1 ships retire.sh)
+That archive may contain credentials and private conversations. It is not an
+off-host backup until it has been copied to encrypted storage controlled by the
+operator and independently verified there.
+
+Recovery sources are intentionally distinct:
+
+- The verified filesystem backup is the only complete source for local config,
+  sessions, databases, skills, and other runtime files.
+- Hindsight can restore only memories/events that were previously written to
+  its remote bank. It is not a backup of the runtime directory.
+- The secret manager can restore only credentials deliberately stored there;
+  it does not contain memories, sessions, or local configuration by default.
+- Re-running provisioning restores the scaffold and service definitions, not
+  learned state.
+
+Restore the project and provision the role first. With its services stopped,
+extract the verified archive at the project root, confirm the profile symlink
+targets the restored runtime, then enable the services.
+
+## Retire an agent (preserves runtime by default)
+
+Retirement stops external behavior and detaches the profile while preserving
+the role directory and every runtime byte. Do not use a profile command whose
+deletion behavior is unknown.
 
 ```bash
-AGENT=bloodbank-dev
-# 1. Stop daemons
-systemctl --user disable --now hermes-${AGENT}-gateway.service
-systemctl --user disable --now hermes-${AGENT}-heartbeat.timer
+PROJECT=/absolute/path/to/project
+ROLE=pm
+AGENT=bloodbank-pm
+RUNTIME="$PROJECT/agents/hermes/$ROLE/runtime"
+PROFILE="$HOME/.hermes/profiles/$AGENT"
 
-# 2. Delete hermes profile (cascades to symlinked runtime — make sure
-#    that's what you want!)
-hermes profile delete ${AGENT}
+systemctl --user disable --now "hermes-${AGENT}-gateway.service"
+systemctl --user disable --now "hermes-${AGENT}-heartbeat.timer"
 
-# 3. Archive Plane project (Plane UI or API)
-PROJECT_ID=$(python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpath('.hermes/agents-registry.yaml').read_text())['agents']['${AGENT}']['plane']['project_id'])")
-curl -X POST "https://plane.delo.sh/api/v1/workspaces/33god/projects/${PROJECT_ID}/archive/" \
-  -H "X-API-Key: ${PLANE_33GOD_API_KEY}"
+# Detach only the expected symlink. Never follow it into the runtime.
+test -L "$PROFILE"
+test "$(readlink -f -- "$PROFILE")" = "$(readlink -f -- "$RUNTIME")"
+unlink -- "$PROFILE"
 
-# 4. BotFather: /deletebot @<repo>_<role>_bot
-# 5. Archive runtime repo (GitHub UI; we don't have delete_repo scope by default)
-# 6. Remove registry entry
-python3 -c "
-import yaml, pathlib
-p = pathlib.Path.home() / '.hermes' / 'agents-registry.yaml'
-d = yaml.safe_load(p.read_text()); d['agents'].pop('${AGENT}', None)
-p.write_text(yaml.safe_dump(d))"
-
-# 7. In the project repo, remove the submodule
-cd /path/to/project
-git submodule deinit -f agents/hermes/<role>/runtime
-git rm -f agents/hermes/<role>/runtime
-rm -rf .git/modules/agents/hermes/<role>/runtime
-rm -rf agents/hermes/<role>
+# Archive the Plane project and retire Telegram/Slack identities through their
+# administrative UIs, then remove the fleet registry entry under its lock.
+# The runtime directory remains in place.
+test -d "$RUNTIME"
 ```
+
+### Optional destructive runtime removal (separate operation)
+
+Only perform this after retirement. Set the exact absolute path, verify a
+complete off-host backup, and type the explicit confirmation phrase. The
+following scoped operation refuses a symlink, repository root, or path outside
+the selected role.
+
+```bash
+PROJECT=/absolute/path/to/project
+ROLE=pm
+RUNTIME="$PROJECT/agents/hermes/$ROLE/runtime"
+BACKUP=/absolute/path/to/verified-off-host-copy.tar.gz
+
+test "$RUNTIME" = "$PROJECT/agents/hermes/$ROLE/runtime"
+test -d "$RUNTIME" && test ! -L "$RUNTIME"
+test -f "$BACKUP" && sha256sum -c "${BACKUP}.sha256"
+read -r -p "Type REMOVE LOCAL RUNTIME $RUNTIME: " CONFIRM
+test "$CONFIRM" = "REMOVE LOCAL RUNTIME $RUNTIME"
+find "$RUNTIME" -xdev -mindepth 1 -delete
+rmdir -- "$RUNTIME"
+```
+
+This operation removes only the confirmed runtime directory. Removing the
+tracked role scaffold is a different project change and is not part of runtime
+retirement.
 
 ## Troubleshooting
 
@@ -288,16 +326,21 @@ rm -rf agents/hermes/<role>
 - Inspect the fleet-shared Bloodbank gateway; there is intentionally no
   `hermes-<agent>-consumer.service` or runtime inbox to repair
 
-### Heartbeat not checkpointing (runtime not pushing)
-The checkpoint runs inside the heartbeat tick (after the board-reconciliation
-sentinel pass), gated to at most once an hour.
+### Runtime changes are not appearing in Hindsight or backups
+
+Pure-local runtime changes are not synchronized by the heartbeat.
 - Look at the most recent heartbeat log: `tail <role>/runtime/logs/heartbeat.log`
-- Verify the submodule's git remote is reachable: `cd ...runtime && git push origin HEAD`
-- If LFS items fail to push: `git lfs push origin HEAD --all`
-- Force a checkpoint out-of-band: `bash agents/hermes/<role>/.scripts/checkpoint.sh`
+- Verify the configured filesystem backup includes the exact runtime path and
+  successfully restore-test its latest snapshot.
+- Query Hindsight separately for the agent bank; only events already written
+  there are recoverable from Hindsight.
+- Check the secret manager separately for the profile credentials you chose to
+  store there.
 
 ### Profile dir contains nested `profiles/profiles/...`
-- That was a `--clone-all` bug; we switched to `--clone`. If you see it, just `rm -rf` the nested tree. The template's 10-hermes-profile.sh also has a belt-and-suspenders rm.
+- That was a `--clone-all` bug; current provisioning uses `--clone`. Preserve
+  the profile and runtime, inspect the unexpected nesting, and move only the
+  confirmed redundant entries to a quarantine directory for review.
 
 ### `hermes` launcher complains about HERMES_BIN
 - Check the launcher script: `./agents/hermes/<role>/hermes` falls back to `$HOME/.hermes/hermes-agent/.venv/bin/hermes` (after `$HERMES_BIN`, `fleet.env`, and config.toml). Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.

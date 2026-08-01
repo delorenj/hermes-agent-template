@@ -2,7 +2,7 @@
 
 The PM runs a provider-agnostic ticket sentinel out-of-band on its heartbeat
 timer: a board-reconciliation pass with an autonomous adversarial review (act,
-do not wait), fused with a gated runtime checkpoint into a single timer tick.
+do not wait). Pure-local runtime persistence is outside the heartbeat contract.
 The full documentation lives in a dedicated handoff guide.
 
 This page is kept as a stable pointer so existing links keep working.

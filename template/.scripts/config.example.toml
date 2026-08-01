@@ -50,8 +50,10 @@ symlinked_runtime_skills = [
 ]
 
 [github]
-# Owner of the per-agent runtime repos (creates <owner>/agent-hm-<repo>-<role>).
-runtime_repo_owner = "delorenj"
+# LEGACY INERT COMPATIBILITY METADATA ONLY. Older role manifests may still
+# carry this owner field. Current provisioning does not create, attach,
+# synchronize, restore, archive, or remove runtime storage from this value.
+runtime_repo_owner = ""
 
 [plane]
 # Plane instance base URL and workspace slug (one project per agent).

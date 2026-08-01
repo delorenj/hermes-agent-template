@@ -22,9 +22,10 @@ The template provisions a single Hermes role per invocation. The `pm` role
 handles project management and triage, and also runs the continuous ticket
 sentinel out-of-band: a provider-agnostic board-reconciliation pass (Linear,
 Plane, or Trello) with an autonomous adversarial review (act, do not wait). The
-sentinel runs as the PM's **heartbeat** — a fused systemd timer tick that does
-the reconciliation pass and then a gated runtime checkpoint. (There is no
-separate `scrum-master` role; its duties folded into the PM heartbeat.)
+sentinel runs as the PM's **heartbeat** systemd timer. Under the current
+pure-local runtime contract, that tick performs board reconciliation only.
+(There is no separate `scrum-master` role; its duties folded into the PM
+heartbeat.)
 
 To work on or extend the heartbeat sentinel, start with the [sentinel handoff
 guide](docs/sentinel/README.md).
@@ -50,7 +51,7 @@ The template will:
 8. Defer Slack by default, or verify and store an explicitly supplied dedicated Slack app+bot pair in `runtime/.env`
 9. Create a Plane project in your configured workspace
 10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
-11. Install systemd `--user` units: profile gateway and heartbeat timer (reconcile + checkpoint)
+11. Install systemd `--user` units: profile gateway and board-reconciliation heartbeat timer
 12. Append the agent and its Bloodbank `target_agent_id` to `~/.hermes/agents-registry.yaml`
 
 ## Configuration
@@ -72,8 +73,11 @@ you to review it. Keys:
 | `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
 | `fleet` | `canonical_skills_dir`, `symlinked_runtime_skills` | Skills mirrored into each profile |
-| `github` | `runtime_repo_owner` | Legacy archive owner retained for registry compatibility; no repo is created |
 | `plane` | `base`, `workspace` | Plane URL + workspace slug |
+
+The example configuration retains an inert `[github].runtime_repo_owner` value
+only so older manifests can still be parsed. Current provisioning never reads
+it to create, attach, synchronize, restore, or retire runtime storage.
 
 Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.env`
 → `config.toml` → built-in fallback**. So you can still override any single value
@@ -101,7 +105,8 @@ your-project/
 
 Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
 gateway reads the registry and routes canonical commands by
-`data.target_agent_id`; runtime repos contain no NATS consumer or inbox bridge.
+`data.target_agent_id`; local runtime directories contain no NATS consumer or
+inbox bridge.
 Provisioning and `fleet-sync.sh --apply` also retire the old
 `hermes-<agent>-consumer.service`, even when an older `.done-70-systemd` marker
 exists. Retirement fails closed: a user-manager/query error, failed disable, or
@@ -180,6 +185,8 @@ SKIP_TELEGRAM=1 SKIP_SYSTEMD=1 ./.scripts/40-plane.sh
 
 (TODO: ship `retire.sh` in v1.1)
 
-Manual: stop systemd units, `hermes profile delete`, archive the Plane
-project, `/deletebot` in BotFather, archive the
-`agent-hm-*` runtime repo, remove the registry entry.
+Manual retirement is deliberately non-destructive: stop the systemd units,
+detach the profile symlink, archive the Plane project, retire messaging bots,
+and remove the registry entry while preserving the ignored runtime directory.
+The verified-backup and separately confirmed data-removal procedure is in
+[Operations](docs/operations.md#retire-an-agent-preserves-runtime-by-default).
