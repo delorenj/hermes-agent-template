@@ -39,7 +39,7 @@ DEFAULT_PACK = Path("/home/delorenj/code/skillex/packs/hermes-base/0.18.2")
 # agent-specific extras).
 MAINLINE_EXTERNAL_DIRS = [
     "/home/delorenj/code/skillex/skill-sets/global/.system",
-    "/home/delorenj/code/skillex/packs/bmad/6.10.2",
+    "/home/delorenj/code/skillex/packs/bmad/6.10.1-next.31",
     str(DEFAULT_PACK),
 ]
 

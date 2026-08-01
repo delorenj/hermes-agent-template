@@ -165,3 +165,12 @@ def test_pinned_fork_publication_replaces_upstream_clean_install_path() -> None:
     assert f'HERMES_RUNTIME_GIT_SHA="{expected_sha}"' in installer
     assert "merge-base --is-ancestor" in installer
     assert f'hermes_git_sha = "{expected_sha}"' in config
+
+
+def test_runtime_templatizer_pins_canonical_bmad_next31_pack() -> None:
+    templatizer = (ROOT / "scripts" / "hermes-runtime-templatize.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "/packs/bmad/6.10.1-next.31" in templatizer
+    assert "/packs/bmad/6.10.2" not in templatizer
