@@ -19,16 +19,28 @@ legacy_consumer_present=0
 [[ -e "$LEGACY_CONSUMER_PATH" || -L "$LEGACY_CONSUMER_PATH" ]] \
   && legacy_consumer_present=1
 if command -v systemctl >/dev/null 2>&1; then
-  systemctl --user is-active --quiet "$LEGACY_CONSUMER_UNIT" 2>/dev/null \
-    && legacy_consumer_present=1 || true
-  systemctl --user is-enabled --quiet "$LEGACY_CONSUMER_UNIT" 2>/dev/null \
-    && legacy_consumer_present=1 || true
+  legacy_active_result="$(systemctl_user_unit_state is-active "$LEGACY_CONSUMER_UNIT")"
+  legacy_enabled_result="$(systemctl_user_unit_state is-enabled "$LEGACY_CONSUMER_UNIT")"
+  [[ "$legacy_active_result" != error\|* ]] \
+    || die "cannot safely query legacy consumer activity; preserving unit: ${legacy_active_result#*|}"
+  [[ "$legacy_enabled_result" != error\|* ]] \
+    || die "cannot safely query legacy consumer enablement; preserving unit: ${legacy_enabled_result#*|}"
+  legacy_active_state="${legacy_active_result#*|}"
+  legacy_enabled_state="${legacy_enabled_result#*|}"
+  [[ "$legacy_active_state" == "not-found" && "$legacy_enabled_state" == "not-found" ]] \
+    || legacy_consumer_present=1
+elif [[ $legacy_consumer_present -eq 1 ]]; then
+  die "systemctl is unavailable; cannot safely retire legacy consumer: $LEGACY_CONSUMER_UNIT"
 fi
 if [[ $legacy_consumer_present -eq 1 ]]; then
-  if command -v systemctl >/dev/null 2>&1; then
-    systemctl --user disable --now "$LEGACY_CONSUMER_UNIT" >/dev/null 2>&1 \
-      || warn "    legacy consumer could not be disabled cleanly: $LEGACY_CONSUMER_UNIT"
-  fi
+  systemctl --user disable --now "$LEGACY_CONSUMER_UNIT" >/dev/null 2>&1 \
+    || die "legacy consumer disable failed; preserving unit: $LEGACY_CONSUMER_UNIT"
+  legacy_active_result="$(systemctl_user_unit_state is-active "$LEGACY_CONSUMER_UNIT")"
+  legacy_enabled_result="$(systemctl_user_unit_state is-enabled "$LEGACY_CONSUMER_UNIT")"
+  [[ "$legacy_active_result" == "ok|inactive" ]] \
+    || die "legacy consumer is not proven inactive; preserving unit: ${legacy_active_result#*|}"
+  [[ "$legacy_enabled_result" == "ok|disabled" ]] \
+    || die "legacy consumer is not proven disabled; preserving unit: ${legacy_enabled_result#*|}"
   rm -f -- "$LEGACY_CONSUMER_PATH"
   if systemd_user_available; then
     systemctl --user daemon-reload >/dev/null 2>&1 \

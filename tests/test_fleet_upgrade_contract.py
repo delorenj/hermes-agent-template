@@ -52,9 +52,16 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
     systemctl.write_text(
         """#!/usr/bin/env bash
 case "$*" in
-  *"disable --now hermes-demo-pm-consumer.service"*) touch "$SYSTEMCTL_RETIRED"; exit 0 ;;
-  *"is-active --quiet hermes-demo-pm-consumer.service"*|*"is-enabled --quiet hermes-demo-pm-consumer.service"*)
-    [[ -f "$SYSTEMCTL_RETIRED" ]] && exit 1 || exit 0 ;;
+  *"disable --now hermes-demo-pm-consumer.service"*)
+    [[ "$SYSTEMCTL_MODE" == "disable-fail" ]] && exit 1
+    touch "$SYSTEMCTL_RETIRED"; exit 0 ;;
+  *"is-active hermes-demo-pm-consumer.service"*)
+    [[ "$SYSTEMCTL_MODE" == "active-query-error" ]] && { echo "Failed to connect to bus" >&2; exit 1; }
+    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo inactive; exit 3; else echo active; exit 0; fi ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*)
+    [[ "$SYSTEMCTL_MODE" == "enabled-query-error" ]] && { echo "Failed to connect to bus" >&2; exit 1; }
+    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
+  *"daemon-reload"*) exit 0 ;;
 esac
 exit 1
 """,
@@ -69,6 +76,7 @@ exit 1
             "HERMES_FLEET_REGISTRY_FILE": str(registry),
             "HERMES_FLEET_HOME": str(home / ".hermes"),
             "SYSTEMCTL_RETIRED": str(retired),
+            "SYSTEMCTL_MODE": "success",
         }
     )
     return env, registry, consumer, role
@@ -99,6 +107,49 @@ def test_fleet_audit_reports_and_apply_retires_legacy_consumer(tmp_path: Path) -
     entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
     assert "consumer_unit" not in entry["systemd"]
     assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+
+
+def test_fleet_apply_preserves_unit_and_metadata_when_disable_fails(tmp_path: Path) -> None:
+    env, registry, consumer, _ = _fixture(tmp_path)
+    env["SYSTEMCTL_MODE"] = "disable-fail"
+
+    result = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "disable failed; unit and metadata preserved" in result.stdout
+    assert consumer.read_text(encoding="utf-8") == "legacy\n"
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["systemd"]["consumer_unit"] == "hermes-demo-pm-consumer.service"
+    assert not Path(env["SYSTEMCTL_RETIRED"]).exists()
+
+
+def test_fleet_audit_and_apply_fail_closed_on_state_query_errors(tmp_path: Path) -> None:
+    for mode in ("active-query-error", "enabled-query-error"):
+        case_dir = tmp_path / mode
+        case_dir.mkdir()
+        env, registry, consumer, _ = _fixture(case_dir)
+        env["SYSTEMCTL_MODE"] = mode
+
+        for apply_args in ([], ["--apply", "--no-restart"]):
+            result = subprocess.run(
+                ["bash", str(FLEET_SYNC), *apply_args, "--agent", "demo-pm"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            assert result.returncode != 0
+            assert "state query failed; unit and metadata preserved" in result.stdout
+            assert consumer.read_text(encoding="utf-8") == "legacy\n"
+            entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+            assert entry["systemd"]["consumer_unit"] == "hermes-demo-pm-consumer.service"
+            assert not Path(env["SYSTEMCTL_RETIRED"]).exists()
 
 
 def test_pinned_fork_publication_replaces_upstream_clean_install_path() -> None:

@@ -139,6 +139,7 @@ trap 'fleet_lock_release' EXIT
 python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" \
   "$slack_team_id" "$slack_bot_user_id" "$slack_bot_id" \
   "$ROLE_DIR" "$PROFILE_NAME" "$slack_team_name" "$slack_bot_username" <<'PYEOF'
+import errno
 import os
 import pathlib
 import re
@@ -244,6 +245,25 @@ claim["slack"] = {
 }
 registry.parent.mkdir(parents=True, exist_ok=True)
 rendered = yaml.safe_dump(data, sort_keys=False)
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=f".{registry.name}.slack-", dir=registry.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -253,6 +273,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, registry)
     os.chmod(registry, 0o600)
+    fsync_parent(registry)
 except BaseException:
     try:
         os.unlink(temporary)
@@ -264,6 +285,7 @@ PYEOF
 # Atomically replace only the Slack fields in the profile-local runtime file.
 # Secrets stay out of argv and are never written to root .env or fleet.env.
 python3 - "$ENVF" <<'PYEOF'
+import errno
 import json
 import os
 import pathlib
@@ -284,6 +306,25 @@ text = text.rstrip("\n")
 if text:
     text += "\n"
 text += "".join(f"{key}={json.dumps(value)}\n" for key, value in values.items())
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=".env.slack-", dir=path.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -293,6 +334,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+    fsync_parent(path)
 except BaseException:
     try:
         os.unlink(temporary)

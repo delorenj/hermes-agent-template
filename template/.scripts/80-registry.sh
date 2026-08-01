@@ -35,6 +35,7 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
   "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" <<'PYEOF'
 import datetime
+import errno
 import os
 import pathlib
 import sys
@@ -89,6 +90,25 @@ data.setdefault("agents", {})[agent_id] = {
 }
 rendered = yaml.safe_dump(data, sort_keys=False)
 p.parent.mkdir(parents=True, exist_ok=True)
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=f".{p.name}.registry-", dir=p.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -98,6 +118,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, p)
     os.chmod(p, 0o600)
+    fsync_parent(p)
 except BaseException:
     try:
         os.unlink(temporary)

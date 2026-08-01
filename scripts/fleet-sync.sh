@@ -117,6 +117,36 @@ note() {  # note <agent> <status> <message>
   printf '%-34s %-7s %s\n' "$1" "$2" "$3"
 }
 
+systemctl_user_unit_state() {  # systemctl_user_unit_state <is-active|is-enabled> <unit>
+  local query="$1" unit="$2" output rc first_line
+  command -v systemctl >/dev/null 2>&1 \
+    || { printf 'error|systemctl unavailable'; return 0; }
+  set +e
+  output="$(LC_ALL=C systemctl --user "$query" "$unit" 2>&1)"
+  rc=$?
+  set -e
+  first_line="${output%%$'\n'*}"
+  first_line="${first_line//$'\t'/ }"
+  first_line="${first_line//|/}"
+  case "$query:$rc:$first_line" in
+    is-active:0:active|is-active:0:reloading|is-active:0:activating|is-active:0:deactivating)
+      printf 'ok|%s' "$first_line" ;;
+    is-active:3:inactive|is-active:3:failed)
+      printf 'ok|%s' "$first_line" ;;
+    is-active:4:inactive)
+      printf 'ok|not-found' ;;
+    is-enabled:0:enabled|is-enabled:0:enabled-runtime|is-enabled:0:linked|is-enabled:0:linked-runtime|is-enabled:0:alias|is-enabled:0:static|is-enabled:0:indirect|is-enabled:0:generated|is-enabled:0:transient)
+      printf 'ok|%s' "$first_line" ;;
+    is-enabled:1:disabled|is-enabled:1:masked|is-enabled:1:masked-runtime)
+      printf 'ok|%s' "$first_line" ;;
+    is-enabled:4:not-found)
+      printf 'ok|not-found' ;;
+    *)
+      [[ -n "$first_line" ]] || first_line="exit $rc with no state"
+      printf 'error|%s' "$first_line" ;;
+  esac
+}
+
 retire_registry_consumer_metadata() {  # retire_registry_consumer_metadata <agent_id>
   local target_agent="$1" lock_file="${REGISTRY_FILE}.lock" registry_lock_fd=""
   command -v flock >/dev/null 2>&1 \
@@ -128,6 +158,7 @@ retire_registry_consumer_metadata() {  # retire_registry_consumer_metadata <agen
   flock -w 30 "$registry_lock_fd" \
     || { echo "fleet-sync: timed out waiting for registry lock" >&2; return 1; }
   python3 - "$REGISTRY_FILE" "$target_agent" <<'PYEOF'
+import errno
 import os
 import pathlib
 import sys
@@ -147,6 +178,25 @@ entry = (data.get("agents") or {}).get(agent_id)
 if isinstance(entry, dict) and isinstance(entry.get("systemd"), dict):
     entry["systemd"].pop("consumer_unit", None)
 rendered = yaml.safe_dump(data, sort_keys=False)
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.fleet-sync-", dir=path.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -156,6 +206,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+    fsync_parent(path)
 except BaseException:
     try:
         os.unlink(temporary)
@@ -219,36 +270,47 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     [[ -n "$consumer_unit" || -e "$legacy_consumer_path" || -L "$legacy_consumer_path" ]] \
       && legacy_consumer_present=1
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl --user is-active --quiet "$legacy_consumer_unit" 2>/dev/null \
-        && legacy_consumer_present=1 || true
-      systemctl --user is-enabled --quiet "$legacy_consumer_unit" 2>/dev/null \
-        && legacy_consumer_present=1 || true
+      legacy_active_result="$(systemctl_user_unit_state is-active "$legacy_consumer_unit")"
+      legacy_enabled_result="$(systemctl_user_unit_state is-enabled "$legacy_consumer_unit")"
+      if [[ "$legacy_active_result" == error\|* || "$legacy_enabled_result" == error\|* ]]; then
+        note "$agent_id" DRIFT "legacy consumer state query failed; unit and metadata preserved"
+        DRIFT=$((DRIFT + 1))
+        legacy_consumer_query_failed=1
+      else
+        legacy_consumer_query_failed=0
+        legacy_active_state="${legacy_active_result#*|}"
+        legacy_enabled_state="${legacy_enabled_result#*|}"
+        [[ "$legacy_active_state" == "not-found" && "$legacy_enabled_state" == "not-found" ]] \
+          || legacy_consumer_present=1
+      fi
+    elif [[ $legacy_consumer_present -eq 1 ]]; then
+      note "$agent_id" DRIFT "systemctl unavailable; legacy unit and metadata preserved"
+      DRIFT=$((DRIFT + 1))
+      legacy_consumer_query_failed=1
+    else
+      legacy_consumer_query_failed=0
     fi
-    if [[ $legacy_consumer_present -eq 1 ]]; then
+    if [[ $legacy_consumer_query_failed -eq 0 && $legacy_consumer_present -eq 1 ]]; then
       if [[ $APPLY -eq 0 ]]; then
         note "$agent_id" DRIFT "legacy per-profile Bloodbank consumer remains: $legacy_consumer_unit"
         DRIFT=$((DRIFT + 1))
       else
-        if command -v systemctl >/dev/null 2>&1; then
-          systemctl --user disable --now "$legacy_consumer_unit" >/dev/null 2>&1 || true
-        fi
-        rm -f -- "$legacy_consumer_path"
-        command -v systemctl >/dev/null 2>&1 \
-          && systemctl --user daemon-reload >/dev/null 2>&1 || true
-        legacy_consumer_still_live=0
-        if command -v systemctl >/dev/null 2>&1; then
-          systemctl --user is-active --quiet "$legacy_consumer_unit" 2>/dev/null \
-            && legacy_consumer_still_live=1 || true
-          systemctl --user is-enabled --quiet "$legacy_consumer_unit" 2>/dev/null \
-            && legacy_consumer_still_live=1 || true
-        fi
-        if [[ $legacy_consumer_still_live -eq 1 ]]; then
-          note "$agent_id" DRIFT "legacy consumer remains active/enabled after retirement attempt: $legacy_consumer_unit"
+        if ! systemctl --user disable --now "$legacy_consumer_unit" >/dev/null 2>&1; then
+          note "$agent_id" DRIFT "legacy consumer disable failed; unit and metadata preserved"
           DRIFT=$((DRIFT + 1))
         else
-          retire_registry_consumer_metadata "$agent_id"
-          note "$agent_id" FIXED "legacy per-profile Bloodbank consumer retired"
-          FIXED=$((FIXED + 1))
+          legacy_active_result="$(systemctl_user_unit_state is-active "$legacy_consumer_unit")"
+          legacy_enabled_result="$(systemctl_user_unit_state is-enabled "$legacy_consumer_unit")"
+          if [[ "$legacy_active_result" != "ok|inactive" || "$legacy_enabled_result" != "ok|disabled" ]]; then
+            note "$agent_id" DRIFT "legacy consumer is not proven inactive and disabled; unit and metadata preserved"
+            DRIFT=$((DRIFT + 1))
+          else
+            rm -f -- "$legacy_consumer_path"
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+            retire_registry_consumer_metadata "$agent_id"
+            note "$agent_id" FIXED "legacy per-profile Bloodbank consumer retired"
+            FIXED=$((FIXED + 1))
+          fi
         fi
       fi
     fi

@@ -129,6 +129,7 @@ fleet_lock_acquire
 trap 'fleet_lock_release' EXIT
 python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" "$bot_id" \
   "$ROLE_DIR" "$PROFILE_NAME" "$bot_username" <<'PYEOF'
+import errno
 import os
 import pathlib
 import re
@@ -220,6 +221,25 @@ claim["telegram"] = {
 }
 registry.parent.mkdir(parents=True, exist_ok=True)
 rendered = yaml.safe_dump(data, sort_keys=False)
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=f".{registry.name}.telegram-", dir=registry.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -229,6 +249,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, registry)
     os.chmod(registry, 0o600)
+    fsync_parent(registry)
 except BaseException:
     try:
         os.unlink(temporary)
@@ -240,6 +261,7 @@ PYEOF
 # Atomically replace only Telegram fields in the profile-local runtime file.
 export TELEGRAM_ALLOWED_USERS
 python3 - "$ENVF" <<'PYEOF'
+import errno
 import json
 import os
 import pathlib
@@ -261,6 +283,25 @@ text += "".join(
     f"{key}={json.dumps(os.environ.get(key, ''))}\n"
     for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS")
 )
+
+def fsync_parent(target):
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        directory_fd = os.open(target.parent, flags)
+    except OSError as exc:
+        if exc.errno in unsupported:
+            return
+        raise
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+
 fd, temporary = tempfile.mkstemp(prefix=".env.telegram-", dir=path.parent)
 try:
     os.fchmod(fd, 0o600)
@@ -270,6 +311,7 @@ try:
         os.fsync(handle.fileno())
     os.replace(temporary, path)
     os.chmod(path, 0o600)
+    fsync_parent(path)
 except BaseException:
     try:
         os.unlink(temporary)

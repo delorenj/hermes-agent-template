@@ -83,6 +83,34 @@ def _run(role: Path, name: str, env: dict[str, str]) -> subprocess.CompletedProc
     )
 
 
+def _inject_parent_fsync_failure(
+    tmp_path: Path, env: dict[str, str], parent: Path
+) -> None:
+    site_dir = tmp_path / "fsync-failure-site"
+    site_dir.mkdir()
+    (site_dir / "sitecustomize.py").write_text(
+        """import errno
+import os
+import stat
+
+_real_fsync = os.fsync
+_failed_parent = os.path.realpath(os.environ["FAIL_PARENT_FSYNC"])
+
+def _fsync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+        resolved = os.path.realpath(f"/proc/self/fd/{fd}")
+        if resolved == _failed_parent:
+            raise OSError(errno.EIO, "injected parent directory fsync failure")
+    return _real_fsync(fd)
+
+os.fsync = _fsync
+""",
+        encoding="utf-8",
+    )
+    env["PYTHONPATH"] = str(site_dir)
+    env["FAIL_PARENT_FSYNC"] = str(parent)
+
+
 def test_future_runtime_scaffolds_have_no_profile_consumer_or_inbox() -> None:
     for scaffold in (ROOT / "runtime-scaffold", ROOT / "template" / ".runtime-scaffold"):
         assert not (scaffold / "bloodbank-consumer.py").exists()
@@ -112,7 +140,17 @@ def test_systemd_installs_only_profile_gateway_and_heartbeat(tmp_path: Path) -> 
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_systemctl = fake_bin / "systemctl"
-    fake_systemctl.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_systemctl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) exit 1 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
     fake_systemctl.chmod(0o755)
     env["PATH"] = f"{fake_bin}:{env['PATH']}"
 
@@ -147,11 +185,13 @@ def test_systemd_done_marker_still_retires_legacy_consumer(tmp_path: Path) -> No
 printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
 case "$*" in
   *"disable --now hermes-demo-pm-consumer.service"*) touch "$SYSTEMCTL_RETIRED"; exit 0 ;;
-  *"is-active --quiet hermes-demo-pm-consumer.service"*|*"is-enabled --quiet hermes-demo-pm-consumer.service"*)
-    [[ -f "$SYSTEMCTL_RETIRED" ]] && exit 1 || exit 0 ;;
+  *"is-active hermes-demo-pm-consumer.service"*)
+    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo inactive; exit 3; else echo active; exit 0; fi ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*)
+    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
   *"is-system-running"*) echo running; exit 0 ;;
 esac
-exit 0
+exit 1
 """,
         encoding="utf-8",
     )
@@ -171,6 +211,87 @@ exit 0
     assert "disable --now hermes-demo-pm-consumer.service" in log.read_text(encoding="utf-8")
     assert "legacy cleanup checked" in result.stderr
     assert not (unit_dir / "hermes-demo-pm-gateway.service").exists()
+
+
+def test_systemd_preserves_legacy_consumer_when_disable_fails(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    consumer = unit_dir / "hermes-demo-pm-consumer.service"
+    consumer.write_text("legacy\n", encoding="utf-8")
+    marker = role / ".scripts" / ".done-70-systemd"
+    marker.touch()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo enabled; exit 0 ;;
+  *"disable --now hermes-demo-pm-consumer.service"*) exit 1 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode != 0
+    assert "disable failed" in result.stderr
+    assert consumer.read_text(encoding="utf-8") == "legacy\n"
+    assert marker.exists()
+    assert not (unit_dir / "hermes-demo-pm-gateway.service").exists()
+
+
+@pytest.mark.parametrize("failed_query", ["is-active", "is-enabled"])
+def test_systemd_preserves_legacy_consumer_when_state_query_fails(
+    tmp_path: Path, failed_query: str
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    consumer = unit_dir / "hermes-demo-pm-consumer.service"
+    consumer.write_text("legacy\n", encoding="utf-8")
+    marker = role / ".scripts" / ".done-70-systemd"
+    marker.touch()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "systemctl.log"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  *"$FAILED_QUERY hermes-demo-pm-consumer.service"*) echo "Failed to connect to bus" >&2; exit 1 ;;
+  *"is-active hermes-demo-pm-consumer.service"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo enabled; exit 0 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "FAILED_QUERY": failed_query,
+            "SYSTEMCTL_LOG": str(log),
+        }
+    )
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode != 0
+    assert "cannot safely query" in result.stderr
+    assert consumer.read_text(encoding="utf-8") == "legacy\n"
+    assert marker.exists()
+    assert "disable --now" not in log.read_text(encoding="utf-8")
 
 
 def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path: Path) -> None:
@@ -238,6 +359,26 @@ def test_concurrent_registry_upserts_are_atomic_and_lossless(tmp_path: Path) -> 
     agents = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
     assert set(agents) == {"demo-pm", "demo-reviewer"}
     assert (registry.stat().st_mode & 0o777) == 0o600
+
+
+def test_registry_parent_fsync_failure_is_reported_and_retryable(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    _inject_parent_fsync_failure(tmp_path, env, registry.parent)
+
+    failed = _run(role, "80-registry.sh", env)
+
+    assert failed.returncode != 0
+    assert "injected parent directory fsync failure" in failed.stderr
+    assert "demo-pm" in yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
+    assert (registry.stat().st_mode & 0o777) == 0o600
+    assert not (role / ".scripts" / ".done-80-registry").exists()
+
+    retry_env = _environment(tmp_path, registry)
+    retried = _run(role, "80-registry.sh", retry_env)
+
+    assert retried.returncode == 0, retried.stderr
+    assert (role / ".scripts" / ".done-80-registry").exists()
 
 
 def test_registry_upsert_refuses_lock_symlink(tmp_path: Path) -> None:

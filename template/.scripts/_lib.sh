@@ -211,6 +211,40 @@ systemd_user_available() {
   [[ "$state" =~ ^(running|degraded|starting|maintenance)$ ]]
 }
 
+# Query one systemd user-unit state without conflating every non-zero exit with
+# an inactive/disabled unit. Output is `ok|<state>` only for documented
+# state/exit-code pairs; D-Bus, manager, and arbitrary query failures become
+# `error|<safe summary>` so retirement callers can fail closed.
+systemctl_user_unit_state() {
+  local query="$1" unit="$2" output rc first_line
+  command -v systemctl >/dev/null 2>&1 \
+    || { printf 'error|systemctl unavailable'; return 0; }
+  set +e
+  output="$(LC_ALL=C systemctl --user "$query" "$unit" 2>&1)"
+  rc=$?
+  set -e
+  first_line="${output%%$'\n'*}"
+  first_line="${first_line//$'\t'/ }"
+  first_line="${first_line//|/}"
+  case "$query:$rc:$first_line" in
+    is-active:0:active|is-active:0:reloading|is-active:0:activating|is-active:0:deactivating)
+      printf 'ok|%s' "$first_line" ;;
+    is-active:3:inactive|is-active:3:failed)
+      printf 'ok|%s' "$first_line" ;;
+    is-active:4:inactive)
+      printf 'ok|not-found' ;;
+    is-enabled:0:enabled|is-enabled:0:enabled-runtime|is-enabled:0:linked|is-enabled:0:linked-runtime|is-enabled:0:alias|is-enabled:0:static|is-enabled:0:indirect|is-enabled:0:generated|is-enabled:0:transient)
+      printf 'ok|%s' "$first_line" ;;
+    is-enabled:1:disabled|is-enabled:1:masked|is-enabled:1:masked-runtime)
+      printf 'ok|%s' "$first_line" ;;
+    is-enabled:4:not-found)
+      printf 'ok|not-found' ;;
+    *)
+      [[ -n "$first_line" ]] || first_line="exit $rc with no state"
+      printf 'error|%s' "$first_line" ;;
+  esac
+}
+
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
 # Walk up from $ROLE_DIR until we find a git root that isn't us.
 project_repo_path() {

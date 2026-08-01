@@ -117,14 +117,19 @@ gateway:
 
 Any active, enabled, installed, or registry-declared
 `hermes-<agent>-consumer.service` is unhealthy drift. Apply mode disables and
-stops it, removes the unit, reloads user systemd, verifies it is no longer live,
-and only then removes the legacy registry metadata. The same cleanup runs in
-step 70 before its done marker is honored.
+stops it, proves the unit is explicitly `inactive` and `disabled`, then removes
+the unit, reloads user systemd, and removes the legacy registry metadata. A
+user-manager/query error, failed disable, or ambiguous post-disable state fails
+closed and preserves both the unit file and registry metadata. The same cleanup
+runs in step 70 before its done marker is honored.
 
 Fleet registry and chat identity changes share `${registry_file}.lock`. `flock`
 owns the lock in the kernel (an on-disk lock file surviving a crash is safe),
 while atomic replace prevents partial YAML. Registry and lock files are mode
-`0600`; symlink targets are refused.
+`0600`; symlink targets are refused. Registry and profile-local credential
+replacements also sync the containing directory where the platform supports it.
+Unexpected directory-sync errors are reported as failures without marking the
+step complete, so rerunning the idempotent provisioning step is safe.
 
 ## Start the daemons for an agent
 

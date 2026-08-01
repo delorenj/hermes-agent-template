@@ -117,6 +117,34 @@ def _run(
     )
 
 
+def _inject_parent_fsync_failure(
+    tmp_path: Path, overrides: dict[str, str], parent: Path
+) -> None:
+    site_dir = tmp_path / "fsync-failure-site"
+    site_dir.mkdir()
+    (site_dir / "sitecustomize.py").write_text(
+        """import errno
+import os
+import stat
+
+_real_fsync = os.fsync
+_failed_parent = os.path.realpath(os.environ["FAIL_PARENT_FSYNC"])
+
+def _fsync(fd):
+    if stat.S_ISDIR(os.fstat(fd).st_mode):
+        resolved = os.path.realpath(f"/proc/self/fd/{fd}")
+        if resolved == _failed_parent:
+            raise OSError(errno.EIO, "injected parent directory fsync failure")
+    return _real_fsync(fd)
+
+os.fsync = _fsync
+""",
+        encoding="utf-8",
+    )
+    overrides["PYTHONPATH"] = str(site_dir)
+    overrides["FAIL_PARENT_FSYNC"] = str(parent)
+
+
 def test_telegram_ignores_shared_fleet_token_and_defers_noninteractive(tmp_path: Path) -> None:
     role, runtime, registry = _make_role(tmp_path)
     home = tmp_path / "home"
@@ -169,6 +197,42 @@ def test_explicit_token_writes_only_private_runtime_env_and_identity(tmp_path: P
         "bot_username": "verified_demo_bot",
         "bot_id": "424242",
     }
+
+
+def test_credential_parent_fsync_failure_is_reported_and_retryable(tmp_path: Path) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    fleet = home / ".hermes" / "fleet.env"
+    fleet.parent.mkdir(parents=True)
+    fleet.write_text("TELEGRAM_ALLOWED_USERS=111\n", encoding="utf-8")
+    bindir = _fake_bin(tmp_path)
+    overrides = {
+        "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+        "EXPECTED_TELEGRAM_TOKEN": BOT_TOKEN,
+    }
+    _inject_parent_fsync_failure(tmp_path, overrides, runtime)
+
+    failed = _run(role, registry, home, bindir, overrides)
+
+    assert failed.returncode != 0
+    assert "injected parent directory fsync failure" in failed.stderr
+    env_file = runtime / ".env"
+    assert f'TELEGRAM_BOT_TOKEN="{BOT_TOKEN}"' in env_file.read_text(encoding="utf-8")
+    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+    assert BOT_TOKEN not in failed.stdout + failed.stderr
+    assert "demo-pm" in yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
+    assert not (role / ".scripts" / ".done-30-telegram").exists()
+
+    retried = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"TELEGRAM_BOT_TOKEN": BOT_TOKEN, "EXPECTED_TELEGRAM_TOKEN": BOT_TOKEN},
+    )
+
+    assert retried.returncode == 0, retried.stderr
+    assert (role / ".scripts" / ".done-30-telegram").exists()
 
 
 def test_rejects_token_parked_in_shared_fleet_env(tmp_path: Path) -> None:

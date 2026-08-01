@@ -112,12 +112,17 @@ gateway reads the registry and routes canonical commands by
 `data.target_agent_id`; runtime repos contain no NATS consumer or inbox bridge.
 Provisioning and `fleet-sync.sh --apply` also retire the old
 `hermes-<agent>-consumer.service`, even when an older `.done-70-systemd` marker
-exists. A dry-run fleet sync reports any surviving consumer as unhealthy drift.
+exists. Retirement fails closed: a user-manager/query error, failed disable, or
+anything short of explicit `inactive` plus `disabled` leaves the unit file and
+registry metadata intact and reports unhealthy drift.
 
 Telegram and Slack ownership checks, identity claims, runtime credential
 writes, and registry upserts serialize on `${registry_file}.lock`. The lock is
 held by `flock`, so a crashed process cannot leave a stale logical lock; registry
-writes use an atomic replace and keep both registry and lock at mode `0600`.
+writes use an atomic replace, sync the containing directory where supported, and
+keep both registry and lock at mode `0600`. Profile credential replacements use
+the same file-plus-parent durability boundary and remain safe to retry when a
+durability sync reports an error.
 
 ## Reviewed Hermes runtime publication
 
