@@ -11,7 +11,7 @@ memory/state checkpointing.
 | What it scaffolds | A new top-level project | An agent role inside an existing project |
 | Copier target | `./my-new-project/` | `./agents/hermes/<role>/` |
 | Asks | project name + description | role + purpose + tone |
-| Post-gen artifacts | Plane project, bmad init, mise tasks | Plane project, Telegram bot wiring, agent-hm-* runtime repo, systemd units |
+| Post-gen artifacts | Plane project, bmad init, mise tasks | Plane project, Telegram bot wiring, optional Slack wiring, agent-hm-* runtime repo, systemd units |
 
 CommonProject runs first to create the umbrella project. hermes-agent-template
 runs second (for each agent role you want) to drop agents into it.
@@ -44,12 +44,14 @@ The template will:
 2. Ensure `~/.hermes/fleet.env` exists (single source of truth for shared Hermes binary/repo/registry)
 3. Create the hermes profile `<repo>-pm` via `hermes profile create --clone`
 4. Create a new private GitHub repo `<owner>/agent-hm-<repo>-pm` for the runtime
-5. Populate it with the runtime scaffold (config.yaml, SOUL.md, memories, consumer.py)
+5. Populate it with the runtime scaffold (config.yaml, SOUL.md, memories)
 6. Add it as a git submodule at `agents/hermes/pm/runtime/` (== HERMES_HOME)
 7. Prompt for a BotFather token, store it in `runtime/.env`
-8. Create a Plane project in your configured workspace
-9. Install systemd `--user` units: gateway, consumer, heartbeat timer (reconcile + checkpoint)
-10. Append the agent to `~/.hermes/agents-registry.yaml`
+8. Defer Slack by default, or verify and store an explicitly supplied dedicated Slack app+bot pair in `runtime/.env`
+9. Create a Plane project in your configured workspace
+10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
+11. Install systemd `--user` units: profile gateway and heartbeat timer (reconcile + checkpoint)
+12. Append the agent and its Bloodbank `target_agent_id` to `~/.hermes/agents-registry.yaml`
 
 ## Configuration
 
@@ -71,7 +73,6 @@ you to review it. Keys:
 | `fleet` | `canonical_skills_dir`, `symlinked_runtime_skills` | Skills mirrored into each profile |
 | `github` | `runtime_repo_owner` | Owner of the `agent-hm-*` runtime repos |
 | `plane` | `base`, `workspace` | Plane URL + workspace slug |
-| `bloodbank` | `nats_host`, `nats_port`, `compose_dir` | NATS endpoint + compose dir hint |
 
 Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.env`
 → `config.toml` → built-in fallback**. So you can still override any single value
@@ -89,6 +90,7 @@ your-project/
 │   ├── .scripts/                           ← provisioning scripts (idempotent re-run)
 │   └── runtime/                            ← git submodule → agent-hm-<repo>-pm
 │       (HERMES_HOME for this agent)
+│       └── .env                            ← profile-local channel credentials, mode 0600, gitignored
 └── ...
 
 github.com/delorenj/agent-hm-<repo>-pm/     ← new private repo, this agent's state
@@ -97,13 +99,16 @@ github.com/delorenj/agent-hm-<repo>-pm/     ← new private repo, this agent's s
 ├── memories/{MEMORY,USER}.md
 ├── sessions/sessions.db                    ← LFS-tracked
 ├── decisions/                              ← markdown files, one per call
-├── bloodbank-consumer.py
 └── .gitattributes / .gitignore             ← LFS rules + secret guards
 
 ~/.hermes/agents-registry.yaml              ← fleet roster
 ~/.hermes/fleet.env                          ← shared Hermes binary/repo pointer
-~/.config/systemd/user/                     ← gateway, consumer, heartbeat timer
+~/.config/systemd/user/                     ← per-profile gateway + heartbeat timer
 ```
+
+Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
+gateway reads the registry and routes canonical commands by
+`data.target_agent_id`; runtime repos contain no NATS consumer or inbox bridge.
 
 ## Fleet single source-of-truth
 
@@ -119,6 +124,10 @@ If you sync/pull your shared Hermes repo and keep the same binary path, every
 agent wrapper picks it up automatically. `HERMES_FLEET_OAUTH_FILE` is the
 shared Hermes provider OAuth store, including `openai-codex`; `HERMES_FLEET_CODEX_HOME`
 is the shared Codex CLI/app-server config/auth home.
+
+Slack bot and app tokens are deliberately excluded from this shared layer.
+They belong only in the enabled agent's `runtime/.env`; fleet config may carry
+the non-secret `SLACK_ALLOWED_USERS` policy as a convenience.
 
 To retrofit existing wrappers and user systemd units:
 

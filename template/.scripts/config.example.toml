@@ -13,7 +13,7 @@
 [fleet]
 # Absolute path to the shared Hermes executable every agent launcher execs.
 hermes_bin = "~/.hermes/hermes-agent/.venv/bin/hermes"
-# Checkout of the hermes-agent repo. Its .venv is used to install nats-py, etc.
+# Checkout of the shared hermes-agent repo.
 hermes_repo = "~/.hermes/hermes-agent"
 # Fallback runtime scaffold dir — used only when an agent's vendored
 # ./.runtime-scaffold is missing.
@@ -52,10 +52,3 @@ runtime_repo_owner = "delorenj"
 # Plane instance base URL and workspace slug (one project per agent).
 base = "https://plane.delo.sh"
 workspace = "33god"
-
-[bloodbank]
-# NATS endpoint the consumer connects to.
-nats_host = "127.0.0.1"
-nats_port = 4222
-# Where the bloodbank docker compose lives (used only for a hint message). ~ ok.
-compose_dir = "~/code/33GOD/bloodbank"

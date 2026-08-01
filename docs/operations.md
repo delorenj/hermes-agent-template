@@ -29,9 +29,10 @@ invocations).
 | 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills`; PM roles also seed `VOX_URL` in profile `.env` | n/a |
 | 20 runtime repo | Create gh:delorenj/agent-hm-<repo>-<role> (private), push scaffold from role-local `.runtime-scaffold/`, submodule-add into ./runtime/, symlink ~/.hermes/profiles/<id> → runtime; PM roles also link the Voxxy plugin and set `tts.provider: voxxy` | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Capture BotFather token, write to runtime/.env, enable hermes-telegram toolset | `SKIP_TELEGRAM=1` |
+| 31 slack | Disabled/deferred by default; verify a dedicated app+bot pair with `auth.test` and write it only to runtime/.env when explicitly enabled | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
-| 60 bloodbank | Install consumer (renders from scaffold w/ agent values), health-check NATS, install nats-py via uv if missing | `SKIP_BLOODBANK=1` |
-| 70 systemd | Install user units: gateway, consumer, heartbeat timer (board-reconciliation sentinel pass + gated runtime checkpoint, one tick) | `SKIP_SYSTEMD=1` |
+| 60 bloodbank | Compatibility checkpoint for fleet-shared routing; installs no files, dependencies, or services | `SKIP_BLOODBANK=1` remains a no-op |
+| 70 systemd | Install user units: profile gateway and heartbeat timer (board-reconciliation sentinel pass + gated runtime checkpoint, one tick) | `SKIP_SYSTEMD=1` |
 | 80 registry | Append entry to ~/.hermes/agents-registry.yaml | n/a |
 | 99 summary | Print summary | n/a |
 
@@ -66,10 +67,6 @@ runtime_repo_owner = "your-gh-owner"
 [plane]
 base = "https://plane.example.com"
 workspace = "your-workspace"
-
-[bloodbank]
-nats_host = "127.0.0.1"
-nats_port = 4222
 ```
 
 `role.yaml` stores an empty `runtime.github_owner` and `plane.workspace` for
@@ -104,11 +101,10 @@ cd /home/delorenj/code/hermes-agent-template
 
 ```bash
 AGENT=bloodbank-pm
-systemctl --user start hermes-${AGENT}-consumer.service
 systemctl --user start hermes-${AGENT}-heartbeat.timer
 
-# Gateway will fail to start until Telegram is wired up (no other platforms
-# configured). After running .scripts/30-telegram.sh:
+# Gateway will fail to start until at least one messaging platform is wired.
+# After running .scripts/30-telegram.sh or .scripts/31-slack.sh:
 systemctl --user start hermes-${AGENT}-gateway.service
 ```
 
@@ -117,8 +113,9 @@ systemctl --user start hermes-${AGENT}-gateway.service
 | Channel | How |
 | --- | --- |
 | Telegram | DM `@<repo>_<role>_bot` (once Telegram is wired) |
+| Slack | DM or mention the verified per-agent Slack bot (once Slack is wired) |
 | Local CLI | `./agents/hermes/<role>/hermes chat "..."` |
-| Bloodbank | Publish to `bloodbank.cmd.v1.agent.task.assign` with `data.target_agent_id = <agent_id>` |
+| Bloodbank | Publish to `bloodbank.cmd.v1.agent.invocation.start` with `data.target_agent_id = <agent_id>` |
 
 ## Inspect fleet state
 
@@ -134,8 +131,8 @@ EOF
 systemctl --user list-units --state=active 'hermes-*'
 systemctl --user list-timers 'hermes-*'
 
-# Tail the consumer for live bloodbank events
-journalctl --user -fu hermes-<agent-id>-consumer.service
+# Bloodbank routing identity consumed by the fleet-shared gateway
+python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpath('.hermes/agents-registry.yaml').read_text())['agents']['<agent-id>']['bloodbank'])"
 ```
 
 ## Deferred manual steps (one-time per agent)
@@ -154,6 +151,32 @@ journalctl --user -fu hermes-<agent-id>-consumer.service
    systemctl --user restart hermes-<agent-id>-gateway.service
    ```
 
+### Slack app and bot (opt-in)
+
+Slack remains deferred unless `ENABLE_SLACK=1` (also accepts
+`WIRE_SLACK=1`) is set or both credentials are supplied. Each enabled agent
+must have its own Slack app-level Socket Mode token and bot token; neither may
+be reused by another profile.
+
+```bash
+cd <project>/agents/hermes/<role>
+ENABLE_SLACK=1 \
+  SLACK_BOT_TOKEN='xoxb-...' \
+  SLACK_APP_TOKEN='xapp-...' \
+  SLACK_ALLOWED_USERS='U01ABC2DEF3' \
+  ./.scripts/31-slack.sh
+systemctl --user restart hermes-<agent-id>-gateway.service
+```
+
+The step calls Slack's read-only `auth.test` endpoint for the bot token, checks
+the local fleet for token or bot-identity reuse, and records only the verified
+workspace/bot identity in `role.yaml` and the fleet registry. Tokens are
+atomically written to the agent's gitignored `runtime/.env` with mode `0600`.
+They must never be placed in `~/.hermes/.env` or `~/.hermes/fleet.env`.
+
+`SLACK_ALLOWED_USERS` is non-secret and may instead be set in `fleet.env` as a
+shared policy. An empty allow-list is safe but denies all inbound Slack users.
+
 ## Restore an agent on a new machine
 
 ```bash
@@ -169,9 +192,8 @@ op read 'op://DeLoSecrets/agent-hm-<repo>-<role>/.env' > agents/hermes/<role>/ru
 ln -sfn $PWD/agents/hermes/<role>/runtime ~/.hermes/profiles/<repo>-<role>
 
 # Re-enable systemd units
-systemctl --user enable hermes-<repo>-<role>-{gateway,consumer}.service
+systemctl --user enable hermes-<repo>-<role>-gateway.service
 systemctl --user enable hermes-<repo>-<role>-heartbeat.timer
-systemctl --user start  hermes-<repo>-<role>-{consumer}.service
 systemctl --user start  hermes-<repo>-<role>-heartbeat.timer
 ```
 
@@ -180,7 +202,7 @@ systemctl --user start  hermes-<repo>-<role>-heartbeat.timer
 ```bash
 AGENT=bloodbank-dev
 # 1. Stop daemons
-systemctl --user disable --now hermes-${AGENT}-{gateway,consumer}.service
+systemctl --user disable --now hermes-${AGENT}-gateway.service
 systemctl --user disable --now hermes-${AGENT}-heartbeat.timer
 
 # 2. Delete hermes profile (cascades to symlinked runtime — make sure
@@ -216,11 +238,12 @@ rm -rf agents/hermes/<role>
 - `journalctl --user -u hermes-<agent>-gateway.service`
 - If "all configured messaging platforms failed to connect" — Telegram step wasn't run yet. Run `.scripts/30-telegram.sh` first.
 
-### Consumer not seeing events
-- Verify NATS is up: `docker compose -f ~/code/33GOD/bloodbank/compose/docker-compose.yml ps`
-- Tail consumer: `journalctl --user -fu hermes-<agent>-consumer.service`
-- Make sure something is publishing canonical repo events such as
-  `bloodbank.evt.v1.repo.issue.updated` with `data.repo = <repo>`
+### Bloodbank command not reaching an agent
+- Confirm the fleet registry entry has `bloodbank.gateway_scope: fleet`
+- Confirm its `bloodbank.target_agent_id` exactly matches the command's
+  `data.target_agent_id`
+- Inspect the fleet-shared Bloodbank gateway; there is intentionally no
+  `hermes-<agent>-consumer.service` or runtime inbox to repair
 
 ### Heartbeat not checkpointing (runtime not pushing)
 The checkpoint runs inside the heartbeat tick (after the board-reconciliation

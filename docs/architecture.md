@@ -30,8 +30,7 @@
                   │     ├── SOUL.md (evolving)             │
                   │     ├── memories/                      │   auto-checkpointed
                   │     ├── sessions/sessions.db  (LFS)    │   by the heartbeat
-                  │     ├── decisions/                     │   + on session end
-                  │     └── bloodbank-consumer.py          │
+                  │     └── decisions/                     │   + on session end
                   └────────────────────────────────────────┘
 ```
 
@@ -92,6 +91,21 @@ happen to share a token, the second one's startup fails fast. The N×M cost
 (N BotFather sessions per fleet) is the price we accept for zero custom
 routing code.
 
+## One app and bot per Slack-enabled agent
+
+Slack is opt-in and remains deferred for newly provisioned agents unless the
+operator explicitly enables it or supplies both required tokens. An enabled
+agent owns one dedicated `xapp-` Socket Mode token and one dedicated `xoxb-`
+bot token; provisioning rejects token reuse and a verified bot identity already
+owned by another registry entry.
+
+The bot token is verified through Slack's read-only `auth.test` endpoint.
+Credentials live only in the agent's mode-`0600`, gitignored `runtime/.env`.
+The shared `~/.hermes/.env`, `fleet.env`, `role.yaml`, and fleet registry never
+contain Slack tokens: manifests and registry entries retain only provisioning
+status, workspace identity, and bot identity. The non-secret allowed-user
+policy may be inherited from fleet config.
+
 ## One Plane project per agent
 
 A Plane "project" is the natural unit of work isolation. Mixing agents into a
@@ -100,9 +114,19 @@ archive-on-retire clean.
 
 ## Bloodbank wiring
 
-Each consumer subscribes to two lanes:
-- `bloodbank.evt.v1.repo.>` — canonical repo-domain events, filtered by `data.repo`
-- `bloodbank.cmd.v1.agent.>` — canonical agent-domain commands, filtered by `data.target_agent_id`
+Bloodbank command ingress is owned by one fleet-shared official Hermes gateway,
+not by a consumer in every runtime. Each registry entry advertises:
+
+```yaml
+bloodbank:
+  gateway_scope: fleet
+  target_agent_id: <agent-id>
+```
+
+The shared gateway subscribes once, resolves `data.target_agent_id` through the
+fleet registry, and routes the turn into that Hermes profile. Per-profile
+messaging gateways and heartbeat timers remain independent; there is no
+per-profile NATS process, systemd consumer unit, or filesystem inbox bridge.
 
 Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
 `producer = hermes-agent:<id>`, `source = hermes://agent/<id>`. The naming

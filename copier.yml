@@ -14,8 +14,10 @@
 #   3. Submodules it at agents/hermes/<role>/runtime/  (this is HERMES_HOME)
 #   4. Creates a Plane project in 33god workspace
 #   6. Prompts for a BotFather Telegram token, stores in runtime/.env
-#   7. Installs a Bloodbank consumer + heartbeat timer (reconcile + checkpoint)
-#   8. Appends to ~/.hermes/agents-registry.yaml
+#   7. Optionally wires a dedicated Slack app+bot pair into runtime/.env
+#   8. Records fleet-shared Bloodbank routing identity (no profile consumer)
+#   9. Installs a profile gateway + heartbeat timer (reconcile + checkpoint)
+#  10. Appends to ~/.hermes/agents-registry.yaml
 #
 # Environment-specific defaults (Hermes binary path, runtime repo owner, Plane
 # workspace/URL, NATS endpoint, skills dir, …) are NOT hardcoded — they live in
@@ -138,6 +140,7 @@ _tasks:
   - "./.scripts/10-hermes-profile.sh"
   - "./.scripts/20-runtime-repo.sh"
   - "./.scripts/30-telegram.sh"
+  - "./.scripts/31-slack.sh"
   - "./.scripts/42-ticket-provider.sh"
   - "./.scripts/60-bloodbank.sh"
   - "./.scripts/70-systemd.sh"

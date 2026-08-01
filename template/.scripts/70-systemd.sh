@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install systemd --user units: gateway, consumer, and a fused heartbeat timer
+# Install systemd --user units: profile gateway and fused heartbeat timer
 # (board-reconciliation sentinel pass + gated runtime checkpoint, one tick).
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
@@ -38,31 +38,6 @@ Restart=on-failure
 RestartSec=10
 StandardOutput=append:$RUNTIME/logs/gateway.systemd.log
 StandardError=append:$RUNTIME/logs/gateway.systemd.log
-
-[Install]
-WantedBy=default.target
-UNIT
-
-# Consumer unit
-CSM_UNIT="hermes-${AGENT_ID}-consumer.service"
-cat > "$SYS_DIR/$CSM_UNIT" <<UNIT
-[Unit]
-Description=Bloodbank Consumer — $DISPLAY_NAME
-After=network-online.target $GW_UNIT
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=$RUNTIME
-Environment=HERMES_HOME=$RUNTIME
-Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
-Environment=CODEX_HOME=$CODEX_HOME
-EnvironmentFile=-$RUNTIME/.env
-ExecStart=$HERMES_AGENT_REPO/.venv/bin/python $RUNTIME/bloodbank-consumer.py
-Restart=on-failure
-RestartSec=5
-StandardOutput=append:$RUNTIME/logs/consumer.log
-StandardError=append:$RUNTIME/logs/consumer.log
 
 [Install]
 WantedBy=default.target
@@ -115,7 +90,7 @@ if systemd_user_available; then
   # `enable --now` both enables (persist across login) AND starts the unit now, so a
   # freshly provisioned agent comes up live instead of dormant. Units with missing
   # creds (e.g. a gateway with no Telegram token yet) fail softly via Restart=on-failure.
-  for u in "$GW_UNIT" "$CSM_UNIT" "$HB_TIMER"; do
+  for u in "$GW_UNIT" "$HB_TIMER"; do
     systemctl --user enable --now "$u" >/dev/null 2>&1 && log "    enabled + started: $u" || warn "    failed to enable/start: $u"
   done
 else

@@ -5,7 +5,6 @@ source "$(dirname "$0")/_lib.sh"
 load_role_env
 
 GW_UNIT="hermes-${AGENT_ID}-gateway.service"
-CSM_UNIT="hermes-${AGENT_ID}-consumer.service"
 HB_TIMER="hermes-${AGENT_ID}-heartbeat.timer"
 
 cat >&2 <<EOF
@@ -21,12 +20,10 @@ cat >&2 <<EOF
 │
 │  Start fleet daemons:
 │    systemctl --user start $GW_UNIT
-│    systemctl --user start $CSM_UNIT
 │    systemctl --user start $HB_TIMER
 │
 │  Tail logs:
 │    journalctl --user -fu $GW_UNIT
-│    journalctl --user -fu $CSM_UNIT
 │
 │  Fleet status:
 │    python3 -c "import yaml,pathlib; print(yaml.safe_dump(yaml.safe_load(pathlib.Path('$REGISTRY_FILE').read_text())['agents']))"

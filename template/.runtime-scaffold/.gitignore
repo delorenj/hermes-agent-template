@@ -17,7 +17,6 @@ honcho.json
 
 # Sandboxes (ephemeral execution environments)
 sandboxes/
-bloodbank-inbox/
 
 # Heartbeat / sentinel ephemeral state — local to this runtime, never checkpointed.
 # (Keeps the fused checkpoint a true no-op on a clean tree.)

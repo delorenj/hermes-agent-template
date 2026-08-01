@@ -95,8 +95,8 @@ NFR1: Default commands must be read-only or dry-run.
 NFR2: Reconciliation must never destroy or merge runtime state automatically
 when profiles or runtime repos contain ambiguous data.
 
-NFR3: n8n outage must not prevent baseline agent health, gateway operation,
-consumer operation, or runtime checkpoint fallback.
+NFR3: n8n outage must not prevent baseline agent health, profile gateway
+operation, fleet Bloodbank routing, or runtime checkpoint fallback.
 
 NFR4: Validation output must be deterministic and grep-friendly.
 
@@ -138,4 +138,3 @@ Out of scope for the first implementation:
 - `npm run prepublishOnly` fails if vendored templates are dirty.
 - A generated n8n Fleet supervisor workflow can be validated before creation.
 - Agents continue local fallback behavior when n8n is unavailable.
-

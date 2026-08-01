@@ -201,7 +201,8 @@ models do not coexist accidentally.
 Acceptance Criteria:
 
 - Given `service_model: hybrid-n8n-systemd`, when validation runs, then required
-  gateway, consumer, and fallback heartbeat expectations are checked.
+  profile gateway, fleet Bloodbank registration, and fallback heartbeat
+  expectations are checked.
 - Given a checkpoint-only agent exists during migration, when status runs, then
   it is classified as legacy rather than broken.
 - Given a heartbeat-enabled agent exists, when status runs, then n8n registration
@@ -277,4 +278,3 @@ Acceptance Criteria:
   expected changes without mutation.
 - Given n8n workflow code is generated, when validation runs, then no workflow is
   created until validation succeeds.
-

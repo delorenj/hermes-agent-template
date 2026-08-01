@@ -21,6 +21,16 @@ profile: {{ agent_id }}
 telegram:
   bot_username: "{{ bot_handle }}"
 
+# Slack is opt-in. Credentials live only in runtime/.env; this block records
+# safe provisioning state and the verified auth.test identity.
+slack:
+  provisioning_status: "deferred"
+  team_id: ""
+  team_name: ""
+  bot_user_id: ""
+  bot_id: ""
+  bot_username: ""
+
 # Ticket-provider binding (linear | plane | trello).
 # The heartbeat reconciliation pass talks ONLY to this via .scripts/lib/ticket-provider.sh;
 # swapping providers is a one-line change here. Filled in by 42-ticket-provider.sh.
@@ -54,14 +64,12 @@ plane:
   # identifier is set by .scripts/42-ticket-provider.sh after creation (plane only)
   identifier: ""
 
-# Bloodbank wiring (consumed + produced subjects).
+# Bloodbank ingress is owned by one fleet-shared Hermes gateway. The gateway
+# reads the fleet registry and routes canonical commands by target_agent_id;
+# this profile does not install its own NATS consumer or inbox bridge.
 bloodbank:
-  subscribe:
-    - "bloodbank.evt.v1.repo.>"
-    - "bloodbank.cmd.v1.agent.>"
-  routing:
-    repo: "{{ target_repo }}"
-    target_agent_id: "{{ agent_id }}"
+  gateway_scope: fleet
+  target_agent_id: "{{ agent_id }}"
   producer: "hermes-agent:{{ agent_id }}"
 
 # Runtime repo (git-tracked HERMES_HOME, auto-checkpointed).

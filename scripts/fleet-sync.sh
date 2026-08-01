@@ -74,7 +74,7 @@ done
 [[ -f "$REGISTRY_FILE" ]] || { echo "fleet-sync: registry not found: $REGISTRY_FILE" >&2; exit 2; }
 [[ -f "$WRAPPER_TEMPLATE" ]] || { echo "fleet-sync: wrapper template not found: $WRAPPER_TEMPLATE" >&2; exit 2; }
 
-# Registry -> TSV: agent_id, role_dir, profile_name, gateway_unit, consumer_unit
+# Registry -> TSV: agent_id, role_dir, profile_name, gateway_unit
 read_registry() {
   python3 - "$REGISTRY_FILE" <<'PYEOF'
 import sys
@@ -96,7 +96,6 @@ for agent_id, a in sorted((data.get("agents") or {}).items()):
         str(a.get("role_dir") or ""),
         str(a.get("profile_name") or agent_id),
         str(systemd.get("gateway_unit") or ""),
-        str(systemd.get("consumer_unit") or ""),
     ]))
 PYEOF
 }
@@ -143,7 +142,7 @@ wanted_agent() {
   return 1
 }
 
-while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit consumer_unit; do
+while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit; do
   wanted_agent "$agent_id" || continue
   if [[ -z "$role_dir" || ! -d "$role_dir" ]]; then
     note "$agent_id" DRIFT "role_dir missing: ${role_dir:-<unset>} (MANUAL: deprovision or fix registry)"
@@ -334,7 +333,6 @@ PYEOF
 
   if [[ $changed -eq 1 && $RESTART -eq 1 ]]; then
     [[ -n "$gateway_unit" ]] && RESTART_UNITS+=("$gateway_unit")
-    [[ -n "$consumer_unit" ]] && RESTART_UNITS+=("$consumer_unit")
   fi
 done < <(read_registry)
 

@@ -173,8 +173,8 @@ script checks its flag and skips cleanly.
 | `SKIP_TELEGRAM` | The interactive BotFather token step. |
 | `SKIP_RUNTIME_REPO` | Creating the GitHub runtime repo. |
 | `SKIP_PLANE` | Creating a Plane project. |
-| `SKIP_BLOODBANK` | Installing the BloodBank consumer. |
-| `SKIP_SYSTEMD` | Installing `systemd` units (gateway, consumer, heartbeat timer). |
+| `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
+| `SKIP_SYSTEMD` | Installing `systemd` units (profile gateway and heartbeat timer). |
 
 For example, a local install that creates no cloud resources:
 
@@ -191,7 +191,7 @@ on Linux through a `systemd` `EnvironmentFile` (for example
 `~/.hermes/<agent_id>.env`); on macOS the `launchd` agent sources that same
 per-agent env file, so write the key there.
 
-`SKIP_SYSTEMD` gates the gateway, consumer, and the fused `heartbeat` timer in
+`SKIP_SYSTEMD` gates the profile gateway and the fused `heartbeat` timer in
 `70-systemd.sh`. The heartbeat timer is what drives the sentinel pass and the
 gated checkpoint, so a local install that wants the sentinel running must leave
 `SKIP_SYSTEMD` unset (or install the timer afterward).

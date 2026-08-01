@@ -57,6 +57,17 @@ rm -f "$PROFILE_HOME/gateway.pid" "$PROFILE_HOME/gateway_state.json" \
 # never borrow the parent's.
 PROFILE_ENV="$PROFILE_HOME/.env"
 if [[ -f "$PROFILE_ENV" ]]; then
+  # Some Hermes versions implement `profile create --clone` by symlinking the
+  # cloned .env back to the default profile.  Never sanitize through that
+  # symlink: doing so would delete the operator's fleet-wide provider secrets.
+  # Break only the .env link into a private, mode-0600 copy first.
+  if [[ -L "$PROFILE_ENV" ]]; then
+    log "    detaching cloned .env symlink before profile-local sanitization"
+    PROFILE_ENV_COPY="$PROFILE_HOME/.env.profile-local.$$"
+    cp -L "$PROFILE_ENV" "$PROFILE_ENV_COPY"
+    chmod 600 "$PROFILE_ENV_COPY"
+    mv -fT "$PROFILE_ENV_COPY" "$PROFILE_ENV"
+  fi
   log "    stripping inherited platform credentials from profile .env"
   python3 - "$PROFILE_ENV" <<'PYEOF'
 import re, sys, pathlib

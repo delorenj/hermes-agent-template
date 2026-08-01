@@ -43,7 +43,10 @@ n8n
   runs visual Fleet workflows generated from pjangler and registry state
 
 systemd --user
-  keeps gateway, consumer, and local fallback heartbeat/checkpoint alive
+  keeps each profile gateway and local fallback heartbeat/checkpoint alive
+
+fleet Bloodbank gateway
+  routes canonical commands to registered target_agent_id values
 ```
 
 ## Architecture Decisions
@@ -115,7 +118,8 @@ Rationale:
 
 Consequences:
 
-- systemd keeps gateway and consumer services running.
+- systemd keeps each profile gateway and heartbeat fallback running.
+- The fleet-shared Bloodbank gateway owns command-bus ingress for all profiles.
 - systemd fallback performs minimal self-health and checkpoint behavior.
 - n8n performs supervisor flows, agent health fanout, delegation, and
   reconciliation triggers.
@@ -164,8 +168,10 @@ systemd:
   fallback: true
   required_units:
     - gateway
-    - consumer
     - fallback-heartbeat
+bloodbank:
+  gateway_scope: fleet
+  routing_key: data.target_agent_id
 ```
 
 ## n8n Workflow Model
@@ -205,8 +211,8 @@ Trigger:
 Flow:
 
 1. Load one agent entry.
-2. Check gateway, consumer, fallback heartbeat, profile symlink, runtime repo,
-   and role manifest.
+2. Check profile gateway, fleet Bloodbank registration, fallback heartbeat,
+   profile symlink, runtime repo, and role manifest.
 3. If safe drift exists, call `pj fleet reconcile --agent <id> --apply`.
 4. If unsafe drift exists, emit manual action.
 5. Record result for supervisor.
@@ -250,4 +256,3 @@ pj fleet n8n create --name <workflow>
 4. Promote heartbeat v2 contract and systemd fallback behavior.
 5. Generate and validate n8n supervisor workflow.
 6. Enable workflow creation only after exported workflow validation passes.
-

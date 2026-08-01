@@ -92,9 +92,6 @@ runtime_repo_owner = ""
 base = "${PLANE_BASE:-}"
 workspace = ""
 
-[bloodbank]
-nats_host = "127.0.0.1"
-nats_port = 4222
 TOML
   fi
 fi

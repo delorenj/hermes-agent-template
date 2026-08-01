@@ -44,8 +44,8 @@ question — not three vague ones.
 You **MUST** emit a Bloodbank event for every consequential action you take.
 Envelope shape: CloudEvents 1.0, type `bloodbank.v1.<domain>.<entity>.<action>`,
 `actor.agent_id = {{ agent_id }}`, `producer = hermes-agent:{{ agent_id }}`,
-`source = hermes://agent/{{ agent_id }}`. The consumer in `./runtime/` already
-imports the envelope helper.
+`source = hermes://agent/{{ agent_id }}`. Inbound commands arrive through the
+fleet-shared Hermes gateway and are routed by `data.target_agent_id`.
 
 You **MUST NOT** invent new event `type` values. Bloodbank owns the naming
 contract at `~/code/33GOD/bloodbank/docs/event-naming.md` —

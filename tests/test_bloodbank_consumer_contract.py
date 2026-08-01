@@ -1,138 +1,174 @@
-import importlib.util
+from __future__ import annotations
+
 import os
-import pathlib
-import re
-import sys
-import tempfile
-import types
-import unittest
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-CONSUMER_PATH = ROOT / "runtime-scaffold" / "bloodbank-consumer.py"
-GENERATED_CONSUMER_PATH = ROOT / "template" / ".runtime-scaffold" / "bloodbank-consumer.py"
+ROOT = Path(__file__).parents[1]
+SCRIPTS = ROOT / "template" / ".scripts"
 
 
-def load_consumer():
-    sys.modules.setdefault("nats", types.ModuleType("nats"))
-    spec = importlib.util.spec_from_file_location("bloodbank_consumer_contract", CONSUMER_PATH)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    module.AGENT_ID = "demo-pm"
-    module.REPO = "demo"
-    module.PRODUCER = "hermes-agent:demo-pm"
-    module.SOURCE = "hermes://agent/demo-pm"
-    return module
+def _make_role(tmp_path: Path) -> tuple[Path, Path]:
+    role = tmp_path / "role"
+    scripts = role / ".scripts"
+    runtime = role / "runtime"
+    scripts.mkdir(parents=True)
+    runtime.mkdir()
+    for name in ("_lib.sh", "60-bloodbank.sh", "70-systemd.sh", "80-registry.sh"):
+        shutil.copy2(SCRIPTS / name, scripts / name)
+    (scripts / "heartbeat.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (scripts / "checkpoint.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    (role / "role.yaml").write_text(
+        """repo: demo
+role: pm
+agent_id: demo-pm
+display_name: "Demo PM"
+profile: demo-pm
+telegram:
+  bot_username: "demo_pm_bot"
+slack:
+  provisioning_status: "deferred"
+  team_id: ""
+  team_name: ""
+  bot_user_id: ""
+  bot_id: ""
+  bot_username: ""
+bloodbank:
+  gateway_scope: fleet
+  target_agent_id: "demo-pm"
+  producer: "hermes-agent:demo-pm"
+plane:
+  workspace: "test"
+  identifier: ""
+runtime:
+  github_owner: "test"
+  github_repo: "agent-hm-demo-pm"
+""",
+        encoding="utf-8",
+    )
+    registry = tmp_path / "agents-registry.yaml"
+    registry.write_text("schema_version: 1\nagents: {}\n", encoding="utf-8")
+    return role, registry
 
 
-class BloodbankConsumerContractTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.temp_home = tempfile.TemporaryDirectory()
-        cls.previous_home = os.environ.get("HERMES_HOME")
-        os.environ["HERMES_HOME"] = cls.temp_home.name
-        cls.consumer = load_consumer()
-
-    @classmethod
-    def tearDownClass(cls):
-        if cls.previous_home is None:
-            os.environ.pop("HERMES_HOME", None)
-        else:
-            os.environ["HERMES_HOME"] = cls.previous_home
-        cls.temp_home.cleanup()
-
-    def test_scaffold_copies_stay_identical(self):
-        self.assertEqual(CONSUMER_PATH.read_bytes(), GENERATED_CONSUMER_PATH.read_bytes())
-
-    def test_subscriptions_use_fixed_canonical_routes(self):
-        self.assertEqual(
-            self.consumer.SUBJECTS,
-            ["bloodbank.evt.v1.repo.>", "bloodbank.cmd.v1.agent.>"],
-        )
-        self.assertNotIn("demo", ".".join(self.consumer.SUBJECTS))
-        self.assertNotIn("demo-pm", ".".join(self.consumer.SUBJECTS))
-
-    def test_envelope_keeps_identity_out_of_type_and_subject(self):
-        envelope = self.consumer.build_envelope(
-            "bloodbank.v1.repo.issue.updated",
-            {"repo": "demo", "issue": "PJAN-1"},
-        )
-        self.assertEqual(envelope["type"], "bloodbank.v1.repo.issue.updated")
-        self.assertEqual(envelope["subject"], "bloodbank.evt.v1.repo.issue.updated")
-        self.assertEqual(envelope["data"]["repo"], "demo")
-        self.assertEqual(envelope["actor"]["agent_id"], "demo-pm")
-        self.assertEqual(envelope["source"], "hermes://agent/demo-pm")
-        self.assertNotIn("demo", envelope["type"])
-        self.assertNotIn("demo", envelope["subject"])
-        with self.assertRaisesRegex(ValueError, r"bloodbank\.v1"):
-            self.consumer.build_envelope(
-                "bloodbank.v2.repo.issue.updated",
-                {"repo": "demo"},
-            )
-
-    def test_repo_events_route_by_data_repo(self):
-        subject = "bloodbank.evt.v1.repo.issue.updated"
-        envelope = self.consumer.build_envelope(
-            "bloodbank.v1.repo.issue.updated",
-            {"repo": "demo"},
-        )
-        self.assertTrue(self.consumer._is_for_consumer(subject, envelope))
-        envelope["data"]["repo"] = "another-repo"
-        self.assertFalse(self.consumer._is_for_consumer(subject, envelope))
-
-    def test_agent_commands_route_by_target_agent_id(self):
-        subject = "bloodbank.cmd.v1.agent.task.assign"
-        envelope = self.consumer.build_envelope(
-            "bloodbank.v1.agent.task.assign",
-            {"target_agent_id": "demo-pm"},
-            kind="command",
-        )
-        self.assertTrue(self.consumer._is_for_consumer(subject, envelope))
-        envelope["data"]["target_agent_id"] = "other-agent"
-        self.assertFalse(self.consumer._is_for_consumer(subject, envelope))
-
-    def test_rejects_identifier_bearing_or_mismatched_routes(self):
-        envelope = self.consumer.build_envelope(
-            "bloodbank.v1.repo.issue.updated",
-            {"repo": "demo"},
-        )
-        self.assertFalse(
-            self.consumer._is_for_consumer(
-                "bloodbank.evt.v1.repo.demo.issue.updated",
-                envelope,
-            )
-        )
-        self.assertFalse(
-            self.consumer._is_for_consumer(
-                "bloodbank.evt.v1.repo.issue.created",
-                envelope,
-            )
-        )
-        envelope["kind"] = "command"
-        self.assertFalse(
-            self.consumer._is_for_consumer(
-                "bloodbank.evt.v1.repo.issue.updated",
-                envelope,
-            )
-        )
-
-    def test_generated_contract_docs_do_not_put_identifiers_in_routes(self):
-        coupled_paths = [
-            ROOT / "docs" / "architecture.md",
-            ROOT / "docs" / "operations.md",
-            ROOT / "template" / "SOUL.md.jinja",
-            ROOT / "template" / "role.yaml.jinja",
-            ROOT / "runtime-scaffold" / "memories" / "MEMORY.md",
-            ROOT / "template" / ".runtime-scaffold" / "memories" / "MEMORY.md",
-        ]
-        forbidden = re.compile(
-            r"bloodbank\.(?:v1\.repo|evt\.v1\.repo|cmd\.v1\.agent)\."
-            r"(?:\{\{|<repo>|<agent_id>)"
-        )
-        for path in coupled_paths:
-            with self.subTest(path=path):
-                self.assertIsNone(forbidden.search(path.read_text()))
+def _environment(tmp_path: Path, registry: Path) -> dict[str, str]:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env.update(
+        {
+            "HOME": str(home),
+            "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
+            "REGISTRY_FILE": str(registry),
+        }
+    )
+    return env
 
 
-if __name__ == "__main__":
-    unittest.main()
+def _run(role: Path, name: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(role / ".scripts" / name)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def test_future_runtime_scaffolds_have_no_profile_consumer_or_inbox() -> None:
+    for scaffold in (ROOT / "runtime-scaffold", ROOT / "template" / ".runtime-scaffold"):
+        assert not (scaffold / "bloodbank-consumer.py").exists()
+        assert "bloodbank-inbox" not in (scaffold / ".gitignore").read_text(encoding="utf-8")
+        readme = (scaffold / "README.md").read_text(encoding="utf-8")
+        assert "fleet-shared" in readme
+        assert "no consumer process or inbox bridge" in readme
+
+
+@pytest.mark.parametrize("skip", ["0", "1"])
+def test_step_60_is_a_harmless_compatibility_noop(tmp_path: Path, skip: str) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    env["SKIP_BLOODBANK"] = skip
+
+    result = _run(role, "60-bloodbank.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert (role / ".scripts" / ".done-60-bloodbank").is_file()
+    assert not (role / "runtime" / "bloodbank-consumer.py").exists()
+    assert "NATS" not in result.stdout + result.stderr
+
+
+def test_systemd_installs_only_profile_gateway_and_heartbeat(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+    fake_systemctl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    assert (unit_dir / "hermes-demo-pm-gateway.service").is_file()
+    assert (unit_dir / "hermes-demo-pm-heartbeat.service").is_file()
+    assert (unit_dir / "hermes-demo-pm-heartbeat.timer").is_file()
+    assert not (unit_dir / "hermes-demo-pm-consumer.service").exists()
+    rendered = "\n".join(path.read_text(encoding="utf-8") for path in unit_dir.iterdir())
+    assert "bloodbank-consumer.py" not in rendered
+    assert "consumer.log" not in rendered
+
+
+def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "demo-pm": {
+                        "systemd": {
+                            "consumer_unit": "hermes-demo-pm-consumer.service"
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["bloodbank"] == {
+        "gateway_scope": "fleet",
+        "target_agent_id": "demo-pm",
+    }
+    assert entry["systemd"] == {
+        "gateway_unit": "hermes-demo-pm-gateway.service",
+        "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
+    }
+    assert "consumer_unit" not in entry["systemd"]
+
+
+def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
+    role = (ROOT / "template" / "role.yaml.jinja").read_text(encoding="utf-8")
+    copier = (ROOT / "copier.yml").read_text(encoding="utf-8")
+    step = (SCRIPTS / "60-bloodbank.sh").read_text(encoding="utf-8")
+
+    assert "gateway_scope: fleet" in role
+    assert 'target_agent_id: "{{ agent_id }}"' in role
+    assert './.scripts/60-bloodbank.sh' in copier
+    assert "SKIP_BLOODBANK accepted as a compatibility no-op" in step
+    for legacy in ("/dev/tcp", "uv pip install", "bloodbank-consumer.py"):
+        assert legacy not in step
