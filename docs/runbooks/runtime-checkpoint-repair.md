@@ -23,8 +23,9 @@ For current recovery and retirement procedures, use
 - treat the secret manager as recovery for only credentials deliberately
   stored there;
 - retire services and profile links without removing runtime data; and
-- keep any optional destructive runtime removal separate, explicitly
-  confirmed, and conditional on a verified off-host backup.
+- preserve retired runtime data because this release intentionally ships no
+  automated purge; any future purge requires a separately reviewed path-safe
+  tool and a verified off-host backup.
 
 The earlier procedure remains recoverable from repository history for incident
 forensics. Repository history is evidence, not an active operator interface.

@@ -188,5 +188,5 @@ SKIP_TELEGRAM=1 SKIP_SYSTEMD=1 ./.scripts/40-plane.sh
 Manual retirement is deliberately non-destructive: stop the systemd units,
 detach the profile symlink, archive the Plane project, retire messaging bots,
 and remove the registry entry while preserving the ignored runtime directory.
-The verified-backup and separately confirmed data-removal procedure is in
+The verified-backup and no-automated-purge retention policy is in
 [Operations](docs/operations.md#retire-an-agent-preserves-runtime-by-default).

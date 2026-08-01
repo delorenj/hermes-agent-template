@@ -286,31 +286,20 @@ unlink -- "$PROFILE"
 test -d "$RUNTIME"
 ```
 
-### Optional destructive runtime removal (separate operation)
+### Runtime retention after retirement
 
-Only perform this after retirement. Set the exact absolute path, verify a
-complete off-host backup, and type the explicit confirmation phrase. The
-following scoped operation refuses a symlink, repository root, or path outside
-the selected role.
+Profile and service retirement always preserves the local runtime. This
+release intentionally provides no automated runtime purge, and this operations
+guide supplies no deletion recipe.
 
-```bash
-PROJECT=/absolute/path/to/project
-ROLE=pm
-RUNTIME="$PROJECT/agents/hermes/$ROLE/runtime"
-BACKUP=/absolute/path/to/verified-off-host-copy.tar.gz
+Any purge is a separate future operator-retention process. It requires a
+separately reviewed, path-safe tool that canonicalizes both the repository root
+and role path, refuses ambiguous or linked targets, and verifies that the
+backup archive contains the expected runtime members before it can remove any
+data. Until such a tool is reviewed and shipped, preserve the runtime.
 
-test "$RUNTIME" = "$PROJECT/agents/hermes/$ROLE/runtime"
-test -d "$RUNTIME" && test ! -L "$RUNTIME"
-test -f "$BACKUP" && sha256sum -c "${BACKUP}.sha256"
-read -r -p "Type REMOVE LOCAL RUNTIME $RUNTIME: " CONFIRM
-test "$CONFIRM" = "REMOVE LOCAL RUNTIME $RUNTIME"
-find "$RUNTIME" -xdev -mindepth 1 -delete
-rmdir -- "$RUNTIME"
-```
-
-This operation removes only the confirmed runtime directory. Removing the
-tracked role scaffold is a different project change and is not part of runtime
-retirement.
+Removing the tracked role scaffold is a different project change and is not
+part of profile or service retirement.
 
 ## Troubleshooting
 

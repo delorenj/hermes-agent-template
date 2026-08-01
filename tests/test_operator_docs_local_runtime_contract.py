@@ -27,6 +27,9 @@ def test_active_operator_surfaces_describe_only_pure_local_runtime() -> None:
         "cascading profile deletion": r"hermes\s+profile\s+delete|cascad(?:e|es|ing)",
         "blanket runtime deletion": r"rm\s+-rf[^\n]*(?:runtime|agents/hermes|\$RUNTIME|\$ROLE_DIR)",
         "runtime submodule deletion": r"git\s+submodule\s+deinit|\.git/modules/agents/hermes|git\s+rm[^\n]*runtime",
+        "runtime find deletion": r"find[^\n]*(?:runtime|\$RUNTIME)[^\n]*-delete",
+        "runtime directory removal": r"rmdir[^\n]*(?:runtime|\$RUNTIME)",
+        "runtime deletion confirmation shell": r"read[^\n]*REMOVE LOCAL RUNTIME",
     }
 
     for path in ACTIVE_OPERATOR_SURFACES:
@@ -39,6 +42,7 @@ def test_active_operator_surfaces_describe_only_pure_local_runtime() -> None:
 
 def test_operations_make_recovery_and_retirement_boundaries_explicit() -> None:
     operations = (ROOT / "docs" / "operations.md").read_text(encoding="utf-8")
+    normalized = " ".join(operations.split())
 
     for required in (
         "does **not** ship automatic backup",
@@ -46,12 +50,13 @@ def test_operations_make_recovery_and_retirement_boundaries_explicit() -> None:
         "Hindsight can restore only",
         "secret manager can restore only",
         "Retire an agent (preserves runtime by default)",
-        "Optional destructive runtime removal (separate operation)",
-        "Type REMOVE LOCAL RUNTIME $RUNTIME",
-        'test "$RUNTIME" = "$PROJECT/agents/hermes/$ROLE/runtime"',
-        'sha256sum -c "${BACKUP}.sha256"',
+        "Profile and service retirement always preserves the local runtime",
+        "This release intentionally provides no automated runtime purge",
+        "separately reviewed, path-safe tool",
+        "canonicalizes both the repository root and role path",
+        "verifies that the backup archive contains the expected runtime members",
     ):
-        assert required in operations
+        assert required in normalized
 
 
 def test_legacy_runtime_owner_config_is_explicitly_inert() -> None:
