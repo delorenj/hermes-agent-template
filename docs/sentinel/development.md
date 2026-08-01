@@ -160,7 +160,8 @@ order. Several of them reach outside the repository.
 <!-- prettier-ignore -->
 > [!CAUTION]
 > Full provisioning is outward-facing and partly interactive.
-> `20-runtime-repo.sh` creates a private GitHub repo with `gh repo create`,
+> `20-runtime-repo.sh` populates the ignored local runtime and links its profile;
+> it creates no GitHub storage,
 > `30-telegram.sh` prompts for a BotFather token and blocks waiting for input,
 > and `42-ticket-provider.sh` can create a Plane project. Don't run full
 > provisioning unattended.

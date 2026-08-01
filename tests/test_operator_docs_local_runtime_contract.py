@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 
@@ -30,6 +31,7 @@ def test_active_operator_surfaces_describe_only_pure_local_runtime() -> None:
         "runtime find deletion": r"find[^\n]*(?:runtime|\$RUNTIME)[^\n]*-delete",
         "runtime directory removal": r"rmdir[^\n]*(?:runtime|\$RUNTIME)",
         "runtime deletion confirmation shell": r"read[^\n]*REMOVE LOCAL RUNTIME",
+        "step-20 GitHub creation claim": r"20-runtime-repo\.sh.{0,160}gh\s+repo\s+create",
     }
 
     for path in ACTIVE_OPERATOR_SURFACES:
@@ -78,3 +80,53 @@ def test_retired_checkpoint_runbook_is_historical_evidence_only() -> None:
     assert "Historical evidence only" in runbook
     assert "do not execute" in runbook
     assert "commands have intentionally been removed" in runbook
+
+
+def test_step_20_is_documented_as_ignored_local_population() -> None:
+    development = (
+        ROOT / "docs" / "sentinel" / "development.md"
+    ).read_text(encoding="utf-8")
+
+    assert "`20-runtime-repo.sh` populates the ignored local runtime" in development
+    assert "it creates no GitHub storage" in development
+    assert "creates a private GitHub repo" not in development
+
+
+def test_retired_checkpoint_repair_is_a_non_mutating_tombstone(tmp_path: Path) -> None:
+    script = ROOT / "scripts" / "repair-runtime-checkpoint.sh"
+    source = script.read_text(encoding="utf-8")
+    forbidden = (
+        r"\bgit\s+(?:init|fetch|reset|lfs|push|remote|submodule|checkout|restore)\b",
+        r"\b(?:rm|mv|cp|touch|truncate)\b",
+        r">>",
+    )
+    for pattern in forbidden:
+        assert re.search(pattern, source, re.IGNORECASE) is None
+
+    runtime = tmp_path / "project" / "agents" / "hermes" / "pm" / "runtime"
+    private = runtime / "sessions" / "private-state.bin"
+    private.parent.mkdir(parents=True)
+    private.write_bytes(bytes((0, 17, 34, 255)))
+    (runtime / ".env").write_text("TOKEN=preserve-exactly\n", encoding="utf-8")
+
+    def snapshot() -> list[tuple[str, str, int, bytes]]:
+        entries: list[tuple[str, str, int, bytes]] = []
+        for path in sorted(runtime.rglob("*")):
+            kind = "dir" if path.is_dir() else "file"
+            payload = b"" if path.is_dir() else path.read_bytes()
+            entries.append((str(path.relative_to(runtime)), kind, path.stat().st_mode, payload))
+        return entries
+
+    before = snapshot()
+    result = subprocess.run(
+        [str(script), "--apply", str(runtime)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert "retired and intentionally non-operational" in result.stderr
+    assert "changed nothing" in result.stderr
+    assert snapshot() == before
