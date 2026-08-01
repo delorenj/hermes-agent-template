@@ -21,6 +21,12 @@
 #   Provider creds: LINEAR_API_KEY | PLANE_API_KEY+PLANE_BASE | TRELLO_KEY+TRELLO_TOKEN
 set -eu
 
+# Fleet runtime publication. These values intentionally identify the reviewed
+# fork commit; clean installs must never fall back to NousResearch/main.
+HERMES_RUNTIME_GIT_URL="https://github.com/delorenj/hermes-agent.git"
+HERMES_RUNTIME_GIT_REF="feature/PJAN-19-routing-publication"
+HERMES_RUNTIME_GIT_SHA="113e1b182b6d72a7dd02a191f134a41668ceaf0e"
+
 say()  { printf '\033[36m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
@@ -53,7 +59,38 @@ if command -v hermes >/dev/null 2>&1; then
   say "1. hermes: found ($(command -v hermes))"
 else
   say "1. hermes: not found — installing"
-  run "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+  HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
+  if [ "${HAT_DRY_RUN:-0}" = "1" ]; then
+    say "  [dry-run] clone $HERMES_RUNTIME_GIT_URL@$HERMES_RUNTIME_GIT_REF"
+    say "  [dry-run] verify and install commit $HERMES_RUNTIME_GIT_SHA"
+  else
+    command -v git >/dev/null 2>&1 || die "git is required to install the pinned Hermes runtime"
+    if [ -d "$HERMES_INSTALL_DIR/.git" ]; then
+      _origin="$(git -C "$HERMES_INSTALL_DIR" remote get-url origin 2>/dev/null || true)"
+      [ "$_origin" = "$HERMES_RUNTIME_GIT_URL" ] \
+        || die "existing Hermes checkout origin is not the reviewed fleet fork: $HERMES_INSTALL_DIR"
+      git -C "$HERMES_INSTALL_DIR" fetch origin "$HERMES_RUNTIME_GIT_REF"
+    elif [ -e "$HERMES_INSTALL_DIR" ]; then
+      die "Hermes install path exists but is not the reviewed fork checkout: $HERMES_INSTALL_DIR"
+    else
+      mkdir -p "$(dirname "$HERMES_INSTALL_DIR")"
+      git clone --branch "$HERMES_RUNTIME_GIT_REF" --single-branch \
+        "$HERMES_RUNTIME_GIT_URL" "$HERMES_INSTALL_DIR"
+    fi
+    git -C "$HERMES_INSTALL_DIR" cat-file -e "$HERMES_RUNTIME_GIT_SHA^{commit}" \
+      || die "pinned Hermes commit is unavailable from the reviewed fork"
+    git -C "$HERMES_INSTALL_DIR" merge-base --is-ancestor \
+      "$HERMES_RUNTIME_GIT_SHA" "origin/$HERMES_RUNTIME_GIT_REF" \
+      || die "pinned Hermes commit is not on the reviewed publication ref"
+    bash "$HERMES_INSTALL_DIR/scripts/install.sh" \
+      --dir "$HERMES_INSTALL_DIR" \
+      --branch "$HERMES_RUNTIME_GIT_REF" \
+      --commit "$HERMES_RUNTIME_GIT_SHA" \
+      --skip-setup
+    _installed_sha="$(git -C "$HERMES_INSTALL_DIR" rev-parse HEAD)"
+    [ "$_installed_sha" = "$HERMES_RUNTIME_GIT_SHA" ] \
+      || die "Hermes installer did not retain pinned commit $HERMES_RUNTIME_GIT_SHA"
+  fi
   command -v hermes >/dev/null 2>&1 || die "hermes install did not put 'hermes' on PATH. Open a new shell and re-run."
 fi
 HERMES_BIN="$(command -v hermes)"
@@ -82,6 +119,9 @@ else
 [fleet]
 hermes_bin = "$HERMES_BIN"
 hermes_repo = "$HOME/.hermes/hermes-agent"
+hermes_git_url = "$HERMES_RUNTIME_GIT_URL"
+hermes_git_ref = "$HERMES_RUNTIME_GIT_REF"
+hermes_git_sha = "$HERMES_RUNTIME_GIT_SHA"
 fleet_env = "~/.hermes/fleet.env"
 registry_file = "~/.hermes/agents-registry.yaml"
 

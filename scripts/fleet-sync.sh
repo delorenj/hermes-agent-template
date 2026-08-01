@@ -10,7 +10,7 @@ set -euo pipefail
 #   contract  runtime/profile.yaml opts into config.inherit_from: default
 #   registry  ~/.hermes/profiles/<profile_name> -> <role_dir>/runtime
 #   role      <role_dir>/role.yaml profile: <profile_name>
-#   services  systemd gateway/consumer units restarted when something changed
+#   services  stale per-profile Bloodbank consumers retired; gateways restarted
 #
 # Default is a DRY-RUN drift report (exit 1 when drift exists, 0 when clean).
 # --apply writes the fixes and restarts the changed agents' services.
@@ -74,7 +74,7 @@ done
 [[ -f "$REGISTRY_FILE" ]] || { echo "fleet-sync: registry not found: $REGISTRY_FILE" >&2; exit 2; }
 [[ -f "$WRAPPER_TEMPLATE" ]] || { echo "fleet-sync: wrapper template not found: $WRAPPER_TEMPLATE" >&2; exit 2; }
 
-# Registry -> TSV: agent_id, role_dir, profile_name, gateway_unit
+# Registry -> TSV: agent_id, role_dir, profile_name, gateway_unit, legacy_consumer_unit
 read_registry() {
   python3 - "$REGISTRY_FILE" <<'PYEOF'
 import sys
@@ -91,11 +91,12 @@ for agent_id, a in sorted((data.get("agents") or {}).items()):
     if not isinstance(a, dict):
         continue
     systemd = a.get("systemd") or {}
-    print("\t".join([
+    print("\x1f".join([
         agent_id,
         str(a.get("role_dir") or ""),
         str(a.get("profile_name") or agent_id),
         str(systemd.get("gateway_unit") or ""),
+        str(systemd.get("consumer_unit") or ""),
     ]))
 PYEOF
 }
@@ -110,10 +111,60 @@ declare -a RESTART_UNITS=()
 
 # Registry agents sharing a role_dir would overwrite each other's wrapper
 # and role.yaml on --apply; refuse to write into contested dirs.
-CONTESTED_DIRS="$(read_registry | cut -f2 | sort | uniq -d)"
+CONTESTED_DIRS="$(read_registry | cut -d $'\x1f' -f2 | sort | uniq -d)"
 
 note() {  # note <agent> <status> <message>
   printf '%-34s %-7s %s\n' "$1" "$2" "$3"
+}
+
+retire_registry_consumer_metadata() {  # retire_registry_consumer_metadata <agent_id>
+  local target_agent="$1" lock_file="${REGISTRY_FILE}.lock" registry_lock_fd=""
+  command -v flock >/dev/null 2>&1 \
+    || { echo "fleet-sync: flock is required for registry updates" >&2; return 1; }
+  [[ ! -L "$lock_file" ]] \
+    || { echo "fleet-sync: refusing registry lock symlink: $lock_file" >&2; return 1; }
+  exec {registry_lock_fd}>"$lock_file"
+  chmod 600 "$lock_file"
+  flock -w 30 "$registry_lock_fd" \
+    || { echo "fleet-sync: timed out waiting for registry lock" >&2; return 1; }
+  python3 - "$REGISTRY_FILE" "$target_agent" <<'PYEOF'
+import os
+import pathlib
+import sys
+import tempfile
+
+try:
+    import yaml
+except ImportError:
+    raise SystemExit("fleet-sync: python3-yaml is required")
+
+path = pathlib.Path(sys.argv[1])
+agent_id = sys.argv[2]
+if path.is_symlink():
+    raise SystemExit(f"fleet-sync: refusing registry symlink: {path}")
+data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+entry = (data.get("agents") or {}).get(agent_id)
+if isinstance(entry, dict) and isinstance(entry.get("systemd"), dict):
+    entry["systemd"].pop("consumer_unit", None)
+rendered = yaml.safe_dump(data, sort_keys=False)
+fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.fleet-sync-", dir=path.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+    os.chmod(path, 0o600)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PYEOF
+  flock -u "$registry_lock_fd"
+  eval "exec ${registry_lock_fd}>&-"
 }
 
 ensure_env_key() {  # ensure_env_key <path> <key> <value>
@@ -142,7 +193,7 @@ wanted_agent() {
   return 1
 }
 
-while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit; do
+while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_unit; do
   wanted_agent "$agent_id" || continue
   if [[ -z "$role_dir" || ! -d "$role_dir" ]]; then
     note "$agent_id" DRIFT "role_dir missing: ${role_dir:-<unset>} (MANUAL: deprovision or fix registry)"
@@ -156,6 +207,52 @@ while IFS=$'\t' read -r agent_id role_dir profile_name gateway_unit; do
   fi
   runtime="$role_dir/runtime"
   changed=0
+
+  # Legacy per-profile Bloodbank consumers are unhealthy until fully retired.
+  legacy_consumer_unit="${consumer_unit:-hermes-${agent_id}-consumer.service}"
+  if [[ ! "$legacy_consumer_unit" =~ ^hermes-[A-Za-z0-9._-]+-consumer\.service$ ]]; then
+    note "$agent_id" DRIFT "unsafe legacy consumer unit name in registry: $legacy_consumer_unit (MANUAL: fix registry)"
+    DRIFT=$((DRIFT + 1))
+  else
+    legacy_consumer_path="$HOME/.config/systemd/user/$legacy_consumer_unit"
+    legacy_consumer_present=0
+    [[ -n "$consumer_unit" || -e "$legacy_consumer_path" || -L "$legacy_consumer_path" ]] \
+      && legacy_consumer_present=1
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl --user is-active --quiet "$legacy_consumer_unit" 2>/dev/null \
+        && legacy_consumer_present=1 || true
+      systemctl --user is-enabled --quiet "$legacy_consumer_unit" 2>/dev/null \
+        && legacy_consumer_present=1 || true
+    fi
+    if [[ $legacy_consumer_present -eq 1 ]]; then
+      if [[ $APPLY -eq 0 ]]; then
+        note "$agent_id" DRIFT "legacy per-profile Bloodbank consumer remains: $legacy_consumer_unit"
+        DRIFT=$((DRIFT + 1))
+      else
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl --user disable --now "$legacy_consumer_unit" >/dev/null 2>&1 || true
+        fi
+        rm -f -- "$legacy_consumer_path"
+        command -v systemctl >/dev/null 2>&1 \
+          && systemctl --user daemon-reload >/dev/null 2>&1 || true
+        legacy_consumer_still_live=0
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl --user is-active --quiet "$legacy_consumer_unit" 2>/dev/null \
+            && legacy_consumer_still_live=1 || true
+          systemctl --user is-enabled --quiet "$legacy_consumer_unit" 2>/dev/null \
+            && legacy_consumer_still_live=1 || true
+        fi
+        if [[ $legacy_consumer_still_live -eq 1 ]]; then
+          note "$agent_id" DRIFT "legacy consumer remains active/enabled after retirement attempt: $legacy_consumer_unit"
+          DRIFT=$((DRIFT + 1))
+        else
+          retire_registry_consumer_metadata "$agent_id"
+          note "$agent_id" FIXED "legacy per-profile Bloodbank consumer retired"
+          FIXED=$((FIXED + 1))
+        fi
+      fi
+    fi
+  fi
 
   # 1. Launcher wrapper regenerated from the current template.
   expected_wrapper="$(render_wrapper "$agent_id")"
@@ -338,7 +435,7 @@ done < <(read_registry)
 
 # 5. Stale registry symlinks: entries pointing into fleet runtimes under a
 # name the registry does not know. Reported only — removal is a human call.
-known_names="$(read_registry | cut -f3 | sort -u)"
+known_names="$(read_registry | cut -d $'\x1f' -f3 | sort -u)"
 if [[ -d "$PROFILES_DIR" ]]; then
   for link in "$PROFILES_DIR"/*; do
     [[ -L "$link" ]] || continue

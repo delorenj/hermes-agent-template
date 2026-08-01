@@ -131,17 +131,37 @@ print("\t".join(str(v).replace("\t", " ").replace("\n", " ") for v in values))
 IFS=$'\t' read -r slack_team_id slack_team_name slack_bot_user_id slack_bot_id slack_bot_username <<< "$identity"
 
 # Reject credential reuse, token rotation onto an identity owned by another
-# agent, and credentials parked in the shared root .env.  Values are compared
-# in-process and never included in output.
+# agent, and credentials parked in shared env files. The scan, durable identity
+# claim, and profile credential write share one fleet-wide flock.
 export SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS
-python3 - "$REGISTRY_FILE" "$ENVF" "$AGENT_ID" \
-  "$slack_team_id" "$slack_bot_user_id" "$slack_bot_id" <<'PYEOF'
+fleet_lock_acquire
+trap 'fleet_lock_release' EXIT
+python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" \
+  "$slack_team_id" "$slack_bot_user_id" "$slack_bot_id" \
+  "$ROLE_DIR" "$PROFILE_NAME" "$slack_team_name" "$slack_bot_username" <<'PYEOF'
 import os
 import pathlib
 import re
 import sys
+import tempfile
+try:
+    import yaml  # type: ignore
+except ImportError:
+    raise SystemExit("PyYAML is required for Slack fleet claims")
 
-registry_path, target_path, agent_id, team_id, user_id, bot_id = sys.argv[1:]
+(
+    registry_path,
+    fleet_path,
+    target_path,
+    agent_id,
+    team_id,
+    user_id,
+    bot_id,
+    role_dir,
+    profile_name,
+    team_name,
+    bot_username,
+) = sys.argv[1:]
 bot_token = os.environ["SLACK_BOT_TOKEN"]
 app_token = os.environ["SLACK_APP_TOKEN"]
 target = pathlib.Path(target_path).resolve(strict=False)
@@ -161,27 +181,32 @@ def env_values(path):
             values[key] = value
     return values
 
-owners = []
+owners = [("shared fleet environment", pathlib.Path(fleet_path))]
 registry = pathlib.Path(registry_path)
+if registry.is_symlink():
+    raise SystemExit(f"refusing to update registry symlink: {registry}")
+data = {"schema_version": 1, "agents": {}}
 if registry.is_file():
     try:
-        import yaml  # type: ignore
-        agents = (yaml.safe_load(registry.read_text(encoding="utf-8")) or {}).get("agents", {})
+        data = yaml.safe_load(registry.read_text(encoding="utf-8")) or data
     except Exception as exc:
         raise SystemExit(f"cannot safely inspect Slack ownership registry: {type(exc).__name__}")
-    for other_id, entry in agents.items():
-        if other_id == agent_id or not isinstance(entry, dict):
-            continue
-        slack = entry.get("slack") or {}
-        if isinstance(slack, dict):
-            same_user = user_id and slack.get("bot_user_id") == user_id
-            same_bot = bot_id and slack.get("bot_id") == bot_id
-            same_team_user = team_id and same_user and slack.get("team_id") == team_id
-            if same_bot or same_team_user:
-                raise SystemExit(f"Slack bot identity is already assigned to agent {other_id}")
-        role_dir = entry.get("role_dir")
-        if role_dir:
-            owners.append((f"agent {other_id}", pathlib.Path(str(role_dir)) / "runtime" / ".env"))
+if not isinstance(data, dict) or not isinstance(data.get("agents", {}), dict):
+    raise SystemExit("cannot safely inspect Slack ownership registry: invalid agents mapping")
+agents = data.setdefault("agents", {})
+for other_id, entry in agents.items():
+    if other_id == agent_id or not isinstance(entry, dict):
+        continue
+    slack = entry.get("slack") or {}
+    if isinstance(slack, dict):
+        same_user = user_id and slack.get("bot_user_id") == user_id
+        same_bot = bot_id and slack.get("bot_id") == bot_id
+        same_team_user = team_id and same_user and slack.get("team_id") == team_id
+        if same_bot or same_team_user:
+            raise SystemExit(f"Slack bot identity is already assigned to agent {other_id}")
+    other_role_dir = entry.get("role_dir")
+    if other_role_dir:
+        owners.append((f"agent {other_id}", pathlib.Path(str(other_role_dir)) / "runtime" / ".env"))
 
 home_value = os.environ.get("HOME", "")
 if home_value:
@@ -203,6 +228,37 @@ for owner, path in owners:
         raise SystemExit(f"Slack bot token is already assigned to {owner}")
     if values.get("SLACK_APP_TOKEN") == app_token:
         raise SystemExit(f"Slack app token is already assigned to {owner}")
+
+claim = agents.setdefault(agent_id, {})
+if not isinstance(claim, dict):
+    raise SystemExit(f"registry entry for {agent_id} is not a mapping")
+claim["role_dir"] = role_dir
+claim["profile_name"] = profile_name
+claim["slack"] = {
+    "provisioning_status": "verified",
+    "team_id": team_id,
+    "team_name": team_name,
+    "bot_user_id": user_id,
+    "bot_id": bot_id,
+    "bot_username": bot_username,
+}
+registry.parent.mkdir(parents=True, exist_ok=True)
+rendered = yaml.safe_dump(data, sort_keys=False)
+fd, temporary = tempfile.mkstemp(prefix=f".{registry.name}.slack-", dir=registry.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, registry)
+    os.chmod(registry, 0o600)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
 PYEOF
 
 # Atomically replace only the Slack fields in the profile-local runtime file.
@@ -253,6 +309,9 @@ slack_yaml_update \
   bot_user_id "$slack_bot_user_id" \
   bot_id "$slack_bot_id" \
   bot_username "$slack_bot_username"
+
+fleet_lock_release
+trap - EXIT
 
 if [[ -z "$SLACK_ALLOWED_USERS" ]]; then
   warn "    Slack is wired but denies all inbound users until SLACK_ALLOWED_USERS is set"

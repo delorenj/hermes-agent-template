@@ -5,13 +5,40 @@
 source "$(dirname "$0")/_lib.sh"
 load_role_env
 
-already_done 70-systemd && { log "[70] systemd already installed — skipping"; exit 0; }
-[[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
-
 RUNTIME="$ROLE_DIR/runtime"
 REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYS_DIR" "$RUNTIME/logs"
+
+# Upgrade remediation must run before honoring a legacy done marker. Older
+# templates installed one per-profile Bloodbank consumer; leaving even one
+# enabled races the fleet-shared durable gateway and can duplicate execution.
+LEGACY_CONSUMER_UNIT="hermes-${AGENT_ID}-consumer.service"
+LEGACY_CONSUMER_PATH="$SYS_DIR/$LEGACY_CONSUMER_UNIT"
+legacy_consumer_present=0
+[[ -e "$LEGACY_CONSUMER_PATH" || -L "$LEGACY_CONSUMER_PATH" ]] \
+  && legacy_consumer_present=1
+if command -v systemctl >/dev/null 2>&1; then
+  systemctl --user is-active --quiet "$LEGACY_CONSUMER_UNIT" 2>/dev/null \
+    && legacy_consumer_present=1 || true
+  systemctl --user is-enabled --quiet "$LEGACY_CONSUMER_UNIT" 2>/dev/null \
+    && legacy_consumer_present=1 || true
+fi
+if [[ $legacy_consumer_present -eq 1 ]]; then
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user disable --now "$LEGACY_CONSUMER_UNIT" >/dev/null 2>&1 \
+      || warn "    legacy consumer could not be disabled cleanly: $LEGACY_CONSUMER_UNIT"
+  fi
+  rm -f -- "$LEGACY_CONSUMER_PATH"
+  if systemd_user_available; then
+    systemctl --user daemon-reload >/dev/null 2>&1 \
+      || warn "    systemd daemon-reload failed after legacy consumer retirement"
+  fi
+  log "    retired legacy per-profile Bloodbank consumer: $LEGACY_CONSUMER_UNIT"
+fi
+
+already_done 70-systemd && { log "[70] systemd already installed — legacy cleanup checked"; exit 0; }
+[[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
 
 # The heartbeat runner (board-reconciliation sentinel pass + gated checkpoint)
 # and the checkpoint helper both render into the role dir; just ensure they are

@@ -55,6 +55,9 @@ different machine/user, edit this one file:
 [fleet]
 hermes_bin = "/path/to/hermes-agent/.venv/bin/hermes"
 hermes_repo = "/path/to/hermes-agent"
+hermes_git_url = "https://github.com/delorenj/hermes-agent.git"
+hermes_git_ref = "feature/PJAN-19-routing-publication"
+hermes_git_sha = "113e1b182b6d72a7dd02a191f134a41668ceaf0e"
 oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
 canonical_skills_dir = "/path/to/.agents/skills"
@@ -90,12 +93,38 @@ For Codex auth, run `hermes auth add openai-codex` through any generated agent
 launcher once; all agents using the same fleet env read the same Hermes OAuth
 store afterward.
 
+The reviewed runtime source is the `delorenj/hermes-agent` fork, publication
+ref `feature/PJAN-19-routing-publication`, pinned at
+`113e1b182b6d72a7dd02a191f134a41668ceaf0e`. `install-local.sh` performs a
+single-branch clone, verifies the pin is on that ref, passes both `--branch` and
+`--commit` to the checked-out installer, and refuses an existing checkout with
+a different origin. It never fetches or writes upstream `main`.
+
 To retrofit older provisioned agents onto this model, run:
 
 ```bash
 cd /home/delorenj/code/hermes-agent-template
 ./scripts/backfill-fleet-sot.sh
 ```
+
+Then audit legacy consumers before relying on the fleet-shared Bloodbank
+gateway:
+
+```bash
+./scripts/fleet-sync.sh
+./scripts/fleet-sync.sh --apply
+```
+
+Any active, enabled, installed, or registry-declared
+`hermes-<agent>-consumer.service` is unhealthy drift. Apply mode disables and
+stops it, removes the unit, reloads user systemd, verifies it is no longer live,
+and only then removes the legacy registry metadata. The same cleanup runs in
+step 70 before its done marker is honored.
+
+Fleet registry and chat identity changes share `${registry_file}.lock`. `flock`
+owns the lock in the kernel (an on-disk lock file surviving a crash is safe),
+while atomic replace prevents partial YAML. Registry and lock files are mode
+`0600`; symlink targets are refused.
 
 ## Start the daemons for an agent
 

@@ -67,6 +67,7 @@ you to review it. Keys:
 | Section | Key | What it sets |
 | --- | --- | --- |
 | `fleet` | `hermes_bin`, `hermes_repo` | Shared Hermes executable + repo checkout |
+| `fleet` | `hermes_git_url`, `hermes_git_ref`, `hermes_git_sha` | Reviewed Hermes fork publication used by clean installs and fleet audit metadata |
 | `fleet` | `fleet_env`, `registry_file` | Fleet source-of-truth + registry locations |
 | `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
@@ -109,6 +110,31 @@ github.com/delorenj/agent-hm-<repo>-pm/     ← new private repo, this agent's s
 Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
 gateway reads the registry and routes canonical commands by
 `data.target_agent_id`; runtime repos contain no NATS consumer or inbox bridge.
+Provisioning and `fleet-sync.sh --apply` also retire the old
+`hermes-<agent>-consumer.service`, even when an older `.done-70-systemd` marker
+exists. A dry-run fleet sync reports any surviving consumer as unhealthy drift.
+
+Telegram and Slack ownership checks, identity claims, runtime credential
+writes, and registry upserts serialize on `${registry_file}.lock`. The lock is
+held by `flock`, so a crashed process cannot leave a stale logical lock; registry
+writes use an atomic replace and keep both registry and lock at mode `0600`.
+
+## Reviewed Hermes runtime publication
+
+Clean installs use only the reviewed fleet fork publication below. The local
+installer verifies the commit belongs to the named ref and refuses an existing
+checkout whose `origin` points elsewhere:
+
+```bash
+git clone --branch feature/PJAN-19-routing-publication --single-branch \
+  https://github.com/delorenj/hermes-agent.git ~/.hermes/hermes-agent
+git -C ~/.hermes/hermes-agent rev-parse HEAD
+# 113e1b182b6d72a7dd02a191f134a41668ceaf0e
+```
+
+Do not install this fleet path from `NousResearch/hermes-agent` or mutate its
+`main` branch. Promotion happens on the fork publication ref and is pinned by
+full commit SHA in `config.example.toml` and each registry entry.
 
 ## Fleet single source-of-truth
 

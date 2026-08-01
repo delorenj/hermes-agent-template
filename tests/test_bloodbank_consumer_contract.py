@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -128,6 +129,50 @@ def test_systemd_installs_only_profile_gateway_and_heartbeat(tmp_path: Path) -> 
     assert "consumer.log" not in rendered
 
 
+def test_systemd_done_marker_still_retires_legacy_consumer(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    unit_dir.mkdir(parents=True)
+    consumer = unit_dir / "hermes-demo-pm-consumer.service"
+    consumer.write_text("legacy\n", encoding="utf-8")
+    (role / ".scripts" / ".done-70-systemd").touch()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    log = tmp_path / "systemctl.log"
+    retired = tmp_path / "retired"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  *"disable --now hermes-demo-pm-consumer.service"*) touch "$SYSTEMCTL_RETIRED"; exit 0 ;;
+  *"is-active --quiet hermes-demo-pm-consumer.service"*|*"is-enabled --quiet hermes-demo-pm-consumer.service"*)
+    [[ -f "$SYSTEMCTL_RETIRED" ]] && exit 1 || exit 0 ;;
+  *"is-system-running"*) echo running; exit 0 ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "SYSTEMCTL_LOG": str(log),
+            "SYSTEMCTL_RETIRED": str(retired),
+        }
+    )
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert not consumer.exists()
+    assert "disable --now hermes-demo-pm-consumer.service" in log.read_text(encoding="utf-8")
+    assert "legacy cleanup checked" in result.stderr
+    assert not (unit_dir / "hermes-demo-pm-gateway.service").exists()
+
+
 def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path: Path) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
@@ -161,6 +206,66 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
         "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
     }
     assert "consumer_unit" not in entry["systemd"]
+
+
+def test_concurrent_registry_upserts_are_atomic_and_lossless(tmp_path: Path) -> None:
+    role_a, _ = _make_role(tmp_path / "a")
+    role_b, _ = _make_role(tmp_path / "b")
+    role_b_yaml = role_b / "role.yaml"
+    role_b_yaml.write_text(
+        role_b_yaml.read_text(encoding="utf-8").replace("demo-pm", "demo-reviewer"),
+        encoding="utf-8",
+    )
+    registry = tmp_path / "agents-registry.yaml"
+    registry.write_text("schema_version: 1\nagents: {}\n", encoding="utf-8")
+    (tmp_path / "env-a").mkdir()
+    (tmp_path / "env-b").mkdir()
+    env_a = _environment(tmp_path / "env-a", registry)
+    env_b = _environment(tmp_path / "env-b", registry)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda args: _run(*args),
+                (
+                    (role_a, "80-registry.sh", env_a),
+                    (role_b, "80-registry.sh", env_b),
+                ),
+            )
+        )
+
+    assert all(result.returncode == 0 for result in results), [r.stderr for r in results]
+    agents = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
+    assert set(agents) == {"demo-pm", "demo-reviewer"}
+    assert (registry.stat().st_mode & 0o777) == 0o600
+
+
+def test_registry_upsert_refuses_lock_symlink(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    lock_target = tmp_path / "lock-target"
+    lock_target.write_text("untouched", encoding="utf-8")
+    Path(f"{registry}.lock").symlink_to(lock_target)
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode != 0
+    assert "lock symlink" in result.stderr
+    assert lock_target.read_text(encoding="utf-8") == "untouched"
+
+
+def test_stale_lock_file_is_safe_when_no_process_holds_flock(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    lock = Path(f"{registry}.lock")
+    lock.write_text("left by a crashed provisioner\n", encoding="utf-8")
+    lock.chmod(0o644)
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert "demo-pm" in yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
+    assert (lock.stat().st_mode & 0o777) == 0o600
 
 
 def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:

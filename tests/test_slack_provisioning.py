@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
@@ -306,3 +307,38 @@ def test_registry_persists_identity_metadata_without_tokens(tmp_path: Path) -> N
     serialized = registry.read_text(encoding="utf-8")
     assert "SLACK_BOT_TOKEN" not in serialized
     assert "SLACK_APP_TOKEN" not in serialized
+
+
+def test_concurrent_profiles_cannot_claim_same_slack_identity(tmp_path: Path) -> None:
+    role_a, _, _ = _make_role(tmp_path / "a")
+    role_b, _, _ = _make_role(tmp_path / "b")
+    role_b_yaml = role_b / "role.yaml"
+    role_b_yaml.write_text(
+        role_b_yaml.read_text(encoding="utf-8").replace("demo-pm", "demo-reviewer"),
+        encoding="utf-8",
+    )
+    registry = tmp_path / "agents-registry.yaml"
+    registry.write_text("schema_version: 1\nagents: {}\n", encoding="utf-8")
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    overrides = {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(
+            pool.map(
+                lambda role: _run(role, registry, home, bindir, overrides),
+                (role_a, role_b),
+            )
+        )
+
+    assert sorted(result.returncode for result in results) == [0, 1]
+    combined = "".join(result.stdout + result.stderr for result in results)
+    assert "bot identity is already assigned" in combined
+    assert BOT_TOKEN not in combined
+    assert APP_TOKEN not in combined
+    agents = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]
+    assert len(agents) == 1
+    assert next(iter(agents.values()))["slack"]["bot_id"] == "B123BOT"
+    assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    assert stat.S_IMODE(Path(f"{registry}.lock").stat().st_mode) == 0o600

@@ -153,6 +153,9 @@ unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 # Tools we expect on the host
 HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}}"
 HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.hermes/hermes-agent")}}"
+HERMES_RUNTIME_GIT_URL="${HERMES_RUNTIME_GIT_URL:-$(config_get fleet.hermes_git_url 'https://github.com/delorenj/hermes-agent.git')}"
+HERMES_RUNTIME_GIT_REF="${HERMES_RUNTIME_GIT_REF:-$(config_get fleet.hermes_git_ref 'feature/PJAN-19-routing-publication')}"
+HERMES_RUNTIME_GIT_SHA="${HERMES_RUNTIME_GIT_SHA:-$(config_get fleet.hermes_git_sha '113e1b182b6d72a7dd02a191f134a41668ceaf0e')}"
 HERMES_OAUTH_FILE="${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$(config_get fleet.oauth_file "$HOME/.hermes/auth.json")}}"
 CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_home "$HOME/.codex")}}"
 # Prefer a scaffold vendored into this agent directory; fall back to the configured template path.
@@ -161,6 +164,29 @@ if [[ ! -d "$RUNTIME_SCAFFOLD_DIR" ]]; then
   RUNTIME_SCAFFOLD_DIR="${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-$(config_get fleet.runtime_scaffold_dir "$HOME/code/hermes-agent-template/runtime-scaffold")}"
 fi
 REGISTRY_FILE="${REGISTRY_FILE:-${HERMES_FLEET_REGISTRY_FILE:-$(config_get fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}}"
+
+# Cross-process serialization for fleet identity claims and registry updates.
+# The lock file may remain on disk; flock ownership is kernel-scoped, so a
+# crashed provisioner cannot leave a permanently stale lock.
+FLEET_LOCK_FD=""
+fleet_lock_acquire() {
+  command -v flock >/dev/null 2>&1 || die "flock is required for safe fleet registry updates"
+  local lock_file="${REGISTRY_FILE}.lock"
+  mkdir -p "$(dirname "$lock_file")"
+  [[ ! -L "$lock_file" ]] || die "refusing fleet lock symlink: $lock_file"
+  exec {FLEET_LOCK_FD}>"$lock_file"
+  chmod 600 "$lock_file"
+  flock -w "${FLEET_LOCK_TIMEOUT_SECONDS:-30}" "$FLEET_LOCK_FD" \
+    || die "timed out waiting for fleet registry lock: $lock_file"
+}
+
+fleet_lock_release() {
+  if [[ "${FLEET_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
+    flock -u "$FLEET_LOCK_FD" 2>/dev/null || true
+    eval "exec ${FLEET_LOCK_FD}>&-"
+  fi
+  FLEET_LOCK_FD=""
+}
 
 # Bloodbank / NATS
 BLOODBANK_NATS_HOST="${BLOODBANK_NATS_HOST:-$(config_get bloodbank.nats_host '127.0.0.1')}"
@@ -171,7 +197,8 @@ BLOODBANK_COMPOSE_DIR="${BLOODBANK_COMPOSE_DIR:-$(config_get bloodbank.compose_d
 PLANE_BASE="${PLANE_BASE:-$(config_get plane.base 'https://plane.delo.sh')}"
 PLANE_API_KEY="${PLANE_API_KEY:-${PLANE_33GOD_API_KEY:-}}"
 
-export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO HERMES_OAUTH_FILE CODEX_HOME \
+export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO HERMES_RUNTIME_GIT_URL \
+       HERMES_RUNTIME_GIT_REF HERMES_RUNTIME_GIT_SHA HERMES_OAUTH_FILE CODEX_HOME \
        RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \
        BLOODBANK_NATS_HOST BLOODBANK_NATS_PORT BLOODBANK_COMPOSE_DIR \
        PLANE_BASE PLANE_API_KEY

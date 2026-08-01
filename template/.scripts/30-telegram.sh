@@ -109,17 +109,46 @@ print("{}\t{}".format(
 IFS=$'\t' read -r bot_id bot_username <<< "$identity"
 log "    verified: @$bot_username (id=$bot_id)"
 
+# Resolve operator's allowed user id before taking the fleet claim lock.
+if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -f "$HOME/.hermes/.env" ]]; then
+  TELEGRAM_ALLOWED_USERS=$(grep -E '^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=' "$HOME/.hermes/.env" \
+    | tail -1 | sed -E 's/^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=//; s/^"//; s/"$//')
+fi
+if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -t 0 ]]; then
+  read -r -p "Your Telegram user id (allow-list for this bot): " TELEGRAM_ALLOWED_USERS
+fi
+if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
+  warn "    Telegram is wired but denies all inbound users until TELEGRAM_ALLOWED_USERS is set"
+fi
+
 # Reject token reuse, token rotation onto an identity owned by another agent,
-# and credentials parked in shared fleet/root env files. Values are compared
-# in-process and never included in output or the fleet registry.
-export TELEGRAM_BOT_TOKEN
-python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" "$bot_id" <<'PYEOF'
+# and credentials parked in shared fleet/root env files. The scan, durable
+# identity claim, and profile credential write share one fleet-wide flock.
+export TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS
+fleet_lock_acquire
+trap 'fleet_lock_release' EXIT
+python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" "$bot_id" \
+  "$ROLE_DIR" "$PROFILE_NAME" "$bot_username" <<'PYEOF'
 import os
 import pathlib
 import re
 import sys
+import tempfile
+try:
+    import yaml  # type: ignore
+except ImportError:
+    raise SystemExit("PyYAML is required for Telegram fleet claims")
 
-registry_path, fleet_path, target_path, agent_id, bot_id = sys.argv[1:]
+(
+    registry_path,
+    fleet_path,
+    target_path,
+    agent_id,
+    bot_id,
+    role_dir,
+    profile_name,
+    bot_username,
+) = sys.argv[1:]
 token = os.environ["TELEGRAM_BOT_TOKEN"]
 target = pathlib.Path(target_path).resolve(strict=False)
 
@@ -140,21 +169,26 @@ def env_token(path):
 
 owners = [("shared fleet environment", pathlib.Path(fleet_path))]
 registry = pathlib.Path(registry_path)
+if registry.is_symlink():
+    raise SystemExit(f"refusing to update registry symlink: {registry}")
+data = {"schema_version": 1, "agents": {}}
 if registry.is_file():
     try:
-        import yaml  # type: ignore
-        agents = (yaml.safe_load(registry.read_text(encoding="utf-8")) or {}).get("agents", {})
+        data = yaml.safe_load(registry.read_text(encoding="utf-8")) or data
     except Exception as exc:
         raise SystemExit(f"cannot safely inspect Telegram ownership registry: {type(exc).__name__}")
-    for other_id, entry in agents.items():
-        if other_id == agent_id or not isinstance(entry, dict):
-            continue
-        telegram = entry.get("telegram") or {}
-        if isinstance(telegram, dict) and str(telegram.get("bot_id") or "") == bot_id:
-            raise SystemExit(f"Telegram bot identity is already assigned to agent {other_id}")
-        role_dir = entry.get("role_dir")
-        if role_dir:
-            owners.append((f"agent {other_id}", pathlib.Path(str(role_dir)) / "runtime" / ".env"))
+if not isinstance(data, dict) or not isinstance(data.get("agents", {}), dict):
+    raise SystemExit("cannot safely inspect Telegram ownership registry: invalid agents mapping")
+agents = data.setdefault("agents", {})
+for other_id, entry in agents.items():
+    if other_id == agent_id or not isinstance(entry, dict):
+        continue
+    telegram = entry.get("telegram") or {}
+    if isinstance(telegram, dict) and str(telegram.get("bot_id") or "") == bot_id:
+        raise SystemExit(f"Telegram bot identity is already assigned to agent {other_id}")
+    other_role_dir = entry.get("role_dir")
+    if other_role_dir:
+        owners.append((f"agent {other_id}", pathlib.Path(str(other_role_dir)) / "runtime" / ".env"))
 
 home_value = os.environ.get("HOME", "")
 if home_value:
@@ -173,19 +207,35 @@ for owner, path in owners:
     seen.add(resolved)
     if env_token(path) == token:
         raise SystemExit(f"Telegram bot token is already assigned to {owner}")
-PYEOF
 
-# Resolve operator's allowed user id
-if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -f "$HOME/.hermes/.env" ]]; then
-  TELEGRAM_ALLOWED_USERS=$(grep -E '^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=' "$HOME/.hermes/.env" \
-    | tail -1 | sed -E 's/^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=//; s/^"//; s/"$//')
-fi
-if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -t 0 ]]; then
-  read -r -p "Your Telegram user id (allow-list for this bot): " TELEGRAM_ALLOWED_USERS
-fi
-if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
-  warn "    Telegram is wired but denies all inbound users until TELEGRAM_ALLOWED_USERS is set"
-fi
+claim = agents.setdefault(agent_id, {})
+if not isinstance(claim, dict):
+    raise SystemExit(f"registry entry for {agent_id} is not a mapping")
+claim["role_dir"] = role_dir
+claim["profile_name"] = profile_name
+claim["telegram"] = {
+    "provisioning_status": "verified",
+    "bot_username": bot_username,
+    "bot_id": bot_id,
+}
+registry.parent.mkdir(parents=True, exist_ok=True)
+rendered = yaml.safe_dump(data, sort_keys=False)
+fd, temporary = tempfile.mkstemp(prefix=f".{registry.name}.telegram-", dir=registry.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, registry)
+    os.chmod(registry, 0o600)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PYEOF
 
 # Atomically replace only Telegram fields in the profile-local runtime file.
 export TELEGRAM_ALLOWED_USERS
@@ -234,6 +284,9 @@ telegram_yaml_update \
   provisioning_status verified \
   bot_username "$bot_username" \
   bot_id "$bot_id"
+
+fleet_lock_release
+trap - EXIT
 
 # Enable telegram toolset for the profile
 env HERMES_HOME="$RUNTIME" "$HERMES_BIN" tools enable telegram hermes-telegram 2>/dev/null \
