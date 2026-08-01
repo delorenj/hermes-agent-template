@@ -14,7 +14,7 @@ cat >&2 <<EOF
 │  Talk:        @$BOT_HANDLE  (Telegram DM)
 │  Shell:       $ROLE_DIR/hermes chat "status"
 │  Board:       $PLANE_BASE/$PLANE_WORKSPACE/projects/$(cat "$ROLE_DIR/.scripts/.plane-project-id" 2>/dev/null || echo "(skipped)")
-│  Runtime:     gh:$RUNTIME_REPO   (reconcile + checkpoint heartbeat)
+│  Runtime:     $ROLE_DIR/runtime   (pure-local, ignored)
 │  Hermes bin:  $HERMES_BIN
 │  Fleet env:   $FLEET_ENV
 │

@@ -8,7 +8,7 @@
 # full pass executes the role's sentinel.prompt.md, which reasons about tickets
 # through the ticket-provider adapter (Linear | Plane | Trello) — never a
 # hardcoded backend. After the sentinel decision (skip OR full), it
-# opportunistically checkpoints the runtime submodule (commit+push) at most once
+# opportunistically checkpoints only legacy nested-Git runtimes at most once
 # per HEARTBEAT_CHECKPOINT_MIN_INTERVAL_SECONDS, so memory/session state stays
 # durable without pushing every minute.
 set -euo pipefail

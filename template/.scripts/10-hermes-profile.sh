@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Stage the per-agent runtime config/secrets via a TRANSIENT Hermes profile.
-# HERMES_HOME is the ./runtime submodule; this profile dir is a staging area
+# HERMES_HOME is the ignored ./runtime directory; this profile dir is a staging area
 # (cred-stripped .env + SOUL) that 20-runtime-repo.sh folds into the runtime and
 # then replaces with a symlink ~/.hermes/profiles/<name> -> ./runtime. That
 # symlink is load-bearing: hermes resolves `--profile <name>` invocations

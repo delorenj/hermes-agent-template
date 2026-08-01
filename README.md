@@ -1,8 +1,8 @@
 # hermes-agent-template
 
 Copier template that provisions a single Hermes agent role into an existing
-repository, complete with its own per-agent runtime repo for git-tracked
-memory/state checkpointing.
+repository, complete with its own ignored per-agent runtime directory for
+memory and session state.
 
 ## How it relates to CommonProject
 
@@ -11,7 +11,7 @@ memory/state checkpointing.
 | What it scaffolds | A new top-level project | An agent role inside an existing project |
 | Copier target | `./my-new-project/` | `./agents/hermes/<role>/` |
 | Asks | project name + description | role + purpose + tone |
-| Post-gen artifacts | Plane project, bmad init, mise tasks | Plane project, Telegram bot wiring, optional Slack wiring, agent-hm-* runtime repo, systemd units |
+| Post-gen artifacts | Plane project, bmad init, mise tasks | Plane project, Telegram bot wiring, optional Slack wiring, pure-local runtime, systemd units |
 
 CommonProject runs first to create the umbrella project. hermes-agent-template
 runs second (for each agent role you want) to drop agents into it.
@@ -43,9 +43,9 @@ The template will:
 1. Seed `~/.config/hermes-agent-template/config.toml` from the shipped example (see [Configuration](#configuration))
 2. Ensure `~/.hermes/fleet.env` exists (single source of truth for shared Hermes binary/repo/registry)
 3. Create the hermes profile `<repo>-pm` via `hermes profile create --clone`
-4. Create a new private GitHub repo `<owner>/agent-hm-<repo>-pm` for the runtime
-5. Populate it with the runtime scaffold (config.yaml, SOUL.md, memories)
-6. Add it as a git submodule at `agents/hermes/pm/runtime/` (== HERMES_HOME)
+4. Create ignored local state at `agents/hermes/pm/runtime/` (== HERMES_HOME)
+5. Populate missing files from the runtime scaffold (config.yaml, SOUL.md, memories)
+6. Refuse any stale project gitlink or `.gitmodules` mapping for that runtime
 7. Verify a profile-dedicated BotFather token and store it only in `runtime/.env`
 8. Defer Slack by default, or verify and store an explicitly supplied dedicated Slack app+bot pair in `runtime/.env`
 9. Create a Plane project in your configured workspace
@@ -72,7 +72,7 @@ you to review it. Keys:
 | `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
 | `fleet` | `canonical_skills_dir`, `symlinked_runtime_skills` | Skills mirrored into each profile |
-| `github` | `runtime_repo_owner` | Owner of the `agent-hm-*` runtime repos |
+| `github` | `runtime_repo_owner` | Legacy archive owner retained for registry compatibility; no repo is created |
 | `plane` | `base`, `workspace` | Plane URL + workspace slug |
 
 Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.env`
@@ -89,18 +89,10 @@ your-project/
 │   ├── SOUL.md                             ← personality (canonical)
 │   ├── hermes                              ← launcher
 │   ├── .scripts/                           ← provisioning scripts (idempotent re-run)
-│   └── runtime/                            ← git submodule → agent-hm-<repo>-pm
+│   └── runtime/                            ← ignored local HERMES_HOME
 │       (HERMES_HOME for this agent)
 │       └── .env                            ← profile-local channel credentials, mode 0600, gitignored
 └── ...
-
-github.com/delorenj/agent-hm-<repo>-pm/     ← new private repo, this agent's state
-├── config.yaml                             ← cloned from global ~/.hermes
-├── SOUL.md                                 ← evolves over time
-├── memories/{MEMORY,USER}.md
-├── sessions/sessions.db                    ← LFS-tracked
-├── decisions/                              ← markdown files, one per call
-└── .gitattributes / .gitignore             ← LFS rules + secret guards
 
 ~/.hermes/agents-registry.yaml              ← fleet roster
 ~/.hermes/fleet.env                          ← shared Hermes binary/repo pointer

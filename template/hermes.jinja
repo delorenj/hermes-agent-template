@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for {{ agent_id }}. Resolves HERMES_HOME to the runtime submodule
+# Launcher for {{ agent_id }}. Resolves HERMES_HOME to the local runtime
 # and execs the shared fleet Hermes binary configured in ~/.hermes/fleet.env.
 
 set -euo pipefail
@@ -52,8 +52,8 @@ HERMES_OAUTH_FILE="${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$(config_get 
 CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_home "$HOME/.codex")}}"
 
 if [[ ! -d "$HERMES_HOME" ]]; then
-  echo "hermes: runtime submodule not initialized at $HERMES_HOME" >&2
-  echo "  fix: git submodule update --init --recursive" >&2
+  echo "hermes: local runtime not provisioned at $HERMES_HOME" >&2
+  echo "  fix: run $ROLE_DIR/.scripts/20-runtime-repo.sh" >&2
   exit 1
 fi
 

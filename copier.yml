@@ -10,8 +10,8 @@
 #
 # What it does:
 #   1. Renders agents/hermes/<role>/{role.yaml, SOUL.md, hermes, .scripts/}
-#   2. Creates a per-agent runtime repo gh:delorenj/agent-hm-<repo>-<role>
-#   3. Submodules it at agents/hermes/<role>/runtime/  (this is HERMES_HOME)
+#   2. Creates ignored local state at agents/hermes/<role>/runtime/
+#      (this is HERMES_HOME; no project gitlink or runtime remote)
 #   4. Creates a Plane project in 33god workspace
 #   6. Prompts for a BotFather Telegram token, stores in runtime/.env
 #   7. Optionally wires a dedicated Slack app+bot pair into runtime/.env
@@ -19,7 +19,7 @@
 #   9. Installs a profile gateway + heartbeat timer (reconcile + checkpoint)
 #  10. Appends to ~/.hermes/agents-registry.yaml
 #
-# Environment-specific defaults (Hermes binary path, runtime repo owner, Plane
+# Environment-specific defaults (Hermes binary path, legacy archive owner, Plane
 # workspace/URL, NATS endpoint, skills dir, …) are NOT hardcoded — they live in
 # ~/.config/hermes-agent-template/config.toml, seeded from config.example.toml on
 # first run. Edit that file to retarget the template for a different machine/user.
@@ -115,7 +115,7 @@ runtime_repo:
 
 runtime_repo_owner:
   type: str
-  # Empty by default — resolved at provision time from
+# Legacy archive identity only. Empty by default — resolved at provision time from
   # ~/.config/hermes-agent-template/config.toml [github].runtime_repo_owner.
   # Pass --data runtime_repo_owner=<owner> to override per-run.
   default: ""

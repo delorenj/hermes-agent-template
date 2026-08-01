@@ -1,6 +1,6 @@
 # Hermes agent role manifest.  Tracked in the PROJECT repository.
 # The agent's actual state (memory, sessions, evolving SOUL) lives in the
-# runtime submodule.  This file is the immutable contract for this role.
+# ignored local runtime. This file is the immutable contract for this role.
 
 repo: {{ target_repo }}
 role: {{ role }}
@@ -14,7 +14,7 @@ model:
   name: "{{ model_name }}"
 
 # Hermes profile name. ~/.hermes/profiles/<name> symlinks to ./runtime/, so both
-# HERMES_HOME and `hermes --profile <name>` resolve to the runtime submodule.
+# HERMES_HOME and `hermes --profile <name>` resolve to the local runtime.
 profile: {{ agent_id }}
 
 # Telegram bot identity (one bot per agent — see docs/architecture.md).
@@ -74,15 +74,16 @@ bloodbank:
   target_agent_id: "{{ agent_id }}"
   producer: "hermes-agent:{{ agent_id }}"
 
-# Runtime repo (git-tracked HERMES_HOME, auto-checkpointed).
+# Pure-local HERMES_HOME. The legacy GitHub identity remains metadata-only for
+# locating old archives; provisioning never creates or attaches a submodule.
 runtime:
   # Empty owner -> resolved from config.toml [github].runtime_repo_owner.
   github_owner: "{{ runtime_repo_owner }}"
   github_repo: "{{ runtime_repo }}"
-  submodule_path: "./runtime"
+  local_path: "./runtime"
   checkpoint:
-    cadence: "heartbeat"
-    on_session_end: true
+    cadence: "disabled"
+    on_session_end: false
 
 # Provenance — managed by the template, do not hand-edit.
 provisioned_at: "{{ '%Y-%m-%dT%H:%M:%SZ' | strftime }}"
