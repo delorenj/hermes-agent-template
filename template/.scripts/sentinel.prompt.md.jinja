@@ -24,6 +24,7 @@ tp list_issues                         # JSON [{id,key,title,state,state_type,..
 tp get_issue <id>                      # JSON incl. description + comments
 tp comment <id> "<body>"               # post a PM/review note
 tp transition <id> <normalized-state>  # backlog|unstarted|started|in_review|completed
+tp create_issue "<title>" "<desc>"    # file a NEW ticket; --if-absent to dedupe by title
 ```
 
 Reason in **normalized states**, not provider terms. This pass works identically

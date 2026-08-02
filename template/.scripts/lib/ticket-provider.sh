@@ -17,6 +17,12 @@
 #   transition <id> <normalized>  -> moves issue; normalized in
 #                                     backlog|unstarted|started|in_review|completed
 #   create_board <name> <id> <d>  -> JSON {board_id, board_url}
+#   create_issue [--if-absent] <title> [desc]
+#                                 -> JSON {issue_id, key, issue_url, created}
+#                                    Files a new ticket on the bound board.
+#                                    NOT idempotent by default (two issues may
+#                                    share a title); --if-absent reuses an exact
+#                                    title match and reports created:false.
 #
 # Each provider reads its credentials from the environment (see providers/*.sh
 # headers) and the board binding from role.yaml under `ticket_provider:`.

@@ -35,11 +35,26 @@ Every adapter must implement these operations.
 | `comment` | `<id> <body>` | Prints the new comment id. |
 | `transition` | `<id> <normalized-state>` | Moves the issue to a normalized state. |
 | `create_board` | `<name> <ident> <desc>` | JSON `{board_id, board_url}`. Creates or reuses the board. |
+| `create_issue` | `[--if-absent] <title> [description]` | JSON `{issue_id, key, issue_url, created}`. Files a new ticket on the bound board. |
 
 The `transition` operation accepts only the normalized states from
 [Architecture: normalized states](architecture.md#normalized-states):
 `backlog`, `unstarted`, `started`, `in_review`, and `completed`. The adapter
 maps each to its back end's concrete state.
+
+The `create_issue` operation is the write counterpart to `list_issues`: it lets
+an orchestrator file a ticket for a gap it discovered instead of only reading
+and updating the board. The board or team it files against always comes from the
+resolved binding — it is never an argument — exactly as it does for
+`create_board`.
+
+Unlike `create_board`, `create_issue` is **not** idempotent by default. Two
+issues can legitimately share a title, so the adapter never silently collapses
+them; every plain call creates a new ticket and reports `"created": true`. An
+automated caller that may re-run the same request passes `--if-absent`, which
+first looks for an existing issue whose title matches exactly
+(case-insensitively) and returns that one with `"created": false` instead of
+filing a duplicate. Callers should branch on `created` rather than assume it.
 
 ## The adapters that ship today
 
@@ -58,7 +73,13 @@ The repository includes three adapters with different verification status.
 - **Trello** (`providers/trello.sh`) uses the Trello REST API with `key` and
   `token` query-parameter authentication. A board maps to both the project and
   the milestone, a list maps to the state, and a card maps to the issue. It's
-  implemented but not yet verified against a live board.
+  implemented but not yet verified against a live board. `create_issue` files
+  the new card into the `backlog` list, falling back to `unstarted`.
+
+All three adapters implement `create_issue`. Plane uses
+`POST projects/<board>/issues/`, Trello uses `POST cards`, and Linear uses the
+`issueCreate` mutation; the Linear and Trello paths carry the same verification
+status as the rest of their adapter.
 
 ### Credentials and binding by provider
 

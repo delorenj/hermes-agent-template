@@ -198,5 +198,41 @@ print(pid)')"
     printf '{"board_id":"%s","board_url":"%s/%s/projects/%s/issues/"}\n' "$PID" "$BASE" "$WS" "$PID"
     ;;
 
+  create_issue)
+    # File a new ticket on the bound board. Board/workspace come from resolved
+    # config, never from an argument. Deliberately NOT idempotent by default:
+    # two issues may legitimately share a title. Pass --if-absent to reuse an
+    # issue whose title already matches exactly (case-insensitive) instead.
+    IF_ABSENT=0
+    case "${1:-}" in --if-absent) IF_ABSENT=1; shift ;; esac
+    TITLE="${1:?usage: create_issue [--if-absent] <title> [description]}"; DESC="${2:-}"
+    [ -n "$WS" ] || die "workspace not set (.project.json ticket_provider.workspace or PLANE_WORKSPACE)"
+    [ -n "$PROJ" ] || die "project not set (.project.json ticket_provider.board_id; run 42-ticket-provider.sh)"
+    IID=""; SEQ=""; CREATED=true
+    if [ "$IF_ABSENT" = 1 ]; then
+      HIT="$(api GET "projects/$PROJ/issues/?per_page=200" | TITLE="$TITLE" python3 -c 'import sys,json,os
+d=json.load(sys.stdin); rows=d.get("results", d if isinstance(d,list) else [])
+want=os.environ["TITLE"].strip().lower()
+m=next((i for i in rows if (i.get("name") or "").strip().lower()==want), None)
+print((str(m.get("id","")) + " " + str(m.get("sequence_id","") or "")) if m else "")')"
+      if [ -n "$HIT" ]; then IID="${HIT%% *}"; SEQ="${HIT#* }"; CREATED=false; fi
+    fi
+    if [ -z "$IID" ]; then
+      NEW="$(api POST "projects/$PROJ/issues/" \
+        "$(python3 -c 'import html,json,sys
+body={"name": sys.argv[1]}
+desc=sys.argv[2]
+if desc: body["description_html"]="<p>"+html.escape(desc)+"</p>"
+print(json.dumps(body))' "$TITLE" "$DESC")" \
+        | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+print(str(d.get("id","")) + " " + str(d.get("sequence_id","") or ""))')"
+      IID="${NEW%% *}"; SEQ="${NEW#* }"
+    fi
+    [ -n "$IID" ] || die "create_issue failed"
+    printf '{"issue_id":"%s","key":"%s","issue_url":"%s/%s/projects/%s/issues/%s","created":%s}\n' \
+      "$IID" "$SEQ" "$BASE" "$WS" "$PROJ" "$IID" "$CREATED"
+    ;;
+
   *) die "unknown op: $OP" ;;
 esac

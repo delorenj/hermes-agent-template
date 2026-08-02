@@ -172,5 +172,42 @@ print(("ok " + (u.get("issue") or {}).get("identifier","")) if u.get("success") 
     exec sh "$0" resolve
     ;;
 
+  create_issue)
+    # File a new issue on the bound team. Team comes from resolved config, never
+    # from an argument. Deliberately NOT idempotent by default: two issues may
+    # legitimately share a title. Pass --if-absent to reuse an issue whose title
+    # already matches instead.
+    IF_ABSENT=0
+    case "${1:-}" in --if-absent) IF_ABSENT=1; shift ;; esac
+    TITLE="${1:?usage: create_issue [--if-absent] <title> [description]}"; DESC="${2:-}"
+    [ -n "$TEAM" ] || die "ticket_provider.team (Linear team key) not set"
+    ISSUE=""; CREATED=true
+    if [ "$IF_ABSENT" = 1 ]; then
+      ISSUE="$(gql 'query($k:String!,$t:String!){ issues(first:1, filter:{team:{key:{eq:$k}}, title:{eq:$t}}){nodes{id identifier url}} }' \
+          "$(python3 -c 'import json,sys; print(json.dumps({"k":sys.argv[1],"t":sys.argv[2]}))' "$TEAM" "$TITLE")" \
+        | python3 -c 'import sys,json
+ns=((json.load(sys.stdin).get("issues") or {}).get("nodes")) or []
+print(json.dumps(ns[0]) if ns else "")')"
+      [ -z "$ISSUE" ] || CREATED=false
+    fi
+    if [ -z "$ISSUE" ]; then
+      TEAM_ID="$(gql 'query($k:String!){ teams(filter:{key:{eq:$k}}){nodes{id}} }' "$(printf '{"k":"%s"}' "$TEAM")" \
+        | python3 -c 'import sys,json
+ns=((json.load(sys.stdin).get("teams") or {}).get("nodes")) or []
+print(ns[0].get("id","") if ns else "")')"
+      [ -n "$TEAM_ID" ] || die "no Linear team with key '$TEAM'"
+      ISSUE="$(gql 'mutation($team:String!,$t:String!,$d:String){ issueCreate(input:{teamId:$team,title:$t,description:$d}){ success issue{id identifier url} } }' \
+          "$(python3 -c 'import json,sys; print(json.dumps({"team":sys.argv[1],"t":sys.argv[2],"d":sys.argv[3] or None}))' "$TEAM_ID" "$TITLE" "$DESC")" \
+        | python3 -c 'import sys,json
+r=json.load(sys.stdin).get("issueCreate") or {}
+print(json.dumps(r["issue"]) if r.get("success") and r.get("issue") else "")')"
+    fi
+    [ -n "$ISSUE" ] || die "create_issue failed"
+    printf '%s' "$ISSUE" | CREATED="$CREATED" python3 -c 'import sys,json,os
+i=json.load(sys.stdin)
+print(json.dumps({"issue_id":i.get("id",""),"key":i.get("identifier",""),
+                  "issue_url":i.get("url",""),"created":os.environ["CREATED"]=="true"}))'
+    ;;
+
   *) die "unknown op: $OP" ;;
 esac

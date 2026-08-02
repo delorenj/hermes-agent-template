@@ -156,5 +156,36 @@ print(next((b["id"] for b in rows if b.get("name","").lower()==nm), ""))')"
 b=json.load(sys.stdin); print(json.dumps({"board_id":os.environ["BID"],"board_url":b.get("url","")}))'
     ;;
 
+  create_issue)
+    # File a new card on the bound board. Board comes from resolved config,
+    # never from an argument. Deliberately NOT idempotent by default: two cards
+    # may legitimately share a title. Pass --if-absent to reuse a card whose
+    # name already matches exactly (case-insensitive) instead.
+    IF_ABSENT=0
+    case "${1:-}" in --if-absent) IF_ABSENT=1; shift ;; esac
+    TITLE="${1:?usage: create_issue [--if-absent] <title> [description]}"; DESC="${2:-}"
+    [ -n "$BOARD" ] || die "board not set (run 42-ticket-provider.sh)"
+    CID=""; CREATED=true
+    if [ "$IF_ABSENT" = 1 ]; then
+      CID="$(api GET "boards/$BOARD/cards" "fields=name" | NM="$TITLE" python3 -c 'import sys,json,os
+rows=json.load(sys.stdin); nm=os.environ["NM"].strip().lower()
+print(next((c["id"] for c in rows if (c.get("name") or "").strip().lower()==nm), ""))')"
+      [ -z "$CID" ] || CREATED=false
+    fi
+    if [ -z "$CID" ]; then
+      # New cards land in the backlog list, falling back to the unstarted one.
+      LID="$(list_id_for backlog)"
+      [ -n "$LID" ] || LID="$(list_id_for unstarted)"
+      [ -n "$LID" ] || die "no Trello list mapped for 'backlog' or 'unstarted' (check state_map)"
+      CID="$(api POST "cards" "idList=$LID&name=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$TITLE")&desc=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$DESC")" \
+        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')"
+    fi
+    [ -n "$CID" ] || die "create_issue failed"
+    api GET "cards/$CID" "fields=url,shortLink" | CID="$CID" CREATED="$CREATED" python3 -c 'import sys,json,os
+c=json.load(sys.stdin)
+print(json.dumps({"issue_id":os.environ["CID"],"key":c.get("shortLink",""),
+                  "issue_url":c.get("url",""),"created":os.environ["CREATED"]=="true"}))'
+    ;;
+
   *) die "unknown op: $OP" ;;
 esac
