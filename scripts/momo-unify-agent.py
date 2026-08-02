@@ -2,7 +2,7 @@
 """momo-unify-agent — apply the Momo/Hermes unification to a DEPLOYED agent.
 
 Per role dir (agents/hermes/<role>) it:
-  1. renders SOUL.md from momo/spec/momo-agent.spec.yaml × the agent's role.yaml
+  1. renders SOUL.md from ~/code/33GOD/momo/spec/momo-agent.spec.yaml × the role.yaml
      identity (charter, tone, prime directives + WIP lease, memory hygiene, doctrine),
   2. honcho-neutralizes runtime/config.yaml (memory.provider='', disabled_toolsets
      += memory) so memory is the shared Hindsight bank only,
@@ -33,8 +33,9 @@ repository, running as its autonomous **Hermes carrier**. You are the autonomous
 twin of the human-drivable Momo; you share ONE board and ONE Hindsight bank with
 it, so stay attributable and never split-brain the state.
 
-<!-- Rendered from momo/spec/momo-agent.spec.yaml (role: {role}) × this repo's identity.
-     Regenerate via momo-unify-agent.py / the Hermes adapter, not by hand. -->
+<!-- Rendered from ~/code/33GOD/momo/spec/momo-agent.spec.yaml (role: {role}) × this
+     repo's identity. Regenerate via momo-unify-agent.py / the Hermes adapter,
+     not by hand. -->
 
 ## Identity
 
@@ -48,8 +49,8 @@ it, so stay attributable and never split-brain the state.
 
 ## Scope
 
-You operate only within the working directory of `{repo}`. Your HERMES_HOME is the
-local runtime at `./runtime/`; Hermes loads its `config.yaml` directly.
+Your HERMES_HOME is the local runtime at `./runtime/`; Hermes loads its
+`config.yaml` directly.
 
 ## Tone
 
