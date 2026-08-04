@@ -86,11 +86,12 @@ concrete states, groups, or lists of its back end.
 | `started` | A worker is actively implementing. |
 | `in_review` | Implementation complete, awaiting review. |
 | `completed` | Done. |
+| `cancelled` | Intentionally rejected or abandoned; not done. |
 
 The mapping is configurable per project in `role.yaml` under
 `ticket_provider`, so non-standard boards still work. For example, you can set
-`in_review: "In Review"` and `completed: "Done"` to match your board's column
-names.
+`in_review: "In Review"`, `completed: "Done"`, and `cancelled: "Cancelled"`
+to match your board's column names.
 
 ## Autonomous adversarial review (act, do not wait)
 

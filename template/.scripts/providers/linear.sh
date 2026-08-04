@@ -6,7 +6,8 @@
 #   name: linear
 #   team:    <TEAM_KEY>          e.g. DEL
 #   project: "<Project name>"    optional; scopes milestone/issue queries
-#   state_map: { in_review: "In Review", completed: "Done" }   optional overrides
+#   state_map: { in_review: "In Review", completed: "Done",
+#                cancelled: "Canceled" }   optional overrides
 #
 # Implements the contract in lib/ticket-provider.sh. All Linear access goes
 # through GraphQL so the same envelope works in unattended runs.
@@ -79,6 +80,7 @@ TEAM="$(pj_cfg team)"; [ -n "$TEAM" ] || TEAM="$(tp_cfg team)"
 PROJECT="$(pj_cfg project)"; [ -n "$PROJECT" ] || PROJECT="$(tp_cfg project)"
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
 SM_DONE="$(tp_cfg completed)"; SM_DONE="${SM_DONE:-Done}"
+SM_CANCELLED="$(tp_cfg cancelled)"; SM_CANCELLED="${SM_CANCELLED:-Canceled}"
 
 # All Linear ops require the API key; fail fast and clean before any pipe.
 need_key
@@ -143,6 +145,7 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("identifier",""),"title":i.get
     # Map normalized -> a concrete Linear state name, then resolve its id on the team.
     case "$TARGET" in
       completed)  WANT_TYPE=completed; WANT_NAME="$SM_DONE" ;;
+      cancelled)  WANT_TYPE=canceled;  WANT_NAME="$SM_CANCELLED" ;;
       in_review)  WANT_TYPE=started;   WANT_NAME="$SM_IN_REVIEW" ;;
       started)    WANT_TYPE=started;   WANT_NAME="" ;;
       unstarted)  WANT_TYPE=unstarted; WANT_NAME="" ;;

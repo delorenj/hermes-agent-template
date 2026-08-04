@@ -31,7 +31,7 @@ Every adapter must implement these operations.
 | `resolve` | none | JSON `{provider, board_id, board_url}`. Validates credentials and board binding. |
 | `active_milestone` | none | JSON `{id, name, state}` for the current milestone, cycle, or board. |
 | `list_issues` | none | JSON array of `{id, key, title, state, state_type, updated_at, assignee, url}`. |
-| `get_issue` | `<id>` | JSON `{id, key, title, description, acceptance, state, state_type, comments}`. |
+| `get_issue` | `<id>` | JSON `{id, key, title, description, acceptance, state, state_type, comments, attachments}`. |
 | `comment` | `<id> <body>` | Prints the new comment id. |
 | `transition` | `<id> <normalized-state>` | Moves the issue to a normalized state. |
 | `create_board` | `<name> <ident> <desc>` | JSON `{board_id, board_url}`. Creates or reuses the board. |
@@ -39,7 +39,7 @@ Every adapter must implement these operations.
 
 The `transition` operation accepts only the normalized states from
 [Architecture: normalized states](architecture.md#normalized-states):
-`backlog`, `unstarted`, `started`, `in_review`, and `completed`. The adapter
+`backlog`, `unstarted`, `started`, `in_review`, `completed`, and `cancelled`. The adapter
 maps each to its back end's concrete state.
 
 The `create_issue` operation is the write counterpart to `list_issues`: it lets
@@ -69,7 +69,9 @@ The repository includes three adapters with different verification status.
   milestone, and `state.group` maps to the state type. It's verified live. Note
   the v1 API returns an issue's `state` as a bare UUID with no `state_detail`,
   so the adapter joins each issue against the project's states map; descriptions
-  come from `description_html`.
+  come from `description_html`. `get_issue` also hydrates attachment metadata
+  from Plane's issue-attachments endpoint so triage can inspect attachments
+  before scoping work.
 - **Trello** (`providers/trello.sh`) uses the Trello REST API with `key` and
   `token` query-parameter authentication. A board maps to both the project and
   the milestone, a list maps to the state, and a card maps to the issue. It's

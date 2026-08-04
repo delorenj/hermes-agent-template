@@ -6,7 +6,8 @@
 #   name: trello
 #   board: <board-id>                 (set by create_board / 42-ticket-provider)
 #   state_map: { backlog:"Backlog", unstarted:"To Do", started:"In Progress",
-#                in_review:"Review", completed:"Done" }   optional
+#                in_review:"Review", completed:"Done", cancelled:"Cancelled" }
+#                                              optional
 #
 # Trello model:  board = project & milestone, list = state, card = issue.
 # Trello has no milestone primitive, so active_milestone returns the board.
@@ -61,6 +62,7 @@ list_name_for() {
     started)   v="$(tp_cfg started)";   printf '%s' "${v:-In Progress}" ;;
     in_review) v="$(tp_cfg in_review)"; printf '%s' "${v:-Review}" ;;
     completed) v="$(tp_cfg completed)"; printf '%s' "${v:-Done}" ;;
+    cancelled) v="$(tp_cfg cancelled)"; printf '%s' "${v:-Cancelled}" ;;
     *) die "invalid normalized state: $1" ;;
   esac
 }
