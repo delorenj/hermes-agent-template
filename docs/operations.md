@@ -99,7 +99,7 @@ a different origin. It never fetches or writes upstream `main`.
 To retrofit older provisioned agents onto this model, run:
 
 ```bash
-cd /home/delorenj/code/hermes-agent-template
+cd /home/delorenj/code/33GOD/hermes-agent-template
 ./scripts/backfill-fleet-sot.sh
 ```
 
