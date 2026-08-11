@@ -5,6 +5,13 @@
 source "$(dirname "$0")/_lib.sh"
 load_role_env
 
+if [[ "$ROLE" == "reporter" ]]; then
+  log "[70] reporter systemd — gateway/consumer intentionally not installed"
+  log "    use the reporter runtime's explicit install command after credential and policy preflight"
+  mark_done 70-systemd
+  exit 0
+fi
+
 RUNTIME="$ROLE_DIR/runtime"
 REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"

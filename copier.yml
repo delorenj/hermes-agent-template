@@ -52,6 +52,7 @@ role:
     "Project Manager (pm)": pm
     "Developer (dev)": dev
     "Reviewer (review)": review
+    "Company Reporter — daily cross-project rollup (reporter)": reporter
     "Ops (ops)": ops
     "QA (qa)": qa
   validator: "{% if not role %}Required{% endif %}"
@@ -68,7 +69,7 @@ ticket_provider:
 agent_purpose:
   type: str
   help: "One-line description of what this agent does in this repo"
-  default: "Project management, triage, and continuous board reconciliation"
+  default: "{% if role == 'reporter' %}Company-wide evidence gathering, freshness-aware daily reporting, and critical delivery monitoring{% else %}Project management, triage, and continuous board reconciliation{% endif %}"
 
 model_provider:
   type: str

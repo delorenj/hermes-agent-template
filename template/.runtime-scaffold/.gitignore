@@ -1,8 +1,13 @@
 # Per-agent runtime — what NOT to commit to the checkpoint repo.
 # Sensitive credentials never go in git.
 .env
+.env.*
+!.env.example
 auth.json
 auth.lock
+secrets.*
+*.pem
+*.key
 gateway.pid
 gateway_state.json
 processes.json
@@ -32,6 +37,8 @@ logs/*.systemd.log
 # Python cruft
 __pycache__/
 *.pyc
+.scripts/.done-*
+.scripts/.provision.log
 
 # Allow these subdirs to exist
 !logs/.gitkeep

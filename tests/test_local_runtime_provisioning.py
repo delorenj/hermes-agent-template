@@ -9,6 +9,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 RUNTIME_SCRIPT = ROOT / "template" / ".scripts" / "20-runtime-repo.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
+SECRET_SCAN = ROOT / "template" / ".scripts" / "secret-scan.py"
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
@@ -20,6 +21,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     scaffold.mkdir()
     shutil.copy2(RUNTIME_SCRIPT, scripts / RUNTIME_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
+    shutil.copy2(SECRET_SCAN, scripts / SECRET_SCAN.name)
     (scaffold / "MEMORY.md").write_text("agent={{agent_id}}\n", encoding="utf-8")
     (role / "SOUL.md").write_text("local soul\n", encoding="utf-8")
     (role / ".gitignore").write_text("runtime/\n", encoding="utf-8")

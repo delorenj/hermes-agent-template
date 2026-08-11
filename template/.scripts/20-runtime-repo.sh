@@ -62,12 +62,62 @@ for path in root.rglob("*"):
         except UnicodeDecodeError:
             pass
 PYEOF
+# Never let a literal secret reach the runtime. The scaffold is rendered from
+# templates, so a leaked credential shows up here before anything is copied.
+python3 "$(dirname "$0")/secret-scan.py" "$TMP"
 cp -an "$TMP/." "$RUNTIME_LOCAL/"
 
 # Seed mutable identity/config only when no local value exists.
-CANONICAL_PM_CONFIG="$(config_get fleet.canonical_pm_config "$HOME/.hermes/config.yaml")"
-if [[ -f "$CANONICAL_PM_CONFIG" && ! -e "$RUNTIME_LOCAL/config.yaml" ]]; then
-  cp "$CANONICAL_PM_CONFIG" "$RUNTIME_LOCAL/config.yaml"
+if [[ "$ROLE" == "reporter" ]]; then
+  # Generate a delta-only runtime config for least-privilege reporters. Never copy the shared PM
+  # config: it may carry dashboard credentials, write-capable MCPs, or broad tools.
+  MODEL_PROVIDER="$(yaml_get model.provider)"
+  MODEL_NAME="$(yaml_get model.name)"
+  CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir "$HOME/.agents/skills")}"
+  if [[ ! -e "$RUNTIME_LOCAL/config.yaml" ]]; then
+    python3 - "$RUNTIME_LOCAL/config.yaml" "$PROJECT_PATH" "${HERMES_TIMEZONE:-America/New_York}" \
+      "$MODEL_PROVIDER" "$MODEL_NAME" "$CANONICAL_SKILLS_DIR" "$ROLE" <<'PYEOF'
+import json, pathlib, re, sys
+path, cwd, timezone, provider, model, skills, role = sys.argv[1:8]
+if not re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z_]+)*", timezone):
+    raise SystemExit("unsafe timezone")
+config = {
+    "timezone": timezone,
+    "terminal": {"cwd": cwd},
+    "skills": {"external_dirs": [skills]},
+}
+if provider or model:
+    config["model"] = {}
+    if provider:
+        config["model"]["provider"] = provider
+    if model:
+        config["model"]["default"] = model
+config["platform_toolsets"] = {
+    "cli": ["web", "delegation", "no_mcp"],
+    "cron": ["web", "delegation", "no_mcp"],
+}
+config["agent"] = {
+    "disabled_toolsets": [
+        "browser", "terminal", "file", "code_execution", "cronjob",
+        "kanban", "homeassistant", "computer_use", "project", "skills",
+    ]
+}
+config["delegation"] = {"max_spawn_depth": 1, "inherit_mcp_toolsets": False}
+pathlib.Path(path).write_text(json.dumps(config, indent=2) + "\n")
+PYEOF
+  fi
+  if [[ ! -e "$RUNTIME_LOCAL/profile.yaml" ]]; then
+    cat > "$RUNTIME_LOCAL/profile.yaml" <<'YAML'
+config:
+  inherit_from: default
+  save_mode: delta
+YAML
+  fi
+else
+  CANONICAL_PM_CONFIG="$(config_get fleet.canonical_pm_config "$HOME/.hermes/config.yaml")"
+  if [[ -f "$CANONICAL_PM_CONFIG" && ! -e "$RUNTIME_LOCAL/config.yaml" ]]; then
+    cp "$CANONICAL_PM_CONFIG" "$RUNTIME_LOCAL/config.yaml"
+  fi
 fi
 if [[ ! -e "$RUNTIME_LOCAL/SOUL.md" ]]; then
   cp "$ROLE_DIR/SOUL.md" "$RUNTIME_LOCAL/SOUL.md"
@@ -78,7 +128,14 @@ fi
 # operator can reconcile it explicitly instead of losing state.
 if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
   log "    migrating supported staging profile state into the local runtime"
-  for file_name in .env config.yaml; do
+  # A reporter never inherits .env; its credentials must be provisioned
+  # explicitly against a bot identity it owns.
+  if [[ "$ROLE" == "reporter" ]]; then
+    MIGRATE_FILES=(config.yaml profile.yaml)
+  else
+    MIGRATE_FILES=(.env config.yaml)
+  fi
+  for file_name in "${MIGRATE_FILES[@]}"; do
     [[ -f "$PROFILE_HOME/$file_name" && ! -e "$RUNTIME_LOCAL/$file_name" ]] && cp "$PROFILE_HOME/$file_name" "$RUNTIME_LOCAL/$file_name"
     [[ -f "$PROFILE_HOME/$file_name" ]] && rm -f -- "$PROFILE_HOME/$file_name"
   done
