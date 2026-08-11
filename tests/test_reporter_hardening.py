@@ -86,6 +86,25 @@ class ReporterTemplateHardeningTests(unittest.TestCase):
         for forbidden in ("git push -u origin main", "gh repo create"):
             self.assertNotIn(forbidden, text)
 
+    def test_reporter_watchdog_has_no_unoverridable_instance_constants(self) -> None:
+        # Salvaged from the company-reporter branch, where every deployment
+        # constant was hardcoded. A second reporter must not need a forked copy.
+        text = (ROOT / "template" / ".scripts" / "reporter-watchdog.py").read_text()
+        for var in (
+            "REPORTER_PROFILE_NAME",
+            "REPORTER_REPORT_SLUG",
+            "REPORTER_JOB_PREFIX",
+            "REPORTER_EXPECTED_JOBS",
+            "REPORTER_TIMEZONE",
+            "REPORTER_NTFY_URL",
+            "REPORTER_NTFY_TOKEN_REF",
+        ):
+            self.assertIn(var, text, f"{var} must be overridable")
+        # No bare instance literals outside the documented override defaults.
+        body = text.split("HOME = Path.home()", 1)[1]
+        for literal in ('"ddr:', "delonet", "ntfy.delo.sh"):
+            self.assertNotIn(literal, body, f"{literal!r} must not be hardcoded below the config block")
+
     def test_reporter_never_inherits_staging_env_credentials(self) -> None:
         text = (ROOT / "template" / ".scripts" / "20-runtime-repo.sh").read_text()
         self.assertIn("MIGRATE_FILES=(config.yaml profile.yaml)", text)
