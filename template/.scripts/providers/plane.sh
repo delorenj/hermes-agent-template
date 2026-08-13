@@ -22,10 +22,6 @@ ROLE_YAML="$ROLE_DIR/role.yaml"
 BASE="${PLANE_BASE:-https://plane.delo.sh}"
 
 FLEET_ENV="${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}"
-if [ -f "$FLEET_ENV" ]; then
-  # shellcheck disable=SC1090
-  . "$FLEET_ENV"
-fi
 
 die() { echo "plane: $*" >&2; exit 1; }
 need_key() { [ -n "${PLANE_API_KEY:-}" ] || die "PLANE_API_KEY is not set"; }
@@ -34,6 +30,33 @@ workspace_key() {
   key="$(printf '%s' "${1:-default}" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g')"
   [ -n "$key" ] || key="DEFAULT"
   printf 'PLANE_%s_API_KEY' "$key"
+}
+
+# dotenv_value FILE KEY — read one exact dotenv assignment as inert data.
+# Never source the shared fleet file: it may contain unrelated command
+# substitutions or credential helpers that this provider must not execute.
+dotenv_value() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+value = ""
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    name, sep, candidate = line.partition("=")
+    if sep and name.strip() == key:
+        candidate = candidate.strip()
+        if len(candidate) >= 2 and candidate[0] == candidate[-1] and candidate[0] in "'\"":
+            candidate = candidate[1:-1]
+        value = candidate
+        break
+print(value, end="")
+PY
 }
 
 tp_cfg() {
@@ -77,6 +100,9 @@ API="$BASE/api/v1/workspaces/$WS"
 if [ -z "${PLANE_API_KEY:-}" ]; then
   KEY="$(workspace_key "$WS")"
   eval "PLANE_API_KEY=\${$KEY:-}"
+  if [ -z "${PLANE_API_KEY:-}" ] && [ -f "$FLEET_ENV" ]; then
+    PLANE_API_KEY="$(dotenv_value "$FLEET_ENV" "$KEY")"
+  fi
   export PLANE_API_KEY
 fi
 
