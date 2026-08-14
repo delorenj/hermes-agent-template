@@ -13,6 +13,12 @@ if [[ "$ROLE" == "reporter" ]]; then
 fi
 
 RUNTIME="$ROLE_DIR/runtime"
+# Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
+# dir, never the raw runtime path — Hermes derives profile identity and shared
+# fleet auth from the unresolved HERMES_HOME. $RUNTIME stays correct for
+# EnvironmentFile and logs: those are the repo-owned side the profile links to.
+FLEET_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}"
+PROFILE_HOME="$FLEET_HOME/profiles/${PROFILE_NAME:-$AGENT_ID}"
 REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SYS_DIR" "$RUNTIME/logs"
@@ -75,8 +81,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=HERMES_HOME=$RUNTIME
-Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
+Environment=HERMES_HOME=$PROFILE_HOME
 Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-$RUNTIME/.env
 ExecStart=$HERMES_BIN gateway run --replace
@@ -104,8 +109,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=$REPO_ROOT
-Environment=HERMES_HOME=$RUNTIME
-Environment=HERMES_OAUTH_FILE=$HERMES_OAUTH_FILE
+Environment=HERMES_HOME=$PROFILE_HOME
 Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-%h/.config/hermes-agent/env
 EnvironmentFile=-%h/.hermes/env

@@ -8,15 +8,25 @@ set -euo pipefail
 # Per agent:
 #   wrapper   <role_dir>/hermes regenerated from template/hermes.jinja
 #   contract  runtime/profile.yaml opts into config.inherit_from: default
-#   registry  ~/.hermes/profiles/<profile_name> -> <role_dir>/runtime
+#   profile   ~/.hermes/profiles/<profile_name> is a REAL dir whose shared
+#             entries link to the fleet root and owned entries link to runtime
+#   units     systemd HERMES_HOME points at that profile dir
 #   role      <role_dir>/role.yaml profile: <profile_name>
 #   services  stale per-profile Bloodbank consumers retired; gateways restarted
 #
+# SINGLETON-RUNTIME CONTRACT (supersedes the old profile-symlink model):
+# ~/.hermes/profiles/<name> MUST be a real directory, NOT a symlink to the
+# runtime. Hermes derives profile identity from the UNRESOLVED HERMES_HOME
+# path, so a symlinked profile dir makes get_active_profile_name() report
+# "default" and disables shared fleet auth. Shared entries (config.yaml, .env,
+# skills) symlink up to the fleet root; owned entries (memories, sessions,
+# state.db, ...) symlink back into <role_dir>/runtime.
+#
 # Default is a DRY-RUN drift report (exit 1 when drift exists, 0 when clean).
 # --apply writes the fixes and restarts the changed agents' services.
-# Anything that would require destroying or merging existing data (a real
-# directory where a symlink belongs, a profile.yaml with foreign content)
-# is reported as MANUAL and never touched.
+# Anything that would require destroying or merging existing data (real data
+# where a symlink belongs, a profile.yaml with foreign content) is reported as
+# MANUAL and never touched.
 #
 # Usage: fleet-sync.sh [--apply] [--no-restart] [--agent <id>]...
 
@@ -53,9 +63,35 @@ if [[ -f "$FLEET_ENV" ]]; then
   source "$FLEET_ENV"
 fi
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
-PROFILES_DIR="${HERMES_FLEET_HOME:-$HOME/.hermes}/profiles"
-VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(cfg fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
+FLEET_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}"
+PROFILES_DIR="$FLEET_HOME/profiles"
+SYSTEMD_USER_DIR="${HERMES_FLEET_SYSTEMD_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 VOX_URL_VALUE="${VOX_URL:-$(cfg fleet.vox_url 'https://vox.delo.sh')}"
+
+# Voxxy TTS is an OPTIONAL capability, and the plugin was renamed voxxy -> vox.
+# Resolve the name and dir from explicit config first, then from known layouts
+# in the voxxy checkout. When voxxy is not installed at all, that is a missing
+# optional dependency reported ONCE — not per-agent drift, which previously
+# buried every real finding under 20+ lines of noise.
+VOX_PLUGIN_NAME="${VOX_PLUGIN_NAME:-$(cfg fleet.vox_plugin_name vox)}"
+VOX_VOICE="${VOX_VOICE:-$(cfg fleet.vox_voice rick)}"
+VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(cfg fleet.voxxy_plugin_dir "")}"
+if [[ -z "$VOXXY_PLUGIN_DIR" || ! -d "$VOXXY_PLUGIN_DIR" ]]; then
+  for candidate in \
+    "$FLEET_HOME/plugins/$VOX_PLUGIN_NAME" \
+    "$HOME/code/voxxy/plugins/tts/$VOX_PLUGIN_NAME" \
+    "$HOME/code/voxxy/plugins/tts/voxxy"
+  do
+    [[ -n "$candidate" && -d "$candidate" ]] && { VOXXY_PLUGIN_DIR="$candidate"; break; }
+  done
+fi
+VOXXY_AVAILABLE=0
+[[ -n "$VOXXY_PLUGIN_DIR" && -d "$VOXXY_PLUGIN_DIR" ]] && VOXXY_AVAILABLE=1
+
+# Singleton-runtime profile contract (mirrors src/parity/rules.ts).
+SHARED_PROFILE_ENTRIES=(config.yaml .env skills)
+OWNED_PROFILE_ENTRIES=(memories sessions workspace logs cron plans hooks pairing audio_cache image_cache)
+OWNED_PROFILE_FILES=(SOUL.md state.db kanban.db)
 
 APPLY=0
 RESTART=1
@@ -101,12 +137,16 @@ for agent_id, a in sorted((data.get("agents") or {}).items()):
 PYEOF
 }
 
-render_wrapper() {  # render_wrapper <agent_id>
-  sed "s/{{ agent_id }}/$1/g" "$WRAPPER_TEMPLATE"
+render_wrapper() {  # render_wrapper <agent_id> <profile_name>
+  # The template defaults PROFILE_NAME to the agent id (copier has no
+  # profile_name variable); the registry is authoritative when they differ.
+  sed "s/{{ agent_id }}/$1/g" "$WRAPPER_TEMPLATE" \
+    | sed "s|^PROFILE_NAME=.*|PROFILE_NAME=\"\${HERMES_PROFILE_NAME:-$2}\"|"
 }
 
 DRIFT=0
 FIXED=0
+UNITS_TOUCHED=0
 declare -a RESTART_UNITS=()
 
 # Registry agents sharing a role_dir would overwrite each other's wrapper
@@ -317,7 +357,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   fi
 
   # 1. Launcher wrapper regenerated from the current template.
-  expected_wrapper="$(render_wrapper "$agent_id")"
+  expected_wrapper="$(render_wrapper "$agent_id" "$profile_name")"
   if [[ ! -f "$role_dir/hermes" ]] || ! diff -q <(printf '%s\n' "$expected_wrapper") "$role_dir/hermes" >/dev/null 2>&1; then
     if [[ $APPLY -eq 1 ]]; then
       printf '%s\n' "$expected_wrapper" > "$role_dir/hermes"
@@ -349,36 +389,106 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     DRIFT=$((DRIFT + 1))
   fi
 
-  # 3. Profile symlink ~/.hermes/profiles/<profile_name> -> runtime.
-  # LOAD-BEARING: hermes resolves agents launched as `hermes --profile <name>`
-  # through this path (and recreates it as a fresh standalone dir if missing,
-  # disconnecting the agent from its runtime) — so it MUST point at the runtime.
-  link="$PROFILES_DIR/$profile_name"
-  if [[ -L "$link" ]]; then
-    if [[ "$(readlink -f "$link")" != "$(readlink -f "$runtime")" ]]; then
+  # 3. Singleton-runtime profile ~/.hermes/profiles/<profile_name>.
+  # LOAD-BEARING and NOT a symlink: Hermes derives the profile identity from
+  # the unresolved HERMES_HOME path, so symlinking the profile dir itself makes
+  # get_active_profile_name() report "default" and _global_auth_file_path()
+  # return None — silently disabling shared fleet auth and giving the agent a
+  # divergent config.yaml. The dir is real; its ENTRIES are the symlinks.
+  profile_dir="$PROFILES_DIR/$profile_name"
+
+  # ensure_profile_link <label> <link path> <target> <mkdir target dir?>
+  ensure_profile_link() {
+    local label="$1" path="$2" target="$3" mkdir_target="$4"
+    if [[ -L "$path" ]]; then
+      [[ "$(readlink -f "$path")" == "$(readlink -f "$target")" ]] && return 0
       if [[ $APPLY -eq 1 ]]; then
-        ln -sfn "$runtime" "$link"
-        note "$agent_id" FIXED "profile symlink repointed -> $runtime"
+        [[ "$mkdir_target" == "dir" ]] && mkdir -p "$target"
+        ln -sfn "$target" "$path"
+        note "$agent_id" FIXED "profile $label repointed -> $target"
         changed=1; FIXED=$((FIXED + 1))
       else
-        note "$agent_id" DRIFT "profile symlink points at $(readlink "$link")"
+        note "$agent_id" DRIFT "profile $label points at $(readlink "$path")"
         DRIFT=$((DRIFT + 1))
       fi
+      return 0
     fi
-  elif [[ -e "$link" ]]; then
-    note "$agent_id" DRIFT "$link is a real directory, expected symlink (MANUAL: merge state)"
-    DRIFT=$((DRIFT + 1))
-  else
+    if [[ -e "$path" ]]; then
+      note "$agent_id" DRIFT "profile $label holds real data, expected symlink -> $target (MANUAL: merge state)"
+      DRIFT=$((DRIFT + 1))
+      return 0
+    fi
     if [[ $APPLY -eq 1 ]]; then
-      mkdir -p "$PROFILES_DIR"
-      ln -sfn "$runtime" "$link"
-      note "$agent_id" FIXED "profile symlink created -> $runtime"
+      [[ "$mkdir_target" == "dir" ]] && mkdir -p "$target"
+      ln -sfn "$target" "$path"
+      note "$agent_id" FIXED "profile $label linked -> $target"
       changed=1; FIXED=$((FIXED + 1))
     else
-      note "$agent_id" DRIFT "profile symlink missing"
+      note "$agent_id" DRIFT "profile $label missing (expected symlink -> $target)"
+      DRIFT=$((DRIFT + 1))
+    fi
+  }
+
+  if [[ -L "$profile_dir" ]]; then
+    # The superseded contract. Converting it back needs a data merge decision.
+    note "$agent_id" DRIFT "$profile_dir is a symlink; the profile dir must be a REAL dir (MANUAL: pj migrate hermes.runtime-singleton)"
+    DRIFT=$((DRIFT + 1))
+  elif [[ ! -d "$profile_dir" ]]; then
+    if [[ -e "$profile_dir" ]]; then
+      note "$agent_id" DRIFT "$profile_dir exists and is not a directory (MANUAL: remove or merge)"
+      DRIFT=$((DRIFT + 1))
+    elif [[ $APPLY -eq 1 ]]; then
+      mkdir -p "$profile_dir"
+      note "$agent_id" FIXED "profile dir created: $profile_dir"
+      changed=1; FIXED=$((FIXED + 1))
+    else
+      note "$agent_id" DRIFT "profile dir missing: $profile_dir"
       DRIFT=$((DRIFT + 1))
     fi
   fi
+
+  if [[ -d "$profile_dir" && ! -L "$profile_dir" ]]; then
+    for entry in "${SHARED_PROFILE_ENTRIES[@]}"; do
+      ensure_profile_link "$entry" "$profile_dir/$entry" "$FLEET_HOME/$entry" \
+        "$([[ "$entry" == "skills" ]] && echo dir || echo file)"
+    done
+    for entry in "${OWNED_PROFILE_ENTRIES[@]}"; do
+      ensure_profile_link "$entry" "$profile_dir/$entry" "$runtime/$entry" dir
+    done
+    for entry in "${OWNED_PROFILE_FILES[@]}"; do
+      ensure_profile_link "$entry" "$profile_dir/$entry" "$runtime/$entry" file
+    done
+  fi
+
+  # 3b. systemd units must point HERMES_HOME at that profile dir. This is the
+  # split-brain that the old symlink rule masked: units ran against the profile
+  # while the launcher ran against the raw runtime, so an agent's interactive
+  # and daemon halves used different config, sessions, and auth.
+  for unit in "hermes-${agent_id}-gateway.service" \
+              "hermes-${agent_id}-heartbeat.service" \
+              "hermes-${agent_id}-checkpoint.service"; do
+    unit_path="$SYSTEMD_USER_DIR/$unit"
+    [[ -f "$unit_path" ]] || continue
+    current_home="$(sed -n 's/^Environment=HERMES_HOME=//p' "$unit_path" | head -1)"
+    [[ -n "$current_home" ]] || continue
+    [[ "$current_home" == "$profile_dir" ]] && continue
+    # Never point a unit at a profile dir that is still a symlink or absent —
+    # that is the very state that breaks profile identity. Migrate the layout
+    # first, then the unit repoint becomes safe.
+    if [[ ! -d "$profile_dir" || -L "$profile_dir" ]]; then
+      note "$agent_id" DRIFT "$unit HERMES_HOME=$current_home (expected $profile_dir; blocked until the profile dir is a real dir)"
+      DRIFT=$((DRIFT + 1))
+      continue
+    fi
+    if [[ $APPLY -eq 1 ]]; then
+      sed -i "s|^Environment=HERMES_HOME=.*|Environment=HERMES_HOME=$profile_dir|" "$unit_path"
+      note "$agent_id" FIXED "$unit HERMES_HOME -> $profile_dir"
+      changed=1; FIXED=$((FIXED + 1)); UNITS_TOUCHED=1
+    else
+      note "$agent_id" DRIFT "$unit HERMES_HOME=$current_home (expected $profile_dir)"
+      DRIFT=$((DRIFT + 1))
+    fi
+  done
 
   # 4. role.yaml binds the registry profile name.
   role_yaml="$role_dir/role.yaml"
@@ -393,40 +503,38 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     fi
   fi
 
-  # 5. PM fleet voice contract: runtime plugin symlink + Voxxy config + VOX_URL.
+  # 5. PM fleet voice contract: the plugin lives at plugins/tts/$VOX_PLUGIN_NAME
+  # under the agent's real HERMES_HOME (the profile dir) — linking it into the
+  # raw runtime instead puts it somewhere Hermes never reads.
   role_name="$(basename "$role_dir")"
   if [[ "$role_name" == "pm" && -d "$runtime" ]]; then
-    plugin_link="$runtime/plugins/tts/voxxy"
-    if [[ -d "$VOXXY_PLUGIN_DIR" ]]; then
+    if [[ $VOXXY_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
+      plugin_link="$profile_dir/plugins/tts/$VOX_PLUGIN_NAME"
       if [[ -L "$plugin_link" ]]; then
         if [[ "$(readlink -f "$plugin_link")" != "$(readlink -f "$VOXXY_PLUGIN_DIR")" ]]; then
           if [[ $APPLY -eq 1 ]]; then
-            mkdir -p "$runtime/plugins/tts"
             ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
-            note "$agent_id" FIXED "runtime Voxxy plugin relinked"
+            note "$agent_id" FIXED "profile $VOX_PLUGIN_NAME plugin relinked"
             changed=1; FIXED=$((FIXED + 1))
           else
-            note "$agent_id" DRIFT "runtime Voxxy plugin points at $(readlink "$plugin_link")"
+            note "$agent_id" DRIFT "profile $VOX_PLUGIN_NAME plugin points at $(readlink "$plugin_link")"
             DRIFT=$((DRIFT + 1))
           fi
         fi
       elif [[ -e "$plugin_link" ]]; then
-        note "$agent_id" DRIFT "$plugin_link exists and is not a symlink (MANUAL: merge runtime plugin state)"
+        note "$agent_id" DRIFT "$plugin_link exists and is not a symlink (MANUAL: merge plugin state)"
         DRIFT=$((DRIFT + 1))
       else
         if [[ $APPLY -eq 1 ]]; then
-          mkdir -p "$runtime/plugins/tts"
+          mkdir -p "$profile_dir/plugins/tts"
           ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
-          note "$agent_id" FIXED "runtime Voxxy plugin linked"
+          note "$agent_id" FIXED "profile $VOX_PLUGIN_NAME plugin linked"
           changed=1; FIXED=$((FIXED + 1))
         else
-          note "$agent_id" DRIFT "runtime Voxxy plugin missing"
+          note "$agent_id" DRIFT "profile $VOX_PLUGIN_NAME plugin missing"
           DRIFT=$((DRIFT + 1))
         fi
       fi
-    else
-      note "$agent_id" DRIFT "configured Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR (MANUAL: install voxxy repo)"
-      DRIFT=$((DRIFT + 1))
     fi
 
     runtime_env="$runtime/.env"
@@ -462,30 +570,38 @@ PYEOF
       esac
     fi
 
-    config_status="$(python3 - "$runtime/config.yaml" <<'PYEOF'
+    # The effective config is the one under the agent's real HERMES_HOME. Under
+    # the singleton contract that file symlinks to the fleet root, so this reads
+    # (and enforces) the shared PM voice contract rather than writing a stray
+    # config.yaml into the repo runtime that nothing ever loads.
+    if [[ $VOXXY_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
+      config_status="$(python3 - "$profile_dir/config.yaml" "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
 import pathlib, sys
 
 path = pathlib.Path(sys.argv[1])
+plugin, voice = sys.argv[2], sys.argv[3]
 if not path.exists():
     print('missing')
     raise SystemExit(0)
 text = path.read_text()
-provider = 'voxxy' if 'provider: voxxy' in text else 'other'
-plugin = 'yes' if 'tts/voxxy' in text else 'no'
-voice = 'rick' if 'voice: rick' in text else 'other'
-print(f'{provider}|{plugin}|{voice}')
+provider = 'ok' if f'provider: {plugin}' in text else 'other'
+enabled = 'ok' if f'tts/{plugin}' in text else 'no'
+voice_ok = 'ok' if f'voice: {voice}' in text else 'other'
+print(f'{provider}|{enabled}|{voice_ok}')
 PYEOF
 )"
-    if [[ "$config_status" != "voxxy|yes|rick" ]]; then
-      if [[ "$APPLY" -eq 1 ]]; then
-        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
-        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.provider voxxy >/dev/null 2>&1 || true
-        HERMES_HOME="$runtime" "${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}" config set tts.voice rick >/dev/null 2>&1 || true
-        note "$agent_id" FIXED "runtime TTS config enforced -> voxxy/rick"
-        changed=1; FIXED=$((FIXED + 1))
-      else
-        note "$agent_id" DRIFT "runtime Voxxy config missing from config.yaml"
-        DRIFT=$((DRIFT + 1))
+      if [[ "$config_status" != "ok|ok|ok" ]]; then
+        if [[ "$APPLY" -eq 1 ]]; then
+          hermes_bin="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}"
+          HERMES_HOME="$profile_dir" "$hermes_bin" config set "plugins.enabled.0" "tts/$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
+          HERMES_HOME="$profile_dir" "$hermes_bin" config set tts.provider "$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
+          HERMES_HOME="$profile_dir" "$hermes_bin" config set "tts.$VOX_PLUGIN_NAME.voice" "$VOX_VOICE" >/dev/null 2>&1 || true
+          note "$agent_id" FIXED "TTS config enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
+          changed=1; FIXED=$((FIXED + 1))
+        else
+          note "$agent_id" DRIFT "TTS config not $VOX_PLUGIN_NAME/$VOX_VOICE in $profile_dir/config.yaml ($config_status)"
+          DRIFT=$((DRIFT + 1))
+        fi
       fi
     fi
   fi
@@ -495,20 +611,32 @@ PYEOF
   fi
 done < <(read_registry)
 
-# 5. Stale registry symlinks: entries pointing into fleet runtimes under a
-# name the registry does not know. Reported only — removal is a human call.
+# 6. Stale profile entries: names in ~/.hermes/profiles the registry does not
+# know. Reported only — removal is a human call.
 known_names="$(read_registry | cut -d $'\x1f' -f3 | sort -u)"
 if [[ -d "$PROFILES_DIR" ]]; then
   for link in "$PROFILES_DIR"/*; do
-    [[ -L "$link" ]] || continue
+    [[ -e "$link" || -L "$link" ]] || continue
     name="$(basename "$link")"
     grep -qx "$name" <<<"$known_names" && continue
-    target="$(readlink "$link")"
-    if [[ "$target" == */agents/hermes/* ]]; then
-      note "$name" STALE "registry symlink not in agents-registry -> $target (MANUAL: remove or register)"
+    if [[ -L "$link" ]]; then
+      target="$(readlink "$link")"
+      [[ "$target" == */agents/hermes/* ]] || continue
+      note "$name" STALE "profile symlink not in agents-registry -> $target (MANUAL: remove or register)"
       DRIFT=$((DRIFT + 1))
     fi
   done
+fi
+
+# Voxxy is optional; say so once instead of once per PM.
+if [[ $VOXXY_AVAILABLE -eq 0 ]]; then
+  echo
+  echo "note: voxxy TTS plugin not installed (looked for plugins/tts/$VOX_PLUGIN_NAME)."
+  echo "      PM voice checks skipped — this is an optional capability, not drift."
+fi
+
+if [[ $UNITS_TOUCHED -eq 1 ]]; then
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
 fi
 
 if [[ ${#RESTART_UNITS[@]} -gt 0 ]]; then
@@ -520,7 +648,14 @@ fi
 echo
 if [[ $APPLY -eq 1 ]]; then
   echo "fleet-sync: $FIXED fixed, $DRIFT unresolved (manual)"
+  if [[ $DRIFT -gt 0 ]]; then
+    echo "  Items marked MANUAL need a human decision — they would destroy or merge"
+    echo "  existing state. Most profile-layout cases are handled by:"
+    echo "      pj migrate hermes.runtime-singleton"
+  fi
 else
-  echo "fleet-sync: $DRIFT drift item(s). Re-run with --apply to fix."
+  echo "fleet-sync: $DRIFT drift item(s). Apply the fixable ones with:"
+  echo "      mise run fleet:sync"
+  echo "  (or run this script directly with --apply)"
 fi
 [[ $DRIFT -eq 0 ]] || exit 1

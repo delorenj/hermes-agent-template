@@ -17,6 +17,11 @@ def test_launcher_drops_shared_identity_credentials_but_keeps_policy(tmp_path: P
     runtime.mkdir(parents=True)
     fleet = home / ".hermes" / "fleet.env"
     fleet.parent.mkdir(parents=True)
+    # Singleton-runtime contract: the launcher resolves HERMES_HOME to the named
+    # profile dir and refuses to start without it, so the fixture must provision
+    # one the same way a real agent has one.
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
     fake_hermes = tmp_path / "fake-hermes"
     fake_hermes.write_text(
         """#!/usr/bin/env python3
@@ -82,4 +87,8 @@ print(json.dumps({key: os.environ.get(key) for key in keys}))
     assert observed["SLACK_APP_TOKEN"] is None
     assert observed["TELEGRAM_ALLOWED_USERS"] == "111"
     assert observed["SLACK_ALLOWED_USERS"] == "U111"
-    assert observed["HERMES_HOME"] == str(runtime)
+    # Singleton-runtime contract: HERMES_HOME is the NAMED PROFILE dir, never the
+    # raw runtime path. Hermes derives profile identity and shared fleet auth
+    # from the unresolved HERMES_HOME, so pointing it at the runtime makes
+    # get_active_profile_name() report "default" and disables shared auth.
+    assert observed["HERMES_HOME"] == str(profile)
