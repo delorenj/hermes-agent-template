@@ -50,7 +50,13 @@ runtime:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     hermes = fake_bin / "hermes"
-    hermes.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    hermes.write_text(
+        """#!/usr/bin/env bash
+printf '%s|%s\n' "${HERMES_HOME:-}" "$*" >> "$HERMES_LOG"
+[[ "${FAIL_HERMES_CONFIG:-0}" != "1" ]]
+""",
+        encoding="utf-8",
+    )
     hermes.chmod(0o755)
     pj = fake_bin / "pj"
     pj.write_text(
@@ -70,6 +76,7 @@ exit 0
         {
             "HOME": str(home),
             "HERMES_BIN": str(hermes),
+            "HERMES_LOG": str(tmp_path / "hermes.log"),
             "PJANGLER_BIN": str(pj),
             "PJANGLER_LOG": str(tmp_path / "pjangler.log"),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
@@ -106,6 +113,13 @@ def test_provisioner_creates_ignored_local_runtime_without_git(tmp_path: Path) -
     calls = Path(env["PJANGLER_LOG"]).read_text(encoding="utf-8")
     assert "migrate hermes.runtime-singleton" in calls
     assert "--dry-run --json" in calls
+    hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert hermes_calls == [
+        f"{profile}|config set terminal.cwd {project}",
+        f"{profile}|config set plugins.enabled.0 tts/voxxy",
+        f"{profile}|config set tts.provider voxxy",
+        f"{profile}|config set tts.voice rick",
+    ]
     assert subprocess.run(
         ["git", "check-ignore", "-q", "agents/hermes/pm/runtime/"],
         cwd=project,
@@ -166,3 +180,22 @@ def test_provisioner_never_replaces_existing_named_profile(tmp_path: Path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
     assert profile.is_dir() and not profile.is_symlink()
     assert sentinel.read_text(encoding="utf-8") == "preserve\n"
+
+
+def test_required_named_profile_config_failure_is_not_suppressed_or_marked_done(
+    tmp_path: Path,
+) -> None:
+    _project, role, env = _fixture(tmp_path)
+    env["FAIL_HERMES_CONFIG"] = "1"
+
+    result = _run(role, env)
+
+    assert result.returncode != 0
+    assert "required Hermes config write failed" in result.stderr
+    assert "named profile terminal.cwd" not in result.stderr
+    assert not (role / ".scripts" / ".done-20-runtime-repo").exists()
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
+    assert hermes_calls == [
+        f"{profile}|config set terminal.cwd {_project}",
+    ]

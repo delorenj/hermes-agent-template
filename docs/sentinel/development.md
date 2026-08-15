@@ -160,7 +160,8 @@ order. Several of them reach outside the repository.
 <!-- prettier-ignore -->
 > [!CAUTION]
 > Full provisioning is outward-facing and partly interactive.
-> `20-runtime-repo.sh` populates the ignored local runtime and links its profile;
+> `20-runtime-repo.sh` populates the ignored local runtime and delegates named-profile
+> wiring to `pj migrate hermes.runtime-singleton`;
 > it creates no GitHub storage,
 > `30-telegram.sh` prompts for a BotFather token and blocks waiting for input,
 > and `42-ticket-provider.sh` can create a Plane project. Don't run full
@@ -172,7 +173,7 @@ script checks its flag and skips cleanly.
 | Flag | Skips |
 | --- | --- |
 | `SKIP_TELEGRAM` | The interactive BotFather token step. |
-| `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile linking. No remote storage is created. |
+| `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile migration. No remote storage is created. |
 | `SKIP_PLANE` | Creating a Plane project. |
 | `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
 | `SKIP_SYSTEMD` | Installing `systemd` units (profile gateway and heartbeat timer). |

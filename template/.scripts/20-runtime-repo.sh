@@ -140,7 +140,17 @@ fi
   || die "PJángler did not establish a real named profile at $PROFILE_HOME"
 log "    singleton profile verified by pj migrate hermes.runtime-singleton: $PROFILE_HOME"
 
-env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set terminal.cwd "$PROJECT_PATH" >/dev/null 2>&1 || true
+profile_config_set() {
+  local key="$1"
+  [[ -x "$HERMES_BIN" ]] \
+    || die "Hermes CLI is not executable; cannot configure named profile: $HERMES_BIN"
+  if ! env HERMES_HOME="$PROFILE_HOME" "$HERMES_BIN" config set "$@" >/dev/null; then
+    die "required Hermes config write failed for named profile $PROFILE_NAME: $key"
+  fi
+}
+
+profile_config_set terminal.cwd "$PROJECT_PATH"
+log "    named profile terminal.cwd -> $PROJECT_PATH"
 
 if [[ "$ROLE" == "pm" ]]; then
   VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"
@@ -152,14 +162,10 @@ if [[ "$ROLE" == "pm" ]]; then
     warn "    Voxxy plugin dir missing: $VOXXY_PLUGIN_DIR"
   fi
 
-  if [[ -x "$HERMES_BIN" ]]; then
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set plugins.enabled.0 tts/voxxy >/dev/null 2>&1 || true
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.provider voxxy >/dev/null 2>&1 || true
-    env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set tts.voice rick >/dev/null 2>&1 || true
-    log "    set PM runtime TTS provider -> voxxy"
-  else
-    warn "    Hermes bin missing; skipped PM Voxxy config"
-  fi
+  profile_config_set plugins.enabled.0 tts/voxxy
+  profile_config_set tts.provider voxxy
+  profile_config_set tts.voice rick
+  log "    set PM named-profile TTS provider -> voxxy"
 fi
 
 mark_done 20-runtime-repo
