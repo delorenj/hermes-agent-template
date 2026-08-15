@@ -20,7 +20,7 @@
                   │     ├── SOUL.md                 │
                   │     ├── hermes (launcher)       │
                   │     ├── .scripts/               │
-                  │     └── runtime/                        │ ← ignored local HERMES_HOME
+                  │     └── runtime/                        │ ← ignored owned state
                   │          ├── config.yaml                │
                   │          ├── memories/                  │
                   │          ├── sessions/                  │
@@ -37,13 +37,34 @@ them means:
 
 - The template repo is small, stable, easy to update fleet-wide
 - Project commits cannot accidentally publish runtime credentials or sessions
-- Each profile has an isolated HERMES_HOME without project-index churn
+- Each agent uses a real named HERMES_HOME under `~/.hermes/profiles/`; PJangler
+  links shared config/auth/skills to the fleet root and owned state to runtime
 - Provisioning can refresh tracked launchers and scaffolds without overwriting
   existing local state
 
 A third file ties the fleet together: `~/.hermes/fleet.env`.
 It is the single source-of-truth pointer for the shared Hermes executable/repo
 that every generated launcher uses.
+
+The template never rewrites the named profile. `.scripts/20-runtime-repo.sh`
+delegates that topology to `pj migrate hermes.runtime-singleton` (dry-run audit,
+then idempotent apply). This prevents a stale local bootstrap from replacing a
+real named profile with the legacy profile-to-runtime symlink.
+
+## Per-agent gateway route and encrypted credentials
+
+`role.yaml` may set `model.name`, `provider`, `base_url`, `api_mode`, and
+`key_env`. The generated systemd gateway launcher translates only those
+non-secret values into explicit `hermes gateway run` flags. Session `/model`
+and channel overrides still take precedence. `key_env` is a variable name,
+never a key value.
+
+For systemd user services, encrypted files named
+`<agent>-telegram-bot-token.cred` and `<agent>-model-api-key.cred` under
+`~/.config/hermes-agent/credentials/` are loaded with
+`LoadCredentialEncrypted`. Decrypted bytes exist only in systemd's volatile
+credential directory and the launched process environment. Ignored
+`runtime/.env` remains a backward-compatible fallback.
 
 ## Durability boundary
 

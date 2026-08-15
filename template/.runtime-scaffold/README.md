@@ -1,21 +1,22 @@
 # {{agent_id}} — runtime
 
-This is the HERMES_HOME for the **{{display_name}}** agent. It is git-tracked
-so memory, SOUL evolution, and conversation history are durable across machines
-and recoverable on failure.
+This is the ignored, role-owned state for the **{{display_name}}** agent. The
+actual HERMES_HOME is a real named directory under `~/.hermes/profiles/`, with
+PJangler-managed links into this runtime. Back it up separately; it is not
+published by project Git.
 
 ## What's in here
 
 | Path | Tracked? | Purpose |
 | --- | --- | --- |
-| `config.yaml` | yes | Inference + skill config (cloned from global at provision time) |
-| `SOUL.md` | yes | The agent's personality, evolves over time |
-| `memories/MEMORY.md` | yes | The condensed mental-model summary loaded each session |
-| `memories/USER.md` | yes | The operator's persona (Jarad DeLorenzo, ...) |
-| `sessions/sessions.db` | yes (LFS) | SQLite store of every conversation |
-| `decisions/` | yes | Agent-emitted decisions, one file per important call |
+| `config.yaml` | local | Legacy seed/delta; shared profile config comes from fleet root |
+| `SOUL.md` | local | The agent's personality, evolves over time |
+| `memories/MEMORY.md` | local | The condensed mental-model summary loaded each session |
+| `memories/USER.md` | local | The operator's persona |
+| `sessions/sessions.db` | local | SQLite store of conversations |
+| `decisions/` | local | Agent-emitted decisions |
 | `.env` | **no** | API keys + Telegram bot token (per-machine secret) |
-| `auth.json` | **no** | Deprecated local OAuth store; fleet auth defaults to `HERMES_OAUTH_FILE=~/.hermes/auth.json` |
+| `auth.json` | **no** | Deprecated local OAuth store; named profiles use fleet auth fallback |
 | `audio_cache/`, `image_cache/` | **no** | Regenerable caches |
 | `sandboxes/` | **no** | Per-session ephemeral execution dirs |
 

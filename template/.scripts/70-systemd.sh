@@ -69,7 +69,34 @@ already_done 70-systemd && { log "[70] systemd already installed — legacy clea
 # and the checkpoint helper both render into the role dir; just ensure they are
 # executable. heartbeat.sh calls checkpoint.sh internally.
 HEARTBEAT_BIN="$ROLE_DIR/.scripts/heartbeat.sh"
-chmod +x "$HEARTBEAT_BIN" "$ROLE_DIR/.scripts/checkpoint.sh" 2>/dev/null || true
+CREDENTIAL_LAUNCHER="$ROLE_DIR/.scripts/credential-launch.sh"
+chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" "$ROLE_DIR/.scripts/checkpoint.sh" 2>/dev/null || true
+
+[[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
+  || die "named profile is not a real directory; run: pj migrate hermes.runtime-singleton '$REPO_ROOT'"
+
+# Encrypted credentials are optional and take precedence over the existing
+# ignored runtime/.env fallback. Their plaintext appears only below /run while
+# systemd executes the unit. Files are provisioned separately with
+# `systemd-creds encrypt --user`; this step never reads or writes secret values.
+CREDENTIAL_DIR="${HERMES_SYSTEMD_CREDENTIAL_DIR:-$HOME/.config/hermes-agent/credentials}"
+TELEGRAM_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-telegram-bot-token.cred"
+MODEL_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-model-api-key.cred"
+GW_CREDENTIAL_LINES=""
+HB_CREDENTIAL_LINES=""
+if [[ -f "$TELEGRAM_CREDENTIAL" ]]; then
+  command -v systemd-creds >/dev/null 2>&1 \
+    || die "encrypted Telegram credential exists but systemd-creds is unavailable"
+  GW_CREDENTIAL_LINES="LoadCredentialEncrypted=telegram_bot_token:$TELEGRAM_CREDENTIAL"
+fi
+if [[ -f "$MODEL_CREDENTIAL" ]]; then
+  [[ -n "$(yaml_get model.key_env)" ]] \
+    || die "encrypted model credential exists but model.key_env is blank in role.yaml"
+  command -v systemd-creds >/dev/null 2>&1 \
+    || die "encrypted model credential exists but systemd-creds is unavailable"
+  GW_CREDENTIAL_LINES="${GW_CREDENTIAL_LINES}${GW_CREDENTIAL_LINES:+$'\n'}LoadCredentialEncrypted=model_api_key:$MODEL_CREDENTIAL"
+  HB_CREDENTIAL_LINES="LoadCredentialEncrypted=model_api_key:$MODEL_CREDENTIAL"
+fi
 
 # Gateway unit
 GW_UNIT="hermes-${AGENT_ID}-gateway.service"
@@ -82,9 +109,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 Environment=HERMES_HOME=$PROFILE_HOME
+Environment=HERMES_BIN=$HERMES_BIN
 Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-$RUNTIME/.env
-ExecStart=$HERMES_BIN gateway run --replace
+$GW_CREDENTIAL_LINES
+ExecStart=$CREDENTIAL_LAUNCHER gateway
 Restart=on-failure
 RestartSec=10
 StandardOutput=append:$RUNTIME/logs/gateway.systemd.log
@@ -110,13 +139,15 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=$REPO_ROOT
 Environment=HERMES_HOME=$PROFILE_HOME
+Environment=HERMES_BIN=$HERMES_BIN
 Environment=CODEX_HOME=$CODEX_HOME
 EnvironmentFile=-%h/.config/hermes-agent/env
 EnvironmentFile=-%h/.hermes/env
 EnvironmentFile=-%h/.hermes/hermes-agent.env
 EnvironmentFile=-%h/.hermes/${AGENT_ID}.env
 EnvironmentFile=-$RUNTIME/.env
-ExecStart=$HEARTBEAT_BIN
+$HB_CREDENTIAL_LINES
+ExecStart=$CREDENTIAL_LAUNCHER heartbeat
 TimeoutStartSec=45min
 StandardOutput=append:$RUNTIME/logs/heartbeat.log
 StandardError=append:$RUNTIME/logs/heartbeat.log

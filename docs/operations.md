@@ -27,7 +27,7 @@ invocations).
 | 01 config | Seed `~/.config/hermes-agent-template/config.toml` from the shipped example if absent (see [Configuration](#configuration)) | n/a |
 | 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
 | 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills`; PM roles also seed `VOX_URL` in profile `.env` | n/a |
-| 20 local runtime | Populate missing files from role-local `.runtime-scaffold/` into ignored `./runtime/`, symlink `~/.hermes/profiles/<id>` → runtime, and refuse stale project gitlinks/mappings; PM roles also link the Voxxy plugin and set `tts.provider: voxxy` | `SKIP_RUNTIME_REPO=1` |
+| 20 local runtime | Populate missing files from role-local `.runtime-scaffold/` into ignored `./runtime/`, then audit/apply `pj migrate hermes.runtime-singleton`; the named profile remains a real directory | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Verify an invocation-supplied, profile-dedicated BotFather token; reject fleet reuse; write only to runtime/.env | `SKIP_TELEGRAM=1` |
 | 31 slack | Disabled/deferred by default; verify a dedicated app+bot pair with `auth.test` and write it only to runtime/.env when explicitly enabled | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
@@ -256,8 +256,32 @@ Recovery sources are intentionally distinct:
   learned state.
 
 Restore the project and provision the role first. With its services stopped,
-extract the verified archive at the project root, confirm the profile symlink
-targets the restored runtime, then enable the services.
+extract the verified archive at the project root, run
+`pj migrate hermes.runtime-singleton /absolute/path/to/project`, and confirm
+the named profile is a real directory before enabling the services.
+
+### Inject encrypted systemd credentials from 1Password
+
+The commands below stream secrets directly from 1Password into
+`systemd-creds`; they do not create a plaintext file. Set `model.key_env` in
+`role.yaml` before creating the model credential.
+
+```bash
+AGENT=example-director
+CRED_DIR="$HOME/.config/hermes-agent/credentials"
+install -d -m 0700 "$CRED_DIR"
+env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
+  | systemd-creds encrypt --user --name=telegram_bot_token - \
+      "$CRED_DIR/${AGENT}-telegram-bot-token.cred"
+env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
+  | systemd-creds encrypt --user --name=model_api_key - \
+      "$CRED_DIR/${AGENT}-model-api-key.cred"
+chmod 0600 "$CRED_DIR/${AGENT}-"*.cred
+```
+
+Re-run `.scripts/70-systemd.sh` after removing only its local
+`.scripts/.done-70-systemd` marker so it renders the encrypted-credential
+directives. Never print, decrypt to disk, or commit either credential.
 
 ## Retire an agent (preserves runtime by default)
 
@@ -275,10 +299,10 @@ PROFILE="$HOME/.hermes/profiles/$AGENT"
 systemctl --user disable --now "hermes-${AGENT}-gateway.service"
 systemctl --user disable --now "hermes-${AGENT}-heartbeat.timer"
 
-# Detach only the expected symlink. Never follow it into the runtime.
-test -L "$PROFILE"
-test "$(readlink -f -- "$PROFILE")" = "$(readlink -f -- "$RUNTIME")"
-unlink -- "$PROFILE"
+# The profile is a real directory. Do not unlink or recursively delete it;
+# archive/retire through a dedicated PJangler migration when available.
+test -d "$PROFILE"
+test ! -L "$PROFILE"
 
 # Archive the Plane project and retire Telegram/Slack identities through their
 # administrative UIs, then remove the fleet registry entry under its lock.

@@ -196,6 +196,11 @@ per-agent env file, so write the key there.
 `70-systemd.sh`. A local install that wants the sentinel running must leave
 `SKIP_SYSTEMD` unset (or install the timer afterward).
 
+Both units keep `HERMES_HOME` on the real named profile established by
+`pj migrate hermes.runtime-singleton`; heartbeat must not reset it to the raw
+runtime path. When encrypted model credentials are present, the units use the
+same secret-free credential launcher as the gateway.
+
 ## Propagating changes
 
 The template is the single source of truth. Deployments pick up engine changes

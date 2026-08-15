@@ -52,11 +52,26 @@ runtime:
     hermes = fake_bin / "hermes"
     hermes.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     hermes.chmod(0o755)
+    pj = fake_bin / "pj"
+    pj.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PJANGLER_LOG"
+case " $* " in
+  *" --dry-run "*) exit 0 ;;
+esac
+mkdir -p "$HOME/.hermes/profiles/demo-pm"
+exit 0
+""",
+        encoding="utf-8",
+    )
+    pj.chmod(0o755)
     env = dict(os.environ)
     env.update(
         {
             "HOME": str(home),
             "HERMES_BIN": str(hermes),
+            "PJANGLER_BIN": str(pj),
+            "PJANGLER_LOG": str(tmp_path / "pjangler.log"),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "RUNTIME_SCAFFOLD_DIR": str(scaffold),
             "VOXXY_PLUGIN_DIR": str(tmp_path / "missing-voxxy"),
@@ -85,7 +100,12 @@ def test_provisioner_creates_ignored_local_runtime_without_git(tmp_path: Path) -
     assert (runtime / "MEMORY.md").read_text(encoding="utf-8") == "agent=demo-pm\n"
     assert (runtime / "SOUL.md").read_text(encoding="utf-8") == "local soul\n"
     assert not (runtime / ".git").exists()
-    assert (Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm").resolve() == runtime
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    assert profile.is_dir()
+    assert not profile.is_symlink()
+    calls = Path(env["PJANGLER_LOG"]).read_text(encoding="utf-8")
+    assert "migrate hermes.runtime-singleton" in calls
+    assert "--dry-run --json" in calls
     assert subprocess.run(
         ["git", "check-ignore", "-q", "agents/hermes/pm/runtime/"],
         cwd=project,
@@ -130,3 +150,19 @@ def test_active_provisioner_has_no_runtime_repo_or_submodule_mutation() -> None:
         assert forbidden not in script
     assert "stale .gitmodules mapping" in script
     assert 'cp -an "$TMP/." "$RUNTIME_LOCAL/"' in script
+    assert "migrate hermes.runtime-singleton" in script
+    assert 'ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"' not in script
+
+
+def test_provisioner_never_replaces_existing_named_profile(tmp_path: Path) -> None:
+    _project, role, env = _fixture(tmp_path)
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
+    sentinel = profile / "owned-marker"
+    sentinel.write_text("preserve\n", encoding="utf-8")
+
+    result = _run(role, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert profile.is_dir() and not profile.is_symlink()
+    assert sentinel.read_text(encoding="utf-8") == "preserve\n"

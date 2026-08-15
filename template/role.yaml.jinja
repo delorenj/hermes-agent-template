@@ -8,13 +8,20 @@ agent_id: {{ agent_id }}
 display_name: "{{ display_name }}"
 purpose: "{{ agent_purpose }}"
 
-# Inference target (empty = inherit from global ~/.hermes/config.yaml)
+# Process-local gateway inference target (empty = inherit from shared
+# ~/.hermes/config.yaml). key_env is a variable NAME only; its secret value is
+# injected at runtime and must never be written here.
 model:
   provider: "{{ model_provider }}"
   name: "{{ model_name }}"
+  base_url: "{{ model_base_url }}"
+  api_mode: "{{ model_api_mode }}"
+  key_env: "{{ model_key_env }}"
 
-# Hermes profile name. ~/.hermes/profiles/<name> symlinks to ./runtime/, so both
-# HERMES_HOME and `hermes --profile <name>` resolve to the local runtime.
+# Hermes profile name. ~/.hermes/profiles/<name> is a REAL directory managed by
+# `pj migrate hermes.runtime-singleton`: shared config/auth/skills link to the
+# fleet root while role-owned state links into ./runtime. Never replace the
+# named profile with a symlink to runtime.
 profile: {{ agent_id }}
 
 # Telegram bot identity (one bot per agent — see docs/architecture.md).
@@ -75,8 +82,9 @@ bloodbank:
   target_agent_id: "{{ agent_id }}"
   producer: "hermes-agent:{{ agent_id }}"
 
-# Pure-local HERMES_HOME. The legacy GitHub identity remains metadata-only for
-# locating old archives; provisioning never creates or attaches a submodule.
+# Pure-local role-owned state. HERMES_HOME itself is the named profile directory
+# above; the legacy GitHub identity remains metadata-only for locating old
+# archives, and provisioning never creates or attaches a submodule.
 runtime:
   # Empty owner -> resolved from config.toml [github].runtime_repo_owner.
   github_owner: "{{ runtime_repo_owner }}"

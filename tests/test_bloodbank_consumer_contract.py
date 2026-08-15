@@ -20,7 +20,13 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path]:
     runtime = role / "runtime"
     scripts.mkdir(parents=True)
     runtime.mkdir()
-    for name in ("_lib.sh", "60-bloodbank.sh", "70-systemd.sh", "80-registry.sh"):
+    for name in (
+        "_lib.sh",
+        "credential-launch.sh",
+        "60-bloodbank.sh",
+        "70-systemd.sh",
+        "80-registry.sh",
+    ):
         shutil.copy2(SCRIPTS / name, scripts / name)
     (scripts / "heartbeat.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (scripts / "checkpoint.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
@@ -30,6 +36,12 @@ role: pm
 agent_id: demo-pm
 display_name: "Demo PM"
 profile: demo-pm
+model:
+  provider: ""
+  name: ""
+  base_url: ""
+  api_mode: ""
+  key_env: ""
 telegram:
   provisioning_status: "deferred"
   bot_username: "demo_pm_bot"
@@ -62,6 +74,9 @@ runtime:
 def _environment(tmp_path: Path, registry: Path) -> dict[str, str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
+    (home / ".hermes" / "profiles" / "demo-pm").mkdir(
+        parents=True, exist_ok=True
+    )
     env = dict(os.environ)
     env.update(
         {
@@ -165,6 +180,58 @@ exit 1
     rendered = "\n".join(path.read_text(encoding="utf-8") for path in unit_dir.iterdir())
     assert "bloodbank-consumer.py" not in rendered
     assert "consumer.log" not in rendered
+    assert f"Environment=HERMES_HOME={Path(env['HOME']) / '.hermes' / 'profiles' / 'demo-pm'}" in rendered
+    assert "ExecStart=" + str(role / ".scripts" / "credential-launch.sh") + " gateway" in rendered
+    assert "HERMES_OAUTH_FILE" not in rendered
+
+
+def test_systemd_loads_optional_encrypted_credentials_without_plaintext(
+    tmp_path: Path,
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            'key_env: ""', 'key_env: "DIRECTOR_LITELLM_KEY"'
+        ),
+        encoding="utf-8",
+    )
+    credential_dir = Path(env["HOME"]) / ".config" / "hermes-agent" / "credentials"
+    credential_dir.mkdir(parents=True)
+    telegram_cred = credential_dir / "demo-pm-telegram-bot-token.cred"
+    model_cred = credential_dir / "demo-pm-model-api-key.cred"
+    telegram_cred.write_text("encrypted-placeholder", encoding="utf-8")
+    model_cred.write_text("encrypted-placeholder", encoding="utf-8")
+    fake_bin = tmp_path / "bin-encrypted"
+    fake_bin.mkdir()
+    for name, script in {
+        "systemd-creds": "#!/usr/bin/env bash\nexit 0\n",
+        "systemctl": """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) exit 1 ;;
+esac
+exit 1
+""",
+    }.items():
+        path = fake_bin / name
+        path.write_text(script, encoding="utf-8")
+        path.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    gateway = (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
+    heartbeat = (unit_dir / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
+    assert f"LoadCredentialEncrypted=telegram_bot_token:{telegram_cred}" in gateway
+    assert f"LoadCredentialEncrypted=model_api_key:{model_cred}" in gateway
+    assert f"LoadCredentialEncrypted=model_api_key:{model_cred}" in heartbeat
+    assert "DIRECTOR_LITELLM_KEY" not in gateway + heartbeat
+    assert "encrypted-placeholder" not in gateway + heartbeat
 
 
 def test_systemd_done_marker_still_retires_legacy_consumer(tmp_path: Path) -> None:

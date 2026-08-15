@@ -10,10 +10,10 @@
 #
 # What it does:
 #   1. Renders agents/hermes/<role>/{role.yaml, SOUL.md, hermes, .scripts/}
-#   2. Creates ignored local state at agents/hermes/<role>/runtime/
-#      (this is HERMES_HOME; no project gitlink or runtime remote)
+#   2. Creates ignored local state at agents/hermes/<role>/runtime/ and delegates
+#      named-profile wiring to `pj migrate hermes.runtime-singleton`
 #   4. Creates a Plane project in 33god workspace
-#   6. Prompts for a BotFather Telegram token, stores in runtime/.env
+#   6. Prompts for a BotFather Telegram token, stores in ignored runtime state
 #   7. Optionally wires a dedicated Slack app+bot pair into runtime/.env
 #   8. Records fleet-shared Bloodbank routing identity (no profile consumer)
 #   9. Installs a profile gateway + heartbeat timer (reconcile + checkpoint)
@@ -50,6 +50,7 @@ role:
   default: pm
   choices:
     "Project Manager (pm)": pm
+    "Company Director (director)": director
     "Developer (dev)": dev
     "Reviewer (review)": review
     "Company Reporter — daily cross-project rollup (reporter)": reporter
@@ -69,7 +70,7 @@ ticket_provider:
 agent_purpose:
   type: str
   help: "One-line description of what this agent does in this repo"
-  default: "{% if role == 'reporter' %}Company-wide evidence gathering, freshness-aware daily reporting, and critical delivery monitoring{% else %}Project management, triage, and continuous board reconciliation{% endif %}"
+  default: "{% if role == 'reporter' %}Company-wide evidence gathering, freshness-aware daily reporting, and critical delivery monitoring{% elif role == 'director' %}Company-level portfolio orchestration, delegation, and cross-project control{% else %}Project management, triage, and continuous board reconciliation{% endif %}"
 
 model_provider:
   type: str
@@ -79,6 +80,28 @@ model_provider:
 model_name:
   type: str
   help: "Model name (empty = inherit from global ~/.hermes config)"
+  default: ""
+
+model_base_url:
+  type: str
+  help: "Per-agent model API base URL (empty = inherit from shared config)"
+  default: ""
+
+model_api_mode:
+  type: str
+  help: "Per-agent model API protocol (empty = inherit from shared config)"
+  default: ""
+  choices:
+    "Inherit from shared config": ""
+    "OpenAI-compatible chat completions": chat_completions
+    "OpenAI Codex responses": codex_responses
+    "Anthropic messages": anthropic_messages
+    "AWS Bedrock converse": bedrock_converse
+    "Codex app server": codex_app_server
+
+model_key_env:
+  type: str
+  help: "Environment variable NAME holding the per-agent model key (never the key value)"
   default: ""
 
 soul_tone:

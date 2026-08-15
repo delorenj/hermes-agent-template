@@ -6,7 +6,8 @@
 source "$(dirname "$0")/_lib.sh"
 load_role_env
 
-already_done 20-runtime-repo && { log "[20] local runtime already set up — skipping"; exit 0; }
+already_done 20-runtime-repo \
+  && log "[20] local runtime scaffold already set up — re-auditing singleton profile wiring"
 [[ "${SKIP_RUNTIME_REPO:-0}" == "1" ]] && { log "[20] local runtime — SKIPPED (SKIP_RUNTIME_REPO=1)"; mark_done 20-runtime-repo; exit 0; }
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
@@ -123,28 +124,21 @@ if [[ ! -e "$RUNTIME_LOCAL/SOUL.md" ]]; then
   cp "$ROLE_DIR/SOUL.md" "$RUNTIME_LOCAL/SOUL.md"
 fi
 
-# Fold the two supported staging-profile files into the runtime without
-# deleting unknown profile content. Unknown content blocks the symlink so an
-# operator can reconcile it explicitly instead of losing state.
-if [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]]; then
-  log "    migrating supported staging profile state into the local runtime"
-  # A reporter never inherits .env; its credentials must be provisioned
-  # explicitly against a bot identity it owns.
-  if [[ "$ROLE" == "reporter" ]]; then
-    MIGRATE_FILES=(config.yaml profile.yaml)
-  else
-    MIGRATE_FILES=(.env config.yaml)
-  fi
-  for file_name in "${MIGRATE_FILES[@]}"; do
-    [[ -f "$PROFILE_HOME/$file_name" && ! -e "$RUNTIME_LOCAL/$file_name" ]] && cp "$PROFILE_HOME/$file_name" "$RUNTIME_LOCAL/$file_name"
-    [[ -f "$PROFILE_HOME/$file_name" ]] && rm -f -- "$PROFILE_HOME/$file_name"
-  done
-  if ! rmdir "$PROFILE_HOME" 2>/dev/null; then
-    die "staging profile contains unrecognized state and was preserved: $PROFILE_HOME"
-  fi
+# Named-profile topology belongs exclusively to PJangler. Preview first, then
+# apply the one idempotent rule. This script never removes or replaces a real
+# profile directory and never creates the obsolete profile -> runtime symlink.
+if [[ "$PJANGLER_BIN" != */* ]]; then
+  PJANGLER_BIN="$(command -v "$PJANGLER_BIN" 2>/dev/null || true)"
 fi
-ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"
-log "    profile symlink $PROFILE_HOME -> $RUNTIME_LOCAL"
+[[ -n "$PJANGLER_BIN" && -x "$PJANGLER_BIN" ]] \
+  || die "PJángler CLI not found; install 'pj' or set PJANGLER_BIN"
+"$PJANGLER_BIN" migrate hermes.runtime-singleton "$PROJECT_PATH" --dry-run --json >/dev/null \
+  || die "singleton-runtime audit failed; profile was left untouched"
+"$PJANGLER_BIN" migrate hermes.runtime-singleton "$PROJECT_PATH" --json >/dev/null \
+  || die "singleton-runtime migration failed; inspect with: pj migrate hermes.runtime-singleton '$PROJECT_PATH' --dry-run"
+[[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
+  || die "PJángler did not establish a real named profile at $PROFILE_HOME"
+log "    singleton profile verified by pj migrate hermes.runtime-singleton: $PROFILE_HOME"
 
 env HERMES_HOME="$RUNTIME_LOCAL" "$HERMES_BIN" config set terminal.cwd "$PROJECT_PATH" >/dev/null 2>&1 || true
 

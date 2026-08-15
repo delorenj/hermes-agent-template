@@ -105,10 +105,11 @@ class ReporterTemplateHardeningTests(unittest.TestCase):
         for literal in ('"ddr:', "delonet", "ntfy.delo.sh"):
             self.assertNotIn(literal, body, f"{literal!r} must not be hardcoded below the config block")
 
-    def test_reporter_never_inherits_staging_env_credentials(self) -> None:
+    def test_runtime_profile_wiring_is_delegated_to_pjangler(self) -> None:
         text = (ROOT / "template" / ".scripts" / "20-runtime-repo.sh").read_text()
-        self.assertIn("MIGRATE_FILES=(config.yaml profile.yaml)", text)
-        self.assertIn("MIGRATE_FILES=(.env config.yaml)", text)
+        self.assertIn("migrate hermes.runtime-singleton", text)
+        self.assertIn("--dry-run --json", text)
+        self.assertNotIn('ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"', text)
 
 
 if __name__ == "__main__":
