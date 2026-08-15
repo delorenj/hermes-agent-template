@@ -185,6 +185,30 @@ exit 1
     assert "HERMES_OAUTH_FILE" not in rendered
 
 
+def test_systemd_skip_never_queries_or_writes_user_manager_state(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    env["SKIP_SYSTEMD"] = "1"
+    fake_bin = tmp_path / "skip-bin"
+    fake_bin.mkdir()
+    called = tmp_path / "systemctl-called"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        "#!/usr/bin/env bash\ntouch \"$SYSTEMCTL_CALLED\"\nexit 99\n",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+    env["SYSTEMCTL_CALLED"] = str(called)
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    assert not called.exists()
+    assert (role / ".scripts" / ".done-70-systemd").is_file()
+    assert not (Path(env["HOME"]) / ".config" / "systemd" / "user").exists()
+
+
 def test_systemd_loads_optional_encrypted_credentials_without_plaintext(
     tmp_path: Path,
 ) -> None:

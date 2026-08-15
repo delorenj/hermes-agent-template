@@ -12,6 +12,11 @@ if [[ "$ROLE" == "reporter" ]]; then
   exit 0
 fi
 
+# Local-only provisioning must not inspect or mutate the host user manager.
+# Honor the explicit skip before creating unit directories or querying legacy
+# unit state; cleanup remains fail-closed whenever systemd management is active.
+[[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
+
 RUNTIME="$ROLE_DIR/runtime"
 # Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
 # dir, never the raw runtime path — Hermes derives profile identity and shared
@@ -63,7 +68,6 @@ if [[ $legacy_consumer_present -eq 1 ]]; then
 fi
 
 already_done 70-systemd && { log "[70] systemd already installed — legacy cleanup checked"; exit 0; }
-[[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
 
 # The heartbeat runner (board-reconciliation sentinel pass + gated checkpoint)
 # and the checkpoint helper both render into the role dir; just ensure they are
