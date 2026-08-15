@@ -8,7 +8,11 @@ load_role_env
 
 already_done 20-runtime-repo \
   && log "[20] local runtime scaffold already set up — re-auditing singleton profile wiring"
-[[ "${SKIP_RUNTIME_REPO:-0}" == "1" ]] && { log "[20] local runtime — SKIPPED (SKIP_RUNTIME_REPO=1)"; mark_done 20-runtime-repo; exit 0; }
+if [[ "${SKIP_RUNTIME_REPO:-0}" == "1" ]]; then
+  clear_done 20-runtime-repo
+  log "[20] local runtime — DEFERRED (SKIP_RUNTIME_REPO=1; completion marker cleared)"
+  exit 0
+fi
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 RUNTIME_LOCAL="$ROLE_DIR/runtime"
@@ -140,6 +144,10 @@ fi
   || die "PJángler did not establish a real named profile at $PROFILE_HOME"
 log "    singleton profile verified by pj migrate hermes.runtime-singleton: $PROFILE_HOME"
 
+# Never persist a project-specific terminal.cwd through the named profile.
+# config.yaml is fleet-shared in the singleton topology.  The manual and
+# service launchers pass TERMINAL_CWD process-locally for this role instead.
+
 profile_config_set() {
   local key="$1"
   [[ -x "$HERMES_BIN" ]] \
@@ -148,9 +156,6 @@ profile_config_set() {
     die "required Hermes config write failed for named profile $PROFILE_NAME: $key"
   fi
 }
-
-profile_config_set terminal.cwd "$PROJECT_PATH"
-log "    named profile terminal.cwd -> $PROJECT_PATH"
 
 if [[ "$ROLE" == "pm" ]]; then
   VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(config_get fleet.voxxy_plugin_dir "$HOME/code/voxxy/plugins/tts/voxxy")}"

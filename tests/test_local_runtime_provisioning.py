@@ -7,6 +7,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
+PROFILE_SCRIPT = ROOT / "template" / ".scripts" / "10-hermes-profile.sh"
 RUNTIME_SCRIPT = ROOT / "template" / ".scripts" / "20-runtime-repo.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
 SECRET_SCAN = ROOT / "template" / ".scripts" / "secret-scan.py"
@@ -115,7 +116,6 @@ def test_provisioner_creates_ignored_local_runtime_without_git(tmp_path: Path) -
     assert "--dry-run --json" in calls
     hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
     assert hermes_calls == [
-        f"{profile}|config set terminal.cwd {project}",
         f"{profile}|config set plugins.enabled.0 tts/voxxy",
         f"{profile}|config set tts.provider voxxy",
         f"{profile}|config set tts.voice rick",
@@ -166,6 +166,8 @@ def test_active_provisioner_has_no_runtime_repo_or_submodule_mutation() -> None:
     assert 'cp -an "$TMP/." "$RUNTIME_LOCAL/"' in script
     assert "migrate hermes.runtime-singleton" in script
     assert 'ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"' not in script
+    assert "config set terminal.cwd" not in script
+    assert "config set terminal.cwd" not in PROFILE_SCRIPT.read_text(encoding="utf-8")
 
 
 def test_provisioner_never_replaces_existing_named_profile(tmp_path: Path) -> None:
@@ -197,5 +199,52 @@ def test_required_named_profile_config_failure_is_not_suppressed_or_marked_done(
     profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
     hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
     assert hermes_calls == [
-        f"{profile}|config set terminal.cwd {_project}",
+        f"{profile}|config set plugins.enabled.0 tts/voxxy",
     ]
+
+
+def test_step20_preserves_shared_config_behind_profile_symlink(tmp_path: Path) -> None:
+    _project, role, env = _fixture(tmp_path)
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace("role: pm", "role: director"),
+        encoding="utf-8",
+    )
+    home = Path(env["HOME"])
+    shared_config = home / ".hermes" / "config.yaml"
+    shared_config.write_bytes(b"fleet: shared\nterminal:\n  cwd: /fleet/default\n")
+    before = shared_config.read_bytes()
+    profile_config = home / ".hermes" / "profiles" / "demo-pm" / "config.yaml"
+    profile_config.parent.mkdir(parents=True)
+    profile_config.symlink_to(shared_config)
+
+    result = _run(role, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert profile_config.is_symlink()
+    assert shared_config.read_bytes() == before
+    assert not Path(env["HERMES_LOG"]).exists()
+
+
+def test_deferred_runtime_step_clears_only_its_marker_and_later_reconciles(
+    tmp_path: Path,
+) -> None:
+    _project, role, env = _fixture(tmp_path)
+    marker = role / ".scripts" / ".done-20-runtime-repo"
+    unrelated = role / ".scripts" / ".done-10-hermes-profile"
+    marker.touch()
+    unrelated.touch()
+    env["SKIP_RUNTIME_REPO"] = "1"
+
+    deferred = _run(role, env)
+
+    assert deferred.returncode == 0, deferred.stderr
+    assert not marker.exists()
+    assert unrelated.exists()
+
+    env.pop("SKIP_RUNTIME_REPO")
+    activated = _run(role, env)
+
+    assert activated.returncode == 0, activated.stderr
+    assert marker.exists()
+    assert unrelated.exists()

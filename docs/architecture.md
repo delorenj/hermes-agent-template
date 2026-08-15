@@ -51,6 +51,11 @@ delegates that topology to `pj migrate hermes.runtime-singleton` (dry-run audit,
 then idempotent apply). This prevents a stale local bootstrap from replacing a
 real named profile with the legacy profile-to-runtime symlink.
 
+Because the named profile's `config.yaml` is deliberately linked to fleet
+truth, provisioning never writes a project-specific `terminal.cwd` into it.
+The manual wrapper, gateway, and heartbeat launcher instead export
+`TERMINAL_CWD` as a process-local value resolved from the role's Git root.
+
 ## Per-agent gateway route and encrypted credentials
 
 `role.yaml` may set `model.name`, `provider`, `base_url`, `api_mode`, and

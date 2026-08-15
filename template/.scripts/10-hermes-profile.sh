@@ -12,9 +12,6 @@ already_done 10-hermes-profile && { log "[10] profile already created — skippi
 log "[10] creating hermes profile: $PROFILE_NAME"
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 
-# Set repo path to directory where .git is
-REPO_PATH="$(cd "$ROLE_DIR" && git rev-parse --show-toplevel 2>/dev/null || echo "$ROLE_DIR")"
-
 if [[ -d "$PROFILE_HOME" ]]; then
   log "    profile dir already exists; reusing"
 else
@@ -110,9 +107,9 @@ PYEOF
   fi
 fi
 
-# Apply role-specific config overrides.
-log "    setting terminal.cwd = $REPO_PATH"
-env HERMES_HOME="$PROFILE_HOME" "$HERMES_BIN" config set terminal.cwd "$REPO_PATH"
+# Never persist a project-specific terminal.cwd through the named profile.
+# PJangler intentionally links profile config.yaml to the fleet-shared config;
+# the generated launchers therefore pass TERMINAL_CWD process-locally instead.
 
 # Canonical shared-skill source of truth + local PM fallback sync.
 CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir '/home/delorenj/.agents/skills')}"

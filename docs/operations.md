@@ -85,6 +85,9 @@ defaults are still filled from `config.toml`.
 
 If you `git pull`/sync the repo at `HERMES_FLEET_REPO` and rebuild/update that
 same binary path, every wrapper benefits immediately with no per-agent edits.
+Every generated wrapper and systemd entrypoint also resolves the containing
+project and exports `TERMINAL_CWD` for that process. Do not set `terminal.cwd`
+through `hermes config`: named-profile config is shared across the fleet.
 For Codex auth, run `hermes auth add openai-codex` through any generated agent
 launcher once; all agents using the same fleet env read the same Hermes OAuth
 store afterward.
@@ -176,7 +179,6 @@ python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpa
 5. Re-run the wire-up step:
    ```bash
    cd <project>/agents/hermes/<role>
-   rm .scripts/.done-30-telegram
    TELEGRAM_BOT_TOKEN='<bot-id>:<secret>' \
      TELEGRAM_ALLOWED_USERS='<your-user-id>' \
      SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
@@ -279,9 +281,9 @@ env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
 chmod 0600 "$CRED_DIR/${AGENT}-"*.cred
 ```
 
-Re-run `.scripts/70-systemd.sh` after removing only its local
-`.scripts/.done-70-systemd` marker so it renders the encrypted-credential
-directives. Never print, decrypt to disk, or commit either credential.
+Re-run `.scripts/70-systemd.sh`; it reconciles the unit definitions even after
+a completed installation, so no marker deletion is required. Never print,
+decrypt to disk, or commit either credential.
 
 ## Retire an agent (preserves runtime by default)
 

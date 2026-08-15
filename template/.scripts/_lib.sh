@@ -137,6 +137,12 @@ already_done() {
 mark_done() {
   touch "$ROLE_DIR/.scripts/.done-$1"
 }
+clear_done() {
+  # Remove only the marker for the explicitly deferred step.  This lets a
+  # later activation reconcile that phase without disturbing completed,
+  # unrelated provisioning state.
+  rm -f -- "$ROLE_DIR/.scripts/.done-$1"
+}
 
 # Fleet source-of-truth (shared across all wrappers/provisioners).
 # Every default below resolves as: env var > fleet.env > config.toml > fallback.

@@ -40,6 +40,11 @@ PROFILE_HOME="$FLEET_HOME/profiles/${PROFILE_NAME:-$AGENT_ID}"
   || { printf 'credential-launch: named profile is not a real directory\n' >&2; exit 1; }
 export HERMES_HOME="$PROFILE_HOME"
 
+if ! REPO_ROOT="$(git -C "$ROLE_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
+  REPO_ROOT="$ROLE_DIR"
+fi
+export TERMINAL_CWD="$REPO_ROOT"
+
 load_credential() {
   local credential_id="$1" env_name="$2" credential_file value
   [[ "$env_name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \

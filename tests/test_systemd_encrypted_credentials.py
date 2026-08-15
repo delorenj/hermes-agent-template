@@ -14,10 +14,12 @@ SCRIPTS = ROOT / "template" / ".scripts"
 def _role(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     home = tmp_path / "home"
     role = tmp_path / "project" / "agents" / "hermes" / "director"
+    project = tmp_path / "project"
     scripts = role / ".scripts"
     runtime = role / "runtime"
     scripts.mkdir(parents=True)
     runtime.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
     for name in ("_lib.sh", "credential-launch.sh"):
         shutil.copy2(SCRIPTS / name, scripts / name)
     (role / "role.yaml").write_text(
@@ -54,6 +56,7 @@ Path(os.environ["CAPTURE_PATH"]).write_text(json.dumps({
     "home": os.environ.get("HERMES_HOME"),
     "telegram": os.environ.get("TELEGRAM_BOT_TOKEN"),
     "model_key": os.environ.get("DIRECTOR_LITELLM_KEY"),
+    "terminal_cwd": os.environ.get("TERMINAL_CWD"),
 }))
 """,
         encoding="utf-8",
@@ -99,6 +102,7 @@ def test_launcher_reads_volatile_credentials_and_forwards_only_key_name(
     assert observed["telegram"] == "telegram-runtime-secret"
     assert observed["model_key"] == "model-runtime-secret"
     assert observed["home"].endswith("/.hermes/profiles/demo-director")
+    assert observed["terminal_cwd"] == str(role.parents[2])
     assert observed["argv"] == [
         "gateway",
         "run",

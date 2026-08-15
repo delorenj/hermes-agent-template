@@ -164,6 +164,42 @@ def test_telegram_ignores_shared_fleet_token_and_defers_noninteractive(tmp_path:
     assert BOT_TOKEN in fleet.read_text(encoding="utf-8")
 
 
+def test_local_only_marker_does_not_block_later_telegram_activation(tmp_path: Path) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    fleet = home / ".hermes" / "fleet.env"
+    fleet.parent.mkdir(parents=True)
+    fleet.write_text("TELEGRAM_ALLOWED_USERS=111\n", encoding="utf-8")
+    marker = role / ".scripts" / ".done-30-telegram"
+    unrelated = role / ".scripts" / ".done-20-runtime-repo"
+    marker.touch()
+    unrelated.touch()
+    bindir = _fake_bin(tmp_path)
+
+    deferred = _run(role, registry, home, bindir, {"SKIP_TELEGRAM": "1"})
+
+    assert deferred.returncode == 0, deferred.stderr
+    assert not marker.exists()
+    assert unrelated.exists()
+    assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "disabled"
+
+    activated = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "EXPECTED_TELEGRAM_TOKEN": BOT_TOKEN,
+        },
+    )
+
+    assert activated.returncode == 0, activated.stderr
+    assert marker.exists()
+    assert unrelated.exists()
+    assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "verified"
+
+
 def test_explicit_token_writes_only_private_runtime_env_and_identity(tmp_path: Path) -> None:
     role, runtime, registry = _make_role(tmp_path)
     home = tmp_path / "home"

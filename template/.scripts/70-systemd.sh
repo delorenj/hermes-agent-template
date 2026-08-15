@@ -12,20 +12,35 @@ if [[ "$ROLE" == "reporter" ]]; then
   exit 0
 fi
 
-# Local-only provisioning must not inspect or mutate the host user manager.
-# Honor the explicit skip before creating unit directories or querying legacy
-# unit state; cleanup remains fail-closed whenever systemd management is active.
-[[ "${SKIP_SYSTEMD:-0}" == "1" ]] && { log "[70] systemd — SKIPPED"; mark_done 70-systemd; exit 0; }
-
+# Resolve expected paths without creating directories or querying the user
+# manager.  A legacy skip-created marker is complete only when all units exist.
 RUNTIME="$ROLE_DIR/runtime"
-# Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
-# dir, never the raw runtime path — Hermes derives profile identity and shared
-# fleet auth from the unresolved HERMES_HOME. $RUNTIME stays correct for
-# EnvironmentFile and logs: those are the repo-owned side the profile links to.
 FLEET_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}"
 PROFILE_HOME="$FLEET_HOME/profiles/${PROFILE_NAME:-$AGENT_ID}"
 REPO_ROOT="$(project_repo_path)" || REPO_ROOT="$ROLE_DIR"
 SYS_DIR="$HOME/.config/systemd/user"
+GW_UNIT="hermes-${AGENT_ID}-gateway.service"
+HB_SVC="hermes-${AGENT_ID}-heartbeat.service"
+HB_TIMER="hermes-${AGENT_ID}-heartbeat.timer"
+
+# Local-only provisioning must not inspect or mutate the host user manager.
+# Honor the explicit skip before creating unit directories or querying legacy
+# unit state; cleanup remains fail-closed whenever systemd management is active.
+if [[ "${SKIP_SYSTEMD:-0}" == "1" ]]; then
+  if already_done 70-systemd \
+     && [[ -f "$SYS_DIR/$GW_UNIT" && -f "$SYS_DIR/$HB_SVC" && -f "$SYS_DIR/$HB_TIMER" ]]; then
+    log "[70] systemd — SKIPPED; existing complete unit set preserved"
+  else
+    clear_done 70-systemd
+    log "[70] systemd — DEFERRED (completion marker cleared)"
+  fi
+  exit 0
+fi
+
+# Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
+# dir, never the raw runtime path — Hermes derives profile identity and shared
+# fleet auth from the unresolved HERMES_HOME. $RUNTIME stays correct for
+# EnvironmentFile and logs: those are the repo-owned side the profile links to.
 mkdir -p "$SYS_DIR" "$RUNTIME/logs"
 
 # Upgrade remediation must run before honoring a legacy done marker. Older
@@ -67,7 +82,14 @@ if [[ $legacy_consumer_present -eq 1 ]]; then
   log "    retired legacy per-profile Bloodbank consumer: $LEGACY_CONSUMER_UNIT"
 fi
 
-already_done 70-systemd && { log "[70] systemd already installed — legacy cleanup checked"; exit 0; }
+if already_done 70-systemd; then
+  if [[ -f "$SYS_DIR/$GW_UNIT" && -f "$SYS_DIR/$HB_SVC" && -f "$SYS_DIR/$HB_TIMER" ]]; then
+    log "[70] systemd already installed — reconciling unit definitions"
+  else
+    clear_done 70-systemd
+    log "    stale/incomplete systemd marker cleared — reconciling required units"
+  fi
+fi
 
 # The heartbeat runner (board-reconciliation sentinel pass + gated checkpoint)
 # and the checkpoint helper both render into the role dir; just ensure they are
@@ -103,7 +125,6 @@ if [[ -f "$MODEL_CREDENTIAL" ]]; then
 fi
 
 # Gateway unit
-GW_UNIT="hermes-${AGENT_ID}-gateway.service"
 cat > "$SYS_DIR/$GW_UNIT" <<UNIT
 [Unit]
 Description=Hermes Gateway — $DISPLAY_NAME
@@ -115,6 +136,7 @@ Type=simple
 Environment=HERMES_HOME=$PROFILE_HOME
 Environment=HERMES_BIN=$HERMES_BIN
 Environment=CODEX_HOME=$CODEX_HOME
+Environment="TERMINAL_CWD=$REPO_ROOT"
 EnvironmentFile=-$RUNTIME/.env
 $GW_CREDENTIAL_LINES
 ExecStart=$CREDENTIAL_LAUNCHER gateway
@@ -131,8 +153,6 @@ UNIT
 # Frequent ticks (1 min); heartbeat.sh's own cooldown/lock logic rate-limits the
 # full Hermes pass, and the checkpoint is gated to ~hourly inside the runner.
 # The per-agent EnvironmentFiles load ticket-provider creds for the sentinel pass.
-HB_SVC="hermes-${AGENT_ID}-heartbeat.service"
-HB_TIMER="hermes-${AGENT_ID}-heartbeat.timer"
 cat > "$SYS_DIR/$HB_SVC" <<UNIT
 [Unit]
 Description=Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME
@@ -145,6 +165,7 @@ WorkingDirectory=$REPO_ROOT
 Environment=HERMES_HOME=$PROFILE_HOME
 Environment=HERMES_BIN=$HERMES_BIN
 Environment=CODEX_HOME=$CODEX_HOME
+Environment="TERMINAL_CWD=$REPO_ROOT"
 EnvironmentFile=-%h/.config/hermes-agent/env
 EnvironmentFile=-%h/.hermes/env
 EnvironmentFile=-%h/.hermes/hermes-agent.env

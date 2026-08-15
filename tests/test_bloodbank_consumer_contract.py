@@ -152,6 +152,7 @@ def test_step_60_is_a_harmless_compatibility_noop(tmp_path: Path, skip: str) -> 
 def test_systemd_installs_only_profile_gateway_and_heartbeat(tmp_path: Path) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_systemctl = fake_bin / "systemctl"
@@ -181,6 +182,7 @@ exit 1
     assert "bloodbank-consumer.py" not in rendered
     assert "consumer.log" not in rendered
     assert f"Environment=HERMES_HOME={Path(env['HOME']) / '.hermes' / 'profiles' / 'demo-pm'}" in rendered
+    assert f'Environment="TERMINAL_CWD={tmp_path}"' in rendered
     assert "ExecStart=" + str(role / ".scripts" / "credential-launch.sh") + " gateway" in rendered
     assert "HERMES_OAUTH_FILE" not in rendered
 
@@ -205,8 +207,28 @@ def test_systemd_skip_never_queries_or_writes_user_manager_state(tmp_path: Path)
 
     assert result.returncode == 0, result.stderr
     assert not called.exists()
-    assert (role / ".scripts" / ".done-70-systemd").is_file()
+    assert not (role / ".scripts" / ".done-70-systemd").exists()
     assert not (Path(env["HOME"]) / ".config" / "systemd" / "user").exists()
+
+    env.pop("SKIP_SYSTEMD")
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) exit 1 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    activated = _run(role, "70-systemd.sh", env)
+    assert activated.returncode == 0, activated.stderr
+    assert (role / ".scripts" / ".done-70-systemd").is_file()
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    assert (unit_dir / "hermes-demo-pm-gateway.service").is_file()
+    assert (unit_dir / "hermes-demo-pm-heartbeat.service").is_file()
+    assert (unit_dir / "hermes-demo-pm-heartbeat.timer").is_file()
 
 
 def test_systemd_loads_optional_encrypted_credentials_without_plaintext(
@@ -265,6 +287,12 @@ def test_systemd_done_marker_still_retires_legacy_consumer(tmp_path: Path) -> No
     unit_dir.mkdir(parents=True)
     consumer = unit_dir / "hermes-demo-pm-consumer.service"
     consumer.write_text("legacy\n", encoding="utf-8")
+    for unit in (
+        "hermes-demo-pm-gateway.service",
+        "hermes-demo-pm-heartbeat.service",
+        "hermes-demo-pm-heartbeat.timer",
+    ):
+        (unit_dir / unit).write_text("existing\n", encoding="utf-8")
     (role / ".scripts" / ".done-70-systemd").touch()
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -281,6 +309,8 @@ case "$*" in
   *"is-enabled hermes-demo-pm-consumer.service"*)
     if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
   *"is-system-running"*) echo running; exit 0 ;;
+  *"daemon-reload"*) exit 0 ;;
+  *"enable --now "*) exit 0 ;;
 esac
 exit 1
 """,
@@ -300,8 +330,8 @@ exit 1
     assert result.returncode == 0, result.stderr
     assert not consumer.exists()
     assert "disable --now hermes-demo-pm-consumer.service" in log.read_text(encoding="utf-8")
-    assert "legacy cleanup checked" in result.stderr
-    assert not (unit_dir / "hermes-demo-pm-gateway.service").exists()
+    assert "reconciling unit definitions" in result.stderr
+    assert "Hermes Gateway" in (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
 
 
 def test_systemd_preserves_legacy_consumer_when_disable_fails(tmp_path: Path) -> None:

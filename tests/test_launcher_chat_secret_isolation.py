@@ -12,9 +12,11 @@ LAUNCHER_TEMPLATE = ROOT / "template" / "hermes.jinja"
 
 def test_launcher_drops_shared_identity_credentials_but_keeps_policy(tmp_path: Path) -> None:
     home = tmp_path / "home"
-    role = tmp_path / "role"
+    project = tmp_path / "project"
+    role = project / "agents" / "hermes" / "pm"
     runtime = role / "runtime"
     runtime.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
     fleet = home / ".hermes" / "fleet.env"
     fleet.parent.mkdir(parents=True)
     # Singleton-runtime contract: the launcher resolves HERMES_HOME to the named
@@ -35,6 +37,7 @@ keys = (
     "TELEGRAM_ALLOWED_USERS",
     "SLACK_ALLOWED_USERS",
     "HERMES_HOME",
+    "TERMINAL_CWD",
 )
 print(json.dumps({key: os.environ.get(key) for key in keys}))
 """,
@@ -92,3 +95,4 @@ print(json.dumps({key: os.environ.get(key) for key in keys}))
     # from the unresolved HERMES_HOME, so pointing it at the runtime makes
     # get_active_profile_name() report "default" and disables shared auth.
     assert observed["HERMES_HOME"] == str(profile)
+    assert observed["TERMINAL_CWD"] == str(project)
