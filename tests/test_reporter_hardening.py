@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,6 +69,86 @@ class ReporterTemplateHardeningTests(unittest.TestCase):
             self.assertEqual(scanner.findings(root), [])
             (root / "unsafe.yaml").write_text("secret: literal-sensitive-value\n")
             self.assertTrue(scanner.findings(root))
+
+    def test_rendered_director_scanner_accepts_op_and_dependencies_but_blocks_literal(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            target = Path(temp) / "rendered-director"
+            subprocess.run(
+                [
+                    "copier",
+                    "copy",
+                    "--skip-tasks",
+                    "--defaults",
+                    "--trust",
+                    "-d",
+                    "target_repo=delonet-company",
+                    "-d",
+                    "role=director",
+                    str(ROOT),
+                    str(target),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            (target / ".env.op").write_text(
+                "OPENAI_API_KEY=op://DeLoSecrets/OpenAI/credential\n",
+                encoding="utf-8",
+            )
+            dependency = target / ".venv" / "lib" / "site-packages"
+            dependency.mkdir(parents=True)
+            secret_name = "sec" + "ret"
+            (dependency / "dependency.py").write_text(
+                secret_name + " = dependency-package-literal\n", encoding="utf-8"
+            )
+            (dependency / "certificate.pem").write_text(
+                "dependency trust bundle\n", encoding="utf-8"
+            )
+            (target / "source-computations.py").write_text(
+                """import os
+import re
+import subprocess
+
+_CONFIG_TOKEN = re.compile(r"token")
+token = os.environ["RUNTIME_TOKEN"]
+token = subprocess.run(["true"], check=False)
+safe_map = {
+    token: value.replace("old", "new")
+    for token, value in []
+}
+headers = {
+    "Authorization": f"Bearer {token}",
+}
+""",
+                encoding="utf-8",
+            )
+            scanner = target / ".scripts" / "secret-scan.py"
+
+            clean = subprocess.run(
+                [sys.executable, str(scanner), str(target)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            self.assertIn("secret scan: clean", clean.stdout)
+
+            (target / ".env.op").write_text(
+                "OPENAI_API_KEY=literal-sensitive-value\n", encoding="utf-8"
+            )
+            blocked = subprocess.run(
+                [sys.executable, str(scanner), str(target)],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn(
+                "literal credential assignment: .env.op",
+                blocked.stdout,
+            )
 
     def test_runtime_bootstrap_scans_before_scaffold_lands_in_runtime(self) -> None:
         # Runtimes are local and are never pushed to a per-agent remote, so the
