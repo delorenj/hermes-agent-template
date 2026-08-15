@@ -54,6 +54,7 @@ slack:
   bot_id: ""
   bot_username: ""
 bloodbank:
+  enabled: false
   gateway_scope: fleet
   target_agent_id: "demo-pm"
   producer: "hermes-agent:demo-pm"
@@ -440,6 +441,7 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
     assert result.returncode == 0, result.stderr
     entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
     assert entry["bloodbank"] == {
+        "enabled": False,
         "gateway_scope": "fleet",
         "target_agent_id": "demo-pm",
     }
@@ -448,6 +450,70 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
         "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
     }
     assert "consumer_unit" not in entry["systemd"]
+
+
+@pytest.mark.parametrize(
+    ("role_name", "agent_id"),
+    (("pm", "demo-pm"), ("director", "demo-director")),
+)
+def test_bloodbank_stays_quarantined_until_explicit_activation(
+    tmp_path: Path, role_name: str, agent_id: str
+) -> None:
+    role, registry = _make_role(tmp_path)
+    role_yaml = role / "role.yaml"
+    if role_name == "director":
+        role_yaml.write_text(
+            role_yaml.read_text(encoding="utf-8")
+            .replace("role: pm", "role: director")
+            .replace("demo-pm", agent_id)
+            .replace("Demo PM", "Demo Director"),
+            encoding="utf-8",
+        )
+    env = _environment(tmp_path, registry)
+
+    planned = _run(role, "80-registry.sh", env)
+    assert planned.returncode == 0, planned.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
+    assert entry["bloodbank"]["enabled"] is False
+    assert isinstance(entry["bloodbank"]["enabled"], bool)
+
+    unchanged = _run(role, "80-registry.sh", env)
+    assert unchanged.returncode == 0, unchanged.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
+    assert entry["bloodbank"]["enabled"] is False
+
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "  enabled: false", "  enabled: true"
+        ),
+        encoding="utf-8",
+    )
+    activated = _run(role, "80-registry.sh", env)
+    assert activated.returncode == 0, activated.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
+    assert entry["bloodbank"]["enabled"] is True
+    assert isinstance(entry["bloodbank"]["enabled"], bool)
+
+
+def test_registry_rejects_malformed_bloodbank_gate_without_mutation(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    seeded = _run(role, "80-registry.sh", env)
+    assert seeded.returncode == 0, seeded.stderr
+    before = registry.read_bytes()
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "  enabled: false", "  enabled: yes"
+        ),
+        encoding="utf-8",
+    )
+
+    malformed = _run(role, "80-registry.sh", env)
+
+    assert malformed.returncode != 0
+    assert "strict YAML boolean" in malformed.stderr
+    assert registry.read_bytes() == before
 
 
 def test_concurrent_registry_upserts_are_atomic_and_lossless(tmp_path: Path) -> None:
@@ -536,6 +602,7 @@ def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
     step = (SCRIPTS / "60-bloodbank.sh").read_text(encoding="utf-8")
 
     assert "gateway_scope: fleet" in role
+    assert "enabled: false" in role
     assert 'target_agent_id: "{{ agent_id }}"' in role
     assert './.scripts/60-bloodbank.sh' in copier
     assert "SKIP_BLOODBANK accepted as a compatibility no-op" in step

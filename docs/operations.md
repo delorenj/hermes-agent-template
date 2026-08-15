@@ -168,6 +168,11 @@ systemctl --user list-timers 'hermes-*'
 python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpath('.hermes/agents-registry.yaml').read_text())['agents']['<agent-id>']['bloodbank'])"
 ```
 
+A resolvable target remains quarantined while `bloodbank.enabled` is `false`.
+After the profile and ingress policy have passed their activation checks, edit
+that strict boolean to `true` in the role's `role.yaml`, then rerun
+`.scripts/80-registry.sh`. No provisioning or parity command auto-enables it.
+
 ## Deferred manual steps (one-time per agent)
 
 ### Telegram bot

@@ -133,6 +133,7 @@ not by a consumer in every runtime. Each registry entry advertises:
 
 ```yaml
 bloodbank:
+  enabled: false
   gateway_scope: fleet
   target_agent_id: <agent-id>
 ```
@@ -141,6 +142,11 @@ The shared gateway subscribes once, resolves `data.target_agent_id` through the
 fleet registry, and routes the turn into that Hermes profile. Per-profile
 messaging gateways and heartbeat timers remain independent; there is no
 per-profile NATS process, systemd consumer unit, or filesystem inbox bridge.
+
+Discovery is not execution authority. New roles and registry entries start
+with strict boolean `bloodbank.enabled: false`; only an explicit activation
+edit may set it to `true`. Provisioning preserves that explicit manifest value
+and never infers activation from a resolvable target or installed service.
 
 Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
 `producer = hermes-agent:<id>`, `source = hermes://agent/<id>`. The naming

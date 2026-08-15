@@ -78,6 +78,8 @@ plane:
 # reads the fleet registry and routes canonical commands by target_agent_id;
 # this profile does not install its own NATS consumer or inbox bridge.
 bloodbank:
+  # Quarantine gate: discovery is safe; execution requires explicit activation.
+  enabled: false
   gateway_scope: fleet
   target_agent_id: "{{ agent_id }}"
   producer: "hermes-agent:{{ agent_id }}"
