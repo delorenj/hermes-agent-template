@@ -592,7 +592,7 @@ PYEOF
 )"
       if [[ "$config_status" != "ok|ok|ok" ]]; then
         if [[ "$APPLY" -eq 1 ]]; then
-          hermes_bin="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}"
+          hermes_bin="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}"
           HERMES_HOME="$profile_dir" "$hermes_bin" config set "plugins.enabled.0" "tts/$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
           HERMES_HOME="$profile_dir" "$hermes_bin" config set tts.provider "$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
           HERMES_HOME="$profile_dir" "$hermes_bin" config set "tts.$VOX_PLUGIN_NAME.voice" "$VOX_VOICE" >/dev/null 2>&1 || true

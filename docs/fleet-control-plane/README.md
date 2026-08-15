@@ -15,7 +15,7 @@ The Fleet remains a set of independently useful parts:
 - `CommonProject` owns the base project scaffold.
 - `hermes-agent-template` owns agent-role provisioning.
 - `~/.hermes` owns live runtime state.
-- `~/.hermes/hermes-agent` owns the Hermes engine checkout and binary.
+- `~/.local/share/hermes-agent/releases/<commit>` owns each immutable Hermes engine checkout and binary.
 - `pjangler` becomes the explicit Fleet control plane.
 - n8n becomes the visual orchestration layer, backed by local systemd fallback.
 
@@ -32,4 +32,3 @@ The formal BMAD workflow expects a project-local `_bmad` runtime, PRD, and
 step-by-step user confirmations. This repo does not currently contain `_bmad`.
 These artifacts preserve the BMAD intent and structure while using the live
 architecture review and advanced elicitation decisions as input.
-

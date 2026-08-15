@@ -21,11 +21,11 @@ else
     cat > "$CONFIG" <<'TOML'
 # hermes-agent-template config — edit for your environment.
 [fleet]
-hermes_bin = "~/.hermes/hermes-agent/.venv/bin/hermes"
-hermes_repo = "~/.hermes/hermes-agent"
+hermes_bin = "~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes"
+hermes_repo = "~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1"
 hermes_git_url = "https://github.com/delorenj/hermes-agent.git"
-hermes_git_ref = "feature/PJAN-19-routing-publication"
-hermes_git_sha = "113e1b182b6d72a7dd02a191f134a41668ceaf0e"
+hermes_git_ref = "main"
+hermes_git_sha = "0408fec7a153e6c32c064acd2b8053917f1525f1"
 fleet_env = "~/.hermes/fleet.env"
 registry_file = "~/.hermes/agents-registry.yaml"
 canonical_skills_dir = "/home/delorenj/.agents/skills"

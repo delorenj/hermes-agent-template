@@ -24,8 +24,8 @@ set -eu
 # Fleet runtime publication. These values intentionally identify the reviewed
 # fork commit; clean installs must never fall back to NousResearch/main.
 HERMES_RUNTIME_GIT_URL="https://github.com/delorenj/hermes-agent.git"
-HERMES_RUNTIME_GIT_REF="feature/PJAN-19-routing-publication"
-HERMES_RUNTIME_GIT_SHA="113e1b182b6d72a7dd02a191f134a41668ceaf0e"
+HERMES_RUNTIME_GIT_REF="main"
+HERMES_RUNTIME_GIT_SHA="0408fec7a153e6c32c064acd2b8053917f1525f1"
 
 say()  { printf '\033[36m%s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
@@ -55,11 +55,13 @@ say "   template: $TEMPLATE_SRC"
 say "   os:       $OS"
 
 # --- 1. Ensure the hermes CLI ------------------------------------------------
-if command -v hermes >/dev/null 2>&1; then
-  say "1. hermes: found ($(command -v hermes))"
+HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.local/share/hermes-agent/releases/$HERMES_RUNTIME_GIT_SHA}"
+HERMES_BIN="$HERMES_INSTALL_DIR/.venv/bin/hermes"
+_installed_sha="$(git -C "$HERMES_INSTALL_DIR" rev-parse HEAD 2>/dev/null || true)"
+if [ "$_installed_sha" = "$HERMES_RUNTIME_GIT_SHA" ] && [ -x "$HERMES_BIN" ]; then
+  say "1. hermes: pinned release found ($HERMES_BIN)"
 else
-  say "1. hermes: not found — installing"
-  HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"
+  say "1. hermes: pinned release not found — installing"
   if [ "${HAT_DRY_RUN:-0}" = "1" ]; then
     say "  [dry-run] clone $HERMES_RUNTIME_GIT_URL@$HERMES_RUNTIME_GIT_REF"
     say "  [dry-run] verify and install commit $HERMES_RUNTIME_GIT_SHA"
@@ -90,10 +92,10 @@ else
     _installed_sha="$(git -C "$HERMES_INSTALL_DIR" rev-parse HEAD)"
     [ "$_installed_sha" = "$HERMES_RUNTIME_GIT_SHA" ] \
       || die "Hermes installer did not retain pinned commit $HERMES_RUNTIME_GIT_SHA"
+    [ -x "$HERMES_BIN" ] \
+      || die "Hermes installer did not create the pinned executable: $HERMES_BIN"
   fi
-  command -v hermes >/dev/null 2>&1 || die "hermes install did not put 'hermes' on PATH. Open a new shell and re-run."
 fi
-HERMES_BIN="$(command -v hermes)"
 
 # --- 2. Ensure copier --------------------------------------------------------
 if command -v copier >/dev/null 2>&1; then
@@ -118,7 +120,7 @@ else
 # Local install — cloud fields intentionally blank.
 [fleet]
 hermes_bin = "$HERMES_BIN"
-hermes_repo = "$HOME/.hermes/hermes-agent"
+hermes_repo = "$HERMES_INSTALL_DIR"
 hermes_git_url = "$HERMES_RUNTIME_GIT_URL"
 hermes_git_ref = "$HERMES_RUNTIME_GIT_REF"
 hermes_git_sha = "$HERMES_RUNTIME_GIT_SHA"

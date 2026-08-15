@@ -157,12 +157,12 @@ fi
 unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
 # Tools we expect on the host
-HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.hermes/hermes-agent/.venv/bin/hermes")}}"
-HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.hermes/hermes-agent")}}"
+HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}}"
+HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}}"
 PJANGLER_BIN="${PJANGLER_BIN:-$(config_get fleet.pjangler_bin "pj")}"
 HERMES_RUNTIME_GIT_URL="${HERMES_RUNTIME_GIT_URL:-$(config_get fleet.hermes_git_url 'https://github.com/delorenj/hermes-agent.git')}"
-HERMES_RUNTIME_GIT_REF="${HERMES_RUNTIME_GIT_REF:-$(config_get fleet.hermes_git_ref 'feature/PJAN-19-routing-publication')}"
-HERMES_RUNTIME_GIT_SHA="${HERMES_RUNTIME_GIT_SHA:-$(config_get fleet.hermes_git_sha '113e1b182b6d72a7dd02a191f134a41668ceaf0e')}"
+HERMES_RUNTIME_GIT_REF="${HERMES_RUNTIME_GIT_REF:-$(config_get fleet.hermes_git_ref 'main')}"
+HERMES_RUNTIME_GIT_SHA="${HERMES_RUNTIME_GIT_SHA:-$(config_get fleet.hermes_git_sha '0408fec7a153e6c32c064acd2b8053917f1525f1')}"
 HERMES_OAUTH_FILE="${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$(config_get fleet.oauth_file "$HOME/.hermes/auth.json")}}"
 CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_home "$HOME/.codex")}}"
 # Prefer a scaffold vendored into this agent directory; fall back to the configured template path.

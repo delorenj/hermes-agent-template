@@ -128,15 +128,17 @@ installer verifies the commit belongs to the named ref and refuses an existing
 checkout whose `origin` points elsewhere:
 
 ```bash
-git clone --branch feature/PJAN-19-routing-publication --single-branch \
-  https://github.com/delorenj/hermes-agent.git ~/.hermes/hermes-agent
-git -C ~/.hermes/hermes-agent rev-parse HEAD
-# 113e1b182b6d72a7dd02a191f134a41668ceaf0e
+git clone --branch main --single-branch \
+  https://github.com/delorenj/hermes-agent.git \
+  ~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1
+git -C ~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1 rev-parse HEAD
+# 0408fec7a153e6c32c064acd2b8053917f1525f1
 ```
 
-Do not install this fleet path from `NousResearch/hermes-agent` or mutate its
-`main` branch. Promotion happens on the fork publication ref and is pinned by
-full commit SHA in `config.example.toml` and each registry entry.
+Do not install this fleet path from `NousResearch/hermes-agent` or mutate a
+shared working checkout. Promotion happens on the reviewed fork `main` and is
+installed into an immutable, full-SHA release directory pinned by
+`config.example.toml` and each registry entry.
 
 ## Fleet single source-of-truth
 
