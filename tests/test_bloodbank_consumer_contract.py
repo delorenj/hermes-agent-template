@@ -603,7 +603,7 @@ def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
 
     assert "gateway_scope: fleet" in role
     assert "enabled: false" in role
-    assert 'target_agent_id: "{{ agent_id }}"' in role
+    assert "target_agent_id: {{ agent_id | tojson }}" in role
     assert './.scripts/60-bloodbank.sh' in copier
     assert "SKIP_BLOODBANK accepted as a compatibility no-op" in step
     for legacy in ("/dev/tcp", "uv pip install", "bloodbank-consumer.py"):

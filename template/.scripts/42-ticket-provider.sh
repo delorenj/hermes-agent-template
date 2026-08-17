@@ -12,6 +12,15 @@
 #         it becomes the SOT for every agent in this repo.
 # Either way we register this agent under .project.json `agents` and mirror the
 # binding into role.yaml for back-compat (80-registry.sh / 99-summary.sh).
+
+# The caller's negative board grant is authoritative. Check it before sourcing
+# _lib.sh so a skipped step cannot load fleet credentials, create logs/markers,
+# inspect bindings, or reach a provider adapter.
+if [[ "${SKIP_PLANE:-0}" == "1" ]]; then
+  printf '%s\n' '[42] ticket provider — SKIPPED (SKIP_PLANE=1)' >&2
+  exit 0
+fi
+
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
@@ -74,7 +83,15 @@ if set_provider == "1":
     if board_url:  tp["board_url"] = board_url
     if team:       tp["team"] = team
 ag = d.setdefault("agents", {})
-ag[os.environ["AGENT_ID"]] = {"role": os.environ["ROLE"], "role_dir": os.environ["ROLE_DIR_REL"]}
+entry = ag.get(os.environ["AGENT_ID"], {})
+if not isinstance(entry, dict):
+    entry = {}
+entry.update({
+    "role": os.environ["ROLE"],
+    "role_dir": os.environ["ROLE_DIR_REL"],
+    "provisioning_state": "provisioned",
+})
+ag[os.environ["AGENT_ID"]] = entry
 p.write_text(json.dumps(d, indent=2) + "\n")
 PY
   log "    .project.json updated (agent=$AGENT_ID)"

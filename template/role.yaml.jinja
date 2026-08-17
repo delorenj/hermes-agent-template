@@ -2,32 +2,32 @@
 # The agent's actual state (memory, sessions, evolving SOUL) lives in the
 # ignored local runtime. This file is the immutable contract for this role.
 
-repo: {{ target_repo }}
-role: "{{ role }}"
-agent_id: {{ agent_id }}
-display_name: "{{ display_name }}"
-purpose: "{{ agent_purpose }}"
+repo: {{ target_repo | tojson }}
+role: {{ role | tojson }}
+agent_id: {{ agent_id | tojson }}
+display_name: {{ display_name | tojson }}
+purpose: {{ agent_purpose | tojson }}
 
 # Process-local gateway inference target (empty = inherit from shared
 # ~/.hermes/config.yaml). key_env is a variable NAME only; its secret value is
 # injected at runtime and must never be written here.
 model:
-  provider: "{{ model_provider }}"
-  name: "{{ model_name }}"
-  base_url: "{{ model_base_url }}"
-  api_mode: "{{ model_api_mode }}"
-  key_env: "{{ model_key_env }}"
+  provider: {{ model_provider | tojson }}
+  name: {{ model_name | tojson }}
+  base_url: {{ model_base_url | tojson }}
+  api_mode: {{ model_api_mode | tojson }}
+  key_env: {{ model_key_env | tojson }}
 
 # Hermes profile name. ~/.hermes/profiles/<name> is a REAL directory managed by
 # `pj migrate hermes.runtime-singleton`: shared config/auth/skills link to the
 # fleet root while role-owned state links into ./runtime. Never replace the
 # named profile with a symlink to runtime.
-profile: {{ agent_id }}
+profile: {{ agent_id | tojson }}
 
 # Telegram bot identity (one bot per agent — see docs/architecture.md).
 telegram:
   provisioning_status: "deferred"
-  bot_username: "{{ bot_handle }}"
+  bot_username: {{ bot_handle | tojson }}
   bot_id: ""
 
 # Slack is opt-in. Credentials live only in runtime/.env; this block records
@@ -44,14 +44,14 @@ slack:
 # The heartbeat reconciliation pass talks ONLY to this via .scripts/lib/ticket-provider.sh;
 # swapping providers is a one-line change here. Filled in by 42-ticket-provider.sh.
 ticket_provider:
-  name: {{ ticket_provider }}
+  name: {{ ticket_provider | tojson }}
   board_id: ""
   board_url: ""
 {%- if ticket_provider == 'linear' %}
   team: ""        # Linear team key, e.g. DEL  (set before first sentinel run)
   project: ""     # optional Linear project name to scope milestones/issues
 {%- elif ticket_provider == 'plane' %}
-  workspace: "{{ plane_workspace }}"
+  workspace: {{ plane_workspace | tojson }}
   project: ""     # Plane project uuid (set by 42-ticket-provider.sh)
 {%- elif ticket_provider == 'trello' %}
   board: ""       # Trello board id (set by 42-ticket-provider.sh)
@@ -70,7 +70,7 @@ reconcile:
 # Plane project (1:1 with this agent) — retained for fleet-registry back-compat.
 plane:
   # Empty -> resolved from ~/.config/hermes-agent-template/config.toml [plane].workspace
-  workspace: "{{ plane_workspace }}"
+  workspace: {{ plane_workspace | tojson }}
   # identifier is set by .scripts/42-ticket-provider.sh after creation (plane only)
   identifier: ""
 
@@ -81,16 +81,16 @@ bloodbank:
   # Quarantine gate: discovery is safe; execution requires explicit activation.
   enabled: false
   gateway_scope: fleet
-  target_agent_id: "{{ agent_id }}"
-  producer: "hermes-agent:{{ agent_id }}"
+  target_agent_id: {{ agent_id | tojson }}
+  producer: {{ ("hermes-agent:" ~ agent_id) | tojson }}
 
 # Pure-local role-owned state. HERMES_HOME itself is the named profile directory
 # above; the legacy GitHub identity remains metadata-only for locating old
 # archives, and provisioning never creates or attaches a submodule.
 runtime:
   # Empty owner -> resolved from config.toml [github].runtime_repo_owner.
-  github_owner: "{{ runtime_repo_owner }}"
-  github_repo: "{{ runtime_repo }}"
+  github_owner: {{ runtime_repo_owner | tojson }}
+  github_repo: {{ runtime_repo | tojson }}
   local_path: "./runtime"
   checkpoint:
     cadence: "disabled"

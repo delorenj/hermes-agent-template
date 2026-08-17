@@ -255,6 +255,19 @@ systemctl_user_unit_state() {
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
 # Walk up from $ROLE_DIR until we find a git root that isn't us.
 project_repo_path() {
+  # Structured provisioners know the project root even before a fresh target
+  # receives its own .git directory. Accept only a root that contains this
+  # exact role path; otherwise fail closed instead of walking into a parent
+  # checkout and mutating its manifest.
+  if [[ -n "${PJANGLER_PROJECT_ROOT:-}" ]]; then
+    local explicit role_real
+    explicit="$(cd "$PJANGLER_PROJECT_ROOT" 2>/dev/null && pwd -P)" || return 1
+    role_real="$(cd "$ROLE_DIR" 2>/dev/null && pwd -P)" || return 1
+    case "$role_real" in
+      "$explicit"/agents/hermes/*) printf '%s\n' "$explicit"; return 0 ;;
+      *) return 1 ;;
+    esac
+  fi
   local d="$ROLE_DIR"
   [[ -d "$d/.git" || -f "$d/.git" ]] && { echo "$d"; return 0; }
   for _ in 1 2 3 4 5; do

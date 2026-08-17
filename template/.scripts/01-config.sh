@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # Ensure the distributable config exists before any other step reads it.
 # Seeds ~/.config/hermes-agent-template/config.toml from the shipped example.
+
+# MCP render transactions establish repo-local lifecycle eligibility before
+# touching any host-global state. This guard must precede _lib.sh because that
+# library creates the role log and may read fleet configuration.
+if [[ "${SKIP_HOST_STATE:-0}" == "1" ]]; then
+  printf '%s\n' '[01] host config — DEFERRED (SKIP_HOST_STATE=1)' >&2
+  exit 0
+fi
+
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 

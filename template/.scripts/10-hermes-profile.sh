@@ -3,6 +3,12 @@
 # The directory remains REAL. Step 20 delegates final shared-vs-owned link
 # topology to `pj migrate hermes.runtime-singleton`; no template step may
 # replace the profile itself with a symlink.
+
+if [[ "${SKIP_HOST_STATE:-0}" == "1" ]]; then
+  printf '%s\n' '[10] Hermes profile — DEFERRED (SKIP_HOST_STATE=1)' >&2
+  exit 0
+fi
+
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
