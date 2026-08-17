@@ -14,6 +14,7 @@ import yaml
 ROOT = Path(__file__).parents[1]
 TELEGRAM_SCRIPT = ROOT / "template" / ".scripts" / "30-telegram.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
+LIB_DIR = ROOT / "template" / ".scripts" / "lib"
 REGISTRY_SCRIPT = ROOT / "template" / ".scripts" / "80-registry.sh"
 
 BOT_TOKEN = "123456:profile-only-secret"
@@ -28,6 +29,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     runtime.mkdir()
     shutil.copy2(TELEGRAM_SCRIPT, scripts / TELEGRAM_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
+    shutil.copytree(LIB_DIR, scripts / LIB_DIR.name)
     (role / "role.yaml").write_text(
         """repo: demo
 role: pm

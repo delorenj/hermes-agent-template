@@ -103,6 +103,13 @@ your-project/
 ~/.config/systemd/user/                     ← per-profile gateway + heartbeat timer
 ```
 
+`fleet.env` is parsed as configuration data, never sourced as shell code. Each
+non-comment line must be an optional `export` followed by a `KEY=literal`
+assignment. Literal values may be unquoted, single-quoted, double-quoted, or
+ANSI-C quoted (`$'...'`); commands, functions, `readonly`, substitutions,
+expansions, duplicate keys, and malformed input are rejected before any value
+is imported.
+
 Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
 gateway reads the registry and routes canonical commands by
 `data.target_agent_id`; local runtime directories contain no NATS consumer or

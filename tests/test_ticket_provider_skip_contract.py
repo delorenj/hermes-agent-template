@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 
@@ -39,6 +40,8 @@ GNU_LOADER_CONTROL_KEYS = tuple(
     for stem in GNU_LOADER_CONTROL_STEMS
     for key in (stem, f"{stem}_32", f"{stem}_64")
 )
+FLEET_FRAME_HEADER = "PJANGLER_FLEET_ENV_V1"
+FLEET_FRAME_FOOTER = "PJANGLER_FLEET_ENV_END"
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
@@ -149,10 +152,9 @@ def _source_library(role: Path, env: dict[str, str]) -> subprocess.CompletedProc
             "-c",
             (
                 'source "$1"; '
-                "if [[ -v PJAN67_SAFE_READONLY ]]; then "
-                "PJAN67_SAFE_READONLY=\"${PJAN67_SAFE_READONLY}:mutable\"; "
-                "export PJAN67_SAFE_READONLY; fi; "
-                "if declare -F pjan67_fleet_probe >/dev/null; then pjan67_fleet_probe; fi; "
+                "if [[ -v PJAN67_SAFE_MUTABLE ]]; then "
+                "PJAN67_SAFE_MUTABLE=\"${PJAN67_SAFE_MUTABLE}:mutable\"; "
+                "export PJAN67_SAFE_MUTABLE; fi; "
                 "env -0"
             ),
             "pjan67-lib-probe",
@@ -175,6 +177,93 @@ def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]
     }
 
 
+def _source_library_after_failure(
+    role: Path, env: dict[str, str]
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, str]]:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'if source "$1"; then source_status=0; else source_status=$?; fi; '
+                "set +e; env -0; exit \"$source_status\""
+            ),
+            "pjan67-lib-failure-probe",
+            str(role / ".scripts" / "_lib.sh"),
+        ],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    child_env = {
+        key.decode(): value.decode()
+        for entry in result.stdout.split(b"\0")
+        if entry
+        for key, value in [entry.split(b"=", 1)]
+    }
+    return result, child_env
+
+
+def _builtin_hijack_source(marker: Path, framed_payload: str) -> str:
+    return "\n".join(
+        [
+            "export PJAN67_ATOMIC_FIRST=must-not-escape",
+            "builtin() {",
+            f"  command printf '%s\\n' \"$*\" >> {shlex.quote(str(marker))}",
+            "  case \"$1\" in",
+            "    printf)",
+            "      if [[ \"${3:-}\" == PJANGLER_FLEET_ENV_V1 ]]; then",
+            f"        command printf '%b' {shlex.quote(framed_payload)}",
+            "      fi",
+            "      return 0",
+            "      ;;",
+            "    read) return 1 ;;",
+            "    *) return 0 ;;",
+            "  esac",
+            "}",
+            "export -f builtin",
+            "readonly -f builtin",
+            "",
+        ]
+    )
+
+
+def _run_raw_fleet_stream(
+    role: Path,
+    env: dict[str, str],
+    stream: Path,
+    *,
+    producer_status: int = 0,
+) -> tuple[subprocess.CompletedProcess[bytes], dict[str, str]]:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; '
+                'exec {fleet_fd}< <(/usr/bin/cat "$2"; exit "$3"); fleet_pid=$!; '
+                "if import_fleet_environment_stream \"$fleet_fd\" \"$fleet_pid\"; "
+                "then import_status=0; else import_status=$?; fi; "
+                "set +e; env -0; exit \"$import_status\""
+            ),
+            "pjan67-raw-frame-probe",
+            str(role / ".scripts" / "_lib.sh"),
+            str(stream),
+            str(producer_status),
+        ],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    child_env = {
+        key.decode(): value.decode()
+        for entry in result.stdout.split(b"\0")
+        if entry and b"=" in entry
+        for key, value in [entry.split(b"=", 1)]
+    }
+    return result, child_env
+
+
 def _fleet_authority_fixture(
     tmp_path: Path, caller_skip: str, fleet_skip: str
 ) -> tuple[Path, dict[str, str]]:
@@ -182,6 +271,7 @@ def _fleet_authority_fixture(
     scripts = role / ".scripts"
     scripts.mkdir(parents=True)
     shutil.copy2(TEMPLATE_SCRIPTS / "_lib.sh", scripts)
+    shutil.copytree(TEMPLATE_SCRIPTS / "lib", scripts / "lib")
     fleet_env = tmp_path / "home" / ".hermes" / "fleet.env"
     fleet_env.parent.mkdir(parents=True)
     fleet_env.write_text(
@@ -194,37 +284,6 @@ def _fleet_authority_fixture(
                 "export TRELLO_KEY=fleet-trello-key-sentinel",
                 "export TRELLO_TOKEN=fleet-trello-token-sentinel",
                 "export LINEAR_API_KEY=fleet-linear-sentinel",
-                "export PYTHONPATH=/tmp/fleet-python-path-sentinel",
-                "export PYTHONHOME=/tmp/fleet-python-home-sentinel",
-                "export PYTHONSTARTUP=/tmp/fleet-python-startup-sentinel.py",
-                "export PYTHONUSERBASE=/tmp/fleet-python-userbase-sentinel",
-                "export BASH_ENV=/tmp/fleet-bash-env-sentinel",
-                "export ENV=/tmp/fleet-shell-env-sentinel",
-                "export NODE_OPTIONS=--require=/tmp/fleet-node-sentinel.cjs",
-                "export NODE_PATH=/tmp/fleet-node-path-sentinel",
-                *[
-                    f"export {key}=fleet-loader-control-sentinel"
-                    for key in GNU_LOADER_CONTROL_KEYS
-                ],
-                "export GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2",
-                "export DYLD_INSERT_LIBRARIES=/tmp/fleet-loader-sentinel.dylib",
-                "export DYLD_LIBRARY_PATH=/tmp/fleet-dyld-path-sentinel",
-                "export BASHOPTS",
-                "export SHELLOPTS",
-                "export BASH_COMPAT=50",
-                "export BASH_LOADABLES_PATH=/tmp/fleet-bash-builtins-sentinel",
-                "export BASH_XTRACEFD=2",
-                "export PROMPT_COMMAND='printf fleet-prompt-sentinel'",
-                "export PS4='fleet-trace-sentinel'",
-                "pjan67_fleet_probe() { printf 'fleet-function-loaded\\n' >> \"$PJAN67_BASH_FUNCTION_LOG\"; }",
-                "export -f pjan67_fleet_probe",
-                "readonly -f pjan67_fleet_probe",
-                f"readonly {' '.join(GNU_LOADER_CONTROL_KEYS)}",
-                (
-                    "readonly GLIBC_TUNABLES BASH_ENV ENV NODE_OPTIONS NODE_PATH "
-                    "BASH_COMPAT BASH_LOADABLES_PATH BASH_XTRACEFD "
-                    "PROMPT_COMMAND PS4 DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH"
-                ),
                 "export LD_SDK_KEY=fleet-non-loader-functional-value",
                 "",
             ]
@@ -247,6 +306,167 @@ def _fleet_authority_fixture(
         }
     )
     return role, env
+
+
+def test_fleet_import_never_executes_a_readonly_builtin_function(
+    tmp_path: Path,
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    marker = tmp_path / "builtin-hijack.log"
+    fleet_env = Path(env["HERMES_FLEET_ENV"])
+    fleet_env.write_text(
+        _builtin_hijack_source(
+            marker,
+            f"{FLEET_FRAME_HEADER}\\0{FLEET_FRAME_FOOTER}\\0",
+        ),
+        encoding="utf-8",
+    )
+
+    result, child_env = _source_library_after_failure(role, env)
+
+    assert result.returncode != 0
+    assert b"fleet environment import failed" in result.stderr
+    assert "PJAN67_ATOMIC_FIRST" not in child_env
+    assert not marker.exists(), "fleet data must never execute as shell code"
+
+
+@pytest.mark.parametrize(
+    "case,framed_payload",
+    [
+        (
+            "malformed",
+            f"{FLEET_FRAME_HEADER}\\0PJAN67_ATOMIC_FIRST=leaked\\0MALFORMED\\0{FLEET_FRAME_FOOTER}\\0",
+        ),
+        (
+            "duplicate",
+            f"{FLEET_FRAME_HEADER}\\0PJAN67_ATOMIC_FIRST=one\\0PJAN67_ATOMIC_FIRST=two\\0{FLEET_FRAME_FOOTER}\\0",
+        ),
+        ("truncated", f"{FLEET_FRAME_HEADER}\\0PJAN67_ATOMIC_FIRST=leaked\\0"),
+        (
+            "unterminated",
+            f"{FLEET_FRAME_HEADER}\\0PJAN67_ATOMIC_FIRST=leaked\\0{FLEET_FRAME_FOOTER}\\0",
+        ),
+    ],
+)
+def test_fleet_import_hijack_cannot_partially_apply_forged_frames(
+    tmp_path: Path, case: str, framed_payload: str
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    marker = tmp_path / f"builtin-{case}.log"
+    Path(env["HERMES_FLEET_ENV"]).write_text(
+        _builtin_hijack_source(marker, framed_payload),
+        encoding="utf-8",
+    )
+
+    result, child_env = _source_library_after_failure(role, env)
+
+    assert result.returncode != 0
+    assert b"fleet environment import failed" in result.stderr
+    assert "PJAN67_ATOMIC_FIRST" not in child_env
+    assert not marker.exists(), "frame generation must not execute fleet shell code"
+
+
+@pytest.mark.parametrize(
+    "case,payload,producer_status",
+    [
+        (
+            "malformed",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0MALFORMED\0"
+            b"PJANGLER_FLEET_ENV_END\0\0",
+            0,
+        ),
+        (
+            "duplicate",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=one\0"
+            b"PJAN67_ATOMIC_FIRST=two\0PJANGLER_FLEET_ENV_END\0\0",
+            0,
+        ),
+        (
+            "invalid-name",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0BAD-NAME=value\0"
+            b"PJANGLER_FLEET_ENV_END\0\0",
+            0,
+        ),
+        (
+            "unsafe-family",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0LD_AUDIT=/tmp/nope\0"
+            b"PJANGLER_FLEET_ENV_END\0\0",
+            0,
+        ),
+        ("truncated", b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0", 0),
+        (
+            "unterminated-footer",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0"
+            b"PJANGLER_FLEET_ENV_END\0",
+            0,
+        ),
+        (
+            "child-failure",
+            b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=leaked\0"
+            b"PJANGLER_FLEET_ENV_END\0\0",
+            37,
+        ),
+    ],
+)
+def test_raw_fleet_frames_are_validated_completely_before_any_apply(
+    tmp_path: Path, case: str, payload: bytes, producer_status: int
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    Path(env["HERMES_FLEET_ENV"]).unlink()
+    stream = tmp_path / f"{case}.frames"
+    stream.write_bytes(payload)
+
+    result, child_env = _run_raw_fleet_stream(
+        role, env, stream, producer_status=producer_status
+    )
+
+    assert result.returncode != 0
+    assert b"fleet environment frame rejected" in result.stderr
+    assert "PJAN67_ATOMIC_FIRST" not in child_env
+
+
+def test_complete_raw_fleet_frame_applies_only_after_validation(tmp_path: Path) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    Path(env["HERMES_FLEET_ENV"]).unlink()
+    stream = tmp_path / "complete.frames"
+    stream.write_bytes(
+        b"PJANGLER_FLEET_ENV_V1\0PJAN67_ATOMIC_FIRST=complete\0"
+        b"PJANGLER_FLEET_ENV_END\0\0"
+    )
+
+    result, child_env = _run_raw_fleet_stream(role, env, stream)
+
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    assert child_env["PJAN67_ATOMIC_FIRST"] == "complete"
+
+
+def test_fleet_apply_rolls_back_if_any_assignment_fails(tmp_path: Path) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    Path(env["HERMES_FLEET_ENV"]).unlink()
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                'source "$1"; '
+                "fleet_keys=(PJAN67_ATOMIC_FIRST BAD-NAME); "
+                "fleet_values=(leaked rejected); "
+                "if apply_fleet_environment_records fleet_keys fleet_values; "
+                "then apply_status=0; else apply_status=$?; fi; "
+                "if [[ -v PJAN67_ATOMIC_FIRST ]]; then exit 91; fi; "
+                "exit \"$apply_status\""
+            ),
+            "pjan67-apply-rollback-probe",
+            str(role / ".scripts" / "_lib.sh"),
+        ],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.returncode != 91, "the first assignment escaped rollback"
+    assert b"fleet environment apply failed" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -382,7 +602,7 @@ def test_explicit_board_grant_preserves_fleet_provider_authority(
     assert child_env["PYTHONSAFEPATH"] == "1"
 
 
-def test_fleet_import_isolates_readonly_state_and_preserves_safe_values(
+def test_fleet_import_preserves_supported_literal_values_and_precedence(
     tmp_path: Path,
 ) -> None:
     role, env = _fleet_authority_fixture(tmp_path, caller_skip="0", fleet_skip="1")
@@ -398,9 +618,9 @@ def test_fleet_import_isolates_readonly_state_and_preserves_safe_values(
                 "export PJAN67_SAFE_SPACES='alpha beta  gamma'",
                 "export PJAN67_SAFE_EQUALS='left=middle=right'",
                 "export PJAN67_SAFE_NEWLINES=$'line one\\nline two\\n'",
-                "readonly PJAN67_SAFE_READONLY='safe readonly value'",
-                "readonly PATH=/fleet/readonly/path/must/not/win",
-                "printf 'fleet diagnostic with spaces\\n'",
+                "export PJAN67_SAFE_MULTILINE='first physical line\nsecond physical line\n'",
+                "export PJAN67_SAFE_MUTABLE='safe value'",
+                "export PATH=/fleet/path/must/not/win",
                 "",
             ]
         ),
@@ -417,7 +637,8 @@ def test_fleet_import_isolates_readonly_state_and_preserves_safe_values(
     assert child_env["PJAN67_SAFE_SPACES"] == "alpha beta  gamma"
     assert child_env["PJAN67_SAFE_EQUALS"] == "left=middle=right"
     assert child_env["PJAN67_SAFE_NEWLINES"] == "line one\nline two\n"
-    assert child_env["PJAN67_SAFE_READONLY"] == "safe readonly value:mutable"
+    assert child_env["PJAN67_SAFE_MULTILINE"] == "first physical line\nsecond physical line\n"
+    assert child_env["PJAN67_SAFE_MUTABLE"] == "safe value:mutable"
     assert not Path(env["PJAN67_BASH_FUNCTION_LOG"]).exists()
 
 
