@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -102,9 +103,8 @@ def _run(role: Path, name: str, env: dict[str, str]) -> subprocess.CompletedProc
 def _inject_parent_fsync_failure(
     tmp_path: Path, env: dict[str, str], parent: Path
 ) -> None:
-    site_dir = tmp_path / "fsync-failure-site"
-    site_dir.mkdir()
-    (site_dir / "sitecustomize.py").write_text(
+    injection = tmp_path / "fsync-failure.py"
+    injection.write_text(
         """import errno
 import os
 import stat
@@ -123,7 +123,22 @@ os.fsync = _fsync
 """,
         encoding="utf-8",
     )
-    env["PYTHONPATH"] = str(site_dir)
+    wrapper_dir = tmp_path / "fsync-failure-bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "python3"
+    wrapper.write_text(
+        f"""#!/usr/bin/env bash
+set -o pipefail
+if [[ "${{1:-}}" == "-" && -n "${{FAIL_PARENT_FSYNC:-}}" ]]; then
+  {{ cat "{injection}"; cat; }} | "{Path(sys.executable).resolve()}" "$@"
+else
+  exec "{Path(sys.executable).resolve()}" "$@"
+fi
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    env["PATH"] = f"{wrapper_dir}:{env['PATH']}"
     env["FAIL_PARENT_FSYNC"] = str(parent)
 
 

@@ -158,6 +158,74 @@ fi
 SKIP_PLANE="$PJANGLER_INVOCATION_SKIP_PLANE"
 unset PJANGLER_INVOCATION_SKIP_PLANE
 
+# fleet.env is shared configuration, not authority to inject code into Python,
+# shell, Node, or dynamic-loader children. The MCP parent removes these values
+# before launching a rendered script; repeat the boundary after sourcing the
+# fleet file so it cannot rehydrate them for any descendant. PATH remains
+# intact so explicitly configured Hermes/PJangler/provider tools still resolve.
+subprocess_injection_key_is_unsafe() {
+  local key="$1" loader_key="$1"
+  case "$key" in
+    PYTHONPATH|PYTHONHOME|PYTHONSTARTUP|PYTHONUSERBASE|\
+    BASH_ENV|ENV|BASHOPTS|SHELLOPTS|BASH_COMPAT|BASH_LOADABLES_PATH|\
+    BASH_XTRACEFD|PROMPT_COMMAND|PS0|PS1|PS2|PS3|PS4|\
+    NODE_OPTIONS|NODE_PATH|GLIBC_TUNABLES|BASH_FUNC_*|DYLD_*)
+      return 0
+      ;;
+  esac
+
+  # GNU and multilib loaders consume the same control stem with an optional
+  # _32/_64 ABI suffix. Do not delete unrelated application keys such as
+  # LD_SDK_KEY merely because they share the LD_ prefix.
+  case "$loader_key" in
+    LD_*_32|LD_*_64) loader_key="${loader_key%_*}" ;;
+  esac
+  case "$loader_key" in
+    LD_ASSUME_KERNEL|LD_AUDIT|LD_BIND_NOT|LD_BIND_NOW|LD_DEBUG|\
+    LD_DEBUG_OUTPUT|LD_DYNAMIC_WEAK|LD_HWCAP_MASK|LD_LIBRARY_PATH|\
+    LD_ORIGIN_PATH|LD_POINTER_GUARD|LD_PREFER_MAP_32BIT_EXEC|LD_PRELOAD|\
+    LD_PROFILE|LD_PROFILE_OUTPUT|LD_SHOW_AUXV|LD_TRACE_LOADED_OBJECTS|\
+    LD_TRACE_PRELINKING|LD_USE_LOAD_BIAS|LD_VERBOSE|LD_WARN)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+scrub_subprocess_interpreter_injection() {
+  local key declaration function_name
+
+  # A fleet file may export Bash's readonly option variables or enable tracing.
+  # Disable trace output first, then remove the export attribute where Bash
+  # cannot unset the variable itself. BASH_XTRACEFD is also unexported rather
+  # than unset because unsetting it can close the referenced descriptor.
+  builtin set +x +v
+  while IFS= read -r key; do
+    if subprocess_injection_key_is_unsafe "$key"; then
+      case "$key" in
+        BASHOPTS|SHELLOPTS|BASH_XTRACEFD)
+          builtin export -n "$key" 2>/dev/null || true
+          ;;
+        *)
+          builtin unset -v "$key" 2>/dev/null || true
+          ;;
+      esac
+    fi
+  done < <(builtin compgen -A variable)
+
+  # Bash imports arbitrary exported functions before script evaluation and
+  # keeps them as live functions, not ordinary BASH_FUNC_* variables. Remove
+  # the whole exported-function family so a fleet value cannot shadow python3,
+  # git, systemctl, or any later helper in this provisioning shell.
+  while IFS= read -r declaration; do
+    function_name="${declaration##* }"
+    [[ -n "$function_name" ]] && builtin unset -f -- "$function_name"
+  done < <(builtin declare -Fx)
+
+  builtin export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1
+}
+scrub_subprocess_interpreter_injection
+
 # fleet.env is allowed to supply provider credentials only for an explicitly
 # board-authorized invocation. A no-board/deferred phase must remove every
 # supported provider alias after sourcing and before any Python, Hermes,

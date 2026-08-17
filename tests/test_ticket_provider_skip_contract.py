@@ -11,6 +11,34 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE_SCRIPTS = ROOT / "template" / ".scripts"
+GNU_LOADER_CONTROL_STEMS = (
+    "LD_ASSUME_KERNEL",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "LD_BIND_NOW",
+    "LD_DEBUG",
+    "LD_DEBUG_OUTPUT",
+    "LD_DYNAMIC_WEAK",
+    "LD_HWCAP_MASK",
+    "LD_LIBRARY_PATH",
+    "LD_ORIGIN_PATH",
+    "LD_POINTER_GUARD",
+    "LD_PREFER_MAP_32BIT_EXEC",
+    "LD_PRELOAD",
+    "LD_PROFILE",
+    "LD_PROFILE_OUTPUT",
+    "LD_SHOW_AUXV",
+    "LD_TRACE_LOADED_OBJECTS",
+    "LD_TRACE_PRELINKING",
+    "LD_USE_LOAD_BIAS",
+    "LD_VERBOSE",
+    "LD_WARN",
+)
+GNU_LOADER_CONTROL_KEYS = tuple(
+    key
+    for stem in GNU_LOADER_CONTROL_STEMS
+    for key in (stem, f"{stem}_32", f"{stem}_64")
+)
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
@@ -119,7 +147,11 @@ def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]
         [
             "bash",
             "-c",
-            'source "$1"; env -0',
+            (
+                'source "$1"; '
+                "if declare -F pjan67_fleet_probe >/dev/null; then pjan67_fleet_probe; fi; "
+                "env -0"
+            ),
             "pjan67-lib-probe",
             str(role / ".scripts" / "_lib.sh"),
         ],
@@ -155,6 +187,31 @@ def _fleet_authority_fixture(
                 "export TRELLO_KEY=fleet-trello-key-sentinel",
                 "export TRELLO_TOKEN=fleet-trello-token-sentinel",
                 "export LINEAR_API_KEY=fleet-linear-sentinel",
+                "export PYTHONPATH=/tmp/fleet-python-path-sentinel",
+                "export PYTHONHOME=/tmp/fleet-python-home-sentinel",
+                "export PYTHONSTARTUP=/tmp/fleet-python-startup-sentinel.py",
+                "export PYTHONUSERBASE=/tmp/fleet-python-userbase-sentinel",
+                "export BASH_ENV=/tmp/fleet-bash-env-sentinel",
+                "export ENV=/tmp/fleet-shell-env-sentinel",
+                "export NODE_OPTIONS=--require=/tmp/fleet-node-sentinel.cjs",
+                "export NODE_PATH=/tmp/fleet-node-path-sentinel",
+                *[
+                    f"export {key}=fleet-loader-control-sentinel"
+                    for key in GNU_LOADER_CONTROL_KEYS
+                ],
+                "export GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2",
+                "export DYLD_INSERT_LIBRARIES=/tmp/fleet-loader-sentinel.dylib",
+                "export DYLD_LIBRARY_PATH=/tmp/fleet-dyld-path-sentinel",
+                "export BASHOPTS",
+                "export SHELLOPTS",
+                "export BASH_COMPAT=50",
+                "export BASH_LOADABLES_PATH=/tmp/fleet-bash-builtins-sentinel",
+                "export BASH_XTRACEFD=2",
+                "export PROMPT_COMMAND='printf fleet-prompt-sentinel'",
+                "export PS4='fleet-trace-sentinel'",
+                "pjan67_fleet_probe() { printf 'fleet-function-loaded\\n' >> \"$PJAN67_BASH_FUNCTION_LOG\"; }",
+                "export -f pjan67_fleet_probe",
+                "export LD_SDK_KEY=fleet-non-loader-functional-value",
                 "",
             ]
         ),
@@ -172,6 +229,7 @@ def _fleet_authority_fixture(
             "HERMES_FLEET_ENV": str(fleet_env),
             "HERMES_TEMPLATE_CONFIG": str(tmp_path / "missing-config.toml"),
             "SKIP_PLANE": caller_skip,
+            "PJAN67_BASH_FUNCTION_LOG": str(tmp_path / "bash-function.log"),
         }
     )
     return role, env
@@ -238,6 +296,33 @@ def test_skip_plane_scrubs_fleet_rehydrated_provider_authority_from_children(
         "LINEAR_API_KEY",
     ):
         assert key not in child_env, f"no-board child inherited {key}"
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        *GNU_LOADER_CONTROL_KEYS,
+        "GLIBC_TUNABLES",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASHOPTS",
+        "SHELLOPTS",
+        "BASH_COMPAT",
+        "BASH_LOADABLES_PATH",
+        "BASH_XTRACEFD",
+        "PROMPT_COMMAND",
+        "PS4",
+    ):
+        assert key not in child_env, f"deferred child inherited interpreter injection variable {key}"
+    assert not any(key.startswith("BASH_FUNC_") for key in child_env)
+    assert not Path(env["PJAN67_BASH_FUNCTION_LOG"]).exists()
+    assert child_env["LD_SDK_KEY"] == "fleet-non-loader-functional-value"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    assert child_env["PYTHONSAFEPATH"] == "1"
 
 
 def test_explicit_board_grant_preserves_fleet_provider_authority(
@@ -254,6 +339,33 @@ def test_explicit_board_grant_preserves_fleet_provider_authority(
     assert child_env["TRELLO_KEY"] == "fleet-trello-key-sentinel"
     assert child_env["TRELLO_TOKEN"] == "fleet-trello-token-sentinel"
     assert child_env["LINEAR_API_KEY"] == "fleet-linear-sentinel"
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        *GNU_LOADER_CONTROL_KEYS,
+        "GLIBC_TUNABLES",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+        "BASHOPTS",
+        "SHELLOPTS",
+        "BASH_COMPAT",
+        "BASH_LOADABLES_PATH",
+        "BASH_XTRACEFD",
+        "PROMPT_COMMAND",
+        "PS4",
+    ):
+        assert key not in child_env, f"granted provider child inherited interpreter injection variable {key}"
+    assert not any(key.startswith("BASH_FUNC_") for key in child_env)
+    assert not Path(env["PJAN67_BASH_FUNCTION_LOG"]).exists()
+    assert child_env["LD_SDK_KEY"] == "fleet-non-loader-functional-value"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    assert child_env["PYTHONSAFEPATH"] == "1"
 
 
 @pytest.mark.parametrize(
