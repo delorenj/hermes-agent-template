@@ -154,7 +154,7 @@ plane_workspace:
 # All scripts are idempotent — safe to re-run if a step fails.
 
 _tasks:
-  - "chmod +x .scripts/*.sh .scripts/sentinel/bin/*.sh hermes 2>/dev/null || true"
+  - "chmod +x .scripts/*.sh .scripts/sentinel/bin/*.sh hermes momo 2>/dev/null || true"
   - "./.scripts/00-banner.sh"
   - "./.scripts/01-config.sh"
   - "./.scripts/05-fleet-env.sh"
