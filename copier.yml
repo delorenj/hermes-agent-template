@@ -46,17 +46,14 @@ target_repo:
 
 role:
   type: str
-  help: "Role for this agent"
+  help: "Role for this agent (safe single path segment; arbitrary roles are supported)"
   default: pm
-  choices:
-    "Project Manager (pm)": pm
-    "Company Director (director)": director
-    "Developer (dev)": dev
-    "Reviewer (review)": review
-    "Company Reporter — daily cross-project rollup (reporter)": reporter
-    "Ops (ops)": ops
-    "QA (qa)": qa
-  validator: "{% if not role %}Required{% endif %}"
+  validator: >-
+    {% set alnum = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789' -%}
+    {% set safe_chars = alnum ~ '._-' -%}
+    {% if not role or role != role|trim or role in ['.', '..'] or role[0] not in alnum or role[-1] not in alnum or role|reject('in', safe_chars)|list|length -%}
+    Role must be a non-empty safe single path segment using letters, numbers, dots, underscores, or hyphens
+    {%- endif %}
 
 ticket_provider:
   type: str
