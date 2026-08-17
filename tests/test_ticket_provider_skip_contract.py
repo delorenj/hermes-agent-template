@@ -142,13 +142,16 @@ def _run(role: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]:
-    result = subprocess.run(
+def _source_library(role: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
         [
             "bash",
             "-c",
             (
                 'source "$1"; '
+                "if [[ -v PJAN67_SAFE_READONLY ]]; then "
+                "PJAN67_SAFE_READONLY=\"${PJAN67_SAFE_READONLY}:mutable\"; "
+                "export PJAN67_SAFE_READONLY; fi; "
                 "if declare -F pjan67_fleet_probe >/dev/null; then pjan67_fleet_probe; fi; "
                 "env -0"
             ),
@@ -159,6 +162,10 @@ def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]
         capture_output=True,
         check=False,
     )
+
+
+def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]:
+    result = _source_library(role, env)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
     return {
         key.decode(): value.decode()
@@ -211,6 +218,13 @@ def _fleet_authority_fixture(
                 "export PS4='fleet-trace-sentinel'",
                 "pjan67_fleet_probe() { printf 'fleet-function-loaded\\n' >> \"$PJAN67_BASH_FUNCTION_LOG\"; }",
                 "export -f pjan67_fleet_probe",
+                "readonly -f pjan67_fleet_probe",
+                f"readonly {' '.join(GNU_LOADER_CONTROL_KEYS)}",
+                (
+                    "readonly GLIBC_TUNABLES BASH_ENV ENV NODE_OPTIONS NODE_PATH "
+                    "BASH_COMPAT BASH_LOADABLES_PATH BASH_XTRACEFD "
+                    "PROMPT_COMMAND PS4 DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH"
+                ),
                 "export LD_SDK_KEY=fleet-non-loader-functional-value",
                 "",
             ]
@@ -366,6 +380,67 @@ def test_explicit_board_grant_preserves_fleet_provider_authority(
     assert child_env["LD_SDK_KEY"] == "fleet-non-loader-functional-value"
     assert child_env["PYTHONNOUSERSITE"] == "1"
     assert child_env["PYTHONSAFEPATH"] == "1"
+
+
+def test_fleet_import_isolates_readonly_state_and_preserves_safe_values(
+    tmp_path: Path,
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="0", fleet_skip="1")
+    fleet_env = Path(env["HERMES_FLEET_ENV"])
+    controlled_path = env["PATH"]
+    env["HERMES_FLEET_BIN"] = "/explicit/hermes must win"
+    fleet_env.write_text(
+        fleet_env.read_text(encoding="utf-8")
+        + "\n".join(
+            [
+                "export HERMES_FLEET_BIN='/fleet/hermes must lose'",
+                "export HERMES_FLEET_REPO='/fleet/repo with spaces'",
+                "export PJAN67_SAFE_SPACES='alpha beta  gamma'",
+                "export PJAN67_SAFE_EQUALS='left=middle=right'",
+                "export PJAN67_SAFE_NEWLINES=$'line one\\nline two\\n'",
+                "readonly PJAN67_SAFE_READONLY='safe readonly value'",
+                "readonly PATH=/fleet/readonly/path/must/not/win",
+                "printf 'fleet diagnostic with spaces\\n'",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    child_env = _source_library_child_env(role, env)
+
+    assert child_env["PATH"] == controlled_path
+    assert child_env["HERMES_FLEET_BIN"] == "/explicit/hermes must win"
+    assert child_env["HERMES_BIN"] == "/explicit/hermes must win"
+    assert child_env["HERMES_FLEET_REPO"] == "/fleet/repo with spaces"
+    assert child_env["HERMES_AGENT_REPO"] == "/fleet/repo with spaces"
+    assert child_env["PJAN67_SAFE_SPACES"] == "alpha beta  gamma"
+    assert child_env["PJAN67_SAFE_EQUALS"] == "left=middle=right"
+    assert child_env["PJAN67_SAFE_NEWLINES"] == "line one\nline two\n"
+    assert child_env["PJAN67_SAFE_READONLY"] == "safe readonly value:mutable"
+    assert not Path(env["PJAN67_BASH_FUNCTION_LOG"]).exists()
+
+
+@pytest.mark.parametrize(
+    "fleet_source",
+    [
+        "export PJAN67_PARTIAL_IMPORT=must-not-escape\nreturn 37\n",
+        "export PJAN67_PARTIAL_IMPORT=must-not-escape\nif [[\n",
+    ],
+    ids=["explicit-source-failure", "syntax-error"],
+)
+def test_fleet_import_fails_closed_on_source_errors(
+    tmp_path: Path, fleet_source: str
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+    Path(env["HERMES_FLEET_ENV"]).write_text(fleet_source, encoding="utf-8")
+
+    result = _source_library(role, env)
+
+    assert result.returncode != 0
+    assert b"fleet environment import failed" in result.stderr
+    assert result.stdout == b""
+    assert not Path(env["PJAN67_BASH_FUNCTION_LOG"]).exists()
 
 
 @pytest.mark.parametrize(
