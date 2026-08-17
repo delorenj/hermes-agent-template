@@ -209,73 +209,131 @@ scrub_subprocess_interpreter_injection() {
   builtin export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1
 }
 
-# Source fleet.env in a separate Bash process and import only ordinary, safe
-# values through a NUL-delimited protocol. Shell attributes and functions are
-# deliberately process-local: a fleet file may mark a value/function readonly,
-# but it cannot make that state immutable in this provisioning shell. The
-# extractor uses builtins only after sourcing so loader controls in the fleet
-# file cannot affect another executable before they are filtered.
-import_fleet_environment() {
-  local __pjangler_fleet_path="$1"
-  local __pjangler_fleet_bash="${BASH:-}"
-  local __pjangler_fleet_fd __pjangler_fleet_pid
-  local __pjangler_fleet_count __pjangler_fleet_index
-  local __pjangler_fleet_record __pjangler_fleet_key __pjangler_fleet_value
-  local -a __pjangler_fleet_records=()
-  local __pjangler_fleet_header="PJANGLER_FLEET_ENV_V1"
-  local __pjangler_fleet_footer="PJANGLER_FLEET_ENV_END"
+# Apply staged records as one transaction. Existing variables always win. New
+# variables are tracked as they are created and removed in reverse order if a
+# later assignment/export fails, so no prefix of a failed import can escape.
+apply_fleet_environment_records() {
+  local -n __pjangler_fleet_keys_ref="$1"
+  local -n __pjangler_fleet_values_ref="$2"
+  local __pjangler_fleet_index __pjangler_fleet_key
+  local -a __pjangler_fleet_applied=()
 
-  if [[ "$__pjangler_fleet_bash" != /* || ! -x "$__pjangler_fleet_bash" ]]; then
-    __pjangler_fleet_bash="$(builtin type -P bash)" || return 1
+  if (( ${#__pjangler_fleet_keys_ref[@]} != ${#__pjangler_fleet_values_ref[@]} )); then
+    builtin printf 'fleet environment apply failed: mismatched staging arrays\n' >&2
+    return 1
   fi
 
-  exec {__pjangler_fleet_fd}< <(
-    "$__pjangler_fleet_bash" --noprofile --norc -c '
-      builtin set -a
-      builtin source "$1" >&2
-      __pjangler_fleet_source_status=$?
-      builtin set +x +v
-      if (( __pjangler_fleet_source_status != 0 )); then
-        builtin exit "$__pjangler_fleet_source_status"
-      fi
+  for ((__pjangler_fleet_index = 0; __pjangler_fleet_index < ${#__pjangler_fleet_keys_ref[@]}; __pjangler_fleet_index++)); do
+    __pjangler_fleet_key="${__pjangler_fleet_keys_ref[__pjangler_fleet_index]}"
+    if [[ ! "$__pjangler_fleet_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || subprocess_injection_key_is_unsafe "$__pjangler_fleet_key"; then
+      builtin printf 'fleet environment apply failed: rejected variable name\n' >&2
+      for ((__pjangler_fleet_index = ${#__pjangler_fleet_applied[@]} - 1; __pjangler_fleet_index >= 0; __pjangler_fleet_index--)); do
+        builtin unset -v "${__pjangler_fleet_applied[__pjangler_fleet_index]}" 2>/dev/null || true
+      done
+      return 1
+    fi
 
-      builtin printf "%s\0" "PJANGLER_FLEET_ENV_V1"
-      while IFS= builtin read -r __pjangler_fleet_key; do
-        case "$__pjangler_fleet_key" in
-          __pjangler_*) continue ;;
-        esac
-        builtin printf "%s=%s\0" \
-          "$__pjangler_fleet_key" "${!__pjangler_fleet_key}"
-      done < <(builtin compgen -e)
-      builtin printf "%s\0" "PJANGLER_FLEET_ENV_END"
-    ' pjangler-fleet-import "$__pjangler_fleet_path"
-  )
-  __pjangler_fleet_pid=$!
-  builtin mapfile -d '' -t -u "$__pjangler_fleet_fd" __pjangler_fleet_records
+    # A declared-but-unset or readonly caller value is still caller state and
+    # therefore wins over fleet configuration.
+    if builtin declare -p "$__pjangler_fleet_key" >/dev/null 2>&1; then
+      continue
+    fi
+    if ! builtin printf -v "$__pjangler_fleet_key" '%s' \
+      "${__pjangler_fleet_values_ref[__pjangler_fleet_index]}"; then
+      builtin printf 'fleet environment apply failed: assignment rejected\n' >&2
+      for ((__pjangler_fleet_index = ${#__pjangler_fleet_applied[@]} - 1; __pjangler_fleet_index >= 0; __pjangler_fleet_index--)); do
+        builtin unset -v "${__pjangler_fleet_applied[__pjangler_fleet_index]}" 2>/dev/null || true
+      done
+      return 1
+    fi
+    __pjangler_fleet_applied+=("$__pjangler_fleet_key")
+    if ! builtin export "$__pjangler_fleet_key"; then
+      builtin printf 'fleet environment apply failed: export rejected\n' >&2
+      for ((__pjangler_fleet_index = ${#__pjangler_fleet_applied[@]} - 1; __pjangler_fleet_index >= 0; __pjangler_fleet_index--)); do
+        builtin unset -v "${__pjangler_fleet_applied[__pjangler_fleet_index]}" 2>/dev/null || true
+      done
+      return 1
+    fi
+  done
+}
+
+# Consume a parser child through a complete, double-NUL-terminated protocol.
+# Nothing reaches the provisioning shell until the child exits successfully and
+# every record, name, duplicate, unsafe family, footer, and final terminator has
+# been validated.
+import_fleet_environment_stream() {
+  local __pjangler_fleet_fd="$1" __pjangler_fleet_pid="$2"
+  local __pjangler_fleet_count __pjangler_fleet_index
+  local __pjangler_fleet_record __pjangler_fleet_key __pjangler_fleet_value
+  local -a __pjangler_fleet_records=() __pjangler_fleet_keys=() __pjangler_fleet_values=()
+  local -A __pjangler_fleet_seen=()
+
+  builtin mapfile -d '' -t -u "$__pjangler_fleet_fd" __pjangler_fleet_records || true
   exec {__pjangler_fleet_fd}<&-
-
   if ! builtin wait "$__pjangler_fleet_pid"; then
+    builtin printf 'fleet environment frame rejected: parser child failed\n' >&2
     return 1
   fi
 
   __pjangler_fleet_count="${#__pjangler_fleet_records[@]}"
-  if (( __pjangler_fleet_count < 2 )) \
-    || [[ "${__pjangler_fleet_records[0]}" != "$__pjangler_fleet_header" ]] \
-    || [[ "${__pjangler_fleet_records[__pjangler_fleet_count - 1]}" != "$__pjangler_fleet_footer" ]]; then
+  if (( __pjangler_fleet_count < 3 )) \
+    || [[ "${__pjangler_fleet_records[0]}" != "PJANGLER_FLEET_ENV_V1" ]] \
+    || [[ "${__pjangler_fleet_records[__pjangler_fleet_count - 2]}" != "PJANGLER_FLEET_ENV_END" ]] \
+    || [[ -n "${__pjangler_fleet_records[__pjangler_fleet_count - 1]}" ]]; then
+    builtin printf 'fleet environment frame rejected: incomplete framing\n' >&2
     return 1
   fi
 
-  for ((__pjangler_fleet_index = 1; __pjangler_fleet_index < __pjangler_fleet_count - 1; __pjangler_fleet_index++)); do
+  for ((__pjangler_fleet_index = 1; __pjangler_fleet_index < __pjangler_fleet_count - 2; __pjangler_fleet_index++)); do
     __pjangler_fleet_record="${__pjangler_fleet_records[__pjangler_fleet_index]}"
-    [[ "$__pjangler_fleet_record" == *=* ]] || return 1
+    if [[ "$__pjangler_fleet_record" != *=* ]]; then
+      builtin printf 'fleet environment frame rejected: malformed record\n' >&2
+      return 1
+    fi
     __pjangler_fleet_key="${__pjangler_fleet_record%%=*}"
     __pjangler_fleet_value="${__pjangler_fleet_record#*=}"
-    [[ "$__pjangler_fleet_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
-    subprocess_injection_key_is_unsafe "$__pjangler_fleet_key" && continue
-    [[ -v "$__pjangler_fleet_key" ]] && continue
-    builtin printf -v "$__pjangler_fleet_key" '%s' "$__pjangler_fleet_value"
-    builtin export "$__pjangler_fleet_key"
+    if [[ ! "$__pjangler_fleet_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || subprocess_injection_key_is_unsafe "$__pjangler_fleet_key"; then
+      builtin printf 'fleet environment frame rejected: unsafe variable\n' >&2
+      return 1
+    fi
+    if [[ -n "${__pjangler_fleet_seen[$__pjangler_fleet_key]+present}" ]]; then
+      builtin printf 'fleet environment frame rejected: duplicate variable\n' >&2
+      return 1
+    fi
+    __pjangler_fleet_seen["$__pjangler_fleet_key"]=1
+    __pjangler_fleet_keys+=("$__pjangler_fleet_key")
+    __pjangler_fleet_values+=("$__pjangler_fleet_value")
   done
+
+  apply_fleet_environment_records __pjangler_fleet_keys __pjangler_fleet_values
+}
+
+# fleet.env is parsed as data by an isolated Python interpreter. The supported
+# grammar is blank/comment lines plus optional `export` KEY=value assignments
+# with unquoted, single-quoted, double-quoted, or ANSI-C quoted literal values.
+# Functions, readonly attributes, expansions, substitutions, and commands are
+# rejected rather than executed.
+import_fleet_environment() {
+  local __pjangler_fleet_path="$1"
+  local __pjangler_fleet_parser="$ROLE_DIR/.scripts/lib/parse-fleet-env.py"
+  local __pjangler_fleet_python __pjangler_fleet_fd __pjangler_fleet_pid
+
+  if [[ ! -f "$__pjangler_fleet_parser" || -L "$__pjangler_fleet_parser" ]]; then
+    builtin printf 'fleet environment frame rejected: trusted parser is unavailable\n' >&2
+    return 1
+  fi
+  __pjangler_fleet_python="$(builtin type -P python3)" || {
+    builtin printf 'fleet environment frame rejected: python3 is unavailable\n' >&2
+    return 1
+  }
+
+  exec {__pjangler_fleet_fd}< <(
+    "$__pjangler_fleet_python" -I "$__pjangler_fleet_parser" "$__pjangler_fleet_path"
+  )
+  __pjangler_fleet_pid=$!
+  import_fleet_environment_stream "$__pjangler_fleet_fd" "$__pjangler_fleet_pid"
 }
 
 # Fleet source-of-truth (shared across all wrappers/provisioners).

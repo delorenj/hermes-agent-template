@@ -13,6 +13,7 @@ import yaml
 ROOT = Path(__file__).parents[1]
 SLACK_SCRIPT = ROOT / "template" / ".scripts" / "31-slack.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
+LIB_DIR = ROOT / "template" / ".scripts" / "lib"
 REGISTRY_SCRIPT = ROOT / "template" / ".scripts" / "80-registry.sh"
 
 BOT_TOKEN = "xoxb-profile-only-secret"
@@ -27,6 +28,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     runtime.mkdir()
     shutil.copy2(SLACK_SCRIPT, scripts / SLACK_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
+    shutil.copytree(LIB_DIR, scripts / LIB_DIR.name)
     (role / "role.yaml").write_text(
         """repo: demo
 role: pm
