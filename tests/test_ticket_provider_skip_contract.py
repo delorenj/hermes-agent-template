@@ -155,6 +155,18 @@ def _fleet_authority_fixture(
                 "export TRELLO_KEY=fleet-trello-key-sentinel",
                 "export TRELLO_TOKEN=fleet-trello-token-sentinel",
                 "export LINEAR_API_KEY=fleet-linear-sentinel",
+                "export PYTHONPATH=/tmp/fleet-python-path-sentinel",
+                "export PYTHONHOME=/tmp/fleet-python-home-sentinel",
+                "export PYTHONSTARTUP=/tmp/fleet-python-startup-sentinel.py",
+                "export PYTHONUSERBASE=/tmp/fleet-python-userbase-sentinel",
+                "export BASH_ENV=/tmp/fleet-bash-env-sentinel",
+                "export ENV=/tmp/fleet-shell-env-sentinel",
+                "export NODE_OPTIONS=--require=/tmp/fleet-node-sentinel.cjs",
+                "export NODE_PATH=/tmp/fleet-node-path-sentinel",
+                "export LD_PRELOAD=/tmp/fleet-loader-sentinel.so",
+                "export LD_LIBRARY_PATH=/tmp/fleet-loader-path-sentinel",
+                "export DYLD_INSERT_LIBRARIES=/tmp/fleet-loader-sentinel.dylib",
+                "export DYLD_LIBRARY_PATH=/tmp/fleet-dyld-path-sentinel",
                 "",
             ]
         ),
@@ -238,6 +250,23 @@ def test_skip_plane_scrubs_fleet_rehydrated_provider_authority_from_children(
         "LINEAR_API_KEY",
     ):
         assert key not in child_env, f"no-board child inherited {key}"
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+    ):
+        assert key not in child_env, f"deferred child inherited interpreter injection variable {key}"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    assert child_env["PYTHONSAFEPATH"] == "1"
 
 
 def test_explicit_board_grant_preserves_fleet_provider_authority(
@@ -254,6 +283,23 @@ def test_explicit_board_grant_preserves_fleet_provider_authority(
     assert child_env["TRELLO_KEY"] == "fleet-trello-key-sentinel"
     assert child_env["TRELLO_TOKEN"] == "fleet-trello-token-sentinel"
     assert child_env["LINEAR_API_KEY"] == "fleet-linear-sentinel"
+    for key in (
+        "PYTHONPATH",
+        "PYTHONHOME",
+        "PYTHONSTARTUP",
+        "PYTHONUSERBASE",
+        "BASH_ENV",
+        "ENV",
+        "NODE_OPTIONS",
+        "NODE_PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "DYLD_LIBRARY_PATH",
+    ):
+        assert key not in child_env, f"granted provider child inherited interpreter injection variable {key}"
+    assert child_env["PYTHONNOUSERSITE"] == "1"
+    assert child_env["PYTHONSAFEPATH"] == "1"
 
 
 @pytest.mark.parametrize(

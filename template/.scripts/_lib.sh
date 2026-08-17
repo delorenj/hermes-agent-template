@@ -158,6 +158,19 @@ fi
 SKIP_PLANE="$PJANGLER_INVOCATION_SKIP_PLANE"
 unset PJANGLER_INVOCATION_SKIP_PLANE
 
+# fleet.env is shared configuration, not authority to inject code into Python,
+# shell, Node, or dynamic-loader children. The MCP parent removes these values
+# before launching a rendered script; repeat the boundary after sourcing the
+# fleet file so it cannot rehydrate them for any descendant. PATH remains
+# intact so explicitly configured Hermes/PJangler/provider tools still resolve.
+scrub_subprocess_interpreter_injection() {
+  unset PYTHONPATH PYTHONHOME PYTHONSTARTUP PYTHONUSERBASE
+  unset BASH_ENV ENV NODE_OPTIONS NODE_PATH
+  unset LD_PRELOAD LD_LIBRARY_PATH DYLD_INSERT_LIBRARIES DYLD_LIBRARY_PATH
+  export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1
+}
+scrub_subprocess_interpreter_injection
+
 # fleet.env is allowed to supply provider credentials only for an explicitly
 # board-authorized invocation. A no-board/deferred phase must remove every
 # supported provider alias after sourcing and before any Python, Hermes,

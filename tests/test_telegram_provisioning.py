@@ -4,6 +4,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -118,11 +119,10 @@ def _run(
 
 
 def _inject_parent_fsync_failure(
-    tmp_path: Path, overrides: dict[str, str], parent: Path
+    tmp_path: Path, overrides: dict[str, str], parent: Path, bindir: Path
 ) -> None:
-    site_dir = tmp_path / "fsync-failure-site"
-    site_dir.mkdir()
-    (site_dir / "sitecustomize.py").write_text(
+    injection = tmp_path / "fsync-failure.py"
+    injection.write_text(
         """import errno
 import os
 import stat
@@ -141,7 +141,19 @@ os.fsync = _fsync
 """,
         encoding="utf-8",
     )
-    overrides["PYTHONPATH"] = str(site_dir)
+    wrapper = bindir / "python3"
+    wrapper.write_text(
+        f"""#!/usr/bin/env bash
+set -o pipefail
+if [[ "${{1:-}}" == "-" && -n "${{FAIL_PARENT_FSYNC:-}}" ]]; then
+  {{ cat "{injection}"; cat; }} | "{Path(sys.executable).resolve()}" "$@"
+else
+  exec "{Path(sys.executable).resolve()}" "$@"
+fi
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
     overrides["FAIL_PARENT_FSYNC"] = str(parent)
 
 
@@ -246,7 +258,7 @@ def test_credential_parent_fsync_failure_is_reported_and_retryable(tmp_path: Pat
         "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
         "EXPECTED_TELEGRAM_TOKEN": BOT_TOKEN,
     }
-    _inject_parent_fsync_failure(tmp_path, overrides, runtime)
+    _inject_parent_fsync_failure(tmp_path, overrides, runtime, bindir)
 
     failed = _run(role, registry, home, bindir, overrides)
 
