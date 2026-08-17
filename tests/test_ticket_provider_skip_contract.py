@@ -114,6 +114,69 @@ def _run(role: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _source_library_child_env(role: Path, env: dict[str, str]) -> dict[str, str]:
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'source "$1"; env -0',
+            "pjan67-lib-probe",
+            str(role / ".scripts" / "_lib.sh"),
+        ],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    return {
+        key.decode(): value.decode()
+        for entry in result.stdout.split(b"\0")
+        if entry
+        for key, value in [entry.split(b"=", 1)]
+    }
+
+
+def _fleet_authority_fixture(
+    tmp_path: Path, caller_skip: str, fleet_skip: str
+) -> tuple[Path, dict[str, str]]:
+    role = tmp_path / "project" / "agents" / "hermes" / "pm"
+    scripts = role / ".scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(TEMPLATE_SCRIPTS / "_lib.sh", scripts)
+    fleet_env = tmp_path / "home" / ".hermes" / "fleet.env"
+    fleet_env.parent.mkdir(parents=True)
+    fleet_env.write_text(
+        "\n".join(
+            [
+                f"export SKIP_PLANE={fleet_skip}",
+                "export PLANE_API_KEY=fleet-generic-sentinel",
+                "export PLANE_33GOD_API_KEY=fleet-workspace-sentinel",
+                "export PLANE_TEST_SPACE_API_KEY=fleet-dynamic-sentinel",
+                "export TRELLO_KEY=fleet-trello-key-sentinel",
+                "export TRELLO_TOKEN=fleet-trello-token-sentinel",
+                "export LINEAR_API_KEY=fleet-linear-sentinel",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("PLANE_", "TRELLO_", "LINEAR_"))
+        and key != "SKIP_PLANE"
+    }
+    env.update(
+        {
+            "HOME": str(tmp_path / "home"),
+            "HERMES_FLEET_ENV": str(fleet_env),
+            "HERMES_TEMPLATE_CONFIG": str(tmp_path / "missing-config.toml"),
+            "SKIP_PLANE": caller_skip,
+        }
+    )
+    return role, env
+
+
 @pytest.mark.parametrize(
     "caller_state",
     [
@@ -156,6 +219,41 @@ def test_explicit_board_grant_reaches_real_provider_adapter(tmp_path: Path) -> N
         "provisioning_state": "provisioned",
     }
     assert (role / ".scripts" / ".done-42-ticket-provider").exists()
+
+
+def test_skip_plane_scrubs_fleet_rehydrated_provider_authority_from_children(
+    tmp_path: Path,
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="1", fleet_skip="0")
+
+    child_env = _source_library_child_env(role, env)
+
+    assert child_env["SKIP_PLANE"] == "1", "fleet.env cannot weaken caller authority"
+    for key in (
+        "PLANE_API_KEY",
+        "PLANE_33GOD_API_KEY",
+        "PLANE_TEST_SPACE_API_KEY",
+        "TRELLO_KEY",
+        "TRELLO_TOKEN",
+        "LINEAR_API_KEY",
+    ):
+        assert key not in child_env, f"no-board child inherited {key}"
+
+
+def test_explicit_board_grant_preserves_fleet_provider_authority(
+    tmp_path: Path,
+) -> None:
+    role, env = _fleet_authority_fixture(tmp_path, caller_skip="0", fleet_skip="1")
+
+    child_env = _source_library_child_env(role, env)
+
+    assert child_env["SKIP_PLANE"] == "0", "fleet.env cannot revoke caller grant"
+    assert child_env["PLANE_API_KEY"] == "fleet-generic-sentinel"
+    assert child_env["PLANE_33GOD_API_KEY"] == "fleet-workspace-sentinel"
+    assert child_env["PLANE_TEST_SPACE_API_KEY"] == "fleet-dynamic-sentinel"
+    assert child_env["TRELLO_KEY"] == "fleet-trello-key-sentinel"
+    assert child_env["TRELLO_TOKEN"] == "fleet-trello-token-sentinel"
+    assert child_env["LINEAR_API_KEY"] == "fleet-linear-sentinel"
 
 
 @pytest.mark.parametrize(

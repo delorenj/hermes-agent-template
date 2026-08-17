@@ -146,10 +146,33 @@ clear_done() {
 
 # Fleet source-of-truth (shared across all wrappers/provisioners).
 # Every default below resolves as: env var > fleet.env > config.toml > fallback.
+# Invocation authority is not fleet configuration. Capture the caller's board
+# gate before sourcing fleet.env so that file cannot weaken an MCP/CLI
+# SKIP_PLANE decision or re-enable credentials by assigning SKIP_PLANE=0.
+PJANGLER_INVOCATION_SKIP_PLANE="${SKIP_PLANE:-0}"
 FLEET_ENV="${HERMES_FLEET_ENV:-$(config_get fleet.fleet_env "$HOME/.hermes/fleet.env")}"
 if [[ -f "$FLEET_ENV" ]]; then
   # shellcheck disable=SC1090
   source "$FLEET_ENV"
+fi
+SKIP_PLANE="$PJANGLER_INVOCATION_SKIP_PLANE"
+unset PJANGLER_INVOCATION_SKIP_PLANE
+
+# fleet.env is allowed to supply provider credentials only for an explicitly
+# board-authorized invocation. A no-board/deferred phase must remove every
+# supported provider alias after sourcing and before any Python, Hermes,
+# systemd, provider, or other child process can inherit it.
+scrub_ticket_provider_authority() {
+  local key
+  unset PLANE_API_KEY TRELLO_KEY TRELLO_TOKEN LINEAR_API_KEY
+  while IFS= read -r key; do
+    case "$key" in
+      PLANE_*_API_KEY) unset "$key" ;;
+    esac
+  done < <(compgen -A variable PLANE_)
+}
+if [[ "$SKIP_PLANE" == "1" ]]; then
+  scrub_ticket_provider_authority
 fi
 # Identity-bearing chat credentials are never fleet-scoped. Platform wiring
 # steps capture explicit invocation values before sourcing this library and
@@ -202,13 +225,18 @@ BLOODBANK_COMPOSE_DIR="${BLOODBANK_COMPOSE_DIR:-$(config_get bloodbank.compose_d
 
 # Plane
 PLANE_BASE="${PLANE_BASE:-$(config_get plane.base 'https://plane.delo.sh')}"
-PLANE_API_KEY="${PLANE_API_KEY:-${PLANE_33GOD_API_KEY:-}}"
+if [[ "$SKIP_PLANE" != "1" ]]; then
+  PLANE_API_KEY="${PLANE_API_KEY:-${PLANE_33GOD_API_KEY:-}}"
+fi
 
 export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO PJANGLER_BIN HERMES_RUNTIME_GIT_URL \
        HERMES_RUNTIME_GIT_REF HERMES_RUNTIME_GIT_SHA HERMES_OAUTH_FILE CODEX_HOME \
        RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \
        BLOODBANK_NATS_HOST BLOODBANK_NATS_PORT BLOODBANK_COMPOSE_DIR \
-       PLANE_BASE PLANE_API_KEY
+       PLANE_BASE SKIP_PLANE
+if [[ "$SKIP_PLANE" != "1" ]]; then
+  export PLANE_API_KEY
+fi
 
 # systemd --user health check. Accept running/degraded/starting — only one
 # broken unit shouldn't disqualify the rest of the user manager.
