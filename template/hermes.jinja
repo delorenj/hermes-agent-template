@@ -16,9 +16,15 @@ PROFILE_NAME="${HERMES_PROFILE_NAME:-{{ agent_id }}}"
 # of a "profiles" dir makes get_active_profile_name() report "default" and
 # _global_auth_file_path() return None — silently disabling shared fleet auth
 # and giving the agent a divergent config.yaml. The profile dir is a REAL dir
-# whose shared entries (config.yaml, .env, skills) symlink to the fleet root
-# and whose owned entries (memories, sessions, state.db, ...) symlink into
-# $RUNTIME_HOME. Provision it with: pj migrate hermes.runtime-singleton
+# whose shared entries (.env, skills) symlink to the fleet root and whose owned
+# entries (memories, sessions, state.db, ...) symlink into $RUNTIME_HOME.
+#
+# config.yaml is NOT symlinked — it is GENERATED as
+# deep_merge(fleet config.yaml, <profile>/config.delta.yaml). Symlinking it
+# detached the profile on the first in-agent write (Hermes' atomic write does
+# os.replace, which swaps the symlink for a regular file) and left no way to
+# override anything. Edit config.delta.yaml, then render.
+# Provision it with: pj migrate hermes.runtime-singleton
 HERMES_HOME="$FLEET_HOME/profiles/$PROFILE_NAME"
 if ! REPO_ROOT="$(git -C "$ROLE_DIR" rev-parse --show-toplevel 2>/dev/null)"; then
   REPO_ROOT="$ROLE_DIR"
