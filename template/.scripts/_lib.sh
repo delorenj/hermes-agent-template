@@ -144,25 +144,9 @@ clear_done() {
   rm -f -- "$ROLE_DIR/.scripts/.done-$1"
 }
 
-# Fleet source-of-truth (shared across all wrappers/provisioners).
-# Every default below resolves as: env var > fleet.env > config.toml > fallback.
-# Invocation authority is not fleet configuration. Capture the caller's board
-# gate before sourcing fleet.env so that file cannot weaken an MCP/CLI
-# SKIP_PLANE decision or re-enable credentials by assigning SKIP_PLANE=0.
-PJANGLER_INVOCATION_SKIP_PLANE="${SKIP_PLANE:-0}"
-FLEET_ENV="${HERMES_FLEET_ENV:-$(config_get fleet.fleet_env "$HOME/.hermes/fleet.env")}"
-if [[ -f "$FLEET_ENV" ]]; then
-  # shellcheck disable=SC1090
-  source "$FLEET_ENV"
-fi
-SKIP_PLANE="$PJANGLER_INVOCATION_SKIP_PLANE"
-unset PJANGLER_INVOCATION_SKIP_PLANE
-
 # fleet.env is shared configuration, not authority to inject code into Python,
-# shell, Node, or dynamic-loader children. The MCP parent removes these values
-# before launching a rendered script; repeat the boundary after sourcing the
-# fleet file so it cannot rehydrate them for any descendant. PATH remains
-# intact so explicitly configured Hermes/PJangler/provider tools still resolve.
+# shell, Node, or dynamic-loader children. PATH remains intact so explicitly
+# configured Hermes/PJangler/provider tools still resolve.
 subprocess_injection_key_is_unsafe() {
   local key="$1" loader_key="$1"
   case "$key" in
@@ -224,6 +208,94 @@ scrub_subprocess_interpreter_injection() {
 
   builtin export PYTHONNOUSERSITE=1 PYTHONSAFEPATH=1
 }
+
+# Source fleet.env in a separate Bash process and import only ordinary, safe
+# values through a NUL-delimited protocol. Shell attributes and functions are
+# deliberately process-local: a fleet file may mark a value/function readonly,
+# but it cannot make that state immutable in this provisioning shell. The
+# extractor uses builtins only after sourcing so loader controls in the fleet
+# file cannot affect another executable before they are filtered.
+import_fleet_environment() {
+  local __pjangler_fleet_path="$1"
+  local __pjangler_fleet_bash="${BASH:-}"
+  local __pjangler_fleet_fd __pjangler_fleet_pid
+  local __pjangler_fleet_count __pjangler_fleet_index
+  local __pjangler_fleet_record __pjangler_fleet_key __pjangler_fleet_value
+  local -a __pjangler_fleet_records=()
+  local __pjangler_fleet_header="PJANGLER_FLEET_ENV_V1"
+  local __pjangler_fleet_footer="PJANGLER_FLEET_ENV_END"
+
+  if [[ "$__pjangler_fleet_bash" != /* || ! -x "$__pjangler_fleet_bash" ]]; then
+    __pjangler_fleet_bash="$(builtin type -P bash)" || return 1
+  fi
+
+  exec {__pjangler_fleet_fd}< <(
+    "$__pjangler_fleet_bash" --noprofile --norc -c '
+      builtin set -a
+      builtin source "$1" >&2
+      __pjangler_fleet_source_status=$?
+      builtin set +x +v
+      if (( __pjangler_fleet_source_status != 0 )); then
+        builtin exit "$__pjangler_fleet_source_status"
+      fi
+
+      builtin printf "%s\0" "PJANGLER_FLEET_ENV_V1"
+      while IFS= builtin read -r __pjangler_fleet_key; do
+        case "$__pjangler_fleet_key" in
+          __pjangler_*) continue ;;
+        esac
+        builtin printf "%s=%s\0" \
+          "$__pjangler_fleet_key" "${!__pjangler_fleet_key}"
+      done < <(builtin compgen -e)
+      builtin printf "%s\0" "PJANGLER_FLEET_ENV_END"
+    ' pjangler-fleet-import "$__pjangler_fleet_path"
+  )
+  __pjangler_fleet_pid=$!
+  builtin mapfile -d '' -t -u "$__pjangler_fleet_fd" __pjangler_fleet_records
+  exec {__pjangler_fleet_fd}<&-
+
+  if ! builtin wait "$__pjangler_fleet_pid"; then
+    return 1
+  fi
+
+  __pjangler_fleet_count="${#__pjangler_fleet_records[@]}"
+  if (( __pjangler_fleet_count < 2 )) \
+    || [[ "${__pjangler_fleet_records[0]}" != "$__pjangler_fleet_header" ]] \
+    || [[ "${__pjangler_fleet_records[__pjangler_fleet_count - 1]}" != "$__pjangler_fleet_footer" ]]; then
+    return 1
+  fi
+
+  for ((__pjangler_fleet_index = 1; __pjangler_fleet_index < __pjangler_fleet_count - 1; __pjangler_fleet_index++)); do
+    __pjangler_fleet_record="${__pjangler_fleet_records[__pjangler_fleet_index]}"
+    [[ "$__pjangler_fleet_record" == *=* ]] || return 1
+    __pjangler_fleet_key="${__pjangler_fleet_record%%=*}"
+    __pjangler_fleet_value="${__pjangler_fleet_record#*=}"
+    [[ "$__pjangler_fleet_key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || return 1
+    subprocess_injection_key_is_unsafe "$__pjangler_fleet_key" && continue
+    [[ -v "$__pjangler_fleet_key" ]] && continue
+    builtin printf -v "$__pjangler_fleet_key" '%s' "$__pjangler_fleet_value"
+    builtin export "$__pjangler_fleet_key"
+  done
+}
+
+# Fleet source-of-truth (shared across all wrappers/provisioners).
+# Every default below resolves as: env var > fleet.env > config.toml > fallback.
+# Invocation authority is not fleet configuration. Capture the caller's board
+# gate before importing fleet.env so that file cannot weaken an MCP/CLI
+# SKIP_PLANE decision or re-enable credentials by assigning SKIP_PLANE=0.
+PJANGLER_INVOCATION_SKIP_PLANE="${SKIP_PLANE:-0}"
+FLEET_ENV="${HERMES_FLEET_ENV:-$(config_get fleet.fleet_env "$HOME/.hermes/fleet.env")}"
+
+# A direct CLI caller may not have passed through the MCP parent boundary.
+# Harden the extractor's inherited environment, then repeat the scrub after
+# import as defense in depth before any later child process can run.
+scrub_subprocess_interpreter_injection
+if [[ -f "$FLEET_ENV" ]] && ! import_fleet_environment "$FLEET_ENV"; then
+  builtin printf 'fleet environment import failed: %s\n' "$FLEET_ENV" >&2
+  return 1
+fi
+SKIP_PLANE="$PJANGLER_INVOCATION_SKIP_PLANE"
+unset PJANGLER_INVOCATION_SKIP_PLANE
 scrub_subprocess_interpreter_injection
 
 # fleet.env is allowed to supply provider credentials only for an explicitly
