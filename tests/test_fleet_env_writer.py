@@ -98,6 +98,11 @@ def test_systemd_environment_serializer_is_lossless_and_rejects_record_injection
     with pytest.raises(ValueError, match="name"):
         serialize("NOT-AN-ENV-NAME", "value")
 
+    serialize_exec = namespace["serialize_systemd_exec_value"]
+    assert serialize_exec(
+        '/space x/${EXPAND}/"quote"/back\\slash/%token/$plain'
+    ) == '"/space x/$${EXPAND}/\\"quote\\"/back\\\\slash/%%token/$$plain"'
+
 
 def test_writer_round_trips_every_value_through_canonical_literal_format(
     tmp_path: Path,

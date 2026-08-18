@@ -259,6 +259,32 @@ def test_systemd_serializes_spaces_quotes_backslashes_percent_and_dollar(
     assert expected in heartbeat
 
 
+def test_systemd_execstart_suppresses_variable_and_specifier_expansion(
+    tmp_path: Path,
+) -> None:
+    unusual = tmp_path / '${PJAN67_EXPAND} "quoted" back\\slash %token space'
+    role, registry = _make_role(unusual)
+    env = _environment(unusual, registry)
+    subprocess.run(["git", "init", "--quiet"], cwd=unusual, check=True)
+    _install_unavailable_systemd_fixture(unusual, env)
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    gateway = (
+        Path(env["HOME"])
+        / ".config"
+        / "systemd"
+        / "user"
+        / "hermes-demo-pm-gateway.service"
+    ).read_text(encoding="utf-8")
+    assert 'ExecStart="' in gateway
+    assert '$${PJAN67_EXPAND}' in gateway
+    assert '\\"quoted\\"' in gateway
+    assert 'back\\\\slash' in gateway
+    assert '%%token space' in gateway
+
+
 def test_systemd_skip_never_queries_or_writes_user_manager_state(tmp_path: Path) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)

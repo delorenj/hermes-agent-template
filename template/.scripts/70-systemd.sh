@@ -50,6 +50,10 @@ systemd_environment() {
   "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-environment "$1" "$2" \
     || die "systemd environment validation failed"
 }
+systemd_exec_value() {
+  "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-exec-value "$1" \
+    || die "systemd ExecStart value validation failed"
+}
 GW_DESCRIPTION="$(systemd_value "Hermes Gateway — $DISPLAY_NAME")"
 HB_DESCRIPTION="$(systemd_value "Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME")"
 TIMER_DESCRIPTION="$(systemd_value "Heartbeat (reconcile + checkpoint) for $AGENT_ID")"
@@ -61,7 +65,7 @@ WORKING_DIRECTORY="$(systemd_value "$REPO_ROOT")"
 RUNTIME_ENV_FILE="$(systemd_value "-$RUNTIME/.env")"
 GW_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/gateway.systemd.log")"
 HB_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/heartbeat.log")"
-GW_EXEC_START="$(systemd_value "$ROLE_DIR/.scripts/credential-launch.sh")"
+GW_EXEC_START="$(systemd_exec_value "$ROLE_DIR/.scripts/credential-launch.sh")"
 HB_EXEC_START="$GW_EXEC_START"
 
 # Encrypted credentials are optional and take precedence over the existing

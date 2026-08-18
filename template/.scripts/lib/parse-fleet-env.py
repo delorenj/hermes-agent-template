@@ -395,6 +395,11 @@ def serialize_systemd_environment(name: str, value: str) -> str:
     return f"Environment={serialize_systemd_value(f'{name}={value}')}"
 
 
+def serialize_systemd_exec_value(value: str) -> str:
+    """Quote one ExecStart token while suppressing systemd $/%% expansion."""
+    return serialize_systemd_value(value.replace("$", "$$"))
+
+
 def read_regular_document(
     path: Path,
     *,
@@ -680,17 +685,21 @@ def main() -> int:
     parse_mode = len(sys.argv) == 2
     upsert_mode = len(sys.argv) == 5 and sys.argv[1] == "--upsert"
     systemd_value_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-value"
+    systemd_exec_value_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-exec-value"
     systemd_environment_mode = len(sys.argv) == 4 and sys.argv[1] == "--systemd-environment"
-    if not parse_mode and not upsert_mode and not systemd_value_mode and not systemd_environment_mode:
+    if not parse_mode and not upsert_mode and not systemd_value_mode and not systemd_exec_value_mode and not systemd_environment_mode:
         print(
             "usage: parse-fleet-env.py PATH | --upsert PATH KEY VALUE | "
-            "--systemd-value VALUE | --systemd-environment NAME VALUE",
+            "--systemd-value VALUE | --systemd-exec-value VALUE | --systemd-environment NAME VALUE",
             file=sys.stderr,
         )
         return 2
     try:
         if systemd_value_mode:
             print(serialize_systemd_value(sys.argv[2]), end="")
+            return 0
+        if systemd_exec_value_mode:
+            print(serialize_systemd_exec_value(sys.argv[2]), end="")
             return 0
         if systemd_environment_mode:
             print(serialize_systemd_environment(sys.argv[2], sys.argv[3]), end="")
