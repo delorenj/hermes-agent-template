@@ -37,6 +37,55 @@ if [[ "${SKIP_SYSTEMD:-0}" == "1" ]]; then
   exit 0
 fi
 
+# Render every caller-controlled systemd scalar through the same data-only
+# serializer used by fleet backfill. This validation happens before mkdir,
+# systemctl, or unit writes, so CR/LF/NUL cannot create a second directive and
+# spaces/quotes/backslashes/specifier bytes remain exact.
+PYTHON_BIN="$(builtin type -P python3)" || die "python3 is unavailable for systemd unit serialization"
+systemd_value() {
+  "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-value "$1" \
+    || die "systemd value validation failed"
+}
+systemd_environment() {
+  "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-environment "$1" "$2" \
+    || die "systemd environment validation failed"
+}
+GW_DESCRIPTION="$(systemd_value "Hermes Gateway — $DISPLAY_NAME")"
+HB_DESCRIPTION="$(systemd_value "Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME")"
+TIMER_DESCRIPTION="$(systemd_value "Heartbeat (reconcile + checkpoint) for $AGENT_ID")"
+ENV_HERMES_HOME="$(systemd_environment HERMES_HOME "$PROFILE_HOME")"
+ENV_HERMES_BIN="$(systemd_environment HERMES_BIN "$HERMES_BIN")"
+ENV_CODEX_HOME="$(systemd_environment CODEX_HOME "$CODEX_HOME")"
+ENV_TERMINAL_CWD="$(systemd_environment TERMINAL_CWD "$REPO_ROOT")"
+WORKING_DIRECTORY="$(systemd_value "$REPO_ROOT")"
+RUNTIME_ENV_FILE="$(systemd_value "-$RUNTIME/.env")"
+GW_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/gateway.systemd.log")"
+HB_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/heartbeat.log")"
+GW_EXEC_START="$(systemd_value "$ROLE_DIR/.scripts/credential-launch.sh")"
+HB_EXEC_START="$GW_EXEC_START"
+
+# Encrypted credentials are optional and take precedence over the existing
+# ignored runtime/.env fallback. Validate every path-derived unit scalar before
+# any directory, unit, marker, or systemd mutation.
+CREDENTIAL_DIR="${HERMES_SYSTEMD_CREDENTIAL_DIR:-$HOME/.config/hermes-agent/credentials}"
+TELEGRAM_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-telegram-bot-token.cred"
+MODEL_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-model-api-key.cred"
+GW_CREDENTIAL_LINES=""
+HB_CREDENTIAL_LINES=""
+if [[ -f "$TELEGRAM_CREDENTIAL" ]]; then
+  command -v systemd-creds >/dev/null 2>&1 \
+    || die "encrypted Telegram credential exists but systemd-creds is unavailable"
+  GW_CREDENTIAL_LINES="LoadCredentialEncrypted=$(systemd_value "telegram_bot_token:$TELEGRAM_CREDENTIAL")"
+fi
+if [[ -f "$MODEL_CREDENTIAL" ]]; then
+  [[ -n "$(yaml_get model.key_env)" ]] \
+    || die "encrypted model credential exists but model.key_env is blank in role.yaml"
+  command -v systemd-creds >/dev/null 2>&1 \
+    || die "encrypted model credential exists but systemd-creds is unavailable"
+  GW_CREDENTIAL_LINES="${GW_CREDENTIAL_LINES}${GW_CREDENTIAL_LINES:+$'\n'}LoadCredentialEncrypted=$(systemd_value "model_api_key:$MODEL_CREDENTIAL")"
+  HB_CREDENTIAL_LINES="LoadCredentialEncrypted=$(systemd_value "model_api_key:$MODEL_CREDENTIAL")"
+fi
+
 # Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
 # dir, never the raw runtime path — Hermes derives profile identity and shared
 # fleet auth from the unresolved HERMES_HOME. $RUNTIME stays correct for
@@ -101,49 +150,26 @@ chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" "$ROLE_DIR/.scripts/checkpoint.
 [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
   || die "named profile is not a real directory; run: pj migrate hermes.runtime-singleton '$REPO_ROOT'"
 
-# Encrypted credentials are optional and take precedence over the existing
-# ignored runtime/.env fallback. Their plaintext appears only below /run while
-# systemd executes the unit. Files are provisioned separately with
-# `systemd-creds encrypt --user`; this step never reads or writes secret values.
-CREDENTIAL_DIR="${HERMES_SYSTEMD_CREDENTIAL_DIR:-$HOME/.config/hermes-agent/credentials}"
-TELEGRAM_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-telegram-bot-token.cred"
-MODEL_CREDENTIAL="$CREDENTIAL_DIR/${AGENT_ID}-model-api-key.cred"
-GW_CREDENTIAL_LINES=""
-HB_CREDENTIAL_LINES=""
-if [[ -f "$TELEGRAM_CREDENTIAL" ]]; then
-  command -v systemd-creds >/dev/null 2>&1 \
-    || die "encrypted Telegram credential exists but systemd-creds is unavailable"
-  GW_CREDENTIAL_LINES="LoadCredentialEncrypted=telegram_bot_token:$TELEGRAM_CREDENTIAL"
-fi
-if [[ -f "$MODEL_CREDENTIAL" ]]; then
-  [[ -n "$(yaml_get model.key_env)" ]] \
-    || die "encrypted model credential exists but model.key_env is blank in role.yaml"
-  command -v systemd-creds >/dev/null 2>&1 \
-    || die "encrypted model credential exists but systemd-creds is unavailable"
-  GW_CREDENTIAL_LINES="${GW_CREDENTIAL_LINES}${GW_CREDENTIAL_LINES:+$'\n'}LoadCredentialEncrypted=model_api_key:$MODEL_CREDENTIAL"
-  HB_CREDENTIAL_LINES="LoadCredentialEncrypted=model_api_key:$MODEL_CREDENTIAL"
-fi
-
 # Gateway unit
 cat > "$SYS_DIR/$GW_UNIT" <<UNIT
 [Unit]
-Description=Hermes Gateway — $DISPLAY_NAME
+Description=$GW_DESCRIPTION
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=HERMES_HOME=$PROFILE_HOME
-Environment=HERMES_BIN=$HERMES_BIN
-Environment=CODEX_HOME=$CODEX_HOME
-Environment="TERMINAL_CWD=$REPO_ROOT"
-EnvironmentFile=-$RUNTIME/.env
+$ENV_HERMES_HOME
+$ENV_HERMES_BIN
+$ENV_CODEX_HOME
+$ENV_TERMINAL_CWD
+EnvironmentFile=$RUNTIME_ENV_FILE
 $GW_CREDENTIAL_LINES
-ExecStart=$CREDENTIAL_LAUNCHER gateway
+ExecStart=$GW_EXEC_START gateway
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:$RUNTIME/logs/gateway.systemd.log
-StandardError=append:$RUNTIME/logs/gateway.systemd.log
+StandardOutput=$GW_LOG_OUTPUT
+StandardError=$GW_LOG_OUTPUT
 
 [Install]
 WantedBy=default.target
@@ -155,31 +181,31 @@ UNIT
 # The per-agent EnvironmentFiles load ticket-provider creds for the sentinel pass.
 cat > "$SYS_DIR/$HB_SVC" <<UNIT
 [Unit]
-Description=Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME
+Description=$HB_DESCRIPTION
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_ROOT
-Environment=HERMES_HOME=$PROFILE_HOME
-Environment=HERMES_BIN=$HERMES_BIN
-Environment=CODEX_HOME=$CODEX_HOME
-Environment="TERMINAL_CWD=$REPO_ROOT"
+WorkingDirectory=$WORKING_DIRECTORY
+$ENV_HERMES_HOME
+$ENV_HERMES_BIN
+$ENV_CODEX_HOME
+$ENV_TERMINAL_CWD
 EnvironmentFile=-%h/.config/hermes-agent/env
 EnvironmentFile=-%h/.hermes/env
 EnvironmentFile=-%h/.hermes/hermes-agent.env
 EnvironmentFile=-%h/.hermes/${AGENT_ID}.env
-EnvironmentFile=-$RUNTIME/.env
+EnvironmentFile=$RUNTIME_ENV_FILE
 $HB_CREDENTIAL_LINES
-ExecStart=$CREDENTIAL_LAUNCHER heartbeat
+ExecStart=$HB_EXEC_START heartbeat
 TimeoutStartSec=45min
-StandardOutput=append:$RUNTIME/logs/heartbeat.log
-StandardError=append:$RUNTIME/logs/heartbeat.log
+StandardOutput=$HB_LOG_OUTPUT
+StandardError=$HB_LOG_OUTPUT
 UNIT
 cat > "$SYS_DIR/$HB_TIMER" <<UNIT
 [Unit]
-Description=Heartbeat (reconcile + checkpoint) for $AGENT_ID
+Description=$TIMER_DESCRIPTION
 
 [Timer]
 OnBootSec=1min

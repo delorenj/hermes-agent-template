@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import stat
 import subprocess
@@ -42,6 +43,7 @@ FLEET_REFERENCE_ALLOWLIST = {
     "template/.scripts/05-fleet-env.sh",
     "template/.scripts/30-telegram.sh",
     "template/.scripts/31-slack.sh",
+    "template/.scripts/70-systemd.sh",
     "template/.scripts/80-registry.sh",
     "template/.scripts/99-summary.sh",
     "template/.scripts/_lib.sh",
@@ -51,6 +53,19 @@ FLEET_REFERENCE_ALLOWLIST = {
     "template/.scripts/providers/plane.sh",
     "template/hermes.jinja",
 }
+
+
+def executable_sources(*roots: Path) -> list[Path]:
+    return [
+        path
+        for root in roots
+        for path in root.rglob("*")
+        if path.is_file()
+        and (
+            path.suffix in {"", ".sh", ".py", ".jinja", ".command"}
+            or stat.S_IMODE(path.stat().st_mode) & 0o111
+        )
+    ]
 
 
 def executable_fleet_violation(text: str) -> re.Match[str] | None:
@@ -212,12 +227,7 @@ def _backfill_fixture(tmp_path: Path, *, invalid_last: bool = False) -> tuple[di
 
 
 def test_shipped_sources_forbid_every_executable_fleet_env_spelling() -> None:
-    production = [
-        path
-        for root in (TEMPLATE, SCRIPTS)
-        for path in root.rglob("*")
-        if path.is_file() and path.suffix in {"", ".sh", ".py", ".jinja"}
-    ]
+    production = executable_sources(TEMPLATE, SCRIPTS)
     references = {
         str(path.relative_to(ROOT))
         for path in production
@@ -241,6 +251,19 @@ def test_shipped_sources_forbid_every_executable_fleet_env_spelling() -> None:
         'command source "$FLEET_ENV"',
     ):
         assert executable_fleet_violation(spelling), spelling
+
+
+def test_executable_command_suffix_is_inside_fleet_reference_inventory(
+    tmp_path: Path,
+) -> None:
+    command = tmp_path / "fleet-escape.command"
+    command.write_text('source "$HERMES_FLEET_ENV"\n', encoding="utf-8")
+    command.chmod(0o755)
+
+    discovered = executable_sources(tmp_path)
+
+    assert discovered == [command]
+    assert executable_fleet_violation(discovered[0].read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize(
@@ -365,6 +388,180 @@ def test_backfill_late_invalid_last_target_is_zero_effect(tmp_path: Path) -> Non
     assert re.search(r"symlink|real directory", result.stderr, re.IGNORECASE)
     assert {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"} == before
     assert not paths["marker"].exists(), "preflight failure must not invoke external processes"
+
+
+def test_backfill_rejects_role_path_with_symlinked_escaping_ancestor(
+    tmp_path: Path,
+) -> None:
+    env, paths = _backfill_fixture(tmp_path)
+    agents = paths["project"] / "agents"
+    escaped_agents = tmp_path / "escaped-agents"
+    agents.rename(escaped_agents)
+    agents.symlink_to(escaped_agents, target_is_directory=True)
+    watched = {**paths, "escaped_agents": escaped_agents}
+    before = {key: _tree_snapshot(path) for key, path in watched.items() if key != "marker"}
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert re.search(r"escape|contain|symlink", result.stderr, re.IGNORECASE)
+    assert {key: _tree_snapshot(path) for key, path in watched.items() if key != "marker"} == before
+    assert not paths["marker"].exists()
+
+
+def test_backfill_batch_preserves_setid_mode_and_exact_ownership(
+    tmp_path: Path,
+) -> None:
+    namespace = runpy.run_path(str(SCRIPTS / "backfill-fleet-sot.py"))
+    batch_plan = namespace["BatchPlan"]
+    destination = tmp_path / "owned.env"
+    destination.write_bytes(b"before\n")
+    destination.chmod(0o4600)
+    before = destination.stat()
+    plan = batch_plan(namespace["load_parser"](FLEET_PARSER)._exchange_paths)
+    plan.plan_file(destination, b"after\n")
+
+    plan.apply()
+
+    after = destination.stat()
+    assert destination.read_bytes() == b"after\n"
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o4600
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+
+
+def test_backfill_batch_fchown_denial_is_zero_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(SCRIPTS / "backfill-fleet-sot.py"))
+    batch_plan = namespace["BatchPlan"]
+    destination = tmp_path / "owned.env"
+    destination.write_bytes(b"before\n")
+    destination.chmod(0o4600)
+    before_bytes = destination.read_bytes()
+    before = destination.stat()
+    plan = batch_plan(namespace["load_parser"](FLEET_PARSER)._exchange_paths)
+    plan.plan_file(destination, b"after\n")
+
+    def reject_ownership(_descriptor: int, _uid: int, _gid: int) -> None:
+        raise PermissionError("synthetic backfill ownership denial")
+
+    monkeypatch.setattr(os, "fchown", reject_ownership)
+    with pytest.raises(PermissionError, match="synthetic backfill ownership denial"):
+        plan.apply()
+
+    after = destination.stat()
+    assert destination.read_bytes() == before_bytes
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o4600
+    assert list(tmp_path.iterdir()) == [destination]
+
+
+def test_backfill_loads_the_attested_parser_bytes_without_reopening_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(SCRIPTS / "backfill-fleet-sot.py"))
+    parser_copy = tmp_path / "parse-fleet-env.py"
+    parser_copy.write_bytes(FLEET_PARSER.read_bytes())
+    original_read = namespace["read_regular_file"]
+    load_parser = namespace["load_parser"]
+
+    def snapshot_then_replace(path: Path, label: str):
+        snapshot = original_read(path, label)
+        path.write_text("raise RuntimeError('mutable parser path reopened')\n", encoding="utf-8")
+        return snapshot
+
+    monkeypatch.setitem(load_parser.__globals__, "read_regular_file", snapshot_then_replace)
+
+    loaded = load_parser(parser_copy)
+
+    assert loaded.parse("SAFE=$'snapshot bytes'\n") == [("SAFE", "snapshot bytes")]
+
+
+def test_backfill_stable_reader_rejects_same_inode_mutation_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(SCRIPTS / "backfill-fleet-sot.py"))
+    source = tmp_path / "large-source.bin"
+    source.write_bytes(b"a" * (2 * 1024 * 1024))
+    inode = source.stat().st_ino
+    real_read = os.read
+    mutated = False
+
+    def mutate_after_first_chunk(descriptor: int, size: int) -> bytes:
+        nonlocal mutated
+        chunk = real_read(descriptor, size)
+        if chunk and not mutated:
+            mutated = True
+            with source.open("r+b") as stream:
+                stream.seek(1024 * 1024)
+                stream.write(b"b" * 4096)
+                stream.flush()
+                os.fsync(stream.fileno())
+            assert source.stat().st_ino == inode
+        return chunk
+
+    monkeypatch.setattr(os, "read", mutate_after_first_chunk)
+    with pytest.raises(namespace["BackfillError"], match="changed while it was read"):
+        namespace["read_regular_file"](source, "concurrent source")
+
+
+def test_backfill_repairs_gateway_and_heartbeat_units_transactionally(
+    tmp_path: Path,
+) -> None:
+    env, paths = _backfill_fixture(tmp_path)
+    heartbeat = paths["systemd"] / "hermes-first-pm-heartbeat.service"
+    timer = paths["systemd"] / "hermes-first-pm-heartbeat.timer"
+    heartbeat.write_text("[Service]\nEnvironment=HERMES_HOME=/old-heartbeat\n", encoding="utf-8")
+    timer_bytes = b"[Timer]\nUnit=hermes-first-pm-heartbeat.service\n"
+    timer.write_bytes(timer_bytes)
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    gateway_text = (paths["systemd"] / "hermes-first-pm-gateway.service").read_text(encoding="utf-8")
+    heartbeat_text = heartbeat.read_text(encoding="utf-8")
+    for rendered in (gateway_text, heartbeat_text):
+        assert 'Environment="HERMES_OAUTH_FILE=/fixture/auth.json"' in rendered
+        assert 'Environment="CODEX_HOME=/fixture/codex"' in rendered
+    assert timer.read_bytes() == timer_bytes
+
+
+def test_backfill_rejects_systemd_newline_injection_before_batch_mutation(
+    tmp_path: Path,
+) -> None:
+    env, paths = _backfill_fixture(tmp_path)
+    heartbeat = paths["systemd"] / "hermes-first-pm-heartbeat.service"
+    heartbeat.write_text("[Service]\nEnvironment=HERMES_HOME=/old-heartbeat\n", encoding="utf-8")
+    env["HERMES_FLEET_CODEX_HOME"] = "/safe\nEnvironment=PJAN67_INJECTED=yes"
+    before = {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"}
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "systemd" in result.stderr.lower()
+    assert {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"} == before
+    assert not paths["marker"].exists()
 
 
 def test_backfill_dry_run_plans_all_targets_without_mutation(tmp_path: Path) -> None:

@@ -363,6 +363,38 @@ def serialize_literal(value: str) -> str:
     return "$'" + "".join(escaped) + "'"
 
 
+def serialize_systemd_value(value: str) -> str:
+    """Return one lossless, injection-safe systemd.syntax scalar."""
+    validate_unicode(value)
+    if "\0" in value:
+        raise FleetEnvParseError(1, "NUL is not allowed in a systemd value")
+    if "\r" in value or "\n" in value:
+        raise FleetEnvParseError(1, "newline control characters are not allowed in a systemd value")
+    escaped: list[str] = []
+    for char in value:
+        if char == "\\":
+            escaped.append(r"\\")
+        elif char == '"':
+            escaped.append(r'\"')
+        elif char == "%":
+            # systemd specifiers are expanded after syntax unquoting. Doubling
+            # preserves a caller-provided percent byte as literal data.
+            escaped.append("%%")
+        elif char == "\t":
+            escaped.append(r"\t")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            escaped.append(f"\\x{ord(char):02x}")
+        else:
+            escaped.append(char)
+    return '"' + "".join(escaped) + '"'
+
+
+def serialize_systemd_environment(name: str, value: str) -> str:
+    if not NAME.fullmatch(name):
+        raise FleetEnvParseError(1, "invalid systemd environment variable name")
+    return f"Environment={serialize_systemd_value(f'{name}={value}')}"
+
+
 def read_regular_document(
     path: Path,
     *,
@@ -382,7 +414,10 @@ def read_regular_document(
             raise FleetEnvParseError(1, "fleet environment path must be a regular file")
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             content = stream.read()
-        return content.decode("utf-8"), metadata
+        after = os.fstat(descriptor)
+        if not _same_file_metadata(metadata, after):
+            raise FleetEnvParseError(1, "fleet environment changed while it was read")
+        return content.decode("utf-8"), after
     finally:
         os.close(descriptor)
 
@@ -391,6 +426,7 @@ def write_atomic_document(
     path: Path,
     content: str,
     original: os.stat_result | None,
+    original_content: bytes | None = None,
 ) -> None:
     parent = path.parent
     descriptor, temporary_name = tempfile.mkstemp(
@@ -441,10 +477,10 @@ def write_atomic_document(
             # there is no portable conditional-replace primitive for this CAS.
             _exchange_paths(temporary, path)
             displaced = os.lstat(temporary)
-            if (
-                not stat.S_ISREG(displaced.st_mode)
-                or (displaced.st_dev, displaced.st_ino)
-                != (original.st_dev, original.st_ino)
+            if original_content is None or not _matches_file_snapshot(
+                temporary,
+                original,
+                original_content,
             ):
                 try:
                     _exchange_paths(temporary, path)
@@ -481,6 +517,47 @@ def write_atomic_document(
                 temporary.unlink()
             except FileNotFoundError:
                 pass
+
+
+def _same_file_metadata(expected: os.stat_result, actual: os.stat_result) -> bool:
+    """Compare the stable identity, content-version, and security metadata."""
+    return (
+        stat.S_ISREG(actual.st_mode)
+        and (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+        and actual.st_mode == expected.st_mode
+        and actual.st_uid == expected.st_uid
+        and actual.st_gid == expected.st_gid
+        and actual.st_size == expected.st_size
+        and actual.st_mtime_ns == expected.st_mtime_ns
+    )
+
+
+def _matches_file_snapshot(
+    path: Path,
+    expected: os.stat_result,
+    expected_content: bytes,
+) -> bool:
+    """Attest one displaced inode without following a replacement symlink."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return False
+    try:
+        before = os.fstat(descriptor)
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    return (
+        _same_file_metadata(expected, before)
+        and _same_file_metadata(before, after)
+        and b"".join(chunks) == expected_content
+    )
 
 
 def _remove_recovery_temporary(path: Path) -> bool:
@@ -588,7 +665,8 @@ def render_upsert(
 def atomic_upsert(path: Path, key: str, value: str) -> None:
     text, original = read_regular_document(path, allow_missing=True)
     updated = render_upsert(text, key, value)
-    write_atomic_document(path, updated, original)
+    original_content = text.encode("utf-8", errors="strict") if original is not None else None
+    write_atomic_document(path, updated, original, original_content)
 
 
 def emit_records(records: list[tuple[str, str]]) -> None:
@@ -601,10 +679,22 @@ def emit_records(records: list[tuple[str, str]]) -> None:
 def main() -> int:
     parse_mode = len(sys.argv) == 2
     upsert_mode = len(sys.argv) == 5 and sys.argv[1] == "--upsert"
-    if not parse_mode and not upsert_mode:
-        print("usage: parse-fleet-env.py PATH | --upsert PATH KEY VALUE", file=sys.stderr)
+    systemd_value_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-value"
+    systemd_environment_mode = len(sys.argv) == 4 and sys.argv[1] == "--systemd-environment"
+    if not parse_mode and not upsert_mode and not systemd_value_mode and not systemd_environment_mode:
+        print(
+            "usage: parse-fleet-env.py PATH | --upsert PATH KEY VALUE | "
+            "--systemd-value VALUE | --systemd-environment NAME VALUE",
+            file=sys.stderr,
+        )
         return 2
     try:
+        if systemd_value_mode:
+            print(serialize_systemd_value(sys.argv[2]), end="")
+            return 0
+        if systemd_environment_mode:
+            print(serialize_systemd_environment(sys.argv[2], sys.argv[3]), end="")
+            return 0
         if upsert_mode:
             atomic_upsert(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
             return 0

@@ -81,6 +81,24 @@ def _upsert(
     )
 
 
+def test_systemd_environment_serializer_is_lossless_and_rejects_record_injection() -> None:
+    namespace = runpy.run_path(str(TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"))
+    serialize = namespace["serialize_systemd_environment"]
+    value = '/path with spaces/"quote"/back\\slash/%token/$dollar\tend'
+
+    rendered = serialize("CODEX_HOME", value)
+
+    assert rendered == (
+        'Environment="CODEX_HOME=/path with spaces/\\"quote\\"/'
+        'back\\\\slash/%%token/$dollar\\tend"'
+    )
+    for unsafe in ("line one\nline two", "carriage\rreturn", "nul\0byte"):
+        with pytest.raises(ValueError, match="control|newline|NUL"):
+            serialize("CODEX_HOME", unsafe)
+    with pytest.raises(ValueError, match="name"):
+        serialize("NOT-AN-ENV-NAME", "value")
+
+
 def test_writer_round_trips_every_value_through_canonical_literal_format(
     tmp_path: Path,
 ) -> None:
@@ -289,6 +307,43 @@ def test_upsert_preserves_a_replacement_racing_the_commit_boundary(
 
     assert calls == 2, "the atomic exchange must be reversed after mismatch"
     assert fleet.read_bytes() == replacement_bytes
+    assert list(tmp_path.iterdir()) == [fleet]
+
+
+def test_upsert_preserves_same_inode_content_mutation_racing_commit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    original_inode = fleet.stat().st_ino
+    concurrent_bytes = b"KEY=concurrent-same-inode\n"
+    namespace = runpy.run_path(str(parser))
+    atomic_upsert = namespace["atomic_upsert"]
+    real_exchange = namespace["_exchange_paths"]
+    calls = 0
+
+    def modify_same_inode_then_exchange(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            with fleet.open("wb") as stream:
+                stream.write(concurrent_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+            assert fleet.stat().st_ino == original_inode
+        real_exchange(source, destination)
+
+    monkeypatch.setitem(
+        atomic_upsert.__globals__, "_exchange_paths", modify_same_inode_then_exchange
+    )
+    with pytest.raises(OSError, match="destination changed"):
+        atomic_upsert(fleet, "KEY", "our-update")
+
+    assert calls == 2, "a same-inode content mismatch must reverse the atomic exchange"
+    assert fleet.read_bytes() == concurrent_bytes
+    assert fleet.stat().st_ino == original_inode
     assert list(tmp_path.iterdir()) == [fleet]
 
 

@@ -101,6 +101,25 @@ def _run(role: Path, name: str, env: dict[str, str]) -> subprocess.CompletedProc
     )
 
 
+def _install_unavailable_systemd_fixture(tmp_path: Path, env: dict[str, str]) -> None:
+    fake_bin = tmp_path / "systemd-unavailable-bin"
+    fake_bin.mkdir()
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) exit 1 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}:{env['PATH']}"
+
+
 def _inject_parent_fsync_failure(
     tmp_path: Path, env: dict[str, str], parent: Path
 ) -> None:
@@ -198,10 +217,46 @@ exit 1
     rendered = "\n".join(path.read_text(encoding="utf-8") for path in unit_dir.iterdir())
     assert "bloodbank-consumer.py" not in rendered
     assert "consumer.log" not in rendered
-    assert f"Environment=HERMES_HOME={Path(env['HOME']) / '.hermes' / 'profiles' / 'demo-pm'}" in rendered
+    assert f'Environment="HERMES_HOME={Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"}"' in rendered
     assert f'Environment="TERMINAL_CWD={tmp_path}"' in rendered
-    assert "ExecStart=" + str(role / ".scripts" / "credential-launch.sh") + " gateway" in rendered
+    assert 'ExecStart="' + str(role / ".scripts" / "credential-launch.sh") + '" gateway' in rendered
     assert "HERMES_OAUTH_FILE" not in rendered
+
+
+def test_systemd_rejects_newline_injection_before_writing_units(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    _install_unavailable_systemd_fixture(tmp_path, env)
+    env["CODEX_HOME"] = "/safe\nEnvironment=PJAN67_INJECTED=yes"
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode != 0
+    assert "systemd" in result.stderr.lower() or "newline" in result.stderr.lower()
+    unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    assert not list(unit_dir.glob("hermes-*.service")) if unit_dir.exists() else True
+    assert not (role / ".scripts" / ".done-70-systemd").exists()
+
+
+def test_systemd_serializes_spaces_quotes_backslashes_percent_and_dollar(
+    tmp_path: Path,
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
+    _install_unavailable_systemd_fixture(tmp_path, env)
+    env["CODEX_HOME"] = '/code x/"quoted"/back\\slash/%token/$dollar'
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    units = Path(env["HOME"]) / ".config" / "systemd" / "user"
+    gateway = (units / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
+    heartbeat = (units / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
+    expected = 'Environment="CODEX_HOME=/code x/\\"quoted\\"/back\\\\slash/%%token/$dollar"'
+    assert expected in gateway
+    assert expected in heartbeat
 
 
 def test_systemd_skip_never_queries_or_writes_user_manager_state(tmp_path: Path) -> None:
@@ -290,9 +345,9 @@ exit 1
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
     gateway = (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
     heartbeat = (unit_dir / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
-    assert f"LoadCredentialEncrypted=telegram_bot_token:{telegram_cred}" in gateway
-    assert f"LoadCredentialEncrypted=model_api_key:{model_cred}" in gateway
-    assert f"LoadCredentialEncrypted=model_api_key:{model_cred}" in heartbeat
+    assert f'LoadCredentialEncrypted="telegram_bot_token:{telegram_cred}"' in gateway
+    assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in gateway
+    assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in heartbeat
     assert "DIRECTOR_LITELLM_KEY" not in gateway + heartbeat
     assert "encrypted-placeholder" not in gateway + heartbeat
 
