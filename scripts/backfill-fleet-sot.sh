@@ -1,6 +1,26 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
+FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
+ROLE_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/_lib.sh"
+WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
+for trusted_asset in \
+  "$FLEET_ENV_LIBRARY_SOURCE" \
+  "$FLEET_ENV_PARSER_SOURCE" \
+  "$ROLE_LIBRARY_SOURCE" \
+  "$WRAPPER_TEMPLATE"
+do
+  if [[ ! -f "$trusted_asset" || -L "$trusted_asset" ]]; then
+    echo "backfill-fleet-sot: trusted template asset is unavailable" >&2
+    exit 2
+  fi
+done
+# shellcheck source=../template/.scripts/lib/fleet-env.sh
+builtin source "$FLEET_ENV_LIBRARY_SOURCE"
+scrub_subprocess_interpreter_injection
+
 # Distributable config — same source of truth the template's _lib.sh reads.
 HERMES_TEMPLATE_CONFIG="${HERMES_TEMPLATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hermes-agent-template/config.toml}"
 cfg() {  # cfg <dotted.key> <default>  — read a value from config.toml (always exits 0)
@@ -27,60 +47,35 @@ PYEOF
 }
 
 FLEET_ENV="${HERMES_FLEET_ENV:-$(cfg fleet.fleet_env "$HOME/.hermes/fleet.env")}"
+load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER_SOURCE"
+
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
-DEFAULT_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}"
-DEFAULT_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}"
-DEFAULT_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$(cfg fleet.oauth_file "$HOME/.hermes/auth.json")}"
-DEFAULT_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$(cfg fleet.codex_home "$HOME/.codex")}"
+HERMES_FLEET_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}"
+HERMES_FLEET_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}"
+HERMES_FLEET_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$(cfg fleet.oauth_file "$HOME/.hermes/auth.json")}"
+HERMES_FLEET_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$(cfg fleet.codex_home "$HOME/.codex")}"
 SCAFFOLD_SRC="$(cd "$(dirname "$0")/../template/.runtime-scaffold" && pwd)"
 
 mkdir -p "$(dirname "$FLEET_ENV")"
-if [[ ! -f "$FLEET_ENV" ]]; then
-  cat > "$FLEET_ENV" <<EOF
-# Hermes fleet source of truth.
-HERMES_FLEET_BIN=${DEFAULT_BIN}
-HERMES_FLEET_REPO=${DEFAULT_REPO}
-HERMES_FLEET_REGISTRY_FILE=${REGISTRY_FILE}
-HERMES_FLEET_OAUTH_FILE=${DEFAULT_OAUTH_FILE}
-HERMES_FLEET_CODEX_HOME=${DEFAULT_CODEX_HOME}
-EOF
-  chmod 600 "$FLEET_ENV"
-fi
-
 upsert_fleet_env() {
   local key="$1" value="$2"
-  python3 - "$FLEET_ENV" "$key" "$value" <<'PYEOF'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-key = sys.argv[2]
-value = sys.argv[3]
-line = f"{key}={value}"
-lines = path.read_text().splitlines() if path.exists() else []
-for idx, existing in enumerate(lines):
-    if existing.startswith(f"{key}="):
-        lines[idx] = line
-        break
-else:
-    lines.append(line)
-path.write_text("\n".join(lines) + "\n")
-PYEOF
+  python3 -I "$FLEET_ENV_PARSER_SOURCE" --upsert "$FLEET_ENV" "$key" "$value"
 }
 
-upsert_fleet_env HERMES_FLEET_OAUTH_FILE "$DEFAULT_OAUTH_FILE"
-upsert_fleet_env HERMES_FLEET_CODEX_HOME "$DEFAULT_CODEX_HOME"
-chmod 600 "$FLEET_ENV"
+new_fleet_env=0
+if [[ ! -e "$FLEET_ENV" && ! -L "$FLEET_ENV" ]]; then
+  new_fleet_env=1
+  upsert_fleet_env HERMES_FLEET_BIN "$HERMES_FLEET_BIN"
+  upsert_fleet_env HERMES_FLEET_REPO "$HERMES_FLEET_REPO"
+  upsert_fleet_env HERMES_FLEET_REGISTRY_FILE "$REGISTRY_FILE"
+fi
+upsert_fleet_env HERMES_FLEET_OAUTH_FILE "$HERMES_FLEET_OAUTH_FILE"
+upsert_fleet_env HERMES_FLEET_CODEX_HOME "$HERMES_FLEET_CODEX_HOME"
 
-# shellcheck disable=SC1090
-source "$FLEET_ENV"
-
-HERMES_FLEET_BIN="${HERMES_FLEET_BIN:-$DEFAULT_BIN}"
-HERMES_FLEET_REPO="${HERMES_FLEET_REPO:-$DEFAULT_REPO}"
-HERMES_FLEET_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$DEFAULT_OAUTH_FILE}"
-HERMES_FLEET_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$DEFAULT_CODEX_HOME}"
-
-python3 - "$REGISTRY_FILE" "$HERMES_FLEET_BIN" "$HERMES_FLEET_REPO" "$FLEET_ENV" "$SCAFFOLD_SRC" "$HERMES_FLEET_OAUTH_FILE" "$HERMES_FLEET_CODEX_HOME" <<'PYEOF'
+python3 - "$REGISTRY_FILE" "$HERMES_FLEET_BIN" "$HERMES_FLEET_REPO" "$FLEET_ENV" \
+  "$SCAFFOLD_SRC" "$HERMES_FLEET_OAUTH_FILE" "$HERMES_FLEET_CODEX_HOME" \
+  "$FLEET_ENV_LIBRARY_SOURCE" "$FLEET_ENV_PARSER_SOURCE" \
+  "$ROLE_LIBRARY_SOURCE" "$WRAPPER_TEMPLATE" <<'PYEOF'
 import os
 import stat
 import sys
@@ -99,6 +94,10 @@ fleet_env = sys.argv[4]
 scaffold_src = pathlib.Path(sys.argv[5])
 oauth_file = sys.argv[6]
 codex_home = sys.argv[7]
+fleet_library_source = pathlib.Path(sys.argv[8])
+fleet_parser_source = pathlib.Path(sys.argv[9])
+role_library_source = pathlib.Path(sys.argv[10])
+wrapper_template = pathlib.Path(sys.argv[11]).read_text()
 
 if not registry_path.exists():
     raise SystemExit(f"Registry not found: {registry_path}")
@@ -169,87 +168,31 @@ for agent_id, cfg in agents.items():
     shutil.copytree(scaffold_src, target_scaffold, dirs_exist_ok=True)
     scaffold_count += 1
 
-    lib_path = role_path / ".scripts" / "_lib.sh"
-    if lib_path.exists():
-        lib_text = lib_path.read_text()
-        old_block = (
-            "# Tools we expect on the host\n"
-            "HERMES_BIN=\"${HERMES_BIN:-/home/delorenj/code/hermes-agent/.venv/bin/hermes}\"\n"
-            "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-/home/delorenj/code/hermes-agent}\"\n"
-            "RUNTIME_SCAFFOLD_DIR=\"${RUNTIME_SCAFFOLD_DIR:-/home/delorenj/code/hermes-agent-template/runtime-scaffold}\"\n"
-            "REGISTRY_FILE=\"${REGISTRY_FILE:-$HOME/.hermes/agents-registry.yaml}\"\n"
-        )
-        new_block = (
-            "# Fleet source-of-truth (shared across all wrappers/provisioners)\n"
-            "FLEET_ENV=\"${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}\"\n"
-            "if [[ -f \"$FLEET_ENV\" ]]; then\n"
-            "  # shellcheck disable=SC1090\n"
-            "  source \"$FLEET_ENV\"\n"
-            "fi\n\n"
-            "# Tools we expect on the host\n"
-            "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes}}\"\n"
-            "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1}}\"\n"
-            "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
-            "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n"
-            "# Prefer a scaffold vendored into this agent directory; fall back to legacy template path.\n"
-            "RUNTIME_SCAFFOLD_DIR=\"${RUNTIME_SCAFFOLD_DIR:-$ROLE_DIR/.runtime-scaffold}\"\n"
-            "if [[ ! -d \"$RUNTIME_SCAFFOLD_DIR\" ]]; then\n"
-            "  RUNTIME_SCAFFOLD_DIR=\"${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-$HOME/code/hermes-agent-template/runtime-scaffold}\"\n"
-            "fi\n"
-            "REGISTRY_FILE=\"${REGISTRY_FILE:-${HERMES_FLEET_REGISTRY_FILE:-$HOME/.hermes/agents-registry.yaml}}\"\n"
-        )
-        if old_block in lib_text:
-            lib_text = lib_text.replace(old_block, new_block)
-        if "HERMES_OAUTH_FILE=" not in lib_text:
-            lib_text = lib_text.replace(
-                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1}}\"\n",
-                "HERMES_AGENT_REPO=\"${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1}}\"\n"
-                "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
-                "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n",
-            )
-        lib_text = lib_text.replace(
-            "export HERMES_BIN HERMES_AGENT_REPO RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \\\n       BLOODBANK_NATS_HOST BLOODBANK_NATS_PORT \\\n       PLANE_BASE PLANE_API_KEY \\\n       CF_API CF_ZONE_DELO_SH CF_ACCOUNT_ID\n",
-            "export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO RUNTIME_SCAFFOLD_DIR REGISTRY_FILE \\\n       BLOODBANK_NATS_HOST BLOODBANK_NATS_PORT \\\n       PLANE_BASE PLANE_API_KEY \\\n       CF_API CF_ZONE_DELO_SH CF_ACCOUNT_ID\n",
-        )
-        lib_text = lib_text.replace(
-            "export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO RUNTIME_SCAFFOLD_DIR REGISTRY_FILE",
-            "export FLEET_ENV HERMES_BIN HERMES_AGENT_REPO HERMES_OAUTH_FILE CODEX_HOME RUNTIME_SCAFFOLD_DIR REGISTRY_FILE",
-        )
-        if lib_text != lib_path.read_text():
-            lib_path.write_text(lib_text)
-            lib_count += 1
+    scripts_dir = role_path / ".scripts"
+    role_lib_dir = scripts_dir / "lib"
+    if scripts_dir.is_symlink() or role_lib_dir.is_symlink():
+        raise SystemExit(f"refusing symlinked role script directory: {role_path}")
+    role_lib_dir.mkdir(parents=True, exist_ok=True)
+    for source, destination in (
+        (fleet_library_source, role_lib_dir / "fleet-env.sh"),
+        (fleet_parser_source, role_lib_dir / "parse-fleet-env.py"),
+        (role_library_source, scripts_dir / "_lib.sh"),
+    ):
+        if destination.is_symlink():
+            raise SystemExit(f"refusing symlinked role template asset: {destination}")
+        shutil.copy2(source, destination)
+    lib_count += 1
 
     wrapper = role_path / "hermes"
-    if not wrapper.exists():
-        continue
-
-    wrapper.write_text(
-        "#!/usr/bin/env bash\n"
-        f"# Launcher for {agent_id}. Resolves HERMES_HOME to runtime and execs shared fleet Hermes.\n"
-        "set -euo pipefail\n\n"
-        "ROLE_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"
-        "HERMES_HOME=\"$ROLE_DIR/runtime\"\n\n"
-        "FLEET_ENV=\"${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}\"\n"
-        "if [[ -f \"$FLEET_ENV\" ]]; then\n"
-        "  # shellcheck disable=SC1090\n"
-        "  source \"$FLEET_ENV\"\n"
-        "fi\n\n"
-        "HERMES_BIN=\"${HERMES_BIN:-${HERMES_FLEET_BIN:-$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes}}\"\n\n"
-        "HERMES_OAUTH_FILE=\"${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$HOME/.hermes/auth.json}}\"\n"
-        "CODEX_HOME=\"${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$HOME/.codex}}\"\n\n"
-        "if [[ ! -d \"$HERMES_HOME\" ]]; then\n"
-        "  echo \"hermes: runtime submodule not initialized at $HERMES_HOME\" >&2\n"
-        "  echo \"  fix: git submodule update --init --recursive\" >&2\n"
-        "  exit 1\n"
-        "fi\n\n"
-        "if [[ ! -x \"$HERMES_BIN\" ]]; then\n"
-        "  echo \"hermes: binary not executable at $HERMES_BIN\" >&2\n"
-        "  echo \"  set HERMES_BIN or HERMES_FLEET_BIN (in $FLEET_ENV) to the shared Hermes binary.\" >&2\n"
-        "  exit 1\n"
-        "fi\n\n"
-        "exec env HERMES_HOME=\"$HERMES_HOME\" HERMES_FLEET_ENV=\"$FLEET_ENV\" "
-        "HERMES_OAUTH_FILE=\"$HERMES_OAUTH_FILE\" CODEX_HOME=\"$CODEX_HOME\" \"$HERMES_BIN\" \"$@\"\n"
+    if wrapper.is_symlink():
+        raise SystemExit(f"refusing symlinked Hermes launcher: {wrapper}")
+    profile_name = str(cfg.get("profile_name") or agent_id)
+    wrapper_text = wrapper_template.replace("{{ agent_id }}", agent_id)
+    wrapper_text = wrapper_text.replace(
+        f'PROFILE_NAME="${{HERMES_PROFILE_NAME:-{agent_id}}}"',
+        f'PROFILE_NAME="${{HERMES_PROFILE_NAME:-{profile_name}}}"',
     )
+    wrapper.write_text(wrapper_text)
 
     mode = wrapper.stat().st_mode
     wrapper.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

@@ -7,6 +7,17 @@ set -euo pipefail
 ROLE_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME_HOME="$ROLE_DIR/runtime"
 
+FLEET_ENV="${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}"
+FLEET_ENV_LIBRARY="$ROLE_DIR/.scripts/lib/fleet-env.sh"
+FLEET_ENV_PARSER="$ROLE_DIR/.scripts/lib/parse-fleet-env.py"
+if [[ ! -f "$FLEET_ENV_LIBRARY" || -L "$FLEET_ENV_LIBRARY" ]]; then
+  echo "hermes: trusted fleet environment loader unavailable" >&2
+  exit 1
+fi
+# shellcheck source=.scripts/lib/fleet-env.sh
+builtin source "$FLEET_ENV_LIBRARY"
+load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER"
+
 FLEET_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}"
 PROFILE_NAME="${HERMES_PROFILE_NAME:-{{ agent_id }}}"
 
@@ -30,11 +41,6 @@ if ! REPO_ROOT="$(git -C "$ROLE_DIR" rev-parse --show-toplevel 2>/dev/null)"; th
   REPO_ROOT="$ROLE_DIR"
 fi
 
-FLEET_ENV="${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}"
-if [[ -f "$FLEET_ENV" ]]; then
-  # shellcheck disable=SC1090
-  source "$FLEET_ENV"
-fi
 # Never pass an identity-bearing chat credential from shared fleet state into
 # a profile process. Hermes loads the profile's own runtime/.env itself.
 unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN

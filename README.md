@@ -115,6 +115,13 @@ path suffix. The sanitized explicit environment wins; otherwise a preceding
 parameter operator, or command syntax is accepted. Step `05` rewrites values
 it owns as canonical ANSI-C literals so spaces, quotes, dollar signs,
 backslashes, metacharacters, and embedded/trailing newlines round-trip as data.
+Launchers, provisioners, `fleet-sync`, `migrate-unify`, and the backfill utility
+all use the same rendered loader/parser pair; no maintenance path evaluates the
+file independently. Existing-file updates use Linux's atomic path exchange to
+bind the commit to the inode that was parsed and restore any concurrent
+replacement before failing. New files use atomic no-clobber linking. A platform
+without atomic exchange refuses an existing-file update rather than falling
+back to a check-then-replace race.
 
 Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
 gateway reads the registry and routes canonical commands by

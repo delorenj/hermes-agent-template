@@ -20,6 +20,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     scaffold = role / ".runtime-scaffold"
     scripts.mkdir(parents=True)
     scaffold.mkdir()
+    shutil.copytree(ROOT / "template" / ".scripts" / "lib", scripts / "lib")
     shutil.copy2(RUNTIME_SCRIPT, scripts / RUNTIME_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
     shutil.copy2(SECRET_SCAN, scripts / SECRET_SCAN.name)

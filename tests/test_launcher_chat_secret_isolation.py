@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -59,6 +60,7 @@ print(json.dumps({key: os.environ.get(key) for key in keys}))
         encoding="utf-8",
     )
     launcher.chmod(0o755)
+    shutil.copytree(ROOT / "template" / ".scripts" / "lib", role / ".scripts" / "lib")
     env = {
         key: value
         for key, value in os.environ.items()

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import re
 import os
 import stat
@@ -212,31 +214,29 @@ def parse_unquoted(
     if "$" not in raw:
         return raw, next_line(text, end)
 
-    expanded: list[str] = []
-    cursor = 0
-    for match in LEGACY_EXPANSION.finditer(raw):
-        literal = raw[cursor : match.start()]
-        if "$" in literal:
-            raise FleetEnvParseError(
-                line_number(text, offset),
-                "dynamic expansion is not supported in fleet.env",
-            )
-        value = expansion_values.get(LEGACY_EXPANSION_NAME)
-        if value is None:
-            raise FleetEnvParseError(
-                line_number(text, offset),
-                "legacy HERMES_FLEET_HOME expansion has no value",
-            )
-        expanded.extend((literal, value))
-        cursor = match.end()
-    suffix = raw[cursor:]
-    if "$" in suffix or cursor == 0:
+    # Compatibility is intentionally narrow: exactly one allowed token must be
+    # the first byte, followed only by the already-validated literal suffix.
+    # Prefixes and repeated/partial tokens would turn this into a general
+    # expansion language and are therefore rejected.
+    match = LEGACY_EXPANSION.match(raw)
+    if match is None or match.start() != 0:
         raise FleetEnvParseError(
             line_number(text, offset),
             "dynamic expansion is not supported in fleet.env",
         )
-    expanded.append(suffix)
-    return "".join(expanded), next_line(text, end)
+    suffix = raw[match.end() :]
+    if "$" in suffix:
+        raise FleetEnvParseError(
+            line_number(text, offset),
+            "dynamic expansion is not supported in fleet.env",
+        )
+    value = expansion_values.get(LEGACY_EXPANSION_NAME)
+    if value is None:
+        raise FleetEnvParseError(
+            line_number(text, offset),
+            "legacy HERMES_FLEET_HOME expansion has no value",
+        )
+    return value + suffix, next_line(text, end)
 
 
 def parse_value(
@@ -402,16 +402,33 @@ def write_atomic_document(
         descriptor = -1
 
         if original is None:
-            if os.path.lexists(path):
-                raise OSError("fleet environment destination appeared during update")
+            # link(2) supplies portable no-clobber creation. The temporary and
+            # destination share a directory/filesystem, so successful linking
+            # commits the fully-written inode without a check/use gap.
+            os.link(temporary, path, follow_symlinks=False)
+            temporary.unlink()
         else:
-            current = os.lstat(path)
+            # Linux renameat2(RENAME_EXCHANGE) swaps the prepared file and the
+            # current destination in one syscall. Only after that atomic claim
+            # do we inspect the displaced inode. A concurrent replacement is
+            # immediately exchanged back and reported, never overwritten.
+            # Platforms without atomic exchange fail closed before mutation;
+            # there is no portable conditional-replace primitive for this CAS.
+            _exchange_paths(temporary, path)
+            displaced = os.lstat(temporary)
             if (
-                not stat.S_ISREG(current.st_mode)
-                or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+                not stat.S_ISREG(displaced.st_mode)
+                or (displaced.st_dev, displaced.st_ino)
+                != (original.st_dev, original.st_ino)
             ):
+                try:
+                    _exchange_paths(temporary, path)
+                except OSError as recovery_error:
+                    raise OSError(
+                        "fleet environment destination changed and recovery failed"
+                    ) from recovery_error
                 raise OSError("fleet environment destination changed during update")
-        os.replace(temporary, path)
+            temporary.unlink()
 
         directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         directory_descriptor = os.open(parent, directory_flags)
@@ -426,6 +443,33 @@ def write_atomic_document(
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _exchange_paths(left: Path, right: Path) -> None:
+    """Atomically exchange two paths, or fail without a portability downgrade."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise OSError(errno.ENOTSUP, "atomic path exchange is unavailable") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    at_fdcwd = -100
+    rename_exchange = 2
+    if renameat2(
+        at_fdcwd,
+        os.fsencode(left),
+        at_fdcwd,
+        os.fsencode(right),
+        rename_exchange,
+    ) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
 
 
 def atomic_upsert(path: Path, key: str, value: str) -> None:

@@ -203,12 +203,45 @@ def test_upsert_failed_replace_leaves_original_and_no_temporary_file(
     namespace = runpy.run_path(str(parser))
     atomic_upsert = namespace["atomic_upsert"]
 
-    def reject_replace(_source: object, _destination: object) -> None:
-        raise OSError("synthetic replace failure")
+    def reject_exchange(_source: object, _destination: object) -> None:
+        raise OSError("synthetic exchange failure")
 
-    monkeypatch.setattr(os, "replace", reject_replace)
-    with pytest.raises(OSError, match="synthetic replace failure"):
+    monkeypatch.setitem(atomic_upsert.__globals__, "_exchange_paths", reject_exchange)
+    with pytest.raises(OSError, match="synthetic exchange failure"):
         atomic_upsert(fleet, "KEY", "replacement")
 
     assert fleet.read_bytes() == before
+    assert list(tmp_path.iterdir()) == [fleet]
+
+
+def test_upsert_preserves_a_replacement_racing_the_commit_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.env"
+    replacement_bytes = b"KEY=concurrent-replacement\n"
+    replacement.write_bytes(replacement_bytes)
+    namespace = runpy.run_path(str(parser))
+    atomic_upsert = namespace["atomic_upsert"]
+    real_exchange = namespace["_exchange_paths"]
+    calls = 0
+
+    def replace_then_exchange(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.replace(replacement, fleet)
+        real_exchange(source, destination)
+
+    monkeypatch.setitem(
+        atomic_upsert.__globals__, "_exchange_paths", replace_then_exchange
+    )
+    with pytest.raises(OSError, match="destination changed"):
+        atomic_upsert(fleet, "KEY", "our-update")
+
+    assert calls == 2, "the atomic exchange must be reversed after mismatch"
+    assert fleet.read_bytes() == replacement_bytes
     assert list(tmp_path.iterdir()) == [fleet]
