@@ -107,8 +107,14 @@ your-project/
 non-comment line must be an optional `export` followed by a `KEY=literal`
 assignment. Literal values may be unquoted, single-quoted, double-quoted, or
 ANSI-C quoted (`$'...'`); commands, functions, `readonly`, substitutions,
-expansions, duplicate keys, and malformed input are rejected before any value
-is imported.
+duplicate keys, and malformed input are rejected before any value is imported.
+For compatibility with the existing fleet layout, an unquoted value may use
+only `$HERMES_FLEET_HOME` (or `${HERMES_FLEET_HOME}`) followed by a literal
+path suffix. The sanitized explicit environment wins; otherwise a preceding
+`HERMES_FLEET_HOME` assignment supplies the base. No other variable expansion,
+parameter operator, or command syntax is accepted. Step `05` rewrites values
+it owns as canonical ANSI-C literals so spaces, quotes, dollar signs,
+backslashes, metacharacters, and embedded/trailing newlines round-trip as data.
 
 Bloodbank command ingress is not a per-profile daemon. One fleet-shared Hermes
 gateway reads the registry and routes canonical commands by
