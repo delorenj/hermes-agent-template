@@ -169,6 +169,51 @@ def test_upsert_recognizes_all_accepted_assignment_prefixes_and_preserves_mode(
     assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
 
 
+def test_upsert_applies_ownership_before_restoring_exact_setid_mode(
+    tmp_path: Path,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    fleet.chmod(0o4600)
+    before = fleet.stat()
+
+    result = _upsert(parser, fleet, "KEY", "replacement")
+
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    after = fleet.stat()
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode) == 0o4600
+    assert (after.st_uid, after.st_gid) == (before.st_uid, before.st_gid)
+    assert _parse_records(parser, fleet, os.environ.copy()) == {"KEY": "replacement"}
+
+
+def test_upsert_ownership_failure_is_zero_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    fleet.chmod(0o600)
+    before_bytes = fleet.read_bytes()
+    before = fleet.stat()
+    namespace = runpy.run_path(str(parser))
+    atomic_upsert = namespace["atomic_upsert"]
+
+    def reject_ownership(_descriptor: int, _uid: int, _gid: int) -> None:
+        raise PermissionError("synthetic ownership denial")
+
+    monkeypatch.setattr(os, "fchown", reject_ownership)
+    with pytest.raises(PermissionError, match="synthetic ownership denial"):
+        atomic_upsert(fleet, "KEY", "replacement")
+
+    after = fleet.stat()
+    assert fleet.read_bytes() == before_bytes
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert stat.S_IMODE(after.st_mode) == stat.S_IMODE(before.st_mode)
+    assert list(tmp_path.iterdir()) == [fleet]
+
+
 def test_upsert_rejects_duplicates_and_symlinks_without_corruption(
     tmp_path: Path,
 ) -> None:
@@ -245,3 +290,83 @@ def test_upsert_preserves_a_replacement_racing_the_commit_boundary(
     assert calls == 2, "the atomic exchange must be reversed after mismatch"
     assert fleet.read_bytes() == replacement_bytes
     assert list(tmp_path.iterdir()) == [fleet]
+
+
+def test_upsert_reverse_exchange_failure_preserves_displaced_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.env"
+    replacement_bytes = b"KEY=concurrent-replacement\n"
+    replacement.write_bytes(replacement_bytes)
+    namespace = runpy.run_path(str(parser))
+    atomic_upsert = namespace["atomic_upsert"]
+    real_exchange = namespace["_exchange_paths"]
+    calls = 0
+
+    def replace_then_block_recovery(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.replace(replacement, fleet)
+            real_exchange(source, destination)
+            return
+        raise OSError("synthetic reverse exchange failure")
+
+    monkeypatch.setitem(
+        atomic_upsert.__globals__, "_exchange_paths", replace_then_block_recovery
+    )
+    with pytest.raises(
+        OSError,
+        match="^fleet environment destination changed and recovery failed; concurrent data preserved$",
+    ) as captured:
+        atomic_upsert(fleet, "KEY", "our-update")
+
+    recovery_path = getattr(captured.value, "recovery_path", None)
+    assert isinstance(recovery_path, Path), "operator recovery metadata must identify the preserved inode"
+    assert recovery_path.parent == tmp_path
+    assert recovery_path.name.startswith(".fleet.env.pjangler-recovery-")
+    assert recovery_path.read_bytes() == replacement_bytes
+    assert stat.S_IMODE(recovery_path.stat().st_mode) == 0o600
+    assert fleet.read_text(encoding="utf-8") == "KEY=$'our-update'\n"
+
+
+def test_upsert_recovery_cleanup_failure_never_deletes_displaced_data(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parser = TEMPLATE_SCRIPTS / "lib" / "parse-fleet-env.py"
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("KEY=original\n", encoding="utf-8")
+    replacement = tmp_path / "replacement.env"
+    replacement_bytes = b"KEY=concurrent-replacement\n"
+    replacement.write_bytes(replacement_bytes)
+    namespace = runpy.run_path(str(parser))
+    atomic_upsert = namespace["atomic_upsert"]
+    real_exchange = namespace["_exchange_paths"]
+    calls = 0
+
+    def replace_then_block_recovery(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            os.replace(replacement, fleet)
+            real_exchange(source, destination)
+            return
+        raise OSError("synthetic reverse exchange failure")
+
+    monkeypatch.setitem(
+        atomic_upsert.__globals__, "_exchange_paths", replace_then_block_recovery
+    )
+    monkeypatch.setitem(atomic_upsert.__globals__, "_remove_recovery_temporary", lambda _path: False)
+    with pytest.raises(OSError) as captured:
+        atomic_upsert(fleet, "KEY", "our-update")
+
+    recovery_path = getattr(captured.value, "recovery_path", None)
+    assert isinstance(recovery_path, Path)
+    assert recovery_path.read_bytes() == replacement_bytes
+    preserved = [path for path in tmp_path.iterdir() if path.read_bytes() == replacement_bytes]
+    assert preserved, "cleanup failure must retain at least one name for the displaced bytes"

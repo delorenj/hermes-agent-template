@@ -99,7 +99,7 @@ API="$BASE/api/v1/workspaces/$WS"
 
 if [ -z "${PLANE_API_KEY:-}" ]; then
   KEY="$(workspace_key "$WS")"
-  eval "PLANE_API_KEY=\${$KEY:-}"
+  PLANE_API_KEY="$(printenv "$KEY" 2>/dev/null || true)"
   if [ -z "${PLANE_API_KEY:-}" ] && [ -f "$FLEET_ENV" ]; then
     PLANE_API_KEY="$(dotenv_value "$FLEET_ENV" "$KEY")"
   fi

@@ -32,10 +32,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
+HEARTBEAT_TEMPLATE="$SCRIPT_DIR/../template/.scripts/heartbeat.sh"
 FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
 FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
 if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
-   || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" ]]; then
+   || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" \
+   || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" ]]; then
   echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
   exit 2
 fi
@@ -262,7 +264,7 @@ except BaseException:
     raise
 PYEOF
   flock -u "$registry_lock_fd"
-  eval "exec ${registry_lock_fd}>&-"
+  exec {registry_lock_fd}>&-
 }
 
 ensure_env_key() {  # ensure_env_key <path> <key> <value>
@@ -337,6 +339,37 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
       fi
     fi
   done
+  heartbeat_target="$role_dir/.scripts/heartbeat.sh"
+  if [[ -L "$heartbeat_target" ]]; then
+    note "$agent_id" DRIFT "$heartbeat_target is a symlink (MANUAL: replace with an attested regular file)"
+    DRIFT=$((DRIFT + 1))
+    fleet_assets_eligible=0
+  elif [[ ! -f "$heartbeat_target" ]] || ! cmp -s "$HEARTBEAT_TEMPLATE" "$heartbeat_target"; then
+    if [[ $APPLY -eq 1 ]]; then
+      mkdir -p "$role_dir/.scripts"
+      cp "$HEARTBEAT_TEMPLATE" "$heartbeat_target"
+      chmod +x "$heartbeat_target"
+      note "$agent_id" FIXED "fleet-aware heartbeat refreshed"
+      changed=1; FIXED=$((FIXED + 1))
+    else
+      note "$agent_id" DRIFT "fleet-aware heartbeat differs from template"
+      DRIFT=$((DRIFT + 1))
+    fi
+  fi
+  if [[ $APPLY -eq 1 ]]; then
+    for attestation in \
+      "$FLEET_ENV_LIBRARY_SOURCE|$role_lib_dir/fleet-env.sh" \
+      "$FLEET_ENV_PARSER_SOURCE|$role_lib_dir/parse-fleet-env.py" \
+      "$HEARTBEAT_TEMPLATE|$heartbeat_target"
+    do
+      source_asset="${attestation%%|*}"
+      target_asset="${attestation#*|}"
+      if [[ ! -f "$target_asset" || -L "$target_asset" ]] \
+        || ! cmp -s "$source_asset" "$target_asset"; then
+        fleet_assets_eligible=0
+      fi
+    done
+  fi
   [[ $fleet_assets_eligible -eq 1 ]] || continue
 
   # Legacy per-profile Bloodbank consumers are unhealthy until fully retired.

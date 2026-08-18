@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import re
 import os
 import stat
@@ -32,6 +33,17 @@ INITIAL_DOCUMENT = (
 class FleetEnvParseError(ValueError):
     def __init__(self, line: int, message: str) -> None:
         super().__init__(f"line {line}: {message}")
+
+
+class FleetEnvRecoveryError(OSError):
+    """A concurrent destination was preserved after rollback could not finish."""
+
+    def __init__(self, recovery_path: Path) -> None:
+        super().__init__(
+            "fleet environment destination changed and recovery failed; "
+            "concurrent data preserved"
+        )
+        self.recovery_path = recovery_path
 
 
 class ParsedRecord(NamedTuple):
@@ -386,17 +398,30 @@ def write_atomic_document(
         dir=parent,
     )
     temporary = Path(temporary_name)
+    preserve_temporary = False
     try:
-        os.fchmod(descriptor, stat.S_IMODE(original.st_mode) if original else 0o600)
+        desired_mode = stat.S_IMODE(original.st_mode) if original else 0o600
         if original is not None:
-            try:
-                os.fchown(descriptor, original.st_uid, original.st_gid)
-            except PermissionError:
-                pass
+            # chown(2) may clear set-ID mode bits. Establish ownership first,
+            # then restore the exact original mode and attest both properties
+            # on the prepared inode before it can participate in an exchange.
+            # Permission failures are not an excuse to silently drift metadata.
+            os.fchown(descriptor, original.st_uid, original.st_gid)
         encoded = content.encode("utf-8", errors="strict")
         with os.fdopen(descriptor, "wb", closefd=False) as stream:
             stream.write(encoded)
             stream.flush()
+        # A content write can also clear set-ID bits. This is therefore the
+        # final metadata operation before attestation and atomic commit.
+        os.fchmod(descriptor, desired_mode)
+        prepared = os.fstat(descriptor)
+        if original is not None and (
+            prepared.st_uid != original.st_uid
+            or prepared.st_gid != original.st_gid
+        ):
+            raise OSError("fleet environment ownership could not be preserved")
+        if stat.S_IMODE(prepared.st_mode) != desired_mode:
+            raise OSError("fleet environment mode could not be preserved")
         os.fsync(descriptor)
         os.close(descriptor)
         descriptor = -1
@@ -424,9 +449,21 @@ def write_atomic_document(
                 try:
                     _exchange_paths(temporary, path)
                 except OSError as recovery_error:
-                    raise OSError(
-                        "fleet environment destination changed and recovery failed"
-                    ) from recovery_error
+                    # After the failed reverse exchange, `path` contains our
+                    # prepared update and `temporary` contains the concurrent
+                    # replacement. From this point onward the temporary name is
+                    # data, not scratch: never let the generic finally cleanup
+                    # unlink it. Give the displaced inode a deterministic,
+                    # restrictive recovery name when the filesystem permits,
+                    # otherwise retain the exact mkstemp name in exception
+                    # metadata for operator recovery.
+                    preserve_temporary = True
+                    recovery_path = _preserve_displaced_recovery(
+                        temporary,
+                        path,
+                        displaced,
+                    )
+                    raise FleetEnvRecoveryError(recovery_path) from recovery_error
                 raise OSError("fleet environment destination changed during update")
             temporary.unlink()
 
@@ -439,10 +476,58 @@ def write_atomic_document(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        if not preserve_temporary:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _remove_recovery_temporary(path: Path) -> bool:
+    """Best-effort cleanup after a durable recovery link was established."""
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    return True
+
+
+def _preserve_displaced_recovery(
+    temporary: Path,
+    destination: Path,
+    displaced: os.stat_result,
+) -> Path:
+    """Keep a displaced concurrent inode reachable without overwriting data."""
+    if stat.S_ISREG(displaced.st_mode):
+        descriptor = os.open(temporary, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+            os.fchmod(descriptor, 0o600)
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+        fingerprint = digest.hexdigest()[:16]
+    else:
+        fingerprint = f"mode-{stat.S_IFMT(displaced.st_mode):x}"
+
+    recovery = destination.parent / (
+        f".{destination.name}.pjangler-recovery-"
+        f"{displaced.st_dev:x}-{displaced.st_ino:x}-{fingerprint}"
+    )
+    try:
+        os.link(temporary, recovery, follow_symlinks=False)
+    except FileExistsError:
+        existing = os.lstat(recovery)
+        if (existing.st_dev, existing.st_ino) != (displaced.st_dev, displaced.st_ino):
+            return temporary
+    except OSError:
+        return temporary
+    _remove_recovery_temporary(temporary)
+    return recovery
 
 
 def _exchange_paths(left: Path, right: Path) -> None:
@@ -472,11 +557,15 @@ def _exchange_paths(left: Path, right: Path) -> None:
         raise OSError(code, os.strerror(code))
 
 
-def atomic_upsert(path: Path, key: str, value: str) -> None:
+def render_upsert(
+    text: str,
+    key: str,
+    value: str,
+    environment: Mapping[str, str] | None = None,
+) -> str:
     if not NAME.fullmatch(key):
         raise FleetEnvParseError(1, "invalid variable name")
-    text, original = read_regular_document(path, allow_missing=True)
-    normalized, records = parse_document(text)
+    normalized, records = parse_document(text, environment)
     matches = [record for record in records if record.key == key]
     if len(matches) > 1:
         raise FleetEnvParseError(1, f"duplicate variable {key}")
@@ -492,7 +581,13 @@ def atomic_upsert(path: Path, key: str, value: str) -> None:
     # Validate the complete prospective document before opening a temporary
     # output. This prevents a malformed legacy record from being partially
     # repaired or hidden by an otherwise valid upsert.
-    parse_document(updated)
+    parse_document(updated, environment)
+    return updated
+
+
+def atomic_upsert(path: Path, key: str, value: str) -> None:
+    text, original = read_regular_document(path, allow_missing=True)
+    updated = render_upsert(text, key, value)
     write_atomic_document(path, updated, original)
 
 
@@ -522,6 +617,13 @@ def main() -> int:
         return 2
     except FleetEnvParseError as error:
         print(f"fleet environment parse error: {error}", file=sys.stderr)
+        return 2
+    except FleetEnvRecoveryError:
+        print(
+            "fleet environment write error: concurrent replacement preserved "
+            "for operator recovery",
+            file=sys.stderr,
+        )
         return 2
     except OSError:
         print("fleet environment write error: update was not committed", file=sys.stderr)
