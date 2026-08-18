@@ -4,19 +4,39 @@
 from __future__ import annotations
 
 import re
+import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
+from typing import Mapping, NamedTuple
 
 
 HEADER = b"PJANGLER_FLEET_ENV_V1"
 FOOTER = b"PJANGLER_FLEET_ENV_END"
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 ASSIGNMENT = re.compile(r"[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=")
+LEGACY_EXPANSION_NAME = "HERMES_FLEET_HOME"
+LEGACY_EXPANSION = re.compile(
+    r"\$(?:\{HERMES_FLEET_HOME\}|HERMES_FLEET_HOME(?![A-Za-z0-9_]))"
+)
+UNICODE_ERROR = "fleet environment parse error: input and values must be valid UTF-8 Unicode"
+INITIAL_DOCUMENT = (
+    "# Hermes fleet source of truth.\n"
+    "# All generated wrappers and provisioning scripts read this file.\n"
+)
 
 
 class FleetEnvParseError(ValueError):
     def __init__(self, line: int, message: str) -> None:
         super().__init__(f"line {line}: {message}")
+
+
+class ParsedRecord(NamedTuple):
+    key: str
+    value: str
+    start: int
+    end: int
 
 
 def line_number(text: str, offset: int) -> int:
@@ -173,7 +193,11 @@ def parse_ansi_c_quoted(text: str, offset: int) -> tuple[str, int]:
     raise FleetEnvParseError(line_number(text, origin), "unterminated ANSI-C quote")
 
 
-def parse_unquoted(text: str, offset: int) -> tuple[str, int]:
+def parse_unquoted(
+    text: str,
+    offset: int,
+    expansion_values: Mapping[str, str],
+) -> tuple[str, int]:
     end = line_end(text, offset)
     raw = text[offset:end]
     comment = re.search(r"[ \t]+#", raw)
@@ -181,14 +205,45 @@ def parse_unquoted(text: str, offset: int) -> tuple[str, int]:
         raw = raw[: comment.start()]
     if not raw:
         return "", next_line(text, end)
-    if re.search(r"[ \t;&|<>()`$\\'\"]", raw):
+    if re.search(r"[ \t;&|<>()`\\'\"]", raw):
         raise FleetEnvParseError(
             line_number(text, offset), "unquoted value contains shell syntax"
         )
-    return raw, next_line(text, end)
+    if "$" not in raw:
+        return raw, next_line(text, end)
+
+    expanded: list[str] = []
+    cursor = 0
+    for match in LEGACY_EXPANSION.finditer(raw):
+        literal = raw[cursor : match.start()]
+        if "$" in literal:
+            raise FleetEnvParseError(
+                line_number(text, offset),
+                "dynamic expansion is not supported in fleet.env",
+            )
+        value = expansion_values.get(LEGACY_EXPANSION_NAME)
+        if value is None:
+            raise FleetEnvParseError(
+                line_number(text, offset),
+                "legacy HERMES_FLEET_HOME expansion has no value",
+            )
+        expanded.extend((literal, value))
+        cursor = match.end()
+    suffix = raw[cursor:]
+    if "$" in suffix or cursor == 0:
+        raise FleetEnvParseError(
+            line_number(text, offset),
+            "dynamic expansion is not supported in fleet.env",
+        )
+    expanded.append(suffix)
+    return "".join(expanded), next_line(text, end)
 
 
-def parse_value(text: str, offset: int) -> tuple[str, int]:
+def parse_value(
+    text: str,
+    offset: int,
+    expansion_values: Mapping[str, str],
+) -> tuple[str, int]:
     if offset >= len(text) or text[offset] == "\n":
         end = line_end(text, offset)
         return "", next_line(text, end)
@@ -198,21 +253,45 @@ def parse_value(text: str, offset: int) -> tuple[str, int]:
         return parse_single_quoted(text, offset)
     if text[offset] == '"':
         return parse_double_quoted(text, offset)
-    return parse_unquoted(text, offset)
+    return parse_unquoted(text, offset, expansion_values)
 
 
-def parse(text: str) -> list[tuple[str, str]]:
+def normalize_text(text: str) -> str:
     if "\0" in text:
         raise FleetEnvParseError(1, "NUL is not allowed")
     if "\r" in text:
         text = text.replace("\r\n", "\n")
         if "\r" in text:
             raise FleetEnvParseError(1, "bare carriage return is not supported")
+    return text
+
+
+def validate_unicode(value: str) -> None:
+    for char in value:
+        codepoint = ord(char)
+        if 0xD800 <= codepoint <= 0xDFFF:
+            raise UnicodeError("surrogate code point")
+        if 0xFDD0 <= codepoint <= 0xFDEF or codepoint & 0xFFFE == 0xFFFE:
+            raise UnicodeError("Unicode noncharacter")
+    value.encode("utf-8", errors="strict")
+
+
+def parse_document(
+    text: str,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[str, list[ParsedRecord]]:
+    text = normalize_text(text)
+    inherited = environment if environment is not None else os.environ
+    expansion_values: dict[str, str] = {}
+    caller_has_fleet_home = LEGACY_EXPANSION_NAME in inherited
+    if caller_has_fleet_home:
+        expansion_values[LEGACY_EXPANSION_NAME] = inherited[LEGACY_EXPANSION_NAME]
 
     cursor = 0
-    records: list[tuple[str, str]] = []
+    records: list[ParsedRecord] = []
     seen: set[str] = set()
     while cursor < len(text):
+        origin = cursor
         end = line_end(text, cursor)
         physical = text[cursor:end]
         if not physical.strip() or physical.lstrip().startswith("#"):
@@ -230,28 +309,179 @@ def parse(text: str) -> list[tuple[str, str]]:
             raise FleetEnvParseError(
                 line_number(text, cursor), f"duplicate variable {key}"
             )
-        value, cursor = parse_value(text, match.end())
+        value, cursor = parse_value(text, match.end(), expansion_values)
+        validate_unicode(value)
         seen.add(key)
-        records.append((key, value))
-    return records
+        records.append(ParsedRecord(key, value, origin, cursor))
+        if key == LEGACY_EXPANSION_NAME and not caller_has_fleet_home:
+            expansion_values[key] = value
+    return text, records
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print("usage: parse-fleet-env.py PATH", file=sys.stderr)
-        return 2
-    path = Path(sys.argv[1])
+def parse(
+    text: str,
+    environment: Mapping[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    _, records = parse_document(text, environment)
+    return [(record.key, record.value) for record in records]
+
+
+def serialize_literal(value: str) -> str:
+    validate_unicode(value)
+    escaped: list[str] = []
+    simple_escapes = {
+        "\\": r"\\",
+        "'": r"\'",
+        "\a": r"\a",
+        "\b": r"\b",
+        "\x1b": r"\e",
+        "\f": r"\f",
+        "\n": r"\n",
+        "\r": r"\r",
+        "\t": r"\t",
+        "\v": r"\v",
+    }
+    for char in value:
+        if char in simple_escapes:
+            escaped.append(simple_escapes[char])
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            escaped.append(f"\\x{ord(char):02x}")
+        else:
+            escaped.append(char)
+    return "$'" + "".join(escaped) + "'"
+
+
+def read_regular_document(
+    path: Path,
+    *,
+    allow_missing: bool = False,
+) -> tuple[str, os.stat_result | None]:
     try:
-        text = path.read_text(encoding="utf-8")
-        records = parse(text)
-    except (OSError, UnicodeError, FleetEnvParseError) as error:
-        print(f"fleet environment parse error: {error}", file=sys.stderr)
-        return 2
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        if allow_missing:
+            return INITIAL_DOCUMENT, None
+        raise FleetEnvParseError(1, "fleet environment path is unavailable")
+    except OSError as error:
+        raise FleetEnvParseError(1, "fleet environment path must be a regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FleetEnvParseError(1, "fleet environment path must be a regular file")
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            content = stream.read()
+        return content.decode("utf-8"), metadata
+    finally:
+        os.close(descriptor)
 
+
+def write_atomic_document(
+    path: Path,
+    content: str,
+    original: os.stat_result | None,
+) -> None:
+    parent = path.parent
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        dir=parent,
+    )
+    temporary = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, stat.S_IMODE(original.st_mode) if original else 0o600)
+        if original is not None:
+            try:
+                os.fchown(descriptor, original.st_uid, original.st_gid)
+            except PermissionError:
+                pass
+        encoded = content.encode("utf-8", errors="strict")
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(encoded)
+            stream.flush()
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+
+        if original is None:
+            if os.path.lexists(path):
+                raise OSError("fleet environment destination appeared during update")
+        else:
+            current = os.lstat(path)
+            if (
+                not stat.S_ISREG(current.st_mode)
+                or (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino)
+            ):
+                raise OSError("fleet environment destination changed during update")
+        os.replace(temporary, path)
+
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        directory_descriptor = os.open(parent, directory_flags)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def atomic_upsert(path: Path, key: str, value: str) -> None:
+    if not NAME.fullmatch(key):
+        raise FleetEnvParseError(1, "invalid variable name")
+    text, original = read_regular_document(path, allow_missing=True)
+    normalized, records = parse_document(text)
+    matches = [record for record in records if record.key == key]
+    if len(matches) > 1:
+        raise FleetEnvParseError(1, f"duplicate variable {key}")
+
+    replacement = f"{key}={serialize_literal(value)}\n"
+    if matches:
+        record = matches[0]
+        updated = normalized[: record.start] + replacement + normalized[record.end :]
+    else:
+        separator = "" if not normalized or normalized.endswith("\n") else "\n"
+        updated = normalized + separator + replacement
+
+    # Validate the complete prospective document before opening a temporary
+    # output. This prevents a malformed legacy record from being partially
+    # repaired or hidden by an otherwise valid upsert.
+    parse_document(updated)
+    write_atomic_document(path, updated, original)
+
+
+def emit_records(records: list[tuple[str, str]]) -> None:
     framed = [HEADER]
     framed.extend(f"{key}={value}".encode("utf-8") for key, value in records)
     framed.extend((FOOTER, b"", b""))
     sys.stdout.buffer.write(b"\0".join(framed))
+
+
+def main() -> int:
+    parse_mode = len(sys.argv) == 2
+    upsert_mode = len(sys.argv) == 5 and sys.argv[1] == "--upsert"
+    if not parse_mode and not upsert_mode:
+        print("usage: parse-fleet-env.py PATH | --upsert PATH KEY VALUE", file=sys.stderr)
+        return 2
+    try:
+        if upsert_mode:
+            atomic_upsert(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
+            return 0
+        path = Path(sys.argv[1])
+        text, _ = read_regular_document(path)
+        records = parse(text)
+        emit_records(records)
+    except UnicodeError:
+        print(UNICODE_ERROR, file=sys.stderr)
+        return 2
+    except FleetEnvParseError as error:
+        print(f"fleet environment parse error: {error}", file=sys.stderr)
+        return 2
+    except OSError:
+        print("fleet environment write error: update was not committed", file=sys.stderr)
+        return 2
     return 0
 
 

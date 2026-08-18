@@ -313,8 +313,10 @@ import_fleet_environment_stream() {
 # fleet.env is parsed as data by an isolated Python interpreter. The supported
 # grammar is blank/comment lines plus optional `export` KEY=value assignments
 # with unquoted, single-quoted, double-quoted, or ANSI-C quoted literal values.
-# Functions, readonly attributes, expansions, substitutions, and commands are
-# rejected rather than executed.
+# One legacy data-only expansion is accepted in unquoted values:
+# `$HERMES_FLEET_HOME` (or its braced spelling) plus a literal path suffix.
+# All other expansions, functions, readonly attributes, substitutions, and
+# commands are rejected rather than executed.
 import_fleet_environment() {
   local __pjangler_fleet_path="$1"
   local __pjangler_fleet_parser="$ROLE_DIR/.scripts/lib/parse-fleet-env.py"
