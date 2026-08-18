@@ -163,9 +163,12 @@ fi
 
 
 def test_future_runtime_scaffolds_have_no_profile_consumer_or_inbox() -> None:
-    for scaffold in (ROOT / "runtime-scaffold", ROOT / "template" / ".runtime-scaffold"):
+    for scaffold, ignore_name in (
+        (ROOT / "runtime-scaffold", ".gitignore"),
+        (ROOT / "template" / ".runtime-scaffold", ".gitignore.jinja"),
+    ):
         assert not (scaffold / "bloodbank-consumer.py").exists()
-        assert "bloodbank-inbox" not in (scaffold / ".gitignore").read_text(encoding="utf-8")
+        assert "bloodbank-inbox" not in (scaffold / ignore_name).read_text(encoding="utf-8")
         readme = (scaffold / "README.md").read_text(encoding="utf-8")
         assert "fleet-shared" in readme
         assert "no consumer process or inbox bridge" in readme

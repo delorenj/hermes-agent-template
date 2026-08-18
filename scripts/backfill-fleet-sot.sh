@@ -76,7 +76,7 @@ HERMES_FLEET_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share
 HERMES_FLEET_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}"
 HERMES_FLEET_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$(cfg fleet.oauth_file "$HOME/.hermes/auth.json")}"
 HERMES_FLEET_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$(cfg fleet.codex_home "$HOME/.codex")}"
-SCAFFOLD_SRC="$(cd "$(dirname "$0")/../template/.runtime-scaffold" && pwd)"
+SCAFFOLD_SRC="$(cd "$(dirname "$0")/../runtime-scaffold" && pwd)"
 SYSTEMD_USER_DIR="${HERMES_FLEET_SYSTEMD_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 PYTHON_BIN="$(builtin type -P python3)" || {
   builtin printf 'backfill-fleet-sot: python3 is unavailable\n' >&2
