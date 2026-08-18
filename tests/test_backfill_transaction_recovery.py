@@ -43,7 +43,8 @@ calls = 0
 def exchange_then_die(left, right):
     global calls
     real_exchange(left, right)
-    calls += 1
+    if Path(right).name == Path(first).name:
+        calls += 1
     if calls == 1:
         os.kill(os.getpid(), int(signal_number))
 
@@ -169,7 +170,8 @@ calls = 0
 def exchange_then_die(left, right):
     global calls
     real_exchange(left, right)
-    calls += 1
+    if Path(right).name == Path(first).name:
+        calls += 1
     if calls == 1: os.kill(os.getpid(), signal.SIGKILL)
 plan = namespace["BatchPlan"](exchange_then_die, Path(journal))
 plan.plan_file(Path(first), b"first-updated\\n")
@@ -362,7 +364,8 @@ namespace = runpy.run_path(driver)
 real_exchange = namespace["load_parser"](Path(parser))._exchange_paths
 def exchange_then_die(left, right):
     real_exchange(left, right)
-    os.kill(os.getpid(), signal.SIGKILL)
+    if Path(right).name == Path(existing).name:
+        os.kill(os.getpid(), signal.SIGKILL)
 plan = namespace["BatchPlan"](exchange_then_die, Path(journal))
 plan.plan_file(Path(created), b"created\\n")
 plan.plan_file(Path(existing), b"updated\\n")
@@ -393,3 +396,274 @@ plan.apply()
     assert existing.read_bytes() == b"original\n"
     assert not (tmp_path / "new").exists()
     assert not journal.exists()
+
+
+def test_preparing_intent_recovers_process_stopped_before_committing_publication(
+    tmp_path: Path,
+) -> None:
+    """Every durable stage/directory must already have a discoverable intent."""
+
+    destination = tmp_path / "new" / "nested" / "value.txt"
+    journal = tmp_path / ".transaction.json"
+    ready = tmp_path / "ready"
+    harness = tmp_path / "stop-before-committing.py"
+    harness.write_text(
+        """from pathlib import Path
+import os, runpy, signal, sys
+driver, parser, journal, destination, ready = sys.argv[1:]
+namespace = runpy.run_path(driver)
+batch_plan = namespace["BatchPlan"]
+exchange = namespace["load_parser"](Path(parser))._exchange_paths
+original_write = batch_plan._write_journal_document
+
+def stop_before_committing(cls, path, payload, exchange_paths, **kwargs):
+    if payload.get("phase") == "committing":
+        Path(ready).write_text("staged", encoding="utf-8")
+        os.kill(os.getpid(), signal.SIGSTOP)
+    return original_write(path, payload, exchange_paths, **kwargs)
+
+batch_plan._write_journal_document = classmethod(stop_before_committing)
+plan = batch_plan(exchange, Path(journal))
+plan.plan_file(Path(destination), b"updated\\n")
+plan.apply()
+""",
+        encoding="utf-8",
+    )
+
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(harness),
+            str(DRIVER),
+            str(PARSER),
+            str(journal),
+            str(destination),
+            str(ready),
+        ],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "backfill did not reach the pre-commit publication boundary"
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    namespace = runpy.run_path(str(DRIVER))
+    namespace["BatchPlan"].recover_pending(
+        journal,
+        namespace["load_parser"](PARSER)._exchange_paths,
+    )
+    namespace["BatchPlan"].recover_pending(
+        journal,
+        namespace["load_parser"](PARSER)._exchange_paths,
+    )
+
+    assert not destination.exists()
+    assert not (tmp_path / "new").exists()
+    assert not journal.exists()
+    assert not list(tmp_path.rglob(".*.pjangler-backfill-*"))
+
+
+def test_preparing_intent_recovers_kill_immediately_after_mkdir(tmp_path: Path) -> None:
+    destination = tmp_path / "new" / "nested" / "value.txt"
+    journal = tmp_path / ".transaction.json"
+    ready = tmp_path / "ready"
+    harness = tmp_path / "stop-after-mkdir.py"
+    harness.write_text(
+        """from pathlib import Path
+import os, runpy, signal, sys
+driver, parser, journal, destination, ready = sys.argv[1:]
+namespace = runpy.run_path(driver)
+real_mkdir = namespace["os"].mkdir
+
+def mkdir_then_stop(path, *args, **kwargs):
+    result = real_mkdir(path, *args, **kwargs)
+    if Path(path).name == "new":
+        Path(ready).write_text("created", encoding="utf-8")
+        os.kill(os.getpid(), signal.SIGSTOP)
+    return result
+
+namespace["os"].mkdir = mkdir_then_stop
+plan = namespace["BatchPlan"](
+    namespace["load_parser"](Path(parser))._exchange_paths,
+    Path(journal),
+)
+plan.plan_file(Path(destination), b"updated\\n")
+plan.apply()
+""",
+        encoding="utf-8",
+    )
+
+    process = subprocess.Popen(
+        [sys.executable, str(harness), str(DRIVER), str(PARSER), str(journal), str(destination), str(ready)],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "backfill did not reach the post-mkdir crash boundary"
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    namespace = runpy.run_path(str(DRIVER))
+    namespace["BatchPlan"].recover_pending(
+        journal,
+        namespace["load_parser"](PARSER)._exchange_paths,
+    )
+    assert not (tmp_path / "new").exists()
+    assert not journal.exists()
+
+
+def test_preparing_intent_recovers_kill_after_stage_fsync_before_identity_update(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "value.txt"
+    destination.write_bytes(b"original\n")
+    journal = tmp_path / ".transaction.json"
+    ready = tmp_path / "ready"
+    harness = tmp_path / "stop-after-stage-fsync.py"
+    harness.write_text(
+        """from pathlib import Path
+import os, runpy, signal, sys
+driver, parser, journal, destination, ready = sys.argv[1:]
+namespace = runpy.run_path(driver)
+batch_plan = namespace["BatchPlan"]
+original_prepare = batch_plan._write_prepared
+
+def prepare_then_stop(self, plan, intended_temporary=None):
+    prepared = original_prepare(self, plan, intended_temporary)
+    Path(ready).write_text("prepared", encoding="utf-8")
+    os.kill(os.getpid(), signal.SIGSTOP)
+    return prepared
+
+batch_plan._write_prepared = prepare_then_stop
+plan = batch_plan(namespace["load_parser"](Path(parser))._exchange_paths, Path(journal))
+plan.plan_file(Path(destination), b"updated\\n")
+plan.apply()
+""",
+        encoding="utf-8",
+    )
+
+    process = subprocess.Popen(
+        [sys.executable, str(harness), str(DRIVER), str(PARSER), str(journal), str(destination), str(ready)],
+    )
+    try:
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists(), "backfill did not reach the post-stage-fsync crash boundary"
+        process.kill()
+        assert process.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+
+    namespace = runpy.run_path(str(DRIVER))
+    namespace["BatchPlan"].recover_pending(
+        journal,
+        namespace["load_parser"](PARSER)._exchange_paths,
+    )
+    assert destination.read_bytes() == b"original\n"
+    assert not journal.exists()
+    assert not list(tmp_path.glob(".*.pjangler-backfill-*"))
+
+
+def test_post_link_journal_fsync_failure_cleans_and_fsyncs_stage_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = runpy.run_path(str(DRIVER))
+    batch_plan = namespace["BatchPlan"]
+    exchange = namespace["load_parser"](PARSER)._exchange_paths
+    journal = tmp_path / ".transaction.json"
+    payload = {
+        "version": namespace["TRANSACTION_JOURNAL_VERSION"],
+        "transaction_id": "1" * 32,
+        "phase": "committing",
+        "directories": [],
+        "entries": [{"fixture": True}],
+    }
+    real_fsync = os.fsync
+    parent_metadata = tmp_path.stat()
+    failed = False
+    successful_parent_fsyncs_after_failure = 0
+
+    def fail_first_parent_fsync_after_link(descriptor: int) -> None:
+        nonlocal failed, successful_parent_fsyncs_after_failure
+        metadata = os.fstat(descriptor)
+        is_parent = (metadata.st_dev, metadata.st_ino) == (
+            parent_metadata.st_dev,
+            parent_metadata.st_ino,
+        )
+        stage_exists = bool(list(tmp_path.glob("..transaction.json.stage-*")))
+        if is_parent and journal.exists() and stage_exists and not failed:
+            failed = True
+            raise OSError("synthetic post-link directory fsync failure")
+        real_fsync(descriptor)
+        if failed and is_parent:
+            successful_parent_fsyncs_after_failure += 1
+
+    monkeypatch.setattr(namespace["os"], "fsync", fail_first_parent_fsync_after_link)
+
+    with pytest.raises(OSError, match="post-link directory fsync"):
+        batch_plan._write_journal_document(
+            journal,
+            payload,
+            exchange,
+            create=True,
+        )
+
+    assert failed
+    assert journal.exists(), "the linked recovery journal must survive publication failure"
+    assert not list(tmp_path.glob("..transaction.json.stage-*")), "the redundant stage link must be removed"
+    assert successful_parent_fsyncs_after_failure >= 1, "stage-link cleanup must be directory-fsynced"
+
+
+def test_parent_rename_after_exchange_rolls_back_through_retained_dirfd(
+    tmp_path: Path,
+) -> None:
+    namespace = runpy.run_path(str(DRIVER))
+    real_exchange = namespace["load_parser"](PARSER)._exchange_paths
+    intended = tmp_path / "intended"
+    displaced = tmp_path / "displaced"
+    outside = tmp_path / "outside"
+    intended.mkdir()
+    outside.mkdir()
+    destination = intended / "value.txt"
+    destination.write_bytes(b"original\n")
+    journal = tmp_path / ".transaction.json"
+    swapped = False
+
+    def exchange_then_swap_parent(left: Path, right: Path) -> None:
+        nonlocal swapped
+        real_exchange(left, right)
+        if Path(right).name == destination.name and not swapped:
+            intended.rename(displaced)
+            intended.symlink_to(outside, target_is_directory=True)
+            swapped = True
+
+    plan = namespace["BatchPlan"](exchange_then_swap_parent, journal)
+    plan.plan_file(destination, b"updated\n")
+
+    with pytest.raises(
+        namespace["BackfillError"],
+        match=r"destination parent (changed|must be a real directory)",
+    ):
+        plan.apply()
+
+    assert swapped
+    assert intended.is_symlink()
+    assert list(outside.iterdir()) == []
+    assert (displaced / "value.txt").read_bytes() == b"original\n"
+    assert not journal.exists()
+    assert not list(displaced.glob(".*.pjangler-backfill-*"))

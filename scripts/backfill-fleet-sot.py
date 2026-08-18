@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import stat
 import sys
@@ -31,7 +32,7 @@ import yaml
 
 AGENT_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 ROLE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
-TRANSACTION_JOURNAL_VERSION = 2
+TRANSACTION_JOURNAL_VERSION = 3
 
 
 class BackfillError(RuntimeError):
@@ -110,6 +111,7 @@ class PreparedFile:
     parent_descriptor: int
     installed_identity: tuple[int, int] | None = None
     installed_snapshot: FileSnapshot | None = None
+    mutation_started: bool = False
 
 
 def absolute(path: str | Path) -> Path:
@@ -447,6 +449,44 @@ class BatchPlan:
             os.close(descriptor)
 
     @classmethod
+    def _unlink_preparing_temporary(
+        cls,
+        parent: DirectoryIdentity,
+        name: str,
+        expected: dict[str, object],
+    ) -> None:
+        expected_keys = {"mode", "uid", "gid", "size", "sha256"}
+        if set(expected) != expected_keys:
+            raise BackfillError("preparing backfill temporary metadata is invalid")
+        numeric = [expected[key] for key in ("mode", "uid", "gid", "size")]
+        digest = expected["sha256"]
+        if (
+            any(not isinstance(value, int) or isinstance(value, bool) for value in numeric)
+            or not isinstance(digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        ):
+            raise BackfillError("preparing backfill temporary metadata is invalid")
+        descriptor = open_attested_directory(parent, "preparing backfill temporary parent")
+        try:
+            try:
+                metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != expected["uid"]
+                or metadata.st_gid != expected["gid"]
+                or stat.S_IMODE(metadata.st_mode) not in {0o600, expected["mode"]}
+                or metadata.st_nlink != 1
+                or metadata.st_size > expected["size"]
+            ):
+                raise BackfillError("preparing backfill temporary changed before recovery")
+            os.unlink(name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @classmethod
     def _exchange_at(
         cls,
         parent: DirectoryIdentity,
@@ -490,6 +530,30 @@ class BatchPlan:
         finally:
             os.close(descriptor)
 
+    @classmethod
+    def _remove_journal_and_stages(
+        cls,
+        parent: DirectoryIdentity,
+        journal_name: str,
+    ) -> None:
+        descriptor = open_attested_directory(parent, "backfill journal cleanup parent")
+        try:
+            stage_prefix = f".{journal_name}.stage-"
+            stage_names = sorted(
+                name for name in os.listdir(descriptor) if name.startswith(stage_prefix)
+            )
+            # A stage left by an interrupted journal exchange contains the
+            # previous valid journal inode. Validate it as recovery metadata,
+            # never as an arbitrary same-prefix file, before removal.
+            for name in stage_names:
+                cls._read_journal(cls._path_at(descriptor, name))
+            for name in stage_names:
+                os.unlink(name, dir_fd=descriptor)
+            os.unlink(journal_name, dir_fd=descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
     def _effective_journal_path(self) -> Path | None:
         if self.journal_path is not None:
             return self.journal_path
@@ -509,11 +573,18 @@ class BatchPlan:
             raise BackfillError("backfill transaction journal is invalid") from error
         if (
             not isinstance(payload, dict)
-            or payload.get("version") != TRANSACTION_JOURNAL_VERSION
+            or payload.get("version") not in {2, TRANSACTION_JOURNAL_VERSION}
         ):
             raise BackfillError("backfill transaction journal has an unsupported contract")
-        if payload.get("phase") not in {"committing", "committed"}:
+        if payload.get("version") == TRANSACTION_JOURNAL_VERSION and (
+            not isinstance(payload.get("transaction_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", payload["transaction_id"])
+        ):
+            raise BackfillError("backfill transaction journal has an invalid identity")
+        if payload.get("phase") not in {"preparing", "committing", "committed"}:
             raise BackfillError("backfill transaction journal has an invalid phase")
+        if payload.get("phase") == "preparing" and payload.get("version") != TRANSACTION_JOURNAL_VERSION:
+            raise BackfillError("backfill transaction journal has an invalid preparing contract")
         entries = payload.get("entries")
         if not isinstance(entries, list) or not entries:
             raise BackfillError("backfill transaction journal has no entries")
@@ -566,7 +637,6 @@ class BatchPlan:
         encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
         descriptor = -1
         temporary_name = ""
-        published = False
         try:
             descriptor, temporary_value = tempfile.mkstemp(
                 prefix=f".{path.name}.stage-",
@@ -592,17 +662,18 @@ class BatchPlan:
                 )
             else:
                 exchange_paths(temporary_at, journal_at)
-            published = True
             # The journal itself must be durable before its staging link is
-            # removed.  If cleanup fails, leave that link intact rather than
-            # deleting data referenced by a surviving journal.
+            # removed. Every exit path below also removes and fsyncs that
+            # redundant name: a post-link fsync error must not strand an
+            # undiscoverable .stage-* artifact next to the durable journal.
             os.fsync(parent_descriptor)
             os.unlink(temporary_name, dir_fd=parent_descriptor)
+            temporary_name = ""
             os.fsync(parent_descriptor)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-            if temporary_name and not published:
+            if temporary_name:
                 try:
                     os.unlink(temporary_name, dir_fd=parent_descriptor)
                     os.fsync(parent_descriptor)
@@ -634,6 +705,7 @@ class BatchPlan:
         finally:
             os.close(journal_parent_descriptor)
         phase = payload["phase"]
+        transaction_id = payload.get("transaction_id")
         raw_entries = payload["entries"]
         assert isinstance(raw_entries, list)
         for raw in reversed(raw_entries):
@@ -644,14 +716,21 @@ class BatchPlan:
             prepared_record = raw.get("prepared")
             original_record = raw.get("original")
             parent_record = raw.get("parent")
+            expected_record = raw.get("expected")
             if (
                 not isinstance(destination_value, str)
                 or not Path(destination_value).is_absolute()
                 or not isinstance(temporary_value, str)
                 or not Path(temporary_value).is_absolute()
-                or not isinstance(prepared_record, dict)
+                or (
+                    not isinstance(prepared_record, dict)
+                    and not (phase == "preparing" and prepared_record is None)
+                )
                 or (original_record is not None and not isinstance(original_record, dict))
-                or not isinstance(parent_record, dict)
+                or (
+                    not isinstance(parent_record, dict)
+                    and not (phase == "preparing" and parent_record is None)
+                )
             ):
                 raise BackfillError("backfill transaction journal entry is invalid")
             destination = absolute(destination_value)
@@ -660,6 +739,27 @@ class BatchPlan:
                 f".{destination.name}.pjangler-backfill-"
             ):
                 raise BackfillError("backfill transaction temporary path is unsafe")
+            if (
+                payload.get("version") == TRANSACTION_JOURNAL_VERSION
+                and (
+                    not isinstance(transaction_id, str)
+                    or not temporary.name.startswith(
+                        f".{destination.name}.pjangler-backfill-{transaction_id}-"
+                    )
+                )
+            ):
+                raise BackfillError("backfill transaction temporary identity is unsafe")
+            if parent_record is None:
+                # An intent is published before any directory or stage is
+                # created. An incomplete record is safe only while its parent
+                # is still absent; otherwise retain the journal for explicit
+                # recovery rather than guessing at an unattested inode.
+                if lstat_optional(destination.parent) is None:
+                    continue
+                if lstat_optional(destination) is None and lstat_optional(temporary) is None:
+                    continue
+                raise BackfillError("preparing backfill parent requires recovery metadata")
+            assert isinstance(parent_record, dict)
             current_parent = cls._identity_from_record(
                 destination.parent,
                 parent_record,
@@ -676,10 +776,14 @@ class BatchPlan:
                 "backfill recovery temporary",
             )
             destination_is_prepared = (
+                isinstance(prepared_record, dict)
+                and
                 destination_snapshot is not None
                 and cls._matches_record(destination_snapshot, prepared_record)
             )
             temporary_is_prepared = (
+                isinstance(prepared_record, dict)
+                and
                 temporary_snapshot is not None
                 and cls._matches_record(temporary_snapshot, prepared_record)
             )
@@ -693,6 +797,24 @@ class BatchPlan:
                 and temporary_snapshot is not None
                 and cls._matches_record(temporary_snapshot, original_record)
             )
+
+            if phase == "preparing" and prepared_record is None:
+                destination_is_unchanged = (
+                    destination_is_original
+                    if isinstance(original_record, dict)
+                    else destination_snapshot is None
+                )
+                if not destination_is_unchanged:
+                    raise BackfillError("preparing backfill destination changed before recovery")
+                if temporary_snapshot is not None:
+                    if not isinstance(expected_record, dict):
+                        raise BackfillError("preparing backfill temporary metadata is invalid")
+                    cls._unlink_preparing_temporary(
+                        current_parent,
+                        temporary.name,
+                        expected_record,
+                    )
+                continue
 
             if phase == "committed":
                 if not destination_is_prepared:
@@ -776,21 +898,76 @@ class BatchPlan:
 
         raw_directories = payload["directories"]
         assert isinstance(raw_directories, list)
-        if phase == "committing":
+        if phase in {"preparing", "committing"}:
             for raw_directory in reversed(raw_directories):
                 if not isinstance(raw_directory, dict):
                     raise BackfillError("backfill transaction directory entry is invalid")
                 path_value = raw_directory.get("path")
                 identity_record = raw_directory.get("identity")
                 parent_record = raw_directory.get("parent")
+                created = raw_directory.get("created", True)
                 if (
                     not isinstance(path_value, str)
                     or not Path(path_value).is_absolute()
-                    or not isinstance(identity_record, dict)
-                    or not isinstance(parent_record, dict)
+                    or not isinstance(created, bool)
+                    or (
+                        not isinstance(identity_record, dict)
+                        and not (phase == "preparing" and identity_record is None)
+                    )
+                    or (
+                        not isinstance(parent_record, dict)
+                        and not (phase == "preparing" and parent_record is None)
+                    )
                 ):
                     raise BackfillError("backfill transaction directory entry is invalid")
+                if not created:
+                    continue
                 path = absolute(path_value)
+                if parent_record is None:
+                    if lstat_optional(path) is None:
+                        continue
+                    raise BackfillError("preparing backfill directory requires recovery metadata")
+                assert isinstance(parent_record, dict)
+                if identity_record is None:
+                    parent_identity = cls._identity_from_record(
+                        path.parent,
+                        parent_record,
+                        "backfill recovery directory parent",
+                    )
+                    parent_descriptor = open_attested_directory(
+                        parent_identity,
+                        "backfill recovery directory parent",
+                    )
+                    try:
+                        try:
+                            actual_identity, child_descriptor = directory_identity_at(
+                                parent_descriptor,
+                                path.name,
+                                path,
+                                "preparing backfill directory",
+                            )
+                        except BackfillError:
+                            try:
+                                os.stat(path.name, dir_fd=parent_descriptor, follow_symlinks=False)
+                            except FileNotFoundError:
+                                continue
+                            raise
+                        try:
+                            planned_mode = raw_directory.get("mode")
+                            if (
+                                not isinstance(planned_mode, int)
+                                or isinstance(planned_mode, bool)
+                                or actual_identity.uid != os.geteuid()
+                                or actual_identity.mode not in {0o700, planned_mode}
+                                or os.listdir(child_descriptor)
+                            ):
+                                raise BackfillError("preparing backfill directory changed before recovery")
+                        finally:
+                            os.close(child_descriptor)
+                    finally:
+                        os.close(parent_descriptor)
+                    identity_record = cls._directory_record(actual_identity)
+                assert isinstance(identity_record, dict)
                 try:
                     parent_identity = cls._identity_from_record(
                         path.parent,
@@ -825,11 +1002,7 @@ class BatchPlan:
                         os.close(parent_descriptor)
                     raise
 
-        cls._unlink_at(
-            journal_parent,
-            journal_path.name,
-            "backfill journal cleanup",
-        )
+        cls._remove_journal_and_stages(journal_parent, journal_path.name)
 
     def plan_directory(self, path: Path, mode: int = 0o755) -> None:
         path = absolute(path)
@@ -883,22 +1056,50 @@ class BatchPlan:
             return
         self.files[path] = planned
 
-    def _write_prepared(self, plan: PlannedFile) -> PreparedFile:
+    def _write_prepared(
+        self,
+        plan: PlannedFile,
+        intended_temporary: Path | None = None,
+    ) -> PreparedFile:
         parent_identity = self.directory_identities.get(plan.path.parent)
         if parent_identity is None:
             raise BackfillError("destination parent has no stable identity")
         parent_descriptor = open_attested_directory(parent_identity, "destination parent")
         parent_handle = Path(f"/proc/self/fd/{parent_descriptor}")
         try:
-            descriptor, temporary_name = tempfile.mkstemp(
-                prefix=f".{plan.path.name}.pjangler-backfill-",
-                dir=parent_handle,
-            )
+            if intended_temporary is None:
+                descriptor, temporary_value = tempfile.mkstemp(
+                    prefix=f".{plan.path.name}.pjangler-backfill-",
+                    dir=parent_handle,
+                )
+                temporary_basename = Path(temporary_value).name
+            else:
+                intended_temporary = absolute(intended_temporary)
+                if (
+                    intended_temporary.parent != plan.path.parent
+                    or not intended_temporary.name.startswith(
+                        f".{plan.path.name}.pjangler-backfill-"
+                    )
+                ):
+                    raise BackfillError("prepared destination path is unsafe")
+                temporary_basename = intended_temporary.name
+                flags = (
+                    os.O_RDWR
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(
+                    temporary_basename,
+                    flags,
+                    0o600,
+                    dir_fd=parent_descriptor,
+                )
         except BaseException:
             os.close(parent_descriptor)
             raise
-        temporary_at = Path(temporary_name)
-        temporary = plan.path.parent / temporary_at.name
+        temporary_at = parent_handle / temporary_basename
+        temporary = plan.path.parent / temporary_basename
         try:
             if plan.original is not None:
                 os.fchown(descriptor, plan.original.uid, plan.original.gid)
@@ -991,9 +1192,14 @@ class BatchPlan:
                 dst_dir_fd=prepared.parent_descriptor,
                 follow_symlinks=False,
             )
+            # From this instruction onward rollback owns the mutation through
+            # the retained parent descriptor. Do not perform any fallible
+            # lexical/path identity check before recording that fact.
+            prepared.mutation_started = True
             installed = read_regular_file(destination_at, "installed backfill destination")
             if not self._same_snapshot(prepared.prepared_snapshot, installed):
                 os.unlink(plan.path.name, dir_fd=prepared.parent_descriptor)
+                prepared.mutation_started = False
                 raise BackfillError("installed destination failed exact reattestation")
             prepared.installed_snapshot = installed
             prepared.installed_identity = (installed.device, installed.inode)
@@ -1009,13 +1215,19 @@ class BatchPlan:
         if not self._same_snapshot(plan.original, current):
             raise BackfillError("destination changed after backfill preflight")
         self.exchange_paths(temporary_at, destination_at)
+        # The exchange may be followed by arbitrarily fallible attestation
+        # (including a concurrent rename of the lexical parent). Mark it first
+        # so the caller cannot discard the only rollback handle.
+        prepared.mutation_started = True
         displaced = read_regular_file(temporary_at, "displaced backfill destination")
         if not self._same_snapshot(plan.original, displaced):
             self.exchange_paths(temporary_at, destination_at)
+            prepared.mutation_started = False
             raise BackfillError("destination changed at backfill commit boundary")
         installed = read_regular_file(destination_at, "installed backfill destination")
         if not self._same_snapshot(prepared.prepared_snapshot, installed):
             self.exchange_paths(temporary_at, destination_at)
+            prepared.mutation_started = False
             raise BackfillError("installed destination failed exact reattestation")
         prepared.installed_snapshot = installed
         prepared.installed_identity = (installed.device, installed.inode)
@@ -1026,14 +1238,19 @@ class BatchPlan:
     def _rollback(self, committed: list[PreparedFile]) -> list[Path]:
         preserved: list[Path] = []
         for prepared in reversed(committed):
+            if not prepared.mutation_started:
+                continue
             plan = prepared.plan
             try:
                 parent_handle = Path(f"/proc/self/fd/{prepared.parent_descriptor}")
                 destination_at = parent_handle / plan.path.name
                 temporary_at = parent_handle / prepared.temporary.name
                 current = read_regular_file(destination_at, "installed backfill destination")
-                if prepared.installed_snapshot is None or not self._same_snapshot(
-                    prepared.installed_snapshot,
+                expected_installed = (
+                    prepared.installed_snapshot or prepared.prepared_snapshot
+                )
+                if not self._same_snapshot(
+                    expected_installed,
                     current,
                 ):
                     preserved.append(prepared.temporary)
@@ -1045,7 +1262,8 @@ class BatchPlan:
                     self.exchange_paths(temporary_at, destination_at)
                     os.unlink(prepared.temporary.name, dir_fd=prepared.parent_descriptor)
                 os.fsync(prepared.parent_descriptor)
-            except OSError:
+                prepared.mutation_started = False
+            except (OSError, BackfillError):
                 try:
                     os.stat(prepared.temporary.name, dir_fd=prepared.parent_descriptor, follow_symlinks=False)
                     preserved.append(prepared.temporary)
@@ -1062,6 +1280,26 @@ class BatchPlan:
         journal_parent_descriptor = -1
         previous_sigterm: Any = None
         signal_handler_installed = False
+        journal_payload: dict[str, object] | None = None
+        journal_directories: dict[Path, dict[str, object]] = {}
+        journal_entries: dict[Path, dict[str, object]] = {}
+        intended_temporaries: dict[Path, Path] = {}
+
+        def write_current_journal(*, create: bool) -> None:
+            if (
+                journal_path is None
+                or journal_payload is None
+                or journal_parent_descriptor < 0
+            ):
+                return
+            self._write_journal_document(
+                journal_path,
+                journal_payload,
+                self.exchange_paths,
+                create=create,
+                parent_descriptor=journal_parent_descriptor,
+            )
+
         try:
             if journal_path is not None:
                 self.recover_pending(journal_path, self.exchange_paths)
@@ -1073,6 +1311,70 @@ class BatchPlan:
                     journal_parent,
                     "backfill journal parent",
                 )
+            if self.files and journal_path is not None:
+                transaction_id = secrets.token_hex(16)
+                for index, plan in enumerate(self.files.values()):
+                    intended_temporaries[plan.path] = (
+                        plan.path.parent
+                        / f".{plan.path.name}.pjangler-backfill-{transaction_id}-{index}"
+                    )
+                    parent_identity = self.directory_identities.get(plan.path.parent)
+                    journal_entries[plan.path] = {
+                        "destination": str(plan.path),
+                        "temporary": str(intended_temporaries[plan.path]),
+                        "parent": (
+                            self._directory_record(parent_identity)
+                            if parent_identity is not None
+                            else None
+                        ),
+                        "original": (
+                            self._snapshot_record(plan.original)
+                            if plan.original is not None
+                            else None
+                        ),
+                        "prepared": None,
+                        "expected": {
+                            "mode": plan.mode,
+                            "uid": plan.original.uid if plan.original is not None else os.geteuid(),
+                            "gid": plan.original.gid if plan.original is not None else os.getegid(),
+                            "size": len(plan.content),
+                            "sha256": hashlib.sha256(plan.content).hexdigest(),
+                        },
+                    }
+                for path, planned_directory in self.directories.items():
+                    parent_identity = self.directory_identities.get(planned_directory.parent)
+                    journal_directories[path] = {
+                        "path": str(path),
+                        "mode": planned_directory.mode,
+                        "created": True,
+                        "identity": None,
+                        "parent": (
+                            self._directory_record(parent_identity)
+                            if parent_identity is not None
+                            else None
+                        ),
+                    }
+                journal_payload = {
+                    "version": TRANSACTION_JOURNAL_VERSION,
+                    "transaction_id": transaction_id,
+                    "phase": "preparing",
+                    "directories": list(journal_directories.values()),
+                    "entries": list(journal_entries.values()),
+                }
+                # Publish durable intent before mkdir(2), temporary creation,
+                # or any other mutation. Every later durable artifact has an
+                # exact, random name in this recovery document first.
+                write_current_journal(create=True)
+
+                def interrupt_backfill(signum: int, _frame: object) -> None:
+                    raise BackfillError(f"backfill transaction interrupted by signal {signum}")
+
+                try:
+                    previous_sigterm = signal.getsignal(signal.SIGTERM)
+                    signal.signal(signal.SIGTERM, interrupt_backfill)
+                    signal_handler_installed = True
+                except ValueError:
+                    pass
             for path, planned_directory in sorted(self.directories.items(), key=lambda item: len(item[0].parts)):
                 if lstat_optional(path) is not None:
                     actual = directory_identity(path, "planned destination directory")
@@ -1080,6 +1382,22 @@ class BatchPlan:
                     if known is not None and actual != known:
                         raise BackfillError("planned destination directory changed after preflight")
                     self.directory_identities[path] = actual
+                    document = journal_directories.get(path)
+                    if document is not None:
+                        document["created"] = False
+                        document["identity"] = self._directory_record(actual)
+                        parent = self.directory_identities.get(path.parent)
+                        document["parent"] = (
+                            self._directory_record(parent) if parent is not None else None
+                        )
+                        actual_record = self._directory_record(actual)
+                        for child_path, child_document in journal_directories.items():
+                            if child_path.parent == path:
+                                child_document["parent"] = actual_record
+                        for file_path, entry_document in journal_entries.items():
+                            if file_path.parent == path:
+                                entry_document["parent"] = actual_record
+                        write_current_journal(create=False)
                     continue
                 parent_identity = self.directory_identities.get(planned_directory.parent)
                 if parent_identity is None:
@@ -1105,79 +1423,73 @@ class BatchPlan:
                             or child_metadata.st_uid != os.geteuid()
                         ):
                             raise BackfillError("created destination directory metadata drifted")
+                        created_identity = DirectoryIdentity(
+                            path=path,
+                            mode=stat.S_IMODE(child_metadata.st_mode),
+                            uid=child_metadata.st_uid,
+                            gid=child_metadata.st_gid,
+                            device=child_metadata.st_dev,
+                            inode=child_metadata.st_ino,
+                            real_path=Path(os.path.realpath(f"/proc/self/fd/{child_descriptor}")),
+                        )
+                        self.directory_identities[path] = created_identity
+                        document = journal_directories.get(path)
+                        if document is not None:
+                            document["created"] = True
+                            document["identity"] = self._directory_record(created_identity)
+                            document["parent"] = self._directory_record(parent_identity)
+                            created_record = self._directory_record(created_identity)
+                            for child_path, child_document in journal_directories.items():
+                                if child_path.parent == path:
+                                    child_document["parent"] = created_record
+                            for file_path, entry_document in journal_entries.items():
+                                if file_path.parent == path:
+                                    entry_document["parent"] = created_record
+                            # Bind the inode in the journal before making its
+                            # directory entry durable.
+                            write_current_journal(create=False)
                         os.fsync(child_descriptor)
                     finally:
                         os.close(child_descriptor)
                     os.fsync(parent_descriptor)
                 finally:
                     os.close(parent_descriptor)
-                self.directory_identities[path] = directory_identity(
-                    path,
-                    "created destination directory",
-                )
             for plan in self.files.values():
-                prepared.append(self._write_prepared(plan))
+                prepared.append(
+                    self._write_prepared(
+                        plan,
+                        intended_temporaries.get(plan.path),
+                    )
+                )
+                document = journal_entries.get(plan.path)
+                if document is not None:
+                    document["parent"] = self._directory_record(
+                        self.directory_identities[plan.path.parent]
+                    )
+                    document["prepared"] = self._snapshot_record(
+                        prepared[-1].prepared_snapshot
+                    )
+                    # The intent already named this stage. Bind its exact inode
+                    # before fsyncing the containing directory.
+                    write_current_journal(create=False)
                 os.fsync(prepared[-1].parent_descriptor)
             if prepared and journal_path is not None:
-                journal_payload: dict[str, object] = {
-                    "version": TRANSACTION_JOURNAL_VERSION,
-                    "phase": "committing",
-                    "directories": [
-                        {
-                            "path": str(path),
-                            "identity": self._directory_record(self.directory_identities[path]),
-                            "parent": self._directory_record(
-                                self.directory_identities[path.parent]
-                            ),
-                        }
-                        for path in created_directories
-                    ],
-                    "entries": [
-                        {
-                            "destination": str(item.plan.path),
-                            "temporary": str(item.temporary),
-                            "parent": self._directory_record(
-                                self.directory_identities[item.plan.path.parent]
-                            ),
-                            "original": (
-                                self._snapshot_record(item.plan.original)
-                                if item.plan.original is not None
-                                else None
-                            ),
-                            "prepared": self._snapshot_record(item.prepared_snapshot),
-                        }
-                        for item in prepared
-                    ],
-                }
-                self._write_journal_document(
-                    journal_path,
-                    journal_payload,
-                    self.exchange_paths,
-                    create=True,
-                    parent_descriptor=journal_parent_descriptor,
-                )
-                def interrupt_backfill(signum: int, _frame: object) -> None:
-                    raise BackfillError(f"backfill transaction interrupted by signal {signum}")
-
-                try:
-                    previous_sigterm = signal.getsignal(signal.SIGTERM)
-                    signal.signal(signal.SIGTERM, interrupt_backfill)
-                    signal_handler_installed = True
-                except ValueError:
-                    pass
+                assert journal_payload is not None
+                journal_payload["phase"] = "committing"
+                write_current_journal(create=False)
             for item in prepared:
-                self._commit_one(item)
                 committed.append(item)
+                try:
+                    self._commit_one(item)
+                except BaseException:
+                    if not item.mutation_started:
+                        committed.pop()
+                    raise
                 os.fsync(item.parent_descriptor)
             if prepared and journal_path is not None:
+                assert journal_payload is not None
                 journal_payload["phase"] = "committed"
-                self._write_journal_document(
-                    journal_path,
-                    journal_payload,
-                    self.exchange_paths,
-                    create=False,
-                    parent_descriptor=journal_parent_descriptor,
-                )
+                write_current_journal(create=False)
         except BaseException as error:
             journal_present = False
             if journal_path is not None and journal_parent_descriptor >= 0:
