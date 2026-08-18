@@ -10,6 +10,7 @@ import yaml
 
 ROOT = Path(__file__).parents[1]
 FLEET_SYNC = ROOT / "scripts" / "fleet-sync.sh"
+HEARTBEAT = ROOT / "template" / ".scripts" / "heartbeat.sh"
 
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
@@ -21,6 +22,11 @@ def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
         "config:\n  inherit_from: default\n  save_mode: delta\n", encoding="utf-8"
     )
     (role / "role.yaml").write_text("profile: demo-pm\n", encoding="utf-8")
+    (role / ".scripts").mkdir()
+    (role / ".scripts" / "heartbeat.sh").write_text(
+        "#!/bin/sh\n# legacy fleet-bypassing heartbeat\n",
+        encoding="utf-8",
+    )
     registry = tmp_path / "agents-registry.yaml"
     registry.write_text(
         yaml.safe_dump(
@@ -83,7 +89,7 @@ exit 1
 
 
 def test_fleet_audit_reports_and_apply_retires_legacy_consumer(tmp_path: Path) -> None:
-    env, registry, consumer, _ = _fixture(tmp_path)
+    env, registry, consumer, role = _fixture(tmp_path)
 
     audit = subprocess.run(
         ["bash", str(FLEET_SYNC), "--agent", "demo-pm"],
@@ -107,6 +113,7 @@ def test_fleet_audit_reports_and_apply_retires_legacy_consumer(tmp_path: Path) -
     entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
     assert "consumer_unit" not in entry["systemd"]
     assert stat.S_IMODE(registry.stat().st_mode) == 0o600
+    assert (role / ".scripts" / "heartbeat.sh").read_bytes() == HEARTBEAT.read_bytes()
 
 
 def test_fleet_apply_preserves_unit_and_metadata_when_disable_fails(tmp_path: Path) -> None:

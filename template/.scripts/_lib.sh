@@ -228,7 +228,7 @@ fleet_lock_acquire() {
 fleet_lock_release() {
   if [[ "${FLEET_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
     flock -u "$FLEET_LOCK_FD" 2>/dev/null || true
-    eval "exec ${FLEET_LOCK_FD}>&-"
+    exec {FLEET_LOCK_FD}>&-
   fi
   FLEET_LOCK_FD=""
 }

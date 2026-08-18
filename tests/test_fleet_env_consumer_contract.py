@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 
 import pytest
@@ -21,9 +22,48 @@ FLEET_PARSER = TEMPLATE / ".scripts" / "lib" / "parse-fleet-env.py"
 # Every full fleet import must cross the shared parser/atomic-apply boundary;
 # executable sourcing is forbidden regardless of quoting or dot/source spelling.
 EXECUTABLE_FLEET_SOURCE = re.compile(
-    r"(?im)(?:^|[;{]\s*)[ \t]*(?:builtin\s+)?(?:source|\.)\s+[^\n#]*"
+    r"(?im)(?:^|[;{]\s*)[ \t]*(?:(?:builtin|command)\s+)*(?:source|\.)\s+[^\n#]*"
     r"(?:\$\{?(?:HERMES_)?FLEET_ENV\}?(?![A-Za-z0-9_])|fleet\\?\.env)"
 )
+FLEET_REFERENCE = re.compile(
+    r"(?i)(?:HERMES_)?FLEET_ENV|fleet\.env|load_fleet_environment|import_fleet_environment"
+)
+DYNAMIC_EXECUTION = (
+    re.compile(r"(?m)\beval\b"),
+    re.compile(r"(?m)\b(?:bash|sh|zsh|dash)\b[^\n]*(?:^|[ \t])(?:-c|--command)(?:[ \t]|$)"),
+    re.compile(r"(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_]*=[\"']?(?:source|\.)[\"']?(?:[; \t]|$)"),
+)
+FLEET_REFERENCE_ALLOWLIST = {
+    "scripts/backfill-fleet-sot.py",
+    "scripts/backfill-fleet-sot.sh",
+    "scripts/fleet-sync.sh",
+    "scripts/migrate-unify.sh",
+    "template/.scripts/01-config.sh",
+    "template/.scripts/05-fleet-env.sh",
+    "template/.scripts/30-telegram.sh",
+    "template/.scripts/31-slack.sh",
+    "template/.scripts/80-registry.sh",
+    "template/.scripts/99-summary.sh",
+    "template/.scripts/_lib.sh",
+    "template/.scripts/heartbeat.sh",
+    "template/.scripts/lib/fleet-env.sh",
+    "template/.scripts/lib/parse-fleet-env.py",
+    "template/.scripts/providers/plane.sh",
+    "template/hermes.jinja",
+}
+
+
+def executable_fleet_violation(text: str) -> re.Match[str] | None:
+    direct = EXECUTABLE_FLEET_SOURCE.search(text)
+    if direct is not None:
+        return direct
+    if not FLEET_REFERENCE.search(text):
+        return None
+    for pattern in DYNAMIC_EXECUTION:
+        match = pattern.search(text)
+        if match is not None:
+            return match
+    return None
 
 
 def _clean_env(tmp_path: Path, fleet: Path) -> dict[str, str]:
@@ -73,6 +113,104 @@ def _parsed_fleet(fleet: Path, env: dict[str, str]) -> dict[str, str]:
     }
 
 
+def _tree_snapshot(root: Path) -> dict[str, tuple[object, ...]]:
+    if not root.exists() and not root.is_symlink():
+        return {}
+    snapshot: dict[str, tuple[object, ...]] = {}
+    for path in [root, *sorted(root.rglob("*"))]:
+        relative = "." if path == root else str(path.relative_to(root))
+        metadata = path.lstat()
+        mode = stat.S_IMODE(metadata.st_mode)
+        if path.is_symlink():
+            snapshot[relative] = ("symlink", os.readlink(path), mode)
+        elif path.is_dir():
+            snapshot[relative] = ("directory", mode)
+        else:
+            snapshot[relative] = ("file", path.read_bytes(), mode)
+    return snapshot
+
+
+def _backfill_fixture(tmp_path: Path, *, invalid_last: bool = False) -> tuple[dict[str, str], dict[str, Path]]:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    first_role = project / "agents" / "hermes" / "first"
+    last_role = project / "agents" / "hermes" / "last"
+    for role in (first_role, last_role):
+        (role / ".scripts").mkdir(parents=True)
+        (role / "runtime").mkdir()
+        (role / "hermes").write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        (role / ".scripts" / "_lib.sh").write_text("# legacy library\n", encoding="utf-8")
+    if invalid_last:
+        shutil.rmtree(last_role / ".scripts")
+        outside = tmp_path / "outside-scripts"
+        outside.mkdir()
+        (last_role / ".scripts").symlink_to(outside, target_is_directory=True)
+
+    systemd = home / ".config" / "systemd" / "user"
+    systemd.mkdir(parents=True)
+    unit = systemd / "hermes-first-pm-gateway.service"
+    unit.write_text("[Service]\nEnvironment=HERMES_HOME=/old\n", encoding="utf-8")
+
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "first-pm": {
+                        "role": "pm",
+                        "role_dir": str(first_role),
+                        "project_path": str(project),
+                        "profile_name": "first-pm",
+                    },
+                    "last-pm": {
+                        "role": "pm",
+                        "role_dir": str(last_role),
+                        "project_path": str(project),
+                        "profile_name": "last-pm",
+                    },
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    fleet = home / ".hermes" / "fleet.env"
+    fleet.parent.mkdir(parents=True)
+    fleet.write_text("SAFE_KEY=$'unchanged'\n", encoding="utf-8")
+
+    marker = tmp_path / "external-process.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_systemctl = fake_bin / "systemctl"
+    fake_systemctl.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PJAN67_EXTERNAL_PROCESS_LOG\"\nexit 0\n",
+        encoding="utf-8",
+    )
+    fake_systemctl.chmod(0o755)
+
+    env = _clean_env(tmp_path, fleet)
+    env.update(
+        {
+            "HERMES_FLEET_REGISTRY_FILE": str(registry),
+            "HERMES_FLEET_BIN": "/fixture/hermes",
+            "HERMES_FLEET_REPO": "/fixture/repo",
+            "HERMES_FLEET_OAUTH_FILE": "/fixture/auth.json",
+            "HERMES_FLEET_CODEX_HOME": "/fixture/codex",
+            "HERMES_FLEET_SYSTEMD_DIR": str(systemd),
+            "PJAN67_EXTERNAL_PROCESS_LOG": str(marker),
+            "PATH": f"{fake_bin}:{env['PATH']}",
+        }
+    )
+    return env, {
+        "fleet": fleet,
+        "registry": registry,
+        "project": project,
+        "systemd": systemd,
+        "marker": marker,
+    }
+
+
 def test_shipped_sources_forbid_every_executable_fleet_env_spelling() -> None:
     production = [
         path
@@ -80,10 +218,16 @@ def test_shipped_sources_forbid_every_executable_fleet_env_spelling() -> None:
         for path in root.rglob("*")
         if path.is_file() and path.suffix in {"", ".sh", ".py", ".jinja"}
     ]
+    references = {
+        str(path.relative_to(ROOT))
+        for path in production
+        if FLEET_REFERENCE.search(path.read_text(encoding="utf-8"))
+    }
+    assert references == FLEET_REFERENCE_ALLOWLIST
     violations = {
         str(path.relative_to(ROOT)): match.group(0)
         for path in production
-        if (match := EXECUTABLE_FLEET_SOURCE.search(path.read_text(encoding="utf-8")))
+        if (match := executable_fleet_violation(path.read_text(encoding="utf-8")))
     }
 
     assert violations == {}
@@ -92,8 +236,11 @@ def test_shipped_sources_forbid_every_executable_fleet_env_spelling() -> None:
         ". '${HERMES_FLEET_ENV}'",
         'builtin source -- "$HOME/.hermes/fleet.env"',
         '{ . "${FLEET_ENV}"; }',
+        'eval "$(cat "$FLEET_ENV")"',
+        'fleet_loader=source; builtin "$fleet_loader" "$FLEET_ENV"',
+        'command source "$FLEET_ENV"',
     ):
-        assert EXECUTABLE_FLEET_SOURCE.search(spelling), spelling
+        assert executable_fleet_violation(spelling), spelling
 
 
 @pytest.mark.parametrize(
@@ -174,6 +321,68 @@ def test_backfill_rejects_invalid_existing_fleet_without_mutation(
     assert protected.read_bytes() == before
     if kind == "symlink":
         assert fleet.is_symlink()
+
+
+def test_backfill_missing_registry_preflight_preserves_valid_fleet(tmp_path: Path) -> None:
+    fleet = tmp_path / "fleet.env"
+    fleet.write_text("SAFE_KEY=$'unchanged'\n", encoding="utf-8")
+    before = fleet.read_bytes()
+    env = _clean_env(tmp_path, fleet)
+    env.update(
+        {
+            "HERMES_FLEET_REGISTRY_FILE": str(tmp_path / "missing-registry.yaml"),
+            "HERMES_FLEET_OAUTH_FILE": "/would-have-been-written",
+            "HERMES_FLEET_CODEX_HOME": "/would-have-been-written",
+        }
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "registry" in result.stderr.lower()
+    assert fleet.read_bytes() == before
+
+
+def test_backfill_late_invalid_last_target_is_zero_effect(tmp_path: Path) -> None:
+    env, paths = _backfill_fixture(tmp_path, invalid_last=True)
+    before = {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"}
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert re.search(r"symlink|real directory", result.stderr, re.IGNORECASE)
+    assert {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"} == before
+    assert not paths["marker"].exists(), "preflight failure must not invoke external processes"
+
+
+def test_backfill_dry_run_plans_all_targets_without_mutation(tmp_path: Path) -> None:
+    env, paths = _backfill_fixture(tmp_path)
+    before = {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"}
+
+    result = subprocess.run(
+        ["bash", str(SCRIPTS / "backfill-fleet-sot.sh"), "--dry-run"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "dry-run" in result.stdout.lower()
+    assert {key: _tree_snapshot(path) for key, path in paths.items() if key != "marker"} == before
+    assert not paths["marker"].exists(), "dry-run must not invoke external processes"
 
 
 def _launcher_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str], Path]:
@@ -259,6 +468,54 @@ def test_real_launcher_preserves_literal_values_and_caller_precedence(
     assert child_env["PATH"] == controlled_path
 
 
+def test_real_rendered_heartbeat_uses_fleet_selected_hermes(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    role = project / "agents" / "hermes" / "pm"
+    runtime = role / "runtime"
+    runtime.mkdir(parents=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
+    shutil.copytree(TEMPLATE / ".scripts", role / ".scripts")
+    (role / ".scripts" / "sentinel.prompt.md").write_text("fixture prompt\n", encoding="utf-8")
+    (role / "role.yaml").write_text(
+        "repo: heartbeat-fixture\n"
+        "role: pm\n"
+        "agent_id: heartbeat-fixture-pm\n"
+        "reconcile:\n  enabled: true\n"
+        "ticket_provider:\n  name: plane\n",
+        encoding="utf-8",
+    )
+    marker = tmp_path / "heartbeat-hermes.json"
+    fake_hermes = tmp_path / "fleet selected hermes"
+    fake_hermes.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys\n"
+        "open(os.environ['PJAN67_HEARTBEAT_MARKER'], 'w').write(json.dumps(sys.argv[1:]))\n",
+        encoding="utf-8",
+    )
+    fake_hermes.chmod(0o755)
+    fleet = home / ".hermes" / "fleet.env"
+    fleet.parent.mkdir(parents=True)
+    fleet.write_text(
+        "HERMES_FLEET_BIN=$'" + str(fake_hermes).replace("'", "\\'") + "'\n",
+        encoding="utf-8",
+    )
+    env = _clean_env(tmp_path, fleet)
+    env["PJAN67_HEARTBEAT_MARKER"] = str(marker)
+    env["HEARTBEAT_CHECKPOINT_MIN_INTERVAL_SECONDS"] = "999999"
+
+    result = subprocess.run(
+        ["bash", str(role / ".scripts" / "heartbeat.sh")],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(marker.read_text(encoding="utf-8"))[0] == "chat"
+
+
 def test_maintenance_scripts_accept_canonical_data_only_fleet(tmp_path: Path) -> None:
     fleet = tmp_path / "fleet state" / "fleet.env"
     fleet.parent.mkdir(parents=True)
@@ -285,6 +542,7 @@ def test_backfill_installs_canonical_loader_and_generated_launcher(
     (home / ".hermes" / "profiles" / "backfill-pm").mkdir(parents=True)
     (role / "hermes").write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
     (role / ".scripts" / "_lib.sh").write_text("# legacy library\n", encoding="utf-8")
+    (role / ".scripts" / "heartbeat.sh").write_text("#!/bin/sh\n# legacy heartbeat\n", encoding="utf-8")
     registry = tmp_path / "registry.yaml"
     registry.write_text(
         yaml.safe_dump(
@@ -323,6 +581,7 @@ def test_backfill_installs_canonical_loader_and_generated_launcher(
     assert (role / ".scripts" / "lib" / "fleet-env.sh").read_bytes() == FLEET_LIBRARY.read_bytes()
     assert (role / ".scripts" / "lib" / "parse-fleet-env.py").read_bytes() == FLEET_PARSER.read_bytes()
     assert (role / ".scripts" / "_lib.sh").read_bytes() == (TEMPLATE / ".scripts" / "_lib.sh").read_bytes()
+    assert (role / ".scripts" / "heartbeat.sh").read_bytes() == (TEMPLATE / ".scripts" / "heartbeat.sh").read_bytes()
     wrapper = (role / "hermes").read_text(encoding="utf-8")
     assert "load_fleet_environment" in wrapper
     assert not EXECUTABLE_FLEET_SOURCE.search(wrapper)
