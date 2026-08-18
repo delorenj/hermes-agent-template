@@ -32,6 +32,16 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
+FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
+FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
+if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
+   || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" ]]; then
+  echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
+  exit 2
+fi
+# shellcheck source=../template/.scripts/lib/fleet-env.sh
+builtin source "$FLEET_ENV_LIBRARY_SOURCE"
+scrub_subprocess_interpreter_injection
 
 HERMES_TEMPLATE_CONFIG="${HERMES_TEMPLATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hermes-agent-template/config.toml}"
 cfg() {  # cfg <dotted.key> <default>
@@ -58,10 +68,7 @@ PYEOF
 }
 
 FLEET_ENV="${HERMES_FLEET_ENV:-$(cfg fleet.fleet_env "$HOME/.hermes/fleet.env")}"
-if [[ -f "$FLEET_ENV" ]]; then
-  # shellcheck disable=SC1090
-  source "$FLEET_ENV"
-fi
+load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER_SOURCE"
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
 FLEET_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}"
 PROFILES_DIR="$FLEET_HOME/profiles"
@@ -298,6 +305,39 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   fi
   runtime="$role_dir/runtime"
   changed=0
+
+  # Launcher dependencies are template-controlled lifecycle assets. Reconcile
+  # them before the launcher so an applied wrapper is never left pointing at a
+  # missing or weaker fleet.env consumer.
+  role_lib_dir="$role_dir/.scripts/lib"
+  if [[ -L "$role_dir/.scripts" || -L "$role_lib_dir" ]]; then
+    note "$agent_id" DRIFT "role .scripts/lib is a symlink (MANUAL: replace with a real directory)"
+    DRIFT=$((DRIFT + 1))
+    continue
+  fi
+  fleet_assets_eligible=1
+  for fleet_asset in fleet-env.sh parse-fleet-env.py; do
+    source_asset="$SCRIPT_DIR/../template/.scripts/lib/$fleet_asset"
+    target_asset="$role_lib_dir/$fleet_asset"
+    if [[ -L "$target_asset" ]]; then
+      note "$agent_id" DRIFT "$target_asset is a symlink (MANUAL: replace with an attested regular file)"
+      DRIFT=$((DRIFT + 1))
+      fleet_assets_eligible=0
+      continue
+    fi
+    if [[ ! -f "$target_asset" ]] || ! cmp -s "$source_asset" "$target_asset"; then
+      if [[ $APPLY -eq 1 ]]; then
+        mkdir -p "$role_lib_dir"
+        cp "$source_asset" "$target_asset"
+        note "$agent_id" FIXED "fleet loader asset refreshed: $fleet_asset"
+        changed=1; FIXED=$((FIXED + 1))
+      else
+        note "$agent_id" DRIFT "fleet loader asset differs: $fleet_asset"
+        DRIFT=$((DRIFT + 1))
+      fi
+    fi
+  done
+  [[ $fleet_assets_eligible -eq 1 ]] || continue
 
   # Legacy per-profile Bloodbank consumers are unhealthy until fully retired.
   legacy_consumer_unit="${consumer_unit:-hermes-${agent_id}-consumer.service}"

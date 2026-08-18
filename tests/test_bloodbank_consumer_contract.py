@@ -21,6 +21,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path]:
     runtime = role / "runtime"
     scripts.mkdir(parents=True)
     runtime.mkdir()
+    shutil.copytree(SCRIPTS / "lib", scripts / "lib")
     for name in (
         "_lib.sh",
         "credential-launch.sh",

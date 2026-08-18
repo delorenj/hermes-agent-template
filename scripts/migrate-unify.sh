@@ -38,6 +38,16 @@ set -euo pipefail
 #   migrate-unify.sh --agent pjangler-scrum-master [--apply ...]   # one only
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FLEET_ENV_LIBRARY="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
+FLEET_ENV_PARSER="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
+if [[ ! -f "$FLEET_ENV_LIBRARY" || -L "$FLEET_ENV_LIBRARY" \
+   || ! -f "$FLEET_ENV_PARSER" || -L "$FLEET_ENV_PARSER" ]]; then
+  echo "migrate-unify: trusted fleet environment loader is unavailable" >&2
+  exit 2
+fi
+# shellcheck source=../template/.scripts/lib/fleet-env.sh
+builtin source "$FLEET_ENV_LIBRARY"
+scrub_subprocess_interpreter_injection
 
 HERMES_TEMPLATE_CONFIG="${HERMES_TEMPLATE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/hermes-agent-template/config.toml}"
 cfg() {  # cfg <dotted.key> <default>
@@ -64,8 +74,7 @@ PYEOF
 }
 
 FLEET_ENV="${HERMES_FLEET_ENV:-$(cfg fleet.fleet_env "$HOME/.hermes/fleet.env")}"
-[[ -f "$FLEET_ENV" ]] && { # shellcheck disable=SC1090
-  source "$FLEET_ENV"; }
+load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER"
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
 PROFILES_DIR="${HERMES_FLEET_HOME:-$HOME/.hermes}/profiles"
 SYS_DIR="$HOME/.config/systemd/user"

@@ -123,6 +123,29 @@ def test_parser_uses_an_earlier_fleet_home_when_the_caller_did_not_set_one(
 
 
 @pytest.mark.parametrize(
+    "value",
+    [
+        "prefix$HERMES_FLEET_HOME/suffix",
+        "$HERMES_FLEET_HOME/$HERMES_FLEET_HOME",
+        "$HERMES_FLEET_HOMEX/suffix",
+        "${HERMES_FLEET_HOME_EXTRA}/suffix",
+    ],
+)
+def test_legacy_fleet_home_expansion_is_exactly_one_leading_token(
+    tmp_path: Path, value: str
+) -> None:
+    result = _parse(
+        tmp_path,
+        f"VALUE={value}\n",
+        env={"HERMES_FLEET_HOME": "/safe/fleet/home"},
+    )
+
+    assert result.returncode == 2
+    assert result.stdout == b""
+    assert b"dynamic expansion is not supported" in result.stderr
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "FIRST=must-not-frame\nFIRST=duplicate\n",
@@ -134,6 +157,10 @@ def test_parser_uses_an_earlier_fleet_home_when_the_caller_did_not_set_one(
         "FIRST=must-not-frame\nSECOND=${HOME}\n",
         "FIRST=must-not-frame\nSECOND=${HERMES_FLEET_HOME:-/fallback}\n",
         "FIRST=must-not-frame\nSECOND=$HERMES_FLEET_REPO/suffix\n",
+        "FIRST=must-not-frame\nSECOND=prefix$HERMES_FLEET_HOME/suffix\n",
+        "FIRST=must-not-frame\nSECOND=$HERMES_FLEET_HOME/$HERMES_FLEET_HOME\n",
+        "FIRST=must-not-frame\nSECOND=$HERMES_FLEET_HOMEX/suffix\n",
+        "FIRST=must-not-frame\nSECOND=${HERMES_FLEET_HOME_EXTRA}/suffix\n",
         "FIRST=must-not-frame\nSECOND=$HERMES_FLEET_HOME$(touch /tmp/must-not-run)\n",
         "FIRST=must-not-frame\nSECOND=unquoted value\n",
         "FIRST=must-not-frame\nSECOND='unterminated\n",

@@ -38,6 +38,5 @@ if [[ "$new_fleet_env" == "1" ]]; then
 fi
 upsert_fleet_env HERMES_FLEET_OAUTH_FILE "$HERMES_OAUTH_FILE"
 upsert_fleet_env HERMES_FLEET_CODEX_HOME "$CODEX_HOME"
-chmod 600 "$FLEET_ENV"
 
 mark_done 05-fleet-env
