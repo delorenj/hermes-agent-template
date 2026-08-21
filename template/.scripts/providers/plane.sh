@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Plane ticket-provider adapter.
 #
-# Credentials:  PLANE_API_KEY or PLANE_<WORKSPACE>_API_KEY (X-API-Key header)
+# Credentials:  PLANE_API_KEY or PLANE_<WORKSPACE>_API_KEY (raw at runtime or
+#               an op:// reference resolved immediately before use)
 # Endpoint:     PLANE_BASE       (default https://plane.delo.sh)
 # Board binding (repo-root .project.json `ticket_provider:`):
 #   workspace: <workspace-slug>      (or env PLANE_WORKSPACE)
@@ -59,6 +60,20 @@ print(value, end="")
 PY
 }
 
+# Resolve an approved secret reference only after selecting the exact provider
+# key. The shared dotenv stays inert and the resolved value exists only in this
+# provider process.
+resolve_secret_value() {
+  value="${1:-}"
+  case "$value" in
+    op://*)
+      command -v op >/dev/null 2>&1 || die "1Password CLI is required for the configured Plane credential"
+      op read "$value" || die "failed to resolve the configured Plane credential"
+      ;;
+    *) printf '%s' "$value" ;;
+  esac
+}
+
 tp_cfg() {
   [ -f "$ROLE_YAML" ] || return 0
   python3 - "$ROLE_YAML" "$1" <<'PY'
@@ -103,8 +118,9 @@ if [ -z "${PLANE_API_KEY:-}" ]; then
   if [ -z "${PLANE_API_KEY:-}" ] && [ -f "$FLEET_ENV" ]; then
     PLANE_API_KEY="$(dotenv_value "$FLEET_ENV" "$KEY")"
   fi
-  export PLANE_API_KEY
 fi
+PLANE_API_KEY="$(resolve_secret_value "${PLANE_API_KEY:-}")"
+export PLANE_API_KEY
 
 # api METHOD PATH [JSON_BODY] — call Plane REST, print response body.
 api() {
