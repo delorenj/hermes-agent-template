@@ -58,6 +58,7 @@ class ReporterTemplateHardeningTests(unittest.TestCase):
             self.assertIn('"no_mcp"', runtime_script)
             self.assertIn(".env.*", ignore)
             self.assertIn(".scripts/.done-*", (target / ".gitignore").read_text())
+            self.assertIn(".scripts/.plane-project-id", (target / ".gitignore").read_text())
 
     def test_secret_scanner_rejects_literal_and_accepts_references(self) -> None:
         scanner = load_scanner()
