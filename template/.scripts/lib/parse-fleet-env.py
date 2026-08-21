@@ -389,6 +389,28 @@ def serialize_systemd_value(value: str) -> str:
     return '"' + "".join(escaped) + '"'
 
 
+def serialize_systemd_scalar(value: str) -> str:
+    """Return a scalar directive value without introducing literal quotes."""
+    validate_unicode(value)
+    if "\0" in value:
+        raise FleetEnvParseError(1, "NUL is not allowed in a systemd value")
+    if "\r" in value or "\n" in value:
+        raise FleetEnvParseError(1, "newline control characters are not allowed in a systemd value")
+    escaped: list[str] = []
+    for char in value:
+        if char == "\\":
+            escaped.append(r"\\")
+        elif char == "%":
+            escaped.append("%%")
+        elif char == "\t":
+            escaped.append(r"\t")
+        elif ord(char) < 0x20 or ord(char) == 0x7F:
+            escaped.append(f"\\x{ord(char):02x}")
+        else:
+            escaped.append(char)
+    return "".join(escaped)
+
+
 def serialize_systemd_environment(name: str, value: str) -> str:
     if not NAME.fullmatch(name):
         raise FleetEnvParseError(1, "invalid systemd environment variable name")
@@ -685,18 +707,23 @@ def main() -> int:
     parse_mode = len(sys.argv) == 2
     upsert_mode = len(sys.argv) == 5 and sys.argv[1] == "--upsert"
     systemd_value_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-value"
+    systemd_scalar_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-scalar"
     systemd_exec_value_mode = len(sys.argv) == 3 and sys.argv[1] == "--systemd-exec-value"
     systemd_environment_mode = len(sys.argv) == 4 and sys.argv[1] == "--systemd-environment"
-    if not parse_mode and not upsert_mode and not systemd_value_mode and not systemd_exec_value_mode and not systemd_environment_mode:
+    if not parse_mode and not upsert_mode and not systemd_value_mode and not systemd_scalar_mode and not systemd_exec_value_mode and not systemd_environment_mode:
         print(
             "usage: parse-fleet-env.py PATH | --upsert PATH KEY VALUE | "
-            "--systemd-value VALUE | --systemd-exec-value VALUE | --systemd-environment NAME VALUE",
+            "--systemd-value VALUE | --systemd-scalar VALUE | "
+            "--systemd-exec-value VALUE | --systemd-environment NAME VALUE",
             file=sys.stderr,
         )
         return 2
     try:
         if systemd_value_mode:
             print(serialize_systemd_value(sys.argv[2]), end="")
+            return 0
+        if systemd_scalar_mode:
+            print(serialize_systemd_scalar(sys.argv[2]), end="")
             return 0
         if systemd_exec_value_mode:
             print(serialize_systemd_exec_value(sys.argv[2]), end="")

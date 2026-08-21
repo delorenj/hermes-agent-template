@@ -46,19 +46,63 @@ PYEOF
 # Apply a sed substitution to role.yaml in-place. Used to record IDs after
 # external provisioning steps return them.
 yaml_set() {
-  # yaml_set KEY VALUE   (only updates the first match; key must already exist)
+  # yaml_set KEY VALUE   (supports flat and one-level nested keys)
   local key="$1" val="$2"
   python3 - "$ROLE_YAML" "$key" "$val" <<'PYEOF'
-import sys, re, pathlib
+import json, pathlib, re, sys
+
 path, key, val = sys.argv[1:4]
-p = pathlib.Path(path); text = p.read_text()
-# Match `<indent><key>:<...>` and rewrite the value (last leaf only).
-leaf = key.split(".")[-1]
-new = re.sub(rf'(?m)^(\s*{re.escape(leaf)}:\s*)("?)[^"\n]*("?)\s*$',
-             lambda m: f'{m.group(1)}"{val}"', text, count=1)
-if new == text:
-    sys.exit(f"yaml_set: leaf '{leaf}' not found in {path}")
-p.write_text(new)
+p = pathlib.Path(path)
+text = p.read_text(encoding="utf-8")
+parts = key.split(".")
+if len(parts) not in (1, 2) or any(
+    not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", part) for part in parts
+):
+    sys.exit(f"yaml_set: unsupported key '{key}'")
+
+lines = text.splitlines(keepends=True)
+start, end, parent_indent = 0, len(lines), -1
+if len(parts) == 2:
+    parent, leaf = parts
+    parents = []
+    for index, raw in enumerate(lines):
+        line = raw.rstrip("\r\n")
+        match = re.fullmatch(rf"( *){re.escape(parent)}:\s*(?:#.*)?", line)
+        if match and len(match.group(1)) == 0:
+            parents.append(index)
+    if len(parents) != 1:
+        sys.exit(f"yaml_set: parent '{parent}' not found uniquely in {path}")
+    parent_index = parents[0]
+    parent_indent = 0
+    start = parent_index + 1
+    for index in range(start, len(lines)):
+        candidate = lines[index].rstrip("\r\n")
+        if not candidate.strip() or candidate.lstrip().startswith("#"):
+            continue
+        indent = len(candidate) - len(candidate.lstrip(" "))
+        if indent <= parent_indent:
+            end = index
+            break
+else:
+    leaf = parts[0]
+
+targets = []
+for index in range(start, end):
+    raw = lines[index]
+    line = raw.rstrip("\r\n")
+    match = re.match(rf"^( *){re.escape(leaf)}:\s*", line)
+    if not match:
+        continue
+    indent = len(match.group(1))
+    if (parent_indent < 0 and indent == 0) or (parent_indent >= 0 and indent > parent_indent):
+        targets.append((index, match.group(1)))
+if len(targets) != 1:
+    sys.exit(f"yaml_set: key '{key}' not found uniquely in {path}")
+
+index, indent = targets[0]
+ending = "\r\n" if lines[index].endswith("\r\n") else "\n" if lines[index].endswith("\n") else ""
+lines[index] = f"{indent}{leaf}: {json.dumps(val, ensure_ascii=False)}{ending}"
+p.write_text("".join(lines), encoding="utf-8")
 PYEOF
 }
 

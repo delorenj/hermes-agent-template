@@ -8,6 +8,7 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -60,6 +61,12 @@ role: pm
 agent_id: demo-pm
 display_name: "Demo PM"
 profile: demo-pm
+model:
+  provider: ""
+  name: "inherited-model"
+  base_url: ""
+  api_mode: ""
+  key_env: ""
 telegram:
   bot_username: demo_pm_bot
 plane:
@@ -69,7 +76,9 @@ runtime:
   github_repo: agent-hm-demo-pm
 ticket_provider:
   name: plane
+  workspace: old-space
   board_id: ""
+  project: ""
 """,
         encoding="utf-8",
     )
@@ -510,6 +519,11 @@ def test_explicit_board_grant_reaches_real_provider_adapter(tmp_path: Path) -> N
         "role_dir": "agents/hermes/pm",
         "provisioning_state": "provisioned",
     }
+    role_manifest = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
+    assert role_manifest["model"]["name"] == "inherited-model"
+    assert role_manifest["ticket_provider"]["name"] == "plane"
+    assert role_manifest["ticket_provider"]["workspace"] == "test-space"
+    assert role_manifest["plane"]["workspace"] == "test-space"
     assert (role / ".scripts" / ".done-42-ticket-provider").exists()
 
 

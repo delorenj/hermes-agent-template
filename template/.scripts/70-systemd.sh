@@ -46,6 +46,10 @@ systemd_value() {
   "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-value "$1" \
     || die "systemd value validation failed"
 }
+systemd_scalar() {
+  "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-scalar "$1" \
+    || die "systemd scalar validation failed"
+}
 systemd_environment() {
   "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-environment "$1" "$2" \
     || die "systemd environment validation failed"
@@ -54,17 +58,17 @@ systemd_exec_value() {
   "$PYTHON_BIN" -I "$FLEET_ENV_PARSER" --systemd-exec-value "$1" \
     || die "systemd ExecStart value validation failed"
 }
-GW_DESCRIPTION="$(systemd_value "Hermes Gateway — $DISPLAY_NAME")"
-HB_DESCRIPTION="$(systemd_value "Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME")"
-TIMER_DESCRIPTION="$(systemd_value "Heartbeat (reconcile + checkpoint) for $AGENT_ID")"
+GW_DESCRIPTION="$(systemd_scalar "Hermes Gateway — $DISPLAY_NAME")"
+HB_DESCRIPTION="$(systemd_scalar "Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME")"
+TIMER_DESCRIPTION="$(systemd_scalar "Heartbeat (reconcile + checkpoint) for $AGENT_ID")"
 ENV_HERMES_HOME="$(systemd_environment HERMES_HOME "$PROFILE_HOME")"
 ENV_HERMES_BIN="$(systemd_environment HERMES_BIN "$HERMES_BIN")"
 ENV_CODEX_HOME="$(systemd_environment CODEX_HOME "$CODEX_HOME")"
 ENV_TERMINAL_CWD="$(systemd_environment TERMINAL_CWD "$REPO_ROOT")"
-WORKING_DIRECTORY="$(systemd_value "$REPO_ROOT")"
-RUNTIME_ENV_FILE="$(systemd_value "-$RUNTIME/.env")"
-GW_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/gateway.systemd.log")"
-HB_LOG_OUTPUT="$(systemd_value "append:$RUNTIME/logs/heartbeat.log")"
+WORKING_DIRECTORY="$(systemd_scalar "$REPO_ROOT")"
+RUNTIME_ENV_FILE="$(systemd_scalar "-$RUNTIME/.env")"
+GW_LOG_OUTPUT="$(systemd_scalar "append:$RUNTIME/logs/gateway.systemd.log")"
+HB_LOG_OUTPUT="$(systemd_scalar "append:$RUNTIME/logs/heartbeat.log")"
 GW_EXEC_START="$(systemd_exec_value "$ROLE_DIR/.scripts/credential-launch.sh")"
 HB_EXEC_START="$GW_EXEC_START"
 

@@ -223,7 +223,25 @@ exit 1
     assert f'Environment="HERMES_HOME={Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"}"' in rendered
     assert f'Environment="TERMINAL_CWD={tmp_path}"' in rendered
     assert 'ExecStart="' + str(role / ".scripts" / "credential-launch.sh") + '" gateway' in rendered
+    assert f"WorkingDirectory={tmp_path}" in rendered
+    assert f"EnvironmentFile=-{role / 'runtime' / '.env'}" in rendered
+    assert f"StandardOutput=append:{role / 'runtime' / 'logs' / 'gateway.systemd.log'}" in rendered
+    assert 'Description="Hermes' not in rendered
     assert "HERMES_OAUTH_FILE" not in rendered
+
+    verification = subprocess.run(
+        [
+            "systemd-analyze",
+            "verify",
+            str(unit_dir / "hermes-demo-pm-gateway.service"),
+            str(unit_dir / "hermes-demo-pm-heartbeat.service"),
+            str(unit_dir / "hermes-demo-pm-heartbeat.timer"),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert verification.returncode == 0, verification.stdout + verification.stderr
 
 
 def test_systemd_rejects_newline_injection_before_writing_units(tmp_path: Path) -> None:

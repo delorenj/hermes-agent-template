@@ -103,6 +103,14 @@ def test_systemd_environment_serializer_is_lossless_and_rejects_record_injection
         '/space x/${EXPAND}/"quote"/back\\slash/%token/$plain'
     ) == '"/space x/$${EXPAND}/\\"quote\\"/back\\\\slash/%%token/$$plain"'
 
+    serialize_scalar = namespace["serialize_systemd_scalar"]
+    assert serialize_scalar(value) == (
+        '/path with spaces/"quote"/back\\\\slash/%%token/$dollar\\tend'
+    )
+    for unsafe in ("line one\nline two", "carriage\rreturn", "nul\0byte"):
+        with pytest.raises(ValueError, match="control|newline|NUL"):
+            serialize_scalar(unsafe)
+
 
 def test_writer_round_trips_every_value_through_canonical_literal_format(
     tmp_path: Path,
