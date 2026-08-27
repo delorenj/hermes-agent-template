@@ -5,6 +5,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -129,6 +130,24 @@ def _run(
     bindir: Path,
     overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    env = _environment(registry, home, bindir, overrides)
+    _prepare_profile(role, home)
+    return subprocess.run(
+        ["bash", str(role / ".scripts" / "30-telegram.sh")],
+        env=env,
+        input="",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _environment(
+    registry: Path,
+    home: Path,
+    bindir: Path,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
@@ -146,24 +165,76 @@ def _run(
         }
     )
     env.update(overrides or {})
+    return env
+
+
+def _prepare_profile(role: Path, home: Path) -> None:
     profile_name = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["profile"]
     fleet_home = home / ".hermes"
     profile = fleet_home / "profiles" / profile_name
     profile.mkdir(parents=True, exist_ok=True)
-    (fleet_home / "config.yaml").write_text(
-        "plugins: {}\nplatforms:\n  telegram:\n    enabled: true\n",
-        encoding="utf-8",
-    )
+    base = fleet_home / "config.yaml"
+    if not base.exists():
+        base.write_text(
+            "plugins: {}\nplatforms:\n  telegram:\n    enabled: true\n",
+            encoding="utf-8",
+        )
     delta = profile / "config.delta.yaml"
     if not delta.exists():
         delta.write_text("{}\n", encoding="utf-8")
-    return subprocess.run(
+
+
+def _start(
+    role: Path,
+    registry: Path,
+    home: Path,
+    bindir: Path,
+    overrides: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
+    env = _environment(registry, home, bindir, overrides)
+    _prepare_profile(role, home)
+    return subprocess.Popen(
         ["bash", str(role / ".scripts" / "30-telegram.sh")],
         env=env,
-        input="",
+        stdin=subprocess.DEVNULL,
         text=True,
-        capture_output=True,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = 8) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"process exited before {path.name}: {process.returncode}\n{stdout}\n{stderr}"
+            )
+        if time.monotonic() >= deadline:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"timed out waiting for {path}: {stdout}\n{stderr}")
+        time.sleep(0.01)
+
+
+def _assert_rotated_wiring(role: Path, registry: Path, home: Path) -> None:
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text(encoding="utf-8"))
+    reference = delta["secrets"]["onepassword"]["env"]["TELEGRAM_BOT_TOKEN"]
+    assert reference == "op://DeLoSecrets/fakeitem0002/telegram_bot_token"
+    assert delta["platforms"]["telegram"]["enabled"] is True
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["secrets"]["onepassword"]["env"]["TELEGRAM_BOT_TOKEN"] == reference
+    assert generated["platforms"]["telegram"]["enabled"] is True
+    role_telegram = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]
+    registry_telegram = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["telegram"]
+    for state in (role_telegram, registry_telegram):
+        assert state["provisioning_status"] == "verified"
+        assert state["bot_username"] == "rotated_demo_bot"
+        assert str(state["bot_id"]) == "989898"
+    assert (role / "runtime" / ".env").read_text(encoding="utf-8") == (
+        'TELEGRAM_ALLOWED_USERS="222"\n'
     )
 
 
@@ -433,6 +504,88 @@ def test_tokenless_telegram_rerun_reconciles_registry_then_is_byte_identical(
 
     assert converged.returncode == 0, converged.stderr
     assert registry.read_bytes() == registry_after
+
+
+def _exercise_tokenless_telegram_rotation_interleaving(
+    tmp_path: Path, *, rotation_first: bool
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_bin(tmp_path)
+    initial = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"TELEGRAM_BOT_TOKEN": BOT_TOKEN, "TELEGRAM_ALLOWED_USERS": "111"},
+    )
+    assert initial.returncode == 0, initial.stderr
+
+    barrier = tmp_path / ("rotation-first" if rotation_first else "tokenless-first")
+    profile_barrier_overrides = {
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER": str(barrier),
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_LABEL": "channel:telegram",
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_TIMEOUT_SECONDS": "15",
+    }
+    attempt = tmp_path / "registry-attempt"
+    rotation = {
+        "TELEGRAM_BOT_TOKEN": OTHER_TOKEN,
+        "TELEGRAM_ALLOWED_USERS": "222",
+    }
+
+    if rotation_first:
+        first = _start(
+            role, registry, home, bindir, {**rotation, **profile_barrier_overrides}
+        )
+        ready = Path(f"{barrier}.ready")
+        _wait_for(ready, first)
+        assert ready.read_text(encoding="utf-8") == "channel:telegram\n"
+        second_overrides = {"PJANGLER_TEST_FLEET_LOCK_ATTEMPT": str(attempt)}
+        second = _start(role, registry, home, bindir, second_overrides)
+        _wait_for(attempt, second)
+        assert second.poll() is None
+        Path(f"{barrier}.resume").touch()
+        first_stdout, first_stderr = first.communicate(timeout=15)
+        second_stdout, second_stderr = second.communicate(timeout=15)
+    else:
+        first = _start(
+            role,
+            registry,
+            home,
+            bindir,
+            {
+                "PJANGLER_TEST_FLEET_LOCK_BARRIER": str(barrier),
+                "PJANGLER_TEST_FLEET_LOCK_BARRIER_TIMEOUT_SECONDS": "15",
+            },
+        )
+        ready = Path(f"{barrier}.ready")
+        _wait_for(ready, first)
+        assert ready.read_text(encoding="utf-8") == "fleet-prelock\n"
+        second = _start(role, registry, home, bindir, rotation)
+        second_stdout, second_stderr = second.communicate(timeout=15)
+        assert second.returncode == 0, second_stdout + second_stderr
+        assert first.poll() is None
+        Path(f"{barrier}.resume").touch()
+        first_stdout, first_stderr = first.communicate(timeout=15)
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    combined = first_stdout + first_stderr + second_stdout + second_stderr
+    assert BOT_TOKEN not in combined
+    assert OTHER_TOKEN not in combined
+    _assert_rotated_wiring(role, registry, home)
+
+
+def test_tokenless_telegram_snapshot_before_rotation_cannot_restore_old_ref(
+    tmp_path: Path,
+) -> None:
+    _exercise_tokenless_telegram_rotation_interleaving(tmp_path, rotation_first=False)
+
+
+def test_telegram_rotation_before_tokenless_snapshot_keeps_new_ref(
+    tmp_path: Path,
+) -> None:
+    _exercise_tokenless_telegram_rotation_interleaving(tmp_path, rotation_first=True)
 
 
 def test_registry_write_failure_rolls_back_all_telegram_files_byte_exactly(

@@ -448,25 +448,9 @@ atomic_write(generated_path, header + yaml.safe_dump(merge(base, delta), sort_ke
 PYEOF
 }
 
-# Record an env-var -> op:// mapping without accepting a raw value.
-profile_onepassword_ref_set() {
-  # profile_onepassword_ref_set PROFILE_HOME ENV_NAME OP_REFERENCE
-  profile_config_delta_update "$1" secret-ref "$2" "$3"
-}
-
-profile_onepassword_ref_pair_set() {
-  # profile_onepassword_ref_pair_set PROFILE_HOME ENV REF ENV REF
-  profile_config_delta_update "$1" secret-ref-pair "$2" "$3" "$4" "$5"
-}
-
 profile_voice_contract_set() {
   # profile_voice_contract_set PROFILE_HOME PLUGIN VOICE
   profile_config_delta_update "$1" voice "$2" "$3"
-}
-
-profile_channel_enabled_set() {
-  # profile_channel_enabled_set PROFILE_HOME telegram|slack true|false
-  profile_config_delta_update "$1" channel-enabled "$2" "$3"
 }
 
 profile_root_require_real() {
@@ -478,8 +462,10 @@ profile_root_require_real() {
 
 profile_onepassword_ref_exists() {
   # profile_onepassword_ref_exists PROFILE_HOME ENV_NAME
+  # This is a read-only service eligibility probe. Channel transactions do not
+  # use it: their refs and identity are captured under registry -> profile lock.
   python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
-import pathlib, re, sys
+import pathlib, sys
 try:
     import yaml
 except ImportError:
@@ -515,23 +501,11 @@ PYEOF
 profile_onepassword_ref_validate() {
   # profile_onepassword_ref_validate PROFILE_HOME ENV_NAME
   # Return 0 when the reference resolves, 2 when no syntactically valid
-  # mapping exists, and 75 when a valid mapping cannot currently be checked
-  # (for example, transient 1Password auth/network failure).  Callers must not
-  # destroy durable wiring on 75.
+  # mapping exists, and 75 when a valid mapping cannot currently be checked.
+  # This is a read-only service eligibility probe, never a transaction input.
   local reference helper="$ROLE_DIR/.scripts/store-onepassword-secret.py"
   [[ -f "$helper" ]] || return 75
-  reference="$(python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
-import pathlib, sys
-try:
-    import yaml
-    data = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
-    ref = data["secrets"]["onepassword"]["env"].get(sys.argv[2], "")
-except Exception:
-    ref = ""
-print(ref if isinstance(ref, str) and ref.startswith("op://") else "", end="")
-PYEOF
-)"
-  [[ -n "$reference" ]] || return 2
+  reference="$(profile_onepassword_ref_get "$1" "$2")" || return 2
   if python3 -I "$helper" --validate-reference "$reference" >/dev/null 2>&1; then
     return 0
   fi
@@ -562,6 +536,55 @@ channel_transaction_telegram() {
     --metadata bot_id "$5"
 }
 
+channel_transaction_telegram_existing() {
+  # channel_transaction_telegram_existing PROFILE_HOME RUNTIME_ENV
+  # Caller holds the fleet registry lock; the helper acquires the profile lock
+  # and reads refs plus role metadata only after both locks are held.
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  local validator="$ROLE_DIR/.scripts/store-onepassword-secret.py"
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || die "trusted channel transaction helper is missing"
+  [[ -f "$validator" && ! -L "$validator" ]] \
+    || die "trusted 1Password reference validator is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
+  python3 -I "$helper" \
+    --channel telegram \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-30-telegram" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --reconcile-existing \
+    --reference-validator "$validator"
+}
+
+channel_transaction_telegram_prepare_unconfigured() {
+  # Caller holds the fleet registry lock. The helper disables only a channel
+  # whose locked role snapshot is not verified; exit 3 means verified/no-op.
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || die "trusted channel transaction helper is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
+  python3 -I "$helper" \
+    --channel telegram \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-30-telegram" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --prepare-unconfigured
+}
+
 channel_transaction_slack() {
   # channel_transaction_slack PROFILE ENV BOT_REF APP_REF TEAM_ID TEAM_NAME USER_ID BOT_ID USERNAME ALLOWED
   local helper="$ROLE_DIR/.scripts/channel-transaction.py"
@@ -588,6 +611,55 @@ channel_transaction_slack() {
     --metadata bot_user_id "$7" \
     --metadata bot_id "$8" \
     --metadata bot_username "$9"
+}
+
+channel_transaction_slack_existing() {
+  # channel_transaction_slack_existing PROFILE_HOME RUNTIME_ENV
+  # Caller holds the fleet registry lock; the helper acquires the profile lock
+  # and reads refs plus role metadata only after both locks are held.
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  local validator="$ROLE_DIR/.scripts/store-onepassword-secret.py"
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || die "trusted channel transaction helper is missing"
+  [[ -f "$validator" && ! -L "$validator" ]] \
+    || die "trusted 1Password reference validator is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
+  python3 -I "$helper" \
+    --channel slack \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-31-slack" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --reconcile-existing \
+    --reference-validator "$validator"
+}
+
+channel_transaction_slack_prepare_unconfigured() {
+  # Caller holds the fleet registry lock. The helper disables only a channel
+  # whose locked role snapshot is not verified; exit 3 means verified/no-op.
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || die "trusted channel transaction helper is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
+  python3 -I "$helper" \
+    --channel slack \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-31-slack" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --prepare-unconfigured
 }
 
 # ─── Distributable config (~/.config/hermes-agent-template/config.toml) ──────
@@ -749,6 +821,34 @@ fleet_lock_acquire() {
   [[ ! -L "$lock_file" ]] || die "refusing fleet lock symlink: $lock_file"
   exec {FLEET_LOCK_FD}>"$lock_file"
   chmod 600 "$lock_file"
+  if [[ -n "${PJANGLER_TEST_FLEET_LOCK_BARRIER:-}" ]]; then
+    [[ -n "${PYTEST_CURRENT_TEST:-}" ]] \
+      || die "PJANGLER_TEST_FLEET_LOCK_BARRIER is test-only and requires pytest"
+    local barrier_file="$PJANGLER_TEST_FLEET_LOCK_BARRIER"
+    local barrier_parent="${barrier_file%/*}"
+    local barrier_timeout="${PJANGLER_TEST_FLEET_LOCK_BARRIER_TIMEOUT_SECONDS:-15}"
+    [[ "$barrier_parent" != "$barrier_file" ]] || barrier_parent="."
+    [[ ! -L "$barrier_file" && ! -L "$barrier_parent" && -d "$barrier_parent" ]] \
+      || die "unsafe test fleet-lock barrier path: $barrier_file"
+    [[ "$barrier_timeout" =~ ^[1-9][0-9]*$ ]] \
+      || die "PJANGLER_TEST_FLEET_LOCK_BARRIER_TIMEOUT_SECONDS must be a positive integer"
+    printf '%s\n' 'fleet-prelock' > "${barrier_file}.ready"
+    local barrier_started=$SECONDS
+    while [[ ! -f "${barrier_file}.resume" ]]; do
+      (( SECONDS - barrier_started < barrier_timeout )) \
+        || die "timed out waiting at test fleet-lock barrier: $barrier_file"
+      sleep 0.02
+    done
+  fi
+  if [[ -n "${PJANGLER_TEST_FLEET_LOCK_ATTEMPT:-}" ]]; then
+    [[ -n "${PYTEST_CURRENT_TEST:-}" ]] \
+      || die "PJANGLER_TEST_FLEET_LOCK_ATTEMPT is test-only and requires pytest"
+    local attempt_file="$PJANGLER_TEST_FLEET_LOCK_ATTEMPT"
+    [[ ! -L "$attempt_file" && ! -L "$(dirname "$attempt_file")" \
+        && -d "$(dirname "$attempt_file")" ]] \
+      || die "unsafe test fleet-lock attempt path: $attempt_file"
+    printf '%s\n' "$lock_file" > "$attempt_file"
+  fi
   flock -w "${FLEET_LOCK_TIMEOUT_SECONDS:-30}" "$FLEET_LOCK_FD" \
     || die "timed out waiting for fleet registry lock: $lock_file"
 }

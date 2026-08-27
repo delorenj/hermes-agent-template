@@ -4,6 +4,8 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -153,6 +155,24 @@ def _run(
     bindir: Path,
     overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    env = _environment(registry, home, bindir, overrides)
+    _prepare_profile(role, home)
+    return subprocess.run(
+        ["bash", str(role / ".scripts" / "31-slack.sh")],
+        env=env,
+        input="",
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def _environment(
+    registry: Path,
+    home: Path,
+    bindir: Path,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
     env = {
         key: value
         for key, value in os.environ.items()
@@ -169,24 +189,81 @@ def _run(
         }
     )
     env.update(overrides or {})
+    return env
+
+
+def _prepare_profile(role: Path, home: Path) -> None:
     profile_name = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["profile"]
     fleet_home = home / ".hermes"
     profile = fleet_home / "profiles" / profile_name
     profile.mkdir(parents=True, exist_ok=True)
-    (fleet_home / "config.yaml").write_text(
-        "plugins: {}\nplatforms:\n  slack:\n    enabled: true\n",
-        encoding="utf-8",
-    )
+    base = fleet_home / "config.yaml"
+    if not base.exists():
+        base.write_text(
+            "plugins: {}\nplatforms:\n  slack:\n    enabled: true\n",
+            encoding="utf-8",
+        )
     delta = profile / "config.delta.yaml"
     if not delta.exists():
         delta.write_text("{}\n", encoding="utf-8")
-    return subprocess.run(
+
+
+def _start(
+    role: Path,
+    registry: Path,
+    home: Path,
+    bindir: Path,
+    overrides: dict[str, str] | None = None,
+) -> subprocess.Popen[str]:
+    env = _environment(registry, home, bindir, overrides)
+    _prepare_profile(role, home)
+    return subprocess.Popen(
         ["bash", str(role / ".scripts" / "31-slack.sh")],
         env=env,
-        input="",
+        stdin=subprocess.DEVNULL,
         text=True,
-        capture_output=True,
-        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _wait_for(path: Path, process: subprocess.Popen[str], timeout: float = 8) -> None:
+    deadline = time.monotonic() + timeout
+    while not path.is_file():
+        if process.poll() is not None:
+            stdout, stderr = process.communicate()
+            raise AssertionError(
+                f"process exited before {path.name}: {process.returncode}\n{stdout}\n{stderr}"
+            )
+        if time.monotonic() >= deadline:
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise AssertionError(f"timed out waiting for {path}: {stdout}\n{stderr}")
+        time.sleep(0.01)
+
+
+def _assert_rotated_wiring(role: Path, registry: Path, home: Path) -> None:
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text(encoding="utf-8"))
+    refs = delta["secrets"]["onepassword"]["env"]
+    assert refs["SLACK_BOT_TOKEN"].endswith("/slack_bot_token")
+    assert refs["SLACK_APP_TOKEN"].endswith("/slack_app_token")
+    assert refs["SLACK_BOT_TOKEN"].rsplit("/", 1)[0] == refs["SLACK_APP_TOKEN"].rsplit("/", 1)[0]
+    assert "fakeitem0002" in refs["SLACK_BOT_TOKEN"]
+    assert delta["platforms"]["slack"]["enabled"] is True
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["secrets"]["onepassword"]["env"] == refs
+    assert generated["platforms"]["slack"]["enabled"] is True
+    role_slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
+    registry_slack = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["slack"]
+    for state in (role_slack, registry_slack):
+        assert state["provisioning_status"] == "verified"
+        assert state["team_id"] == "T456"
+        assert state["bot_user_id"] == "U456BOT"
+        assert state["bot_id"] == "B456BOT"
+        assert state["bot_username"] == "rotated-pm"
+    assert (role / "runtime" / ".env").read_text(encoding="utf-8") == (
+        'SLACK_ALLOWED_USERS="U456"\n'
     )
 
 
@@ -244,7 +321,11 @@ def test_invocation_tokens_are_cleared_before_first_path_child(tmp_path: Path) -
         registry,
         home,
         bindir,
-        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+        {
+            "SLACK_BOT_TOKEN": BOT_TOKEN,
+            "SLACK_APP_TOKEN": APP_TOKEN,
+            "SLACK_ALLOWED_USERS": "U123",
+        },
     )
 
     assert result.returncode == 0, result.stderr
@@ -567,6 +648,164 @@ def test_tokenless_slack_rerun_reconciles_registry_then_is_byte_identical(
 
     assert converged.returncode == 0, converged.stderr
     assert registry.read_bytes() == registry_after
+
+
+def _exercise_tokenless_slack_rotation_interleaving(
+    tmp_path: Path, *, rotation_first: bool
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    initial = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {
+            "SLACK_BOT_TOKEN": BOT_TOKEN,
+            "SLACK_APP_TOKEN": APP_TOKEN,
+            "SLACK_ALLOWED_USERS": "U123",
+        },
+    )
+    assert initial.returncode == 0, initial.stderr
+
+    barrier = tmp_path / ("rotation-first" if rotation_first else "tokenless-first")
+    profile_barrier_overrides = {
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER": str(barrier),
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_LABEL": "channel:slack",
+        "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_TIMEOUT_SECONDS": "15",
+    }
+    attempt = tmp_path / "registry-attempt"
+    rotation = {
+        "SLACK_BOT_TOKEN": ROTATED_BOT_TOKEN,
+        "SLACK_APP_TOKEN": ROTATED_APP_TOKEN,
+        "SLACK_ALLOWED_USERS": "U456",
+    }
+
+    if rotation_first:
+        first = _start(
+            role, registry, home, bindir, {**rotation, **profile_barrier_overrides}
+        )
+        ready = Path(f"{barrier}.ready")
+        _wait_for(ready, first)
+        assert ready.read_text(encoding="utf-8") == "channel:slack\n"
+        second_overrides = {"PJANGLER_TEST_FLEET_LOCK_ATTEMPT": str(attempt)}
+        second = _start(role, registry, home, bindir, second_overrides)
+        _wait_for(attempt, second)
+        assert second.poll() is None
+        Path(f"{barrier}.resume").touch()
+        first_stdout, first_stderr = first.communicate(timeout=15)
+        second_stdout, second_stderr = second.communicate(timeout=15)
+    else:
+        first = _start(
+            role,
+            registry,
+            home,
+            bindir,
+            {
+                "PJANGLER_TEST_FLEET_LOCK_BARRIER": str(barrier),
+                "PJANGLER_TEST_FLEET_LOCK_BARRIER_TIMEOUT_SECONDS": "15",
+            },
+        )
+        ready = Path(f"{barrier}.ready")
+        _wait_for(ready, first)
+        assert ready.read_text(encoding="utf-8") == "fleet-prelock\n"
+        second = _start(role, registry, home, bindir, rotation)
+        second_stdout, second_stderr = second.communicate(timeout=15)
+        assert second.returncode == 0, second_stdout + second_stderr
+        assert first.poll() is None
+        Path(f"{barrier}.resume").touch()
+        first_stdout, first_stderr = first.communicate(timeout=15)
+    assert first.returncode == 0, first_stdout + first_stderr
+    assert second.returncode == 0, second_stdout + second_stderr
+    combined = first_stdout + first_stderr + second_stdout + second_stderr
+    for token in (BOT_TOKEN, APP_TOKEN, ROTATED_BOT_TOKEN, ROTATED_APP_TOKEN):
+        assert token not in combined
+    _assert_rotated_wiring(role, registry, home)
+
+
+def test_tokenless_slack_snapshot_before_rotation_cannot_restore_old_refs(
+    tmp_path: Path,
+) -> None:
+    _exercise_tokenless_slack_rotation_interleaving(tmp_path, rotation_first=False)
+
+
+def test_slack_rotation_before_tokenless_snapshot_keeps_new_refs(
+    tmp_path: Path,
+) -> None:
+    _exercise_tokenless_slack_rotation_interleaving(tmp_path, rotation_first=True)
+
+
+def test_tokenless_slack_registry_timeout_is_clean_and_crash_releases_lock(
+    tmp_path: Path,
+) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    initial = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+    assert initial.returncode == 0, initial.stderr
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    marker = role / ".scripts" / ".done-31-slack"
+    before = {
+        "delta": (profile / "config.delta.yaml").read_bytes(),
+        "generated": (profile / "config.yaml").read_bytes(),
+        "role": (role / "role.yaml").read_bytes(),
+        "registry": registry.read_bytes(),
+        "env": (runtime / ".env").read_bytes(),
+        "marker": marker.read_bytes(),
+    }
+
+    ready = tmp_path / "registry-holder.ready"
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl,pathlib,signal,sys; "
+            "handle=open(sys.argv[1],'a+'); "
+            "fcntl.flock(handle.fileno(),fcntl.LOCK_EX); "
+            "pathlib.Path(sys.argv[2]).write_text('locked\\n',encoding='utf-8'); "
+            "signal.pause()",
+            str(Path(f"{registry}.lock")),
+            str(ready),
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _wait_for(ready, holder)
+
+    blocked = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"FLEET_LOCK_TIMEOUT_SECONDS": "0.1"},
+    )
+    assert blocked.returncode != 0
+    assert "timed out waiting for fleet registry lock" in blocked.stderr
+    assert (profile / "config.delta.yaml").read_bytes() == before["delta"]
+    assert (profile / "config.yaml").read_bytes() == before["generated"]
+    assert (role / "role.yaml").read_bytes() == before["role"]
+    assert registry.read_bytes() == before["registry"]
+    assert (runtime / ".env").read_bytes() == before["env"]
+    assert marker.read_bytes() == before["marker"]
+
+    holder.kill()
+    holder.communicate(timeout=3)
+    assert holder.returncode is not None and holder.returncode < 0
+    recovered = _run(role, registry, home, bindir)
+    assert recovered.returncode == 0, recovered.stderr
+    assert "existing verified 1Password wiring reconciled" in recovered.stderr
+    assert (profile / "config.delta.yaml").read_bytes() == before["delta"]
+    assert registry.read_bytes() == before["registry"]
 
 
 def test_registry_write_failure_rolls_back_all_slack_files_byte_exactly(

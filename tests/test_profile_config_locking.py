@@ -14,6 +14,7 @@ ROOT = Path(__file__).parents[1]
 VOICE_HELPER = ROOT / "template" / ".scripts" / "lib" / "voice-config.py"
 CHANNEL_HELPER = ROOT / "template" / ".scripts" / "channel-transaction.py"
 PROFILE_RENDERER = ROOT / "scripts" / "hermes-profile-config.py"
+PROFILE_SEEDER = ROOT / "template" / ".scripts" / "lib" / "profile-config-seed.py"
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -404,3 +405,69 @@ def test_profile_lock_timeout_is_truthful_and_process_crash_releases_lock(
         ).returncode
         == 0
     )
+
+
+def test_initial_delta_seed_uses_shared_lock_and_recovers_after_crash(
+    tmp_path: Path,
+) -> None:
+    profile = tmp_path / "home" / ".hermes" / "profiles" / "seed-pm"
+    profile.mkdir(parents=True)
+    barrier = tmp_path / "seed-holder"
+    holder_env = _barrier_env(barrier)
+    holder_env["PJANGLER_TEST_PROFILE_CONFIG_BARRIER_LABEL"] = "seed"
+    holder = subprocess.Popen(
+        [sys.executable, "-I", str(PROFILE_SEEDER), "--profile", str(profile)],
+        env=holder_env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    _wait_for(Path(f"{barrier}.ready"), holder)
+    assert Path(f"{barrier}.ready").read_text(encoding="utf-8") == "seed\n"
+    assert not (profile / "config.delta.yaml").exists()
+
+    blocked_env = os.environ.copy()
+    blocked_env["HERMES_PROFILE_CONFIG_LOCK_TIMEOUT_SECONDS"] = "0.1"
+    blocked = subprocess.run(
+        [sys.executable, "-I", str(PROFILE_SEEDER), "--profile", str(profile)],
+        env=blocked_env,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=3,
+    )
+    assert blocked.returncode != 0
+    assert "timed out waiting for profile config lock" in blocked.stderr
+    assert not (profile / "config.delta.yaml").exists()
+
+    holder.kill()
+    holder.communicate(timeout=3)
+    assert holder.returncode is not None and holder.returncode < 0
+    seeded = subprocess.run(
+        [sys.executable, "-I", str(PROFILE_SEEDER), "--profile", str(profile)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert seeded.returncode == 0, seeded.stderr
+    assert seeded.stdout == "seeded\n"
+    delta = profile / "config.delta.yaml"
+    assert delta.read_text(encoding="utf-8").endswith("{}\n")
+    assert delta.stat().st_mode & 0o777 == 0o600
+    before = delta.read_bytes()
+
+    converged = subprocess.run(
+        [sys.executable, "-I", str(PROFILE_SEEDER), "--profile", str(profile)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert converged.returncode == 0, converged.stderr
+    assert converged.stdout == "exists\n"
+    assert delta.read_bytes() == before
+
+    profile_step = (ROOT / "template" / ".scripts" / "10-hermes-profile.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "profile-config-seed.py" in profile_step
+    assert 'cat > "$PROFILE_DELTA"' not in profile_step

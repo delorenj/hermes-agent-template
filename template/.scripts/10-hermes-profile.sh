@@ -22,6 +22,9 @@ PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 if [[ -L "$PROFILE_HOME" ]]; then
   die "legacy named profile symlink detected at $PROFILE_HOME; refusing mutation. Run: pj migrate hermes.runtime-singleton '$(project_repo_path 2>/dev/null || printf '%s' "$ROLE_DIR")'"
 fi
+PROFILE_DELTA_SEEDER="$ROLE_DIR/.scripts/lib/profile-config-seed.py"
+[[ -f "$PROFILE_DELTA_SEEDER" && ! -L "$PROFILE_DELTA_SEEDER" ]] \
+  || die "trusted profile config seed helper is unavailable: $PROFILE_DELTA_SEEDER"
 
 already_done 10-hermes-profile \
   && log "[10] profile marker found — revalidating required profile contract"
@@ -124,15 +127,13 @@ fi
 # Seed an EMPTY delta: a new agent should be identical to the fleet base, and
 # every line here is an override someone must justify later.
 PROFILE_DELTA="$PROFILE_HOME/config.delta.yaml"
-if [[ ! -f "$PROFILE_DELTA" ]]; then
+profile_delta_seed_result="$(
+  python3 -I "$PROFILE_DELTA_SEEDER" --profile "$PROFILE_HOME"
+)" || die "config.delta.yaml seed reconciliation failed"
+if [[ "$profile_delta_seed_result" == "seeded" ]]; then
   log "    seeding empty config.delta.yaml (override-only SSOT)"
-  cat > "$PROFILE_DELTA" <<'DELTA_EOF'
-# Override-only delta for this Hermes profile.
-# Merged over ~/.hermes/config.yaml to produce config.yaml (which is GENERATED).
-# Empty == identical to the fleet base. Add ONLY what must differ.
-{}
-DELTA_EOF
-  chmod 600 "$PROFILE_DELTA"
+elif [[ "$profile_delta_seed_result" != "exists" ]]; then
+  die "profile config seed helper returned an invalid result"
 fi
 
 # Pin the identity-memory bank explicitly rather than relying on the fleet

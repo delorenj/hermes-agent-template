@@ -23,80 +23,114 @@ else
 fi
 unset INVOCATION_TELEGRAM_BOT_TOKEN INVOCATION_TELEGRAM_ALLOWED_USERS
 
-telegram_yaml_update() {
-  python3 - "$ROLE_YAML" "$@" <<'PYEOF'
-import json
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-updates = dict(zip(sys.argv[2::2], sys.argv[3::2]))
-text = path.read_text(encoding="utf-8")
-match = re.search(r"(?ms)^telegram:\s*\n(?P<body>(?:^[ \t]+.*\n?)*)", text)
-if not match:
-    raise SystemExit(f"telegram metadata block missing from {path}")
-body = match.group("body")
-for key, value in updates.items():
-    replacement = f"  {key}: {json.dumps(value)}"
-    body, count = re.subn(
-        rf"(?m)^\s+{re.escape(key)}:\s*.*$", lambda _: replacement, body, count=1
-    )
-    if count == 0:
-        if body and not body.endswith("\n"):
-            body += "\n"
-        body += replacement + "\n"
-path.write_text(text[: match.start("body")] + body + text[match.end("body") :], encoding="utf-8")
-PYEOF
-}
-
-telegram_status="$(yaml_get telegram.provisioning_status)"
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 profile_root_require_real "$PROFILE_HOME"
 RUNTIME="$ROLE_DIR/runtime"
 ENVF="$RUNTIME/.env"
 mkdir -p "$RUNTIME"
 [[ ! -L "$ENVF" ]] || die "refusing to write Telegram credentials through symlink: $ENVF"
-if [[ "$telegram_status" != "verified" ]]; then
-  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
-    || die "Telegram could not be disabled in the profile override"
+
+telegram_reconcile_existing() {
+  # Registry first, then the transaction helper's profile lock. The helper
+  # snapshots and validates refs plus role metadata only inside this window.
+  local rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_telegram_existing "$PROFILE_HOME" "$ENVF" || rc=$?
+  fleet_lock_release
+  trap - EXIT
+  return "$rc"
+}
+
+telegram_defer_if_unconfigured() {
+  # Prepare and, when already verified, reconcile under one registry-lock
+  # window. The helpers independently take the profile lock second.
+  local prepare_rc=0 rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_telegram_prepare_unconfigured \
+    "$PROFILE_HOME" "$ENVF" || prepare_rc=$?
+  case "$prepare_rc" in
+    0)
+      fleet_lock_release
+      trap - EXIT
+      return 2
+      ;;
+    3)
+      channel_transaction_telegram_existing "$PROFILE_HOME" "$ENVF" || rc=$?
+      ;;
+    *)
+      die "Telegram deferred-state preparation transaction failed"
+      ;;
+  esac
+  case "$rc" in
+    0)
+      fleet_lock_release
+      trap - EXIT
+      return 0
+      ;;
+    75)
+      die "Telegram 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+      ;;
+    *)
+      die "Telegram verified wiring reconciliation transaction failed"
+      ;;
+  esac
+}
+
+telegram_prepare_for_attempt() {
+  # A new profile becomes explicitly disabled before remote verification. A
+  # verified profile is a no-op so a failed rotation preserves active wiring.
+  local rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_telegram_prepare_unconfigured \
+    "$PROFILE_HOME" "$ENVF" || rc=$?
+  fleet_lock_release
+  trap - EXIT
+  case "$rc" in
+    0|3) return 0 ;;
+    *) die "Telegram deferred-state preparation transaction failed" ;;
+  esac
+}
+
+# A valid durable mapping survives a transient 1Password outage. If the caller
+# supplied no rotation value, adopt/revalidate the complete current wiring
+# under registry -> profile locks. No ref or identity snapshot escapes that
+# window.
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  telegram_reference_rc=0
+  telegram_reconcile_existing || telegram_reference_rc=$?
+  case "$telegram_reference_rc" in
+    0)
+      log "[30] telegram — existing verified 1Password wiring reconciled"
+      exit 0
+      ;;
+    2) ;;
+    75)
+      die "Telegram 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+      ;;
+    *)
+      die "Telegram verified wiring reconciliation transaction failed"
+      ;;
+  esac
 fi
 
-# A valid durable mapping survives a transient 1Password outage.  If the
-# caller did not explicitly supply a rotation value, adopt/revalidate the
-# existing wiring even when an old run lost its done marker.
-if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && "$telegram_status" == "verified" ]] \
-   && profile_onepassword_ref_exists "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
-  telegram_reference_rc=0
-  profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN \
-    || telegram_reference_rc=$?
-  if [[ $telegram_reference_rc -eq 0 ]]; then
-    telegram_reference="$(profile_onepassword_ref_get "$PROFILE_HOME" TELEGRAM_BOT_TOKEN)" \
-      || die "Telegram verified reference could not be read for reconciliation"
-    existing_bot_username="$(yaml_get telegram.bot_username)"
-    existing_bot_id="$(yaml_get telegram.bot_id)"
-    fleet_lock_acquire
-    trap 'fleet_lock_release' EXIT
-    channel_transaction_telegram \
-      "$PROFILE_HOME" "$ENVF" "$telegram_reference" \
-      "$existing_bot_username" "$existing_bot_id" "${TELEGRAM_ALLOWED_USERS:-}" \
-      || die "Telegram verified wiring reconciliation transaction failed"
-    fleet_lock_release
-    trap - EXIT
-    log "[30] telegram — existing verified 1Password wiring reconciled"
-    exit 0
-  fi
-  if [[ $telegram_reference_rc -eq 75 ]]; then
-    die "Telegram 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
-  fi
+# Establish explicit disabled state for a first-time credential attempt. This
+# recheck is serialized with rotations: existing verified wiring is preserved,
+# while an unconfigured profile is disabled before any fallible remote check.
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  telegram_prepare_for_attempt
 fi
 
 if [[ "${SKIP_TELEGRAM:-0}" == "1" ]]; then
-  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
-    || die "Telegram could not be disabled in the profile override"
-  telegram_yaml_update provisioning_status deferred
-  clear_done 30-telegram
-  log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; no verified 1Password reference)"
+  telegram_defer_rc=0
+  telegram_defer_if_unconfigured || telegram_defer_rc=$?
+  if [[ $telegram_defer_rc -eq 2 ]]; then
+    log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; no verified 1Password reference)"
+  else
+    log "[30] telegram — existing verified 1Password wiring reconciled"
+  fi
   exit 0
 fi
 
@@ -124,12 +158,14 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -t 0 ]]; then
 fi
 
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
-  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
-    || die "Telegram could not be disabled in the profile override"
-  telegram_yaml_update provisioning_status deferred
-  clear_done 30-telegram
-  warn "    no token provided; Telegram step deferred"
-  warn "    re-run later with a profile-dedicated TELEGRAM_BOT_TOKEN invocation"
+  telegram_defer_rc=0
+  telegram_defer_if_unconfigured || telegram_defer_rc=$?
+  if [[ $telegram_defer_rc -eq 2 ]]; then
+    warn "    no token provided; Telegram step deferred"
+    warn "    re-run later with a profile-dedicated TELEGRAM_BOT_TOKEN invocation"
+  else
+    log "[30] telegram — existing verified 1Password wiring reconciled"
+  fi
   exit 0
 fi
 

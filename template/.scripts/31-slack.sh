@@ -27,42 +27,76 @@ fi
 ENABLE_SLACK="$INVOCATION_ENABLE_SLACK"
 unset INVOCATION_SLACK_BOT_TOKEN INVOCATION_SLACK_APP_TOKEN
 
-slack_yaml_update() {
-  python3 - "$ROLE_YAML" "$@" <<'PYEOF'
-import json
-import pathlib
-import re
-import sys
-
-path = pathlib.Path(sys.argv[1])
-updates = dict(zip(sys.argv[2::2], sys.argv[3::2]))
-text = path.read_text(encoding="utf-8")
-match = re.search(r"(?ms)^slack:\s*\n(?P<body>(?:^[ \t]+.*\n?)*)", text)
-if not match:
-    raise SystemExit(f"slack metadata block missing from {path}")
-body = match.group("body")
-for key, value in updates.items():
-    replacement = f"  {key}: {json.dumps(value)}"
-    body, count = re.subn(
-        rf"(?m)^\s+{re.escape(key)}:\s*.*$", lambda _: replacement, body, count=1
-    )
-    if count != 1:
-        raise SystemExit(f"Slack metadata key {key!r} missing from {path}")
-path.write_text(text[: match.start("body")] + body + text[match.end("body") :], encoding="utf-8")
-PYEOF
-}
-
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 profile_root_require_real "$PROFILE_HOME"
 RUNTIME="$ROLE_DIR/runtime"
 ENVF="$RUNTIME/.env"
 mkdir -p "$RUNTIME"
 [[ ! -L "$ENVF" ]] || die "refusing to write Slack credentials through symlink: $ENVF"
-slack_status="$(yaml_get slack.provisioning_status)"
-if [[ "$slack_status" != "verified" ]]; then
-  profile_channel_enabled_set "$PROFILE_HOME" slack false \
-    || die "Slack could not be disabled in the profile override"
-fi
+
+slack_reconcile_existing() {
+  # Registry first, then the transaction helper's profile lock. The helper
+  # snapshots and validates both refs plus role metadata inside this window.
+  local rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_slack_existing "$PROFILE_HOME" "$ENVF" || rc=$?
+  fleet_lock_release
+  trap - EXIT
+  return "$rc"
+}
+
+slack_defer_if_unconfigured() {
+  # Prepare and, when already verified, reconcile under one registry-lock
+  # window. The helpers independently take the profile lock second.
+  local prepare_rc=0 rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_slack_prepare_unconfigured \
+    "$PROFILE_HOME" "$ENVF" || prepare_rc=$?
+  case "$prepare_rc" in
+    0)
+      fleet_lock_release
+      trap - EXIT
+      return 2
+      ;;
+    3)
+      channel_transaction_slack_existing "$PROFILE_HOME" "$ENVF" || rc=$?
+      ;;
+    *)
+      die "Slack deferred-state preparation transaction failed"
+      ;;
+  esac
+  case "$rc" in
+    0)
+      fleet_lock_release
+      trap - EXIT
+      return 0
+      ;;
+    75)
+      die "Slack 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+      ;;
+    *)
+      die "Slack verified wiring reconciliation transaction failed"
+      ;;
+  esac
+}
+
+slack_prepare_for_attempt() {
+  # A new profile becomes explicitly disabled before remote verification. A
+  # verified profile is a no-op so a failed rotation preserves active wiring.
+  local rc=0
+  fleet_lock_acquire
+  trap 'fleet_lock_release' EXIT
+  channel_transaction_slack_prepare_unconfigured \
+    "$PROFILE_HOME" "$ENVF" || rc=$?
+  fleet_lock_release
+  trap - EXIT
+  case "$rc" in
+    0|3) return 0 ;;
+    *) die "Slack deferred-state preparation transaction failed" ;;
+  esac
+}
 
 truthy() {
   case "${1,,}" in
@@ -72,47 +106,41 @@ truthy() {
 }
 
 # Preserve and reconcile durable wiring across transient 1Password outages.
-# An explicit token remains an intentional rotation request and bypasses this
-# adoption path.
-if [[ -z "${SLACK_BOT_TOKEN:-}" && -z "${SLACK_APP_TOKEN:-}" \
-      && "$slack_status" == "verified" ]] \
-   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_BOT_TOKEN \
-   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_APP_TOKEN; then
-  slack_bot_reference_rc=0
-  slack_app_reference_rc=0
-  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
-    || slack_bot_reference_rc=$?
-  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN \
-    || slack_app_reference_rc=$?
-  if [[ $slack_bot_reference_rc -eq 0 && $slack_app_reference_rc -eq 0 ]]; then
-    slack_bot_reference="$(profile_onepassword_ref_get "$PROFILE_HOME" SLACK_BOT_TOKEN)" \
-      || die "Slack verified bot reference could not be read for reconciliation"
-    slack_app_reference="$(profile_onepassword_ref_get "$PROFILE_HOME" SLACK_APP_TOKEN)" \
-      || die "Slack verified app reference could not be read for reconciliation"
-    fleet_lock_acquire
-    trap 'fleet_lock_release' EXIT
-    channel_transaction_slack \
-      "$PROFILE_HOME" "$ENVF" "$slack_bot_reference" "$slack_app_reference" \
-      "$(yaml_get slack.team_id)" "$(yaml_get slack.team_name)" \
-      "$(yaml_get slack.bot_user_id)" "$(yaml_get slack.bot_id)" \
-      "$(yaml_get slack.bot_username)" "${SLACK_ALLOWED_USERS:-}" \
-      || die "Slack verified wiring reconciliation transaction failed"
-    fleet_lock_release
-    trap - EXIT
-    log "[31] slack — existing verified 1Password wiring reconciled"
-    exit 0
-  fi
-  if [[ $slack_bot_reference_rc -eq 75 || $slack_app_reference_rc -eq 75 ]]; then
-    die "Slack 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
-  fi
+# An explicit token is a rotation request. With no tokens, the complete current
+# ref/identity snapshot is taken only after registry -> profile locks are held.
+if [[ -z "${SLACK_BOT_TOKEN:-}" && -z "${SLACK_APP_TOKEN:-}" ]]; then
+  slack_reference_rc=0
+  slack_reconcile_existing || slack_reference_rc=$?
+  case "$slack_reference_rc" in
+    0)
+      log "[31] slack — existing verified 1Password wiring reconciled"
+      exit 0
+      ;;
+    2) ;;
+    75)
+      die "Slack 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+      ;;
+    *)
+      die "Slack verified wiring reconciliation transaction failed"
+      ;;
+  esac
+fi
+
+# Establish explicit disabled state for a first-time credential attempt. The
+# registry -> profile lock recheck preserves any already-verified wiring and
+# prevents this preparation from racing a concurrent rotation.
+if [[ -n "${SLACK_BOT_TOKEN:-}" || -n "${SLACK_APP_TOKEN:-}" ]]; then
+  slack_prepare_for_attempt
 fi
 
 if [[ "${SKIP_SLACK:-0}" == "1" ]]; then
-  profile_channel_enabled_set "$PROFILE_HOME" slack false \
-    || die "Slack could not be disabled in the profile override"
-  slack_yaml_update provisioning_status deferred
-  clear_done 31-slack
-  log "[31] slack — DEFERRED (SKIP_SLACK=1; no verified 1Password reference pair)"
+  slack_defer_rc=0
+  slack_defer_if_unconfigured || slack_defer_rc=$?
+  if [[ $slack_defer_rc -eq 2 ]]; then
+    log "[31] slack — DEFERRED (SKIP_SLACK=1; no verified 1Password reference pair)"
+  else
+    log "[31] slack — existing verified 1Password wiring reconciled"
+  fi
   exit 0
 fi
 
@@ -126,10 +154,13 @@ have_app=0
 [[ -n "$SLACK_APP_TOKEN" ]] && have_app=1
 
 if ! truthy "${ENABLE_SLACK:-0}" && (( ! have_bot && ! have_app )); then
-  profile_channel_enabled_set "$PROFILE_HOME" slack false \
-    || die "Slack could not be disabled in the profile override"
-  slack_yaml_update provisioning_status deferred
-  log "[31] slack — deferred (opt in with ENABLE_SLACK=1 or supply both Slack tokens)"
+  slack_defer_rc=0
+  slack_defer_if_unconfigured || slack_defer_rc=$?
+  if [[ $slack_defer_rc -eq 2 ]]; then
+    log "[31] slack — deferred (opt in with ENABLE_SLACK=1 or supply both Slack tokens)"
+  else
+    log "[31] slack — existing verified 1Password wiring reconciled"
+  fi
   exit 0
 fi
 

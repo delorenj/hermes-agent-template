@@ -29,6 +29,7 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 LOCK_TIMEOUT_ENV = "HERMES_PROFILE_CONFIG_LOCK_TIMEOUT_SECONDS"
 TEST_BARRIER_ENV = "PJANGLER_TEST_PROFILE_CONFIG_BARRIER"
 TEST_BARRIER_TIMEOUT_ENV = "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_TIMEOUT_SECONDS"
+TEST_BARRIER_LABEL_ENV = "PJANGLER_TEST_PROFILE_CONFIG_BARRIER_LABEL"
 TEST_LOCK_ATTEMPT_ENV = "PJANGLER_TEST_PROFILE_CONFIG_LOCK_ATTEMPT"
 
 
@@ -157,6 +158,9 @@ def test_snapshot_barrier(label: str) -> None:
     this lock without widening the production interface.
     """
 
+    selected_label = os.environ.get(TEST_BARRIER_LABEL_ENV)
+    if selected_label and selected_label != label:
+        return
     barrier = _test_path_from_env(TEST_BARRIER_ENV)
     if barrier is None:
         return
