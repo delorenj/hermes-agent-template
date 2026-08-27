@@ -8,6 +8,10 @@ INVOCATION_SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN-}"
 INVOCATION_SLACK_APP_TOKEN="${SLACK_APP_TOKEN-}"
 INVOCATION_SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS-}"
 INVOCATION_ENABLE_SLACK="${ENABLE_SLACK-${WIRE_SLACK-}}"
+# Copy invocation-only inputs, then immediately clear their exported form.
+# Resolving/sourcing _lib.sh executes PATH children; none may inherit channel
+# credentials (or accidentally treat the invocation policy as fleet state).
+unset SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS ENABLE_SLACK WIRE_SLACK
 
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
@@ -49,6 +53,7 @@ PYEOF
 }
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+profile_root_require_real "$PROFILE_HOME"
 slack_status="$(yaml_get slack.provisioning_status)"
 if [[ "$slack_status" != "verified" ]]; then
   profile_channel_enabled_set "$PROFILE_HOME" slack false \
@@ -150,7 +155,8 @@ auth_response="$({
   printf '%s\n' 'url = "https://slack.com/api/auth.test"'
   printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN"
   printf '%s\n' 'header = "Content-Type: application/x-www-form-urlencoded"'
-  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error'
+  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error' \
+    'connect-timeout = 10' 'max-time = 20' 'max-filesize = 1048576'
 } | curl --config -)" \
   || die "Slack auth.test request failed"
 
@@ -165,11 +171,45 @@ if not data.get("ok"):
     safe = "".join(c for c in error if c.isalnum() or c in "_-.")[:80]
     raise SystemExit("Slack auth.test rejected the bot token ({})".format(safe or "unknown_error"))
 values = [data.get(k, "") for k in ("team_id", "team", "user_id", "bot_id", "user")]
-if not values[0] or not values[2]:
+if not values[0] or not values[2] or not values[3]:
     raise SystemExit("Slack auth.test response omitted required identity fields")
 print("\t".join(str(v).replace("\t", " ").replace("\n", " ") for v in values))
 ') || die "Slack bot identity verification failed"
 IFS=$'\t' read -r slack_team_id slack_team_name slack_bot_user_id slack_bot_id slack_bot_username <<< "$identity"
+
+# auth.test proves the bot installation/workspace, while bots.info provides the
+# authoritative Slack app identity for that bot.  Correlation requires the
+# app's users:read scope; missing scope is a hard, truthful deferred outcome.
+log "[31] resolving Slack bot app identity via bots.info"
+bot_info_response="$({
+  printf '%s\n' 'url = "https://slack.com/api/bots.info"'
+  printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN"
+  printf '%s\n' 'header = "Content-Type: application/x-www-form-urlencoded"'
+  printf 'data = "bot=%s"\n' "$slack_bot_id"
+  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error' \
+    'connect-timeout = 10' 'max-time = 20' 'max-filesize = 1048576'
+} | curl --config -)" \
+  || die "Slack bots.info request failed; Slack remains deferred"
+slack_bot_app_id="$(printf '%s' "$bot_info_response" | python3 -c '
+import json, re, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit("Slack bots.info returned an invalid response")
+if not isinstance(data, dict) or not data.get("ok"):
+    error = str(data.get("error") if isinstance(data, dict) else "unknown_error")
+    if error == "missing_scope":
+        raise SystemExit(
+            "Slack bots.info requires users:read; add that bot scope, reinstall the app, and rerun"
+        )
+    safe = "".join(c for c in error if c.isalnum() or c in "_-." )[:80]
+    raise SystemExit("Slack bots.info rejected identity lookup ({})".format(safe or "unknown_error"))
+bot = data.get("bot")
+app_id = bot.get("app_id") if isinstance(bot, dict) else None
+if not isinstance(app_id, str) or not re.fullmatch(r"[A-Z][A-Z0-9]+", app_id):
+    raise SystemExit("Slack bots.info response omitted a valid bot.app_id")
+print(app_id)
+')" || die "Slack bot app identity verification failed; Slack remains deferred"
 
 # Socket Mode requires a separately authenticated app-level token. A valid bot
 # token says nothing about the xapp credential, so prove that credential can
@@ -177,13 +217,15 @@ IFS=$'\t' read -r slack_team_id slack_team_name slack_bot_user_id slack_bot_id s
 # token and Slack's returned WebSocket URL stay on anonymous pipes: neither is
 # exposed through curl argv, child environments, logs, or durable files.
 log "[31] verifying Slack Socket Mode app token via apps.connections.open"
-if ! {
+slack_socket_app_id="$({
   printf '%s\n' 'url = "https://slack.com/api/apps.connections.open"'
   printf 'header = "Authorization: Bearer %s"\n' "$SLACK_APP_TOKEN"
   printf '%s\n' 'header = "Content-Type: application/x-www-form-urlencoded"'
-  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error'
+  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error' \
+    'connect-timeout = 10' 'max-time = 20' 'max-filesize = 1048576'
 } | curl --config - | python3 -c '
-import json, sys
+import json, re, sys
+from urllib.parse import parse_qs, urlparse
 try:
     data = json.load(sys.stdin)
 except Exception:
@@ -193,11 +235,19 @@ if not isinstance(data, dict) or not data.get("ok"):
     safe = "".join(c for c in error if c.isalnum() or c in "_-." )[:80]
     raise SystemExit("Slack apps.connections.open rejected the app token ({})".format(safe or "unknown_error"))
 url = data.get("url")
-if not isinstance(url, str) or not url.startswith("wss://"):
+if not isinstance(url, str):
     raise SystemExit("Slack apps.connections.open response omitted a Socket Mode URL")
-'; then
-  die "Slack Socket Mode app-token verification failed"
-fi
+parsed = urlparse(url)
+if parsed.scheme != "wss" or not parsed.netloc:
+    raise SystemExit("Slack apps.connections.open response omitted a valid Socket Mode URL")
+app_ids = parse_qs(parsed.query, keep_blank_values=True).get("app_id", [])
+if len(app_ids) != 1 or not re.fullmatch(r"[A-Z][A-Z0-9]+", app_ids[0]):
+    raise SystemExit("Slack Socket Mode URL omitted a valid app_id identity")
+print(app_ids[0])
+')" || die "Slack Socket Mode app-token verification failed; Slack remains deferred"
+
+[[ "$slack_bot_app_id" == "$slack_socket_app_id" ]] \
+  || die "Slack bot and Socket Mode tokens belong to different apps; Slack remains deferred"
 
 # Reject credential reuse, token rotation onto an identity owned by another
 # agent, and credentials parked in shared env files. The scan, durable identity
@@ -236,6 +286,11 @@ credential_lines = sys.stdin.read().splitlines()
 if len(credential_lines) != 2 or not all(credential_lines):
     raise SystemExit("Slack ownership scan received an invalid credential pair")
 bot_token, app_token = credential_lines
+for metadata_path in (pathlib.Path("/proc/self/cmdline"), pathlib.Path("/proc/self/environ")):
+    if metadata_path.is_file():
+        metadata = metadata_path.read_bytes()
+        if any(secret.encode() in metadata for secret in (bot_token, app_token)):
+            raise SystemExit("Slack ownership scan detected credential exposure in process metadata")
 target = pathlib.Path(target_path).resolve(strict=False)
 
 def env_values(path):
@@ -353,21 +408,27 @@ except BaseException:
     raise
 PYEOF
 
-# Persist both credentials directly to 1Password, then map only op://
-# references into the named profile's override config.
+# Stage both credentials in one new 1Password item, verify both fields, then
+# switch both profile refs with one atomic delta update.  A failed rotation
+# leaves the previously active pair untouched.
 ONEPASSWORD_ITEM_PREFIX="${HERMES_ONEPASSWORD_ITEM_PREFIX:-$(config_get fleet.onepassword_item_prefix 'hermes-agent')}"
-slack_bot_reference="$(store_onepassword_secret \
-  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-bot-token" \
-  "$SLACK_BOT_TOKEN")" \
-  || die "Slack bot credential could not be stored in 1Password"
-slack_app_reference="$(store_onepassword_secret \
-  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-app-token" \
-  "$SLACK_APP_TOKEN")" \
-  || die "Slack app credential could not be stored in 1Password"
-profile_onepassword_ref_set "$PROFILE_HOME" SLACK_BOT_TOKEN "$slack_bot_reference" \
-  || die "Slack bot 1Password reference could not be mapped into the named profile"
-profile_onepassword_ref_set "$PROFILE_HOME" SLACK_APP_TOKEN "$slack_app_reference" \
-  || die "Slack app 1Password reference could not be mapped into the named profile"
+slack_pair_references="$(store_onepassword_secret_pair \
+  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-credentials" \
+  slack_bot_token "$SLACK_BOT_TOKEN" \
+  slack_app_token "$SLACK_APP_TOKEN")" \
+  || die "Slack credential pair could not be staged and verified in 1Password"
+if [[ "$slack_pair_references" != *$'\n'* ]]; then
+  die "Slack credential-pair storage returned an invalid reference set"
+fi
+slack_bot_reference="${slack_pair_references%%$'\n'*}"
+slack_app_reference="${slack_pair_references#*$'\n'}"
+[[ "$slack_app_reference" != *$'\n'* ]] \
+  || die "Slack credential-pair storage returned too many references"
+profile_onepassword_ref_pair_set \
+  "$PROFILE_HOME" \
+  SLACK_BOT_TOKEN "$slack_bot_reference" \
+  SLACK_APP_TOKEN "$slack_app_reference" \
+  || die "Slack 1Password reference pair could not be atomically mapped into the named profile"
 profile_channel_enabled_set "$PROFILE_HOME" slack true \
   || die "Slack could not be enabled in the profile override"
 

@@ -721,8 +721,20 @@ actual_voice = actual_voice or tts.get("voice")
 voice_ok = "ok" if actual_voice == voice else "other"
 delta_plugins = delta.get("plugins") or {}
 explicit = delta_plugins.get("enabled") if isinstance(delta_plugins, dict) else None
-legacy = "legacy" if isinstance(explicit, list) and f"tts/{plugin}" in explicit else "ok"
-print(f"{provider}|{enabled}|{voice_ok}|{legacy}")
+directive = delta.get("x-pjangler-merge") or {}
+migrations = directive.get("migrations") if isinstance(directive, dict) else None
+snapshot = migrations.get("plugins_enabled_snapshot") if isinstance(migrations, dict) else None
+if snapshot is None:
+    migration = "ok"
+elif not isinstance(snapshot, dict):
+    migration = "invalid"
+elif snapshot.get("state", "pending") == "pending" and isinstance(explicit, list):
+    migration = "pending"
+elif snapshot.get("state") == "completed":
+    migration = "ok"
+else:
+    migration = "invalid"
+print(f"{provider}|{enabled}|{voice_ok}|{migration}")
 PYEOF
 )"
       if [[ "$config_status" != "ok|ok|ok|ok" ]]; then
@@ -763,32 +775,44 @@ role_plugin = f"tts/{plugin}"
 if not all(isinstance(entry, str) for entry in [*additions, *removals]):
     raise SystemExit("plugins.enabled list patch values must be string lists")
 explicit_enabled = plugins.get("enabled")
-if isinstance(explicit_enabled, list) and role_plugin in explicit_enabled:
-    if not all(isinstance(entry, str) for entry in explicit_enabled):
-        raise SystemExit("plugins.enabled delta must contain strings")
-    base_plugins = base.get("plugins") or {}
-    if not isinstance(base_plugins, dict):
-        raise SystemExit("base plugins must be a mapping")
-    base_enabled = base_plugins.get("enabled") or []
-    if not isinstance(base_enabled, list) or not all(
-        isinstance(entry, str) for entry in base_enabled
+if explicit_enabled is not None and not isinstance(explicit_enabled, list):
+    raise SystemExit("plugins.enabled delta must be a list")
+migrations = directives.get("migrations", {})
+if not isinstance(migrations, dict):
+    raise SystemExit("x-pjangler-merge.migrations delta must be a mapping")
+snapshot = migrations.get("plugins_enabled_snapshot")
+if snapshot is not None:
+    if not isinstance(snapshot, dict):
+        raise SystemExit("plugins_enabled_snapshot migration must be a mapping")
+    source = snapshot.get("source")
+    state = snapshot.get("state", "pending")
+    inherited = snapshot.get("inherited")
+    if source != "pjangler-52d9445":
+        raise SystemExit("plugins_enabled_snapshot migration has unknown provenance")
+    if not isinstance(inherited, list) or not inherited or not all(
+        isinstance(entry, str) for entry in inherited
     ):
-        raise SystemExit("base plugins.enabled must be a string list")
-    for entry in explicit_enabled:
-        if (
-            entry not in base_enabled
-            and entry not in {role_plugin, "tts/voxxy"}
-            and entry not in removals
-            and entry not in additions
+        raise SystemExit("plugins_enabled_snapshot.inherited must be a non-empty string list")
+    if state == "pending":
+        if not isinstance(explicit_enabled, list) or not all(
+            isinstance(entry, str) for entry in explicit_enabled
         ):
-            additions.append(entry)
-    plugins.pop("enabled")
-    if not plugins:
-        delta.pop("plugins", None)
-    migrations = directives.setdefault("migrations", {})
-    if not isinstance(migrations, dict):
-        raise SystemExit("x-pjangler-merge.migrations delta must be a mapping")
-    migrations["plugins_enabled_snapshot_thawed"] = True
+            raise SystemExit("provenance-backed plugin snapshot is missing its replacement list")
+        inherited_set = set(inherited)
+        for entry in explicit_enabled:
+            if (
+                entry not in inherited_set
+                and entry not in {role_plugin, "tts/voxxy"}
+                and entry not in removals
+                and entry not in additions
+            ):
+                additions.append(entry)
+        plugins.pop("enabled")
+        if not plugins:
+            delta.pop("plugins", None)
+        snapshot["state"] = "completed"
+    elif state != "completed":
+        raise SystemExit("plugins_enabled_snapshot migration state must be pending or completed")
 additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
 additions.append(role_plugin)
 removals[:] = [entry for entry in removals if entry != role_plugin]

@@ -6,6 +6,10 @@
 # or be silently reused by a profile. The non-secret allow-list may be shared.
 INVOCATION_TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN-}"
 INVOCATION_TELEGRAM_ALLOWED_USERS="${TELEGRAM_ALLOWED_USERS-}"
+# Invocation credentials may have arrived as exported variables.  Remove them
+# before even resolving/sourcing _lib.sh: that path invokes utilities and loads
+# fleet state, and no child involved in setup should inherit a raw token.
+unset TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS
 
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
@@ -48,6 +52,7 @@ PYEOF
 
 telegram_status="$(yaml_get telegram.provisioning_status)"
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+profile_root_require_real "$PROFILE_HOME"
 if [[ "$telegram_status" != "verified" ]]; then
   profile_channel_enabled_set "$PROFILE_HOME" telegram false \
     || die "Telegram could not be disabled in the profile override"
@@ -195,6 +200,9 @@ if token.endswith("\n"):
     token = token[:-1]
 if not token:
     raise SystemExit("Telegram ownership scan received no credential")
+for metadata_path in (pathlib.Path("/proc/self/cmdline"), pathlib.Path("/proc/self/environ")):
+    if metadata_path.is_file() and token.encode() in metadata_path.read_bytes():
+        raise SystemExit("Telegram ownership scan detected credential exposure in process metadata")
 target = pathlib.Path(target_path).resolve(strict=False)
 
 def env_token(path):

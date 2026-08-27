@@ -20,6 +20,8 @@ FAKE_OP = ROOT / "tests" / "support" / "fake-op.py"
 
 BOT_TOKEN = "xoxb-profile-only-secret"
 APP_TOKEN = "xapp-profile-only-secret"
+ROTATED_BOT_TOKEN = "xoxb-rotated-profile-secret"
+ROTATED_APP_TOKEN = "xapp-rotated-profile-secret"
 
 
 def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
@@ -64,6 +66,28 @@ runtime:
 def _fake_curl(tmp_path: Path) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
+    dirname = bindir / "dirname"
+    dirname.write_text(
+        """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+environ = pathlib.Path("/proc/self/environ").read_bytes()
+for raw in (
+    "xoxb-profile-only-secret",
+    "xapp-profile-only-secret",
+    "xoxb-rotated-profile-secret",
+    "xapp-rotated-profile-secret",
+):
+    assert raw.encode() not in environ
+pathlib.Path(os.environ["EARLY_CHILD_PROBE"]).write_text("clean\\n", encoding="utf-8")
+value = sys.argv[1].rstrip("/")
+print(str(pathlib.Path(value).parent) if value else "/")
+""",
+        encoding="utf-8",
+    )
+    dirname.chmod(0o755)
     curl = bindir / "curl"
     curl.write_text(
         """#!/usr/bin/env python3
@@ -80,9 +104,8 @@ assert match
 token = match.group(1)
 cmdline = pathlib.Path("/proc/self/cmdline").read_bytes()
 environ = pathlib.Path("/proc/self/environ").read_bytes()
-for raw in ("xoxb-profile-only-secret", "xapp-profile-only-secret"):
-    assert raw.encode() not in cmdline
-    assert raw.encode() not in environ
+assert token.encode() not in cmdline
+assert token.encode() not in environ
 if 'url = "https://slack.com/api/auth.test"' in config:
     assert token.startswith("xoxb-")
     print(json.dumps({
@@ -93,12 +116,19 @@ if 'url = "https://slack.com/api/auth.test"' in config:
         "bot_id": "B123BOT",
         "user": "demo-pm",
     }))
+elif 'url = "https://slack.com/api/bots.info"' in config:
+    assert token.startswith("xoxb-")
+    if os.environ.get("FAKE_SLACK_BOTS_INFO_MISSING_SCOPE") == "1":
+        print(json.dumps({"ok": False, "error": "missing_scope", "needed": "users:read"}))
+    else:
+        print(json.dumps({"ok": True, "bot": {"app_id": "A123APP"}}))
 elif 'url = "https://slack.com/api/apps.connections.open"' in config:
     assert token.startswith("xapp-")
     if os.environ.get("FAKE_SLACK_APP_AUTH_FAILURE") == "1":
         print(json.dumps({"ok": False, "error": "invalid_auth"}))
     else:
-        print(json.dumps({"ok": True, "url": "wss://wss-primary.slack.test/link"}))
+        app_id = "A999OTHER" if os.environ.get("FAKE_SLACK_APP_MISMATCH") == "1" else "A123APP"
+        print(json.dumps({"ok": True, "url": f"wss://wss-primary.slack.test/link?ticket=test&app_id={app_id}"}))
 else:
     raise AssertionError("unexpected Slack API endpoint")
 """,
@@ -130,6 +160,7 @@ def _run(
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "REGISTRY_FILE": str(registry),
             "UNRELATED_PROVIDER_SECRET": "must-not-reach-op",
+            "EARLY_CHILD_PROBE": str(bindir.parent / ".slack-early-child"),
         }
     )
     env.update(overrides or {})
@@ -197,6 +228,48 @@ def test_explicit_noninteractive_enable_requires_both_tokens(tmp_path: Path) -> 
     assert not (runtime / ".env").exists()
 
 
+def test_invocation_tokens_are_cleared_before_first_path_child(tmp_path: Path) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+
+    result = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / ".slack-early-child").read_text(encoding="utf-8") == "clean\n"
+
+
+def test_slack_rejects_symlinked_profile_root_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    profiles = home / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    target = tmp_path / "shared-profile-target"
+    target.mkdir()
+    sentinel = target / "operator-state"
+    delta = target / "config.delta.yaml"
+    sentinel.write_bytes(b"do-not-touch\n")
+    delta.write_bytes(b"platforms:\n  slack:\n    enabled: true\n")
+    (profiles / "demo-pm").symlink_to(target, target_is_directory=True)
+    before = {path.name: path.read_bytes() for path in target.iterdir()}
+
+    result = _run(role, registry, home, _fake_curl(tmp_path))
+
+    assert result.returncode != 0
+    assert "refusing symlinked profile root" in result.stderr
+    assert "runtime-singleton migration" in result.stderr
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == before
+
+
 def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) -> None:
     role, runtime, registry = _make_role(tmp_path)
     home = tmp_path / "home"
@@ -230,10 +303,14 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
     delta_text = (profile / "config.delta.yaml").read_text(encoding="utf-8")
     delta = yaml.safe_load(delta_text)
     references = delta["secrets"]["onepassword"]["env"]
-    assert references == {
-        "SLACK_BOT_TOKEN": "op://DeLoSecrets/hermes-agent-demo-pm-slack-bot-token/password",
-        "SLACK_APP_TOKEN": "op://DeLoSecrets/hermes-agent-demo-pm-slack-app-token/password",
-    }
+    bot_reference = references["SLACK_BOT_TOKEN"]
+    app_reference = references["SLACK_APP_TOKEN"]
+    assert bot_reference.startswith(
+        "op://DeLoSecrets/hermes-agent-demo-pm-slack-credentials-v-"
+    )
+    assert bot_reference.endswith("/slack_bot_token")
+    assert app_reference.endswith("/slack_app_token")
+    assert bot_reference.rsplit("/", 1)[0] == app_reference.rsplit("/", 1)[0]
     assert BOT_TOKEN not in delta_text
     assert APP_TOKEN not in delta_text
     generated = (profile / "config.yaml").read_text(encoding="utf-8")
@@ -284,6 +361,113 @@ def test_bot_auth_success_without_app_auth_never_enables_or_stores_slack(
     slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
     assert slack["provisioning_status"] == "deferred"
     assert not (home / ".fake-onepassword").exists()
+
+
+def test_slack_requires_users_read_to_correlate_bot_app_identity(tmp_path: Path) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(
+        role,
+        registry,
+        home,
+        _fake_curl(tmp_path),
+        {
+            "SLACK_BOT_TOKEN": BOT_TOKEN,
+            "SLACK_APP_TOKEN": APP_TOKEN,
+            "FAKE_SLACK_BOTS_INFO_MISSING_SCOPE": "1",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "requires users:read" in result.stderr
+    assert "reinstall the app" in result.stderr
+    assert BOT_TOKEN not in result.stdout + result.stderr
+    assert APP_TOKEN not in result.stdout + result.stderr
+    assert not (runtime / ".env").exists()
+    delta = yaml.safe_load(
+        (home / ".hermes" / "profiles" / "demo-pm" / "config.delta.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert delta["platforms"]["slack"]["enabled"] is False
+    assert "secrets" not in delta
+
+
+def test_independently_valid_slack_tokens_from_different_apps_are_rejected(
+    tmp_path: Path,
+) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(
+        role,
+        registry,
+        home,
+        _fake_curl(tmp_path),
+        {
+            "SLACK_BOT_TOKEN": BOT_TOKEN,
+            "SLACK_APP_TOKEN": APP_TOKEN,
+            "FAKE_SLACK_APP_MISMATCH": "1",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "belong to different apps" in result.stderr
+    assert BOT_TOKEN not in result.stdout + result.stderr
+    assert APP_TOKEN not in result.stdout + result.stderr
+    assert not (runtime / ".env").exists()
+    assert not (home / ".fake-onepassword").exists()
+
+
+def test_slack_pair_rotation_is_atomic_when_second_field_write_fails(
+    tmp_path: Path,
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    first = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+    assert first.returncode == 0, first.stderr
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    delta_before = (profile / "config.delta.yaml").read_bytes()
+    role_before = (role / "role.yaml").read_bytes()
+    item_paths_before = sorted((home / ".fake-onepassword").glob("*.json"))
+    assert len(item_paths_before) == 1
+    item_before = item_paths_before[0].read_bytes()
+    (home / ".fake-onepassword-reject-field").write_text(
+        "slack_app_token\n", encoding="utf-8"
+    )
+
+    rotated = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {
+            "SLACK_BOT_TOKEN": ROTATED_BOT_TOKEN,
+            "SLACK_APP_TOKEN": ROTATED_APP_TOKEN,
+        },
+    )
+
+    assert rotated.returncode != 0
+    assert "credential pair could not be staged" in rotated.stderr
+    assert (profile / "config.delta.yaml").read_bytes() == delta_before
+    assert (role / "role.yaml").read_bytes() == role_before
+    item_paths_after = sorted((home / ".fake-onepassword").glob("*.json"))
+    assert item_paths_after == item_paths_before
+    assert item_paths_after[0].read_bytes() == item_before
+    combined = rotated.stdout + rotated.stderr
+    for token in (BOT_TOKEN, APP_TOKEN, ROTATED_BOT_TOKEN, ROTATED_APP_TOKEN):
+        assert token not in combined
 
 
 def test_transient_onepassword_outage_preserves_verified_slack_wiring_and_recovers(

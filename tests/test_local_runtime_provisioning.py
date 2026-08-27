@@ -247,7 +247,7 @@ def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> N
     assert "fleet/core-one" not in rerendered
     assert "tts/voxxy" not in rerendered
 
-    delta["plugins"] = {"enabled": ["operator/only"]}
+    delta["plugins"] = {"enabled": ["operator/only", "tts/vox"]}
     delta_path.write_text(
         "# operator exclusion must survive\n"
         + yaml.safe_dump(delta, sort_keys=False),
@@ -259,10 +259,12 @@ def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> N
         (profile / "config.yaml").read_text(encoding="utf-8")
     )
     assert excluded_generated["plugins"]["enabled"] == ["operator/only", "tts/vox"]
+    excluded_delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
+    assert excluded_delta["plugins"]["enabled"] == ["operator/only", "tts/vox"]
     assert "# operator exclusion must survive" in delta_path.read_text(encoding="utf-8")
 
 
-def test_profile_voice_update_thaws_legacy_frozen_plugin_snapshot(
+def test_profile_voice_update_thaws_only_provenance_backed_historical_snapshot(
     tmp_path: Path,
 ) -> None:
     _project, role, env = _fixture(tmp_path)
@@ -272,6 +274,14 @@ def test_profile_voice_update_thaws_legacy_frozen_plugin_snapshot(
     fleet_home = Path(env["HOME"]) / ".hermes"
     profile = fleet_home / "profiles" / "demo-pm"
     profile.mkdir(parents=True)
+    # The live fleet base has already advanced before the first migration.
+    # Historical provenance, never the current base, determines what may be
+    # removed from the frozen replacement.
+    (fleet_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - fleet/core-two\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: newer\n",
+        encoding="utf-8",
+    )
     delta_path = profile / "config.delta.yaml"
     delta_path.write_text(
         "# retain local voice note\n"
@@ -281,6 +291,14 @@ def test_profile_voice_update_thaws_legacy_frozen_plugin_snapshot(
         "    - operator/extra\n"
         "    - tts/vox\n"
         "  local_metadata: keep\n"
+        "x-pjangler-merge:\n"
+        "  migrations:\n"
+        "    plugins_enabled_snapshot:\n"
+        "      source: pjangler-52d9445\n"
+        "      state: pending\n"
+        "      inherited:\n"
+        "        - fleet/core-one\n"
+        "        - tts/voxxy\n"
         "tts:\n"
         "  provider: vox\n"
         "  voice: carlin\n"
@@ -300,24 +318,35 @@ def test_profile_voice_update_thaws_legacy_frozen_plugin_snapshot(
     delta = yaml.safe_load(delta_text)
     assert delta["plugins"] == {"local_metadata": "keep"}
     assert delta["x-pjangler-merge"]["migrations"][
-        "plugins_enabled_snapshot_thawed"
-    ] is True
+        "plugins_enabled_snapshot"
+    ] == {
+        "source": "pjangler-52d9445",
+        "state": "completed",
+        "inherited": ["fleet/core-one", "tts/voxxy"],
+    }
     assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
         "add": ["operator/extra", "tts/vox"],
         "remove": ["tts/voxxy"],
     }
     assert "# retain local voice note" in delta_text
+    first_generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert first_generated["plugins"]["enabled"] == [
+        "fleet/core-two",
+        "operator/extra",
+        "tts/vox",
+    ]
+    assert "fleet/core-one" not in first_generated["plugins"]["enabled"]
 
     (fleet_home / "config.yaml").write_text(
-        "plugins:\n  enabled:\n    - fleet/core-two\n    - tts/voxxy\n"
-        "tts:\n  provider: voxxy\n  voice: newer\n",
+        "plugins:\n  enabled:\n    - fleet/core-three\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: newest\n",
         encoding="utf-8",
     )
     second = _run(role, env)
     assert second.returncode == 0, second.stderr
     generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
     assert generated["plugins"]["enabled"] == [
-        "fleet/core-two",
+        "fleet/core-three",
         "operator/extra",
         "tts/vox",
     ]

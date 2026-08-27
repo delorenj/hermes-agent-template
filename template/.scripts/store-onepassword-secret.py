@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Store one process-only secret in 1Password and print its op:// reference.
+"""Store process-only secrets in 1Password and print op:// references.
 
-The secret is read from stdin and is never placed in argv, a temporary file,
-stdout, or an ``op`` child environment.  Item JSON travels only over an
-anonymous pipe to the 1Password CLI.
+Secret values are read from stdin and are never placed in argv, a temporary
+file, stdout, or an ``op`` child environment. Item JSON travels only over an
+anonymous pipe to the 1Password CLI. Credential pairs are staged in a new,
+versioned item and both fields are verified before either reference is emitted.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 
 def fail(message: str) -> "None":
@@ -71,19 +73,80 @@ if len(sys.argv) == 3 and sys.argv[1] == "--validate-reference":
         fail("the configured reference did not resolve")
     raise SystemExit(0)
 
-if len(sys.argv) != 3:
-    fail("usage: store-onepassword-secret.py <vault> <item>")
-
-vault, item = sys.argv[1:]
+pair_mode = len(sys.argv) == 6 and sys.argv[1] == "--store-pair"
+if pair_mode:
+    vault, item, field_one, field_two = sys.argv[2:]
+    if field_one == field_two or not all(
+        re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field)
+        for field in (field_one, field_two)
+    ):
+        fail("pair field names are invalid or not distinct")
+else:
+    if len(sys.argv) != 3:
+        fail(
+            "usage: store-onepassword-secret.py <vault> <item> or "
+            "--store-pair <vault> <item-prefix> <field-one> <field-two>"
+        )
+    vault, item = sys.argv[1:]
 safe = re.compile(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,126}")
 if not safe.fullmatch(vault) or not safe.fullmatch(item):
     fail("vault or item name contains unsupported characters")
 
-secret = sys.stdin.read()
-if secret.endswith("\n"):
-    secret = secret[:-1]
-if not secret:
-    fail("refusing to store an empty value")
+payload = sys.stdin.read()
+if pair_mode:
+    values = payload.split("\n")
+    if len(values) != 2 or not all(values):
+        fail("credential pair input must contain exactly two non-empty lines")
+    secrets = [(field_one, values[0]), (field_two, values[1])]
+    if len(item) > 105:
+        fail("pair item prefix is too long for a versioned item")
+    item = f"{item}-v-{uuid.uuid4().hex[:16]}"
+else:
+    if payload.endswith("\n"):
+        payload = payload[:-1]
+    secrets = [("password", payload)]
+if any(not value or any(ch in value for ch in "\r\n\0") for _, value in secrets):
+    fail("refusing to store an empty or multiline value")
+
+if pair_mode:
+    document = {
+        "title": item,
+        "category": "PASSWORD",
+        "fields": [
+            {
+                "id": field,
+                "type": "CONCEALED",
+                "label": field,
+                "value": value,
+            }
+            for field, value in secrets
+        ]
+        + [
+            {
+                "id": "notesPlain",
+                "type": "STRING",
+                "purpose": "NOTES",
+                "label": "notesPlain",
+                "value": (
+                    "Managed by hermes-agent-template as an atomic staged pair; "
+                    "rotate through the provisioner."
+                ),
+            }
+        ],
+    }
+    stored = op_run(
+        ["item", "create", "--vault", vault, "-"],
+        payload=json.dumps(document),
+    )
+    if stored.returncode != 0:
+        fail("op rejected the staged credential-pair update")
+    references = [f"op://{vault}/{item}/{field}" for field, _ in secrets]
+    for reference, (_, expected) in zip(references, secrets, strict=True):
+        verified = op_run(["read", "--", reference])
+        if verified.returncode != 0 or verified.stdout.rstrip("\n") != expected:
+            fail("a staged credential-pair field did not verify")
+    print("\n".join(references))
+    raise SystemExit(0)
 
 listed = op_run(["item", "list", "--vault", vault, "--format=json"])
 if listed.returncode != 0:
@@ -123,7 +186,7 @@ if matches:
             "label": "password",
         }
         fields.append(concealed_field)
-    concealed_field["value"] = secret
+    concealed_field["value"] = secrets[0][1]
     stored = op_run(
         ["item", "edit", item_id, "--vault", vault],
         payload=json.dumps(document),
@@ -138,7 +201,7 @@ else:
                 "type": "CONCEALED",
                 "purpose": "PASSWORD",
                 "label": "password",
-                "value": secret,
+                "value": secrets[0][1],
             },
             {
                 "id": "notesPlain",
@@ -159,7 +222,7 @@ if stored.returncode != 0:
 
 reference = f"op://{vault}/{item}/password"
 verified = op_run(["read", "--", reference])
-if verified.returncode != 0 or verified.stdout.rstrip("\n") != secret:
+if verified.returncode != 0 or verified.stdout.rstrip("\n") != secrets[0][1]:
     fail("the stored reference did not resolve to the supplied value")
 
 print(reference)

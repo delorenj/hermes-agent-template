@@ -37,6 +37,12 @@ if args[:2] == ["item", "list"]:
     print(json.dumps([{"id": row["id"], "title": row["title"]} for row in documents()]))
 elif args[:2] == ["item", "create"]:
     document = json.load(sys.stdin)
+    reject_field = home / ".fake-onepassword-reject-field"
+    if reject_field.exists():
+        rejected = reject_field.read_text(encoding="utf-8").strip()
+        reject_field.unlink()
+        if any(field.get("id") == rejected for field in document.get("fields", [])):
+            raise SystemExit(73)
     document["id"] = document["title"]
     (store / f"{document['id']}.json").write_text(json.dumps(document), encoding="utf-8")
     print("{}")

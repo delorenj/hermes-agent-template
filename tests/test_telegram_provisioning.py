@@ -70,6 +70,23 @@ runtime:
 def _fake_bin(tmp_path: Path) -> Path:
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
+    dirname = bindir / "dirname"
+    dirname.write_text(
+        """#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+environ = pathlib.Path("/proc/self/environ").read_bytes()
+for raw in ("123456:profile-only-secret", "654321:different-profile-secret"):
+    assert raw.encode() not in environ
+pathlib.Path(os.environ["EARLY_CHILD_PROBE"]).write_text("clean\\n", encoding="utf-8")
+value = sys.argv[1].rstrip("/")
+print(str(pathlib.Path(value).parent) if value else "/")
+""",
+        encoding="utf-8",
+    )
+    dirname.chmod(0o755)
     curl = bindir / "curl"
     curl.write_text(
         """#!/usr/bin/env python3
@@ -119,6 +136,7 @@ def _run(
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "REGISTRY_FILE": str(registry),
             "UNRELATED_PROVIDER_SECRET": "must-not-reach-op",
+            "EARLY_CHILD_PROBE": str(bindir.parent / ".telegram-early-child"),
         }
     )
     env.update(overrides or {})
@@ -203,6 +221,48 @@ def test_telegram_ignores_shared_fleet_token_and_defers_noninteractive(tmp_path:
     assert yaml.safe_load(generated.read_text(encoding="utf-8"))["platforms"][
         "telegram"
     ]["enabled"] is False
+
+
+def test_invocation_token_is_cleared_before_first_path_child(tmp_path: Path) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_bin(tmp_path)
+
+    result = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"TELEGRAM_BOT_TOKEN": BOT_TOKEN, "TELEGRAM_ALLOWED_USERS": "111"},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / ".telegram-early-child").read_text(encoding="utf-8") == "clean\n"
+
+
+def test_telegram_rejects_symlinked_profile_root_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    profiles = home / ".hermes" / "profiles"
+    profiles.mkdir(parents=True)
+    target = tmp_path / "shared-profile-target"
+    target.mkdir()
+    sentinel = target / "operator-state"
+    delta = target / "config.delta.yaml"
+    sentinel.write_bytes(b"do-not-touch\n")
+    delta.write_bytes(b"platforms:\n  telegram:\n    enabled: true\n")
+    (profiles / "demo-pm").symlink_to(target, target_is_directory=True)
+    before = {path.name: path.read_bytes() for path in target.iterdir()}
+
+    result = _run(role, registry, home, _fake_bin(tmp_path))
+
+    assert result.returncode != 0
+    assert "refusing symlinked profile root" in result.stderr
+    assert "runtime-singleton migration" in result.stderr
+    assert {path.name: path.read_bytes() for path in target.iterdir()} == before
 
 
 def test_local_only_marker_does_not_block_later_telegram_activation(tmp_path: Path) -> None:

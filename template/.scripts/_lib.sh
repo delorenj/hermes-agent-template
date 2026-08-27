@@ -191,15 +191,31 @@ store_onepassword_secret() {
     | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" "$vault" "$item"
 }
 
+# Persist a credential pair with one atomic 1Password item update.  The helper
+# verifies both fields before returning either reference, so a failed rotation
+# cannot leave a profile pointing at one old and one new channel credential.
+store_onepassword_secret_pair() {
+  # store_onepassword_secret_pair ITEM_NAME FIELD_ONE VALUE_ONE FIELD_TWO VALUE_TWO
+  local item="$1" field_one="$2" value_one="$3" field_two="$4" value_two="$5" vault
+  vault="${HERMES_ONEPASSWORD_VAULT:-$(config_get fleet.onepassword_vault 'DeLoSecrets')}"
+  [[ -n "$vault" ]] || die "fleet.onepassword_vault is required for channel credentials"
+  [[ -f "$ROLE_DIR/.scripts/store-onepassword-secret.py" ]] \
+    || die "trusted 1Password storage helper is missing"
+  printf '%s\n%s' "$value_one" "$value_two" \
+    | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" \
+        --store-pair "$vault" "$item" "$field_one" "$field_two"
+}
+
 # Update one supported profile override and immediately regenerate config.yaml
 # from fleet base + delta.  Keeping both operations in one helper prevents the
 # first deploy and fleet-sync paths from disagreeing about which file is the
 # source of truth.
 profile_config_delta_update() {
   # profile_config_delta_update PROFILE_HOME secret-ref ENV_NAME OP_REFERENCE
+  # profile_config_delta_update PROFILE_HOME secret-ref-pair ENV REF ENV REF
   # profile_config_delta_update PROFILE_HOME channel-enabled telegram|slack true|false
   # profile_config_delta_update PROFILE_HOME voice PLUGIN VOICE
-  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+  python3 - "$@" <<'PYEOF'
 import copy, os, pathlib, re, sys, tempfile
 try:
     import yaml
@@ -207,7 +223,20 @@ except ImportError:
     raise SystemExit("PyYAML is required for Hermes profile config")
 
 profile = pathlib.Path(sys.argv[1])
-mode, name, value = sys.argv[2:5]
+# A profile root is a security boundary.  Never follow the legacy symlink form:
+# even a read would escape the named profile and a later atomic replace could
+# mutate shared/runtime state.  Migration must happen in the lifecycle step.
+if profile.is_symlink():
+    raise SystemExit(
+        f"refusing symlinked profile root: {profile}; "
+        "run the pjangler Hermes runtime-singleton migration before provisioning channels"
+    )
+if not profile.is_dir():
+    raise SystemExit(f"required profile root is unavailable: {profile}")
+args = sys.argv[2:]
+if not args:
+    raise SystemExit("profile config update mode is required")
+mode = args[0]
 base_path = profile.parent.parent / "config.yaml"
 delta_path = profile / "config.delta.yaml"
 generated_path = profile / "config.yaml"
@@ -295,6 +324,9 @@ if delta_path.exists():
 else:
     delta = {}
 if mode == "secret-ref":
+    if len(args) != 3:
+        raise SystemExit("secret-ref requires an environment name and reference")
+    name, value = args[1:]
     if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
         raise SystemExit("invalid secret environment variable name")
     if not value.startswith("op://") or any(ch in value for ch in "\r\n\0"):
@@ -307,7 +339,32 @@ if mode == "secret-ref":
     if not isinstance(env, dict):
         raise SystemExit("secrets.onepassword.env delta must be a mapping")
     env[name] = value
+elif mode == "secret-ref-pair":
+    if len(args) != 5:
+        raise SystemExit("secret-ref-pair requires two environment/reference pairs")
+    name_one, value_one, name_two, value_two = args[1:]
+    pairs = ((name_one, value_one), (name_two, value_two))
+    if name_one == name_two:
+        raise SystemExit("secret-ref-pair environment names must be distinct")
+    for env_name, reference in pairs:
+        if not re.fullmatch(r"[A-Z][A-Z0-9_]*", env_name):
+            raise SystemExit("invalid secret environment variable name")
+        if not reference.startswith("op://") or any(ch in reference for ch in "\r\n\0"):
+            raise SystemExit("invalid 1Password reference")
+    onepassword = delta.setdefault("secrets", {}).setdefault("onepassword", {})
+    if not isinstance(onepassword, dict):
+        raise SystemExit("secrets.onepassword delta must be a mapping")
+    onepassword["enabled"] = True
+    env = onepassword.setdefault("env", {})
+    if not isinstance(env, dict):
+        raise SystemExit("secrets.onepassword.env delta must be a mapping")
+    # Both refs enter the same in-memory document and one atomic delta write.
+    for env_name, reference in pairs:
+        env[env_name] = reference
 elif mode == "channel-enabled":
+    if len(args) != 3:
+        raise SystemExit("channel-enabled requires a channel and boolean")
+    name, value = args[1:]
     if name not in {"telegram", "slack"}:
         raise SystemExit("unsupported channel enablement key")
     if value not in {"true", "false"}:
@@ -320,6 +377,9 @@ elif mode == "channel-enabled":
         raise SystemExit(f"platforms.{name} delta must be a mapping")
     channel["enabled"] = value == "true"
 elif mode == "voice":
+    if len(args) != 3:
+        raise SystemExit("voice requires a plugin and voice")
+    name, value = args[1:]
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
         raise SystemExit("invalid TTS plugin name")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
@@ -346,38 +406,50 @@ elif mode == "voice":
     if not all(isinstance(entry, str) for entry in [*additions, *removals]):
         raise SystemExit("plugins.enabled list patch values must be string lists")
 
-    # 52d9445 materialized base plugins into the profile delta. Recognize that
-    # generated legacy shape by its role-owned Vox entry, remove the replacement
-    # list, and retain only entries that were not inherited from the current
-    # fleet base as additive operator/role intent. Explicit operator replacement
-    # lists without the generated Vox member remain untouched.
+    # 52d9445 materialized a fleet plugin snapshot into some profile deltas.
+    # The list alone cannot distinguish that generated snapshot from an
+    # intentional operator replacement.  Thaw only with durable historical
+    # provenance naming the exact inherited entries; an unmarked list is
+    # preserved verbatim (fail closed, manual migration).
     explicit_enabled = plugins.get("enabled")
-    if isinstance(explicit_enabled, list) and role_plugin in explicit_enabled:
-        if not all(isinstance(entry, str) for entry in explicit_enabled):
-            raise SystemExit("plugins.enabled delta must contain strings")
-        base_plugins = base.get("plugins") or {}
-        if not isinstance(base_plugins, dict):
-            raise SystemExit("base plugins must be a mapping")
-        base_enabled = base_plugins.get("enabled") or []
-        if not isinstance(base_enabled, list) or not all(
-            isinstance(entry, str) for entry in base_enabled
+    if explicit_enabled is not None and not isinstance(explicit_enabled, list):
+        raise SystemExit("plugins.enabled delta must be a list")
+    migrations = directives.get("migrations", {})
+    if not isinstance(migrations, dict):
+        raise SystemExit(f"{LIST_PATCH_KEY}.migrations delta must be a mapping")
+    snapshot = migrations.get("plugins_enabled_snapshot")
+    if snapshot is not None:
+        if not isinstance(snapshot, dict):
+            raise SystemExit("plugins_enabled_snapshot migration must be a mapping")
+        source = snapshot.get("source")
+        state = snapshot.get("state", "pending")
+        inherited = snapshot.get("inherited")
+        if source != "pjangler-52d9445":
+            raise SystemExit("plugins_enabled_snapshot migration has unknown provenance")
+        if not isinstance(inherited, list) or not inherited or not all(
+            isinstance(entry, str) for entry in inherited
         ):
-            raise SystemExit("base plugins.enabled must be a string list")
-        for entry in explicit_enabled:
-            if (
-                entry not in base_enabled
-                and entry not in {role_plugin, "tts/voxxy"}
-                and entry not in removals
-                and entry not in additions
+            raise SystemExit("plugins_enabled_snapshot.inherited must be a non-empty string list")
+        if state == "pending":
+            if not isinstance(explicit_enabled, list) or not all(
+                isinstance(entry, str) for entry in explicit_enabled
             ):
-                additions.append(entry)
-        plugins.pop("enabled")
-        if not plugins:
-            delta.pop("plugins", None)
-        migrations = directives.setdefault("migrations", {})
-        if not isinstance(migrations, dict):
-            raise SystemExit(f"{LIST_PATCH_KEY}.migrations delta must be a mapping")
-        migrations["plugins_enabled_snapshot_thawed"] = True
+                raise SystemExit("provenance-backed plugin snapshot is missing its replacement list")
+            inherited_set = set(inherited)
+            for entry in explicit_enabled:
+                if (
+                    entry not in inherited_set
+                    and entry not in {role_plugin, "tts/voxxy"}
+                    and entry not in removals
+                    and entry not in additions
+                ):
+                    additions.append(entry)
+            plugins.pop("enabled")
+            if not plugins:
+                delta.pop("plugins", None)
+            snapshot["state"] = "completed"
+        elif state != "completed":
+            raise SystemExit("plugins_enabled_snapshot migration state must be pending or completed")
     additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
     additions.append(role_plugin)
     removals[:] = [entry for entry in removals if entry != role_plugin]
@@ -420,6 +492,11 @@ profile_onepassword_ref_set() {
   profile_config_delta_update "$1" secret-ref "$2" "$3"
 }
 
+profile_onepassword_ref_pair_set() {
+  # profile_onepassword_ref_pair_set PROFILE_HOME ENV REF ENV REF
+  profile_config_delta_update "$1" secret-ref-pair "$2" "$3" "$4" "$5"
+}
+
 profile_voice_contract_set() {
   # profile_voice_contract_set PROFILE_HOME PLUGIN VOICE
   profile_config_delta_update "$1" voice "$2" "$3"
@@ -428,6 +505,13 @@ profile_voice_contract_set() {
 profile_channel_enabled_set() {
   # profile_channel_enabled_set PROFILE_HOME telegram|slack true|false
   profile_config_delta_update "$1" channel-enabled "$2" "$3"
+}
+
+profile_root_require_real() {
+  # profile_root_require_real PROFILE_HOME
+  [[ ! -L "$1" ]] \
+    || die "refusing symlinked profile root: $1; run the pjangler Hermes runtime-singleton migration before provisioning channels"
+  [[ -d "$1" ]] || die "required profile root is unavailable: $1"
 }
 
 profile_onepassword_ref_exists() {

@@ -203,7 +203,7 @@ def test_fleet_vox_delta_uses_list_patch_and_preserves_base_flow_and_exclusions(
     # may append its role-owned plugin through the directive, but must not copy
     # excluded fleet entries back into the replacement list.
     delta_path.write_text(
-        "# explicit operator exclusion\nplugins:\n  enabled:\n    - operator/only\n",
+        "# explicit operator exclusion\nplugins:\n  enabled:\n    - operator/only\n    - tts/vox\n",
         encoding="utf-8",
     )
     excluded = subprocess.run(
@@ -215,7 +215,7 @@ def test_fleet_vox_delta_uses_list_patch_and_preserves_base_flow_and_exclusions(
     )
     assert excluded.returncode == 0, excluded.stdout + excluded.stderr
     delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
-    assert delta["plugins"]["enabled"] == ["operator/only"]
+    assert delta["plugins"]["enabled"] == ["operator/only", "tts/vox"]
     assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]["add"] == [
         "tts/vox"
     ]
@@ -224,7 +224,7 @@ def test_fleet_vox_delta_uses_list_patch_and_preserves_base_flow_and_exclusions(
     assert "# explicit operator exclusion" in delta_path.read_text(encoding="utf-8")
 
 
-def test_fleet_thaws_legacy_frozen_plugin_snapshot_before_base_changes(
+def test_fleet_thaws_only_provenance_backed_snapshot_after_base_already_changed(
     tmp_path: Path,
 ) -> None:
     env, registry, _consumer, role = _fixture(tmp_path)
@@ -235,8 +235,11 @@ def test_fleet_thaws_legacy_frozen_plugin_snapshot_before_base_changes(
     registry.write_text(yaml.safe_dump(registry_data, sort_keys=False), encoding="utf-8")
     fleet_home = Path(env["HERMES_FLEET_HOME"])
     base = fleet_home / "config.yaml"
+    # The current base no longer contains core-one before the first migration.
+    # The historical list below is the only authority for thawing inherited
+    # values, preventing a retired plugin from becoming an additive override.
     base.write_text(
-        "plugins:\n  enabled:\n    - fleet/core-one\n    - fleet/excluded\n    - tts/voxxy\n"
+        "plugins:\n  enabled:\n    - fleet/core-two\n    - fleet/new-default\n    - fleet/excluded\n    - tts/voxxy\n"
         "tts:\n  provider: voxxy\n  voice: old\n",
         encoding="utf-8",
     )
@@ -259,6 +262,14 @@ def test_fleet_thaws_legacy_frozen_plugin_snapshot_before_base_changes(
         "      remove:\n"
         "        - tts/voxxy\n"
         "        - fleet/excluded\n"
+        "  migrations:\n"
+        "    plugins_enabled_snapshot:\n"
+        "      source: pjangler-52d9445\n"
+        "      state: pending\n"
+        "      inherited:\n"
+        "        - fleet/core-one\n"
+        "        - fleet/excluded\n"
+        "        - tts/voxxy\n"
         "  operator_extension: keep-me\n"
         "tts:\n"
         "  provider: vox\n"
@@ -284,15 +295,27 @@ def test_fleet_thaws_legacy_frozen_plugin_snapshot_before_base_changes(
     assert delta["plugins"] == {"operator_metadata": "preserve-me"}
     directive = delta["x-pjangler-merge"]
     assert directive["operator_extension"] == "keep-me"
-    assert directive["migrations"]["plugins_enabled_snapshot_thawed"] is True
+    assert directive["migrations"]["plugins_enabled_snapshot"] == {
+        "source": "pjangler-52d9445",
+        "state": "completed",
+        "inherited": ["fleet/core-one", "fleet/excluded", "tts/voxxy"],
+    }
     assert directive["list_patches"]["plugins.enabled"] == {
         "add": ["operator/extra", "tts/vox"],
         "remove": ["tts/voxxy", "fleet/excluded"],
     }
     assert "# legacy operator comment survives thaw" in delta_text
+    first_generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert first_generated["plugins"]["enabled"] == [
+        "fleet/core-two",
+        "fleet/new-default",
+        "operator/extra",
+        "tts/vox",
+    ]
+    assert "fleet/core-one" not in first_generated["plugins"]["enabled"]
 
     base.write_text(
-        "plugins:\n  enabled:\n    - fleet/core-two\n    - fleet/new-default\n"
+        "plugins:\n  enabled:\n    - fleet/core-three\n    - fleet/later-default\n"
         "    - fleet/excluded\n    - tts/voxxy\n"
         "tts:\n  provider: voxxy\n  voice: newer\n",
         encoding="utf-8",
@@ -307,8 +330,8 @@ def test_fleet_thaws_legacy_frozen_plugin_snapshot_before_base_changes(
     assert second.returncode == 0, second.stdout + second.stderr
     generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
     assert generated["plugins"]["enabled"] == [
-        "fleet/core-two",
-        "fleet/new-default",
+        "fleet/core-three",
+        "fleet/later-default",
         "operator/extra",
         "tts/vox",
     ]
