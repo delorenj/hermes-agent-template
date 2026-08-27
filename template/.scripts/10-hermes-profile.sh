@@ -13,15 +13,43 @@ fi
 source "$(dirname "$0")/_lib.sh"
 load_role_env
 
+PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+
+# Older deployments made the named profile itself a symlink into project
+# state.  Following that link here would make the cleanup below delete files
+# from the link target before the singleton-runtime migration can preserve
+# them.  Refuse the legacy topology before any profile mutation.
+if [[ -L "$PROFILE_HOME" ]]; then
+  die "legacy named profile symlink detected at $PROFILE_HOME; refusing mutation. Run: pj migrate hermes.runtime-singleton '$(project_repo_path 2>/dev/null || printf '%s' "$ROLE_DIR")'"
+fi
+
 already_done 10-hermes-profile \
   && log "[10] profile marker found — revalidating required profile contract"
 
 # Skillex projects the canonical global catalog into ~/.agents/skills. These
-# five skills are part of the deployed PM contract, not optional suggestions.
+# six skills are the immutable deployed PM contract, not optional suggestions.
 # Validate the complete set before any profile mutation so a partial/missing
 # projection cannot warn and then be falsely reported as provisioned.
 CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir "$HOME/.agents/skills")}"
-read -r -a SYMLINKED_RUNTIME_SKILLS <<< "${SYMLINKED_RUNTIME_SKILLS:-$(config_get fleet.symlinked_runtime_skills 'delonet-conventions delonet-dotenv hermes-pm-template-maintenance hindsight subagent-driven-development')}"
+CORE_RUNTIME_SKILLS=(
+  33god-projects
+  delonet-conventions
+  delonet-dotenv
+  hermes-pm-template-maintenance
+  hindsight
+  subagent-driven-development
+)
+OPTIONAL_RUNTIME_SKILLS_TEXT="${SYMLINKED_RUNTIME_SKILLS:-$(config_get fleet.symlinked_runtime_skills '')}"
+read -r -a OPTIONAL_RUNTIME_SKILLS <<< "$OPTIONAL_RUNTIME_SKILLS_TEXT"
+SYMLINKED_RUNTIME_SKILLS=("${CORE_RUNTIME_SKILLS[@]}")
+for skill_name in "${OPTIONAL_RUNTIME_SKILLS[@]}"; do
+  [[ -n "$skill_name" ]] || continue
+  skill_present=0
+  for required_name in "${SYMLINKED_RUNTIME_SKILLS[@]}"; do
+    [[ "$required_name" == "$skill_name" ]] && { skill_present=1; break; }
+  done
+  [[ $skill_present -eq 1 ]] || SYMLINKED_RUNTIME_SKILLS+=("$skill_name")
+done
 missing_runtime_skills=()
 for skill_name in "${SYMLINKED_RUNTIME_SKILLS[@]}"; do
   [[ -f "$CANONICAL_SKILLS_DIR/$skill_name/SKILL.md" ]] \
@@ -34,7 +62,6 @@ fi
 log "[10] required Skillex skills validated: ${SYMLINKED_RUNTIME_SKILLS[*]}"
 
 log "[10] creating hermes profile: $PROFILE_NAME"
-PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 
 if [[ -d "$PROFILE_HOME" ]]; then
   log "    profile dir already exists; reusing"

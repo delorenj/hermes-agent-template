@@ -137,6 +137,90 @@ def test_fleet_audit_reports_and_apply_retires_legacy_consumer(tmp_path: Path) -
     assert not (profile / "config.yaml").is_symlink()
 
 
+def test_fleet_vox_delta_uses_list_patch_and_preserves_base_flow_and_exclusions(
+    tmp_path: Path,
+) -> None:
+    env, registry, _consumer, role = _fixture(tmp_path)
+    pm_role = tmp_path / "pm"
+    role.rename(pm_role)
+    registry_data = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    registry_data["agents"]["demo-pm"]["role_dir"] = str(pm_role)
+    registry.write_text(yaml.safe_dump(registry_data, sort_keys=False), encoding="utf-8")
+    fleet_home = Path(env["HERMES_FLEET_HOME"])
+    base = fleet_home / "config.yaml"
+    base.write_text(
+        "plugins:\n  enabled:\n    - fleet/core-one\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: old\n",
+        encoding="utf-8",
+    )
+    profile = fleet_home / "profiles" / "demo-pm"
+    delta_path = profile / "config.delta.yaml"
+    delta_path.write_text("# operator comment survives\n{}\n", encoding="utf-8")
+    plugin = tmp_path / "vox-plugin"
+    plugin.mkdir()
+    env["VOX_PLUGIN_DIR"] = str(plugin)
+
+    first = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
+    assert "plugins" not in delta
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
+        "add": ["tts/vox"],
+        "remove": ["tts/voxxy"],
+    }
+    assert "# operator comment survives" in delta_path.read_text(encoding="utf-8")
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["plugins"]["enabled"] == ["fleet/core-one", "tts/vox"]
+    assert "x-pjangler-merge" not in generated
+
+    base.write_text(
+        "plugins:\n  enabled:\n    - fleet/core-two\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: newer\n",
+        encoding="utf-8",
+    )
+    changed_base = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert changed_base.returncode == 0, changed_base.stdout + changed_base.stderr
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["plugins"]["enabled"] == ["fleet/core-two", "tts/vox"]
+
+    # An explicit list replacement is operator intent.  Fleet reconciliation
+    # may append its role-owned plugin through the directive, but must not copy
+    # excluded fleet entries back into the replacement list.
+    delta_path.write_text(
+        "# explicit operator exclusion\nplugins:\n  enabled:\n    - operator/only\n",
+        encoding="utf-8",
+    )
+    excluded = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert excluded.returncode == 0, excluded.stdout + excluded.stderr
+    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
+    assert delta["plugins"]["enabled"] == ["operator/only"]
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]["add"] == [
+        "tts/vox"
+    ]
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["plugins"]["enabled"] == ["operator/only", "tts/vox"]
+    assert "# explicit operator exclusion" in delta_path.read_text(encoding="utf-8")
+
+
 def test_fleet_apply_preserves_unit_and_metadata_when_disable_fails(tmp_path: Path) -> None:
     env, registry, consumer, _ = _fixture(tmp_path)
     env["SYSTEMCTL_MODE"] = "disable-fail"

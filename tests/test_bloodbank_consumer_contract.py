@@ -89,6 +89,9 @@ def _environment(tmp_path: Path, registry: Path) -> dict[str, str]:
             "HOME": str(home),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "REGISTRY_FILE": str(registry),
+            "SYSTEMD_STABILIZATION_ATTEMPTS": "3",
+            "SYSTEMD_STABLE_SAMPLES": "2",
+            "SYSTEMD_STABILIZATION_INTERVAL_SECONDS": "0",
         }
     )
     return env
@@ -437,6 +440,11 @@ case "$*" in
   *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
   *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
   *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.timer"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.service"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
   *"disable --now hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"reset-failed hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo inactive; exit 3 ;;
@@ -469,6 +477,89 @@ exit 1
     states = role_data["service_state"]
     assert states == {"gateway": "deferred", "heartbeat": "active"}
     assert role_data["reconcile"] == {"enabled": True, "explicit_opt_out": False}
+
+
+def test_gateway_that_exits_78_never_persists_or_summarizes_as_operational(
+    tmp_path: Path,
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    scripts = role / ".scripts"
+    shutil.copy2(SCRIPTS / "store-onepassword-secret.py", scripts)
+    shutil.copy2(SCRIPTS / "99-summary.sh", scripts)
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            'provisioning_status: "deferred"',
+            'provisioning_status: "verified"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    (profile / "config.delta.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        "      TELEGRAM_BOT_TOKEN: op://DeLoSecrets/demo/password\n",
+        encoding="utf-8",
+    )
+    fake_bin = tmp_path / "crash-bin"
+    fake_bin.mkdir()
+    log = tmp_path / "systemctl.log"
+    op = fake_bin / "op"
+    op.write_text(
+        "#!/usr/bin/env bash\n[[ \"$1\" == read ]] && { printf '%s\\n' resolved; exit 0; }; exit 1\n",
+        encoding="utf-8",
+    )
+    op.chmod(0o755)
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$SYSTEMCTL_LOG"
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) echo running; exit 0 ;;
+  *"daemon-reload"*|*"enable --now"*|*"disable --now"*|*"reset-failed"*) exit 0 ;;
+  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.timer"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.service"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
+  *"is-active hermes-demo-pm-gateway.service"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-gateway.service"*) echo enabled; exit 0 ;;
+  *"show hermes-demo-pm-gateway.service"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=failed' 'SubState=failed' \
+      'Result=exit-code' 'ExecMainStatus=78' 'NRestarts=1'; exit 0 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env.update({"PATH": f"{fake_bin}:{env['PATH']}", "SYSTEMCTL_LOG": str(log)})
+
+    deployed = _run(role, "70-systemd.sh", env)
+
+    assert deployed.returncode != 0
+    assert "did not stabilize healthy" in deployed.stderr
+    assert "status=78" in deployed.stderr
+    role_data = yaml.safe_load(role_yaml.read_text(encoding="utf-8"))
+    assert role_data["service_state"]["gateway"] == "error"
+    assert role_data["service_state"]["heartbeat"] == "active"
+    assert not (scripts / ".done-70-systemd").exists()
+    calls = log.read_text(encoding="utf-8")
+    assert "disable --now hermes-demo-pm-gateway.service" in calls
+
+    summary = _run(role, "99-summary.sh", env)
+
+    assert summary.returncode == 0, summary.stderr
+    assert "Mode:           INCOMPLETE" in summary.stderr
+    assert "OPERATIONAL" not in summary.stderr
 
 
 def test_systemd_preserves_legacy_consumer_when_disable_fails(tmp_path: Path) -> None:
@@ -588,6 +679,53 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
         "heartbeat_state": "pending",
     }
     assert "consumer_unit" not in entry["systemd"]
+
+
+def test_registry_merge_preserves_extensions_timestamp_and_is_byte_convergent(
+    tmp_path: Path,
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    original_timestamp = "2026-01-02T03:04:05Z"
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "registry_extension": {"owner": "operator"},
+                "agents": {
+                    "demo-pm": {
+                        "provisioned_at": original_timestamp,
+                        "extension": {"labels": ["keep", "me"]},
+                        "telegram": {"operator_note": "preserve"},
+                        "systemd": {
+                            "operator_policy": "manual-window",
+                            "consumer_unit": "hermes-demo-pm-consumer.service",
+                        },
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    first = _run(role, "80-registry.sh", env)
+    assert first.returncode == 0, first.stderr
+    after_first = registry.read_bytes()
+    entry = yaml.safe_load(after_first)["agents"]["demo-pm"]
+    assert entry["provisioned_at"] == original_timestamp
+    assert entry["extension"] == {"labels": ["keep", "me"]}
+    assert entry["telegram"]["operator_note"] == "preserve"
+    assert entry["systemd"]["operator_policy"] == "manual-window"
+    assert "consumer_unit" not in entry["systemd"]
+
+    second = _run(role, "80-registry.sh", env)
+
+    assert second.returncode == 0, second.stderr
+    assert registry.read_bytes() == after_first
+    assert yaml.safe_load(registry.read_text(encoding="utf-8"))["registry_extension"] == {
+        "owner": "operator"
+    }
 
 
 @pytest.mark.parametrize(

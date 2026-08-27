@@ -53,6 +53,8 @@ elif args[:2] == ["item", "edit"]:
     found[0].write_text(json.dumps(document), encoding="utf-8")
     print("{}")
 elif args[:1] == ["read"]:
+    if (home / ".fake-onepassword-outage").exists():
+        raise SystemExit(75)
     reference = args[-1]
     _vault, item, field = reference.removeprefix("op://").split("/", 2)
     found = locate(item)

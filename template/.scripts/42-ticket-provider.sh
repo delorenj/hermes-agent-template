@@ -24,11 +24,6 @@ fi
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
-# shellcheck source=lib/ticket-provider.sh
-source "$(dirname "$0")/lib/ticket-provider.sh"
-
-already_done 42-ticket-provider \
-  && log "[42] ticket-provider marker found — revalidating canonical board binding"
 
 # Locate the repo-root .project.json (the SOT).
 REPO_ROOT="$(project_repo_path 2>/dev/null || true)"
@@ -36,15 +31,59 @@ REPO_ROOT="$(project_repo_path 2>/dev/null || true)"
 PROJECT_JSON="$REPO_ROOT/.project.json"
 ROLE_DIR_REL="${ROLE_DIR#"$REPO_ROOT"/}"
 
+# Serialize the complete read / provider check-or-create / atomic write
+# transaction per project.  The lock lives outside the checkout so a normal
+# provision cannot leave repository dirt behind.
+command -v flock >/dev/null 2>&1 \
+  || die "flock is required for safe ticket-provider binding"
+PROJECT_LOCK_KEY="$(printf '%s' "$PROJECT_JSON" | sha256sum)"
+PROJECT_LOCK_KEY="${PROJECT_LOCK_KEY%% *}"
+PROJECT_LOCK_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/pjangler-ticket-provider"
+mkdir -p "$PROJECT_LOCK_DIR"
+PROJECT_LOCK_FILE="$PROJECT_LOCK_DIR/$PROJECT_LOCK_KEY.lock"
+[[ ! -L "$PROJECT_LOCK_FILE" ]] \
+  || die "refusing ticket-provider lock symlink: $PROJECT_LOCK_FILE"
+exec {PROJECT_LOCK_FD}>"$PROJECT_LOCK_FILE"
+chmod 600 "$PROJECT_LOCK_FILE"
+flock -w "${PROJECT_LOCK_TIMEOUT_SECONDS:-30}" "$PROJECT_LOCK_FD" \
+  || die "timed out waiting for ticket-provider lock: $PROJECT_JSON"
+project_lock_release() {
+  flock -u "$PROJECT_LOCK_FD" 2>/dev/null || true
+  exec {PROJECT_LOCK_FD}>&-
+}
+trap project_lock_release EXIT
+
+[[ ! -L "$PROJECT_JSON" ]] || die "refusing .project.json symlink: $PROJECT_JSON"
+if [[ -e "$PROJECT_JSON" ]]; then
+  python3 - "$PROJECT_JSON" <<'PY' \
+    || die "malformed .project.json; refusing ticket-provider mutation or board creation"
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    value = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(value, dict) else 1)
+PY
+fi
+
+# shellcheck source=lib/ticket-provider.sh
+source "$(dirname "$0")/lib/ticket-provider.sh"
+
+already_done 42-ticket-provider \
+  && log "[42] ticket-provider marker found — revalidating canonical board binding"
+
 # pj <dotted.key> — read a string value from .project.json (empty if absent).
 pj() {
   [ -f "$PROJECT_JSON" ] || { printf ''; return 0; }
   python3 - "$PROJECT_JSON" "$1" <<'PY'
 import sys, json, pathlib
-try:
-    d = json.loads(pathlib.Path(sys.argv[1]).read_text())
-except Exception:
-    print(""); raise SystemExit(0)
+d = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+if not isinstance(d, dict):
+    raise SystemExit(".project.json root must be an object")
 cur = d
 for k in sys.argv[2].split("."):
     if isinstance(cur, dict) and k in cur:
@@ -61,14 +100,20 @@ pj_write() {
   REPO="$REPO" REPO_ROOT="$REPO_ROOT" AGENT_ID="$AGENT_ID" ROLE="$ROLE" \
   ROLE_DIR_REL="$ROLE_DIR_REL" PROJECT_DESC="${PROJECT_DESC:-}" \
   python3 - "$PROJECT_JSON" "$@" <<'PY'
-import sys, os, json, pathlib
+import errno
+import sys, os, json, pathlib, stat, tempfile
 (path, set_provider, provider, board_id, workspace, identifier, team) = sys.argv[1:8]
 p = pathlib.Path(path)
-try:
-    d = json.loads(p.read_text())
+if p.is_symlink():
+    raise SystemExit(f"refusing .project.json symlink: {p}")
+if p.exists():
+    try:
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"malformed .project.json: {type(exc).__name__}")
     if not isinstance(d, dict):
-        d = {}
-except Exception:
+        raise SystemExit(".project.json root must be an object")
+else:
     d = {}
 repo = os.environ.get("REPO", "")
 d.setdefault("project_name", repo)
@@ -94,7 +139,33 @@ entry.update({
     "provisioning_state": "linked" if board_id else "deferred",
 })
 ag[os.environ["AGENT_ID"]] = entry
-p.write_text(json.dumps(d, indent=2) + "\n")
+rendered = json.dumps(d, indent=2) + "\n"
+p.parent.mkdir(parents=True, exist_ok=True)
+mode = stat.S_IMODE(p.stat().st_mode) if p.exists() else 0o644
+fd, temporary = tempfile.mkstemp(prefix=f".{p.name}.ticket-provider-", dir=p.parent)
+try:
+    os.fchmod(fd, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, p)
+    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
+    directory_fd = os.open(p.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        try:
+            os.fsync(directory_fd)
+        except OSError as exc:
+            if exc.errno not in unsupported:
+                raise
+    finally:
+        os.close(directory_fd)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
 PY
   log "    .project.json updated (agent=$AGENT_ID)"
 }

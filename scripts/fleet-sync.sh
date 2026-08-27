@@ -709,19 +709,34 @@ except ImportError:
 base_path, delta_path = map(pathlib.Path, sys.argv[1:3])
 plugin, voice = sys.argv[3:5]
 base = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
-delta = yaml.safe_load(delta_path.read_text(encoding="utf-8")) or {}
+delta_text = delta_path.read_text(encoding="utf-8")
+delta = yaml.safe_load(delta_text) or {}
 if not isinstance(base, dict) or not isinstance(delta, dict):
     raise SystemExit("base and delta must be mappings")
-enabled = [
-    entry for entry in ((base.get("plugins") or {}).get("enabled") or [])
-    if entry != "tts/voxxy"
-]
-for entry in ((delta.get("plugins") or {}).get("enabled") or []):
-    if entry != "tts/voxxy" and entry not in enabled:
-        enabled.append(entry)
-if f"tts/{plugin}" not in enabled:
-    enabled.append(f"tts/{plugin}")
-delta.setdefault("plugins", {})["enabled"] = enabled
+plugins = delta.get("plugins") or {}
+if not isinstance(plugins, dict):
+    raise SystemExit("plugins delta must be a mapping")
+if "enabled" in plugins and not isinstance(plugins["enabled"], list):
+    raise SystemExit("plugins.enabled delta must be a list")
+directives = delta.setdefault("x-pjangler-merge", {})
+if not isinstance(directives, dict):
+    raise SystemExit("x-pjangler-merge delta must be a mapping")
+patches = directives.setdefault("list_patches", {})
+if not isinstance(patches, dict):
+    raise SystemExit("x-pjangler-merge.list_patches delta must be a mapping")
+patch = patches.setdefault("plugins.enabled", {})
+if not isinstance(patch, dict):
+    raise SystemExit("plugins.enabled list patch must be a mapping")
+additions = patch.setdefault("add", [])
+removals = patch.setdefault("remove", [])
+if not isinstance(additions, list) or not isinstance(removals, list):
+    raise SystemExit("plugins.enabled list patch values must be lists")
+role_plugin = f"tts/{plugin}"
+additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
+additions.append(role_plugin)
+removals[:] = [entry for entry in removals if entry != role_plugin]
+if "tts/voxxy" not in removals:
+    removals.append("tts/voxxy")
 tts = delta.setdefault("tts", {})
 tts.pop("voxxy", None)
 tts["provider"] = plugin
@@ -731,7 +746,15 @@ fd, temporary = tempfile.mkstemp(prefix=f".{delta_path.name}.", dir=delta_path.p
 try:
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write("# Override-only delta for this Hermes profile.\n")
+        comments = []
+        for line in delta_text.splitlines():
+            if line.lstrip().startswith("#") and line not in comments:
+                comments.append(line)
+        standard = "# Override-only delta for this Hermes profile."
+        handle.write(standard + "\n")
+        for line in comments:
+            if line != standard:
+                handle.write(line + "\n")
         handle.write(yaml.safe_dump(delta, sort_keys=False))
         handle.flush(); os.fsync(handle.fileno())
     os.replace(temporary, delta_path)

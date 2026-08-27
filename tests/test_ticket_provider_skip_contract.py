@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import yaml
@@ -563,6 +564,74 @@ def test_done_marker_rerun_canonicalizes_live_plane_binding_and_preserves_unrela
     }
     assert updated["unrelated"] == {"preserve": [1, 2, 3]}
     assert "revalidating canonical board binding" in result.stderr
+
+
+@pytest.mark.parametrize("malformed", ["{", "[]\n", "null\n"])
+def test_malformed_project_manifest_is_preserved_before_any_provider_call(
+    tmp_path: Path, malformed: str
+) -> None:
+    project, role, env, call_log = _fixture(tmp_path)
+    manifest_path = project / ".project.json"
+    manifest_path.write_text(malformed, encoding="utf-8")
+    before = manifest_path.read_bytes()
+    env["SKIP_PLANE"] = "0"
+
+    result = _run(role, env)
+
+    assert result.returncode != 0
+    assert "malformed .project.json" in result.stderr
+    assert manifest_path.read_bytes() == before
+    assert not call_log.exists()
+    assert not (role / ".scripts" / ".done-42-ticket-provider").exists()
+
+
+def test_concurrent_board_bootstrap_converges_through_one_create_transaction(
+    tmp_path: Path,
+) -> None:
+    project, role, env, call_log = _fixture(tmp_path)
+    fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
+    fake_curl.write_text(
+        """#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$PROVIDER_CALL_LOG"
+case "$*" in
+  *'/projects/?per_page=200'*) printf '%s\n' '[]' ;;
+  *'-X POST '*'/projects/'*)
+    printf '%s\n' create >> "${PROVIDER_CALL_LOG}.creates"
+    printf '%s\n' '{"id":"converged-board","identifier":"LIVE"}'
+    ;;
+  *'/projects/converged-board/'*)
+    printf '%s\n' '{"id":"converged-board","name":"Demo","identifier":"LIVE"}'
+    ;;
+  *) printf '%s\n' '{}' ;;
+esac
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    env["SKIP_PLANE"] = "0"
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: _run(role, env), range(2)))
+
+    assert [result.returncode for result in results] == [0, 0], [
+        result.stderr for result in results
+    ]
+    creates = Path(f"{call_log}.creates").read_text(encoding="utf-8").splitlines()
+    assert creates == ["create"]
+    calls = call_log.read_text(encoding="utf-8")
+    assert calls.count("/projects/?per_page=200") == 1
+    manifest = json.loads((project / ".project.json").read_text(encoding="utf-8"))
+    assert manifest["ticket_provider"]["board_id"] == "converged-board"
+    assert manifest["ticket_provider"]["identifier"] == "LIVE"
+    assert manifest["ticket_provider"]["state"] == "linked"
+    assert manifest["agents"] == {
+        "demo-pm": {
+            "role": "pm",
+            "role_dir": "agents/hermes/pm",
+            "provisioning_state": "linked",
+        }
+    }
+    assert not list(project.glob("..project.json.ticket-provider-*"))
 
 
 def test_skip_plane_scrubs_fleet_rehydrated_provider_authority_from_children(

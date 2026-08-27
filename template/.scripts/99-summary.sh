@@ -14,6 +14,29 @@ RECONCILE_STATE="$(yaml_get reconcile.enabled)"
 RECONCILE_OPT_OUT="$(yaml_get reconcile.explicit_opt_out)"
 BOARD_ID="$(yaml_get ticket_provider.board_id)"
 
+# Reconcile durable claims with live unit truth at presentation time.  A stale
+# role.yaml must never turn an exited launcher or failed heartbeat into an
+# operational summary.
+if [[ "$HB_STATE" == "active" || "$GW_STATE" =~ ^(active|deferred)$ ]]; then
+  if systemd_user_available; then
+    if [[ "$HB_STATE" == "active" ]]; then
+      hb_live="$(systemd_timer_health_snapshot "$HB_TIMER" "hermes-${AGENT_ID}-heartbeat.service")"
+      [[ "$hb_live" == ok\|* ]] || HB_STATE="error (stale active claim)"
+    fi
+    if [[ "$GW_STATE" == "active" ]]; then
+      gw_live="$(systemd_service_health_snapshot "$GW_UNIT" running)"
+      [[ "$gw_live" == ok\|* ]] || GW_STATE="error (stale active claim)"
+    elif [[ "$GW_STATE" == "deferred" ]]; then
+      gw_live="$(systemd_gateway_deferred_snapshot "$GW_UNIT")"
+      [[ "$gw_live" == "ok|deferred" ]] || GW_STATE="error (stale deferred claim)"
+    fi
+  else
+    [[ "$HB_STATE" != "active" ]] || HB_STATE="unverified (user manager unavailable)"
+    [[ "$GW_STATE" != "active" && "$GW_STATE" != "deferred" ]] \
+      || GW_STATE="unverified (user manager unavailable)"
+  fi
+fi
+
 case "$HB_STATE:$GW_STATE" in
   active:active) MODE="OPERATIONAL" ;;
   active:deferred) MODE="OPERATIONAL_WITH_GATEWAY_DEFERRED" ;;

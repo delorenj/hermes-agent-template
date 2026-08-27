@@ -84,24 +84,82 @@ SKIP = {"33god-pm.bak"}
 
 
 # --------------------------------------------------------------------------
-# merge semantics -- must match hermes_cli.config._deep_merge exactly
+# merge semantics -- Hermes deep merge plus one template-owned list patch
 # --------------------------------------------------------------------------
+LIST_PATCH_KEY = "x-pjangler-merge"
+
+
+def _plain_deep_merge(base: dict, override: dict) -> dict:
+    """Hermes-compatible recursive merge without template directives."""
+    result = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _plain_deep_merge(result[key], value)
+        elif key in result and isinstance(result[key], dict) and value is None:
+            continue
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def _apply_list_patches(result: dict, directive: Any) -> None:
+    if directive is None:
+        return
+    if not isinstance(directive, dict):
+        raise ValueError(f"{LIST_PATCH_KEY} must be a mapping")
+    patches = directive.get("list_patches", {})
+    if not isinstance(patches, dict):
+        raise ValueError(f"{LIST_PATCH_KEY}.list_patches must be a mapping")
+    for dotted, rule in patches.items():
+        if not isinstance(dotted, str) or not dotted or any(
+            not part or not part.replace("_", "").replace("-", "").isalnum()
+            for part in dotted.split(".")
+        ):
+            raise ValueError("list patch path is invalid")
+        if not isinstance(rule, dict):
+            raise ValueError(f"list patch for {dotted} must be a mapping")
+        additions = rule.get("add", []) or []
+        removals = rule.get("remove", []) or []
+        if not isinstance(additions, list) or not isinstance(removals, list) or not all(
+            isinstance(item, str) for item in [*additions, *removals]
+        ):
+            raise ValueError(f"list patch for {dotted} must contain string lists")
+        cursor = result
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            child = cursor.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise ValueError(f"list patch parent for {dotted} is not a mapping")
+            cursor = child
+        leaf = parts[-1]
+        current = cursor.get(leaf, []) or []
+        if not isinstance(current, list):
+            raise ValueError(f"list patch target {dotted} is not a list")
+        removed = set(removals)
+        merged = [item for item in current if item not in removed]
+        for item in additions:
+            if item not in merged:
+                merged.append(item)
+        cursor[leaf] = merged
+
+
 def deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge *override* into *base*.
 
     Mirrors Hermes' ``_deep_merge``: override wins; two dicts recurse; a
     ``None`` override of a dict base is ignored (an empty YAML section must not
     blow away a whole default subtree); everything else -- lists included --
-    is replaced wholesale rather than concatenated.
+    is replaced wholesale rather than concatenated.  The reserved
+    ``x-pjangler-merge.list_patches`` directive is then applied and stripped
+    from generated config.  It lets a role own one list addition/removal while
+    future base-list edits continue to flow through.
     """
-    result = base.copy()
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = deep_merge(result[key], value)
-        elif key in result and isinstance(result[key], dict) and value is None:
-            continue
-        else:
-            result[key] = value
+    if not isinstance(base, dict) or not isinstance(override, dict):
+        raise ValueError("base and delta must be mappings")
+    directive = override.get(LIST_PATCH_KEY)
+    ordinary = {key: value for key, value in override.items() if key != LIST_PATCH_KEY}
+    result = _plain_deep_merge(base, ordinary)
+    _apply_list_patches(result, directive)
     return result
 
 
@@ -381,9 +439,15 @@ def cmd_absorb(args) -> int:
         if cfg_path.is_symlink():
             print(f"skip   {pdir.name:36s} (symlink -- run init first)")
             continue
-        current = load_yaml(cfg_path)
-        new_delta = minimal_delta(current, base)
         old_delta = load_yaml(pdir / "config.delta.yaml")
+        current = load_yaml(cfg_path)
+        directive = copy.deepcopy(old_delta.get(LIST_PATCH_KEY))
+        effective_base = deep_merge(
+            base, {LIST_PATCH_KEY: directive} if directive is not None else {}
+        )
+        new_delta = minimal_delta(current, effective_base)
+        if directive is not None:
+            new_delta[LIST_PATCH_KEY] = directive
         if new_delta == old_delta:
             print(f"clean  {pdir.name}")
             continue

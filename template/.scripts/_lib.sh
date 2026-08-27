@@ -197,9 +197,10 @@ store_onepassword_secret() {
 # source of truth.
 profile_config_delta_update() {
   # profile_config_delta_update PROFILE_HOME secret-ref ENV_NAME OP_REFERENCE
+  # profile_config_delta_update PROFILE_HOME channel-enabled telegram|slack true|false
   # profile_config_delta_update PROFILE_HOME voice PLUGIN VOICE
   python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
-import os, pathlib, re, sys, tempfile
+import copy, os, pathlib, re, sys, tempfile
 try:
     import yaml
 except ImportError:
@@ -219,15 +220,55 @@ def load(path):
         raise SystemExit(f"config source must be a mapping: {path}")
     return data
 
-def merge(base, override):
-    result = base.copy()
+LIST_PATCH_KEY = "x-pjangler-merge"
+
+def plain_merge(base, override):
+    result = copy.deepcopy(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = merge(result[key], value)
+            result[key] = plain_merge(result[key], value)
         elif key in result and isinstance(result[key], dict) and value is None:
             continue
         else:
-            result[key] = value
+            result[key] = copy.deepcopy(value)
+    return result
+
+def apply_list_patches(result, directive):
+    if directive is None:
+        return
+    if not isinstance(directive, dict) or not isinstance(directive.get("list_patches", {}), dict):
+        raise SystemExit(f"{LIST_PATCH_KEY}.list_patches must be a mapping")
+    for dotted, rule in directive.get("list_patches", {}).items():
+        if not isinstance(dotted, str) or not dotted or not isinstance(rule, dict):
+            raise SystemExit("invalid list patch")
+        additions = rule.get("add", []) or []
+        removals = rule.get("remove", []) or []
+        if not isinstance(additions, list) or not isinstance(removals, list) or not all(
+            isinstance(item, str) for item in [*additions, *removals]
+        ):
+            raise SystemExit(f"list patch for {dotted} must contain string lists")
+        cursor = result
+        parts = dotted.split(".")
+        for part in parts[:-1]:
+            child = cursor.setdefault(part, {})
+            if not isinstance(child, dict):
+                raise SystemExit(f"list patch parent for {dotted} is not a mapping")
+            cursor = child
+        current = cursor.get(parts[-1], []) or []
+        if not isinstance(current, list):
+            raise SystemExit(f"list patch target {dotted} is not a list")
+        removed = set(removals)
+        merged = [item for item in current if item not in removed]
+        for item in additions:
+            if item not in merged:
+                merged.append(item)
+        cursor[parts[-1]] = merged
+
+def merge(base, override):
+    directive = override.get(LIST_PATCH_KEY)
+    ordinary = {key: value for key, value in override.items() if key != LIST_PATCH_KEY}
+    result = plain_merge(base, ordinary)
+    apply_list_patches(result, directive)
     return result
 
 def atomic_write(path, content):
@@ -266,21 +307,47 @@ if mode == "secret-ref":
     if not isinstance(env, dict):
         raise SystemExit("secrets.onepassword.env delta must be a mapping")
     env[name] = value
+elif mode == "channel-enabled":
+    if name not in {"telegram", "slack"}:
+        raise SystemExit("unsupported channel enablement key")
+    if value not in {"true", "false"}:
+        raise SystemExit("channel enablement must be true or false")
+    platforms = delta.setdefault("platforms", {})
+    if not isinstance(platforms, dict):
+        raise SystemExit("platforms delta must be a mapping")
+    channel = platforms.setdefault(name, {})
+    if not isinstance(channel, dict):
+        raise SystemExit(f"platforms.{name} delta must be a mapping")
+    channel["enabled"] = value == "true"
 elif mode == "voice":
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
         raise SystemExit("invalid TTS plugin name")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
         raise SystemExit("invalid TTS voice name")
-    base_enabled = (base.get("plugins") or {}).get("enabled") or []
-    delta_enabled = (delta.get("plugins") or {}).get("enabled") or []
-    if not isinstance(base_enabled, list) or not isinstance(delta_enabled, list):
-        raise SystemExit("plugins.enabled must be a list")
-    enabled = []
-    for entry in [*base_enabled, *delta_enabled, f"tts/{name}"]:
-        if entry == "tts/voxxy" or entry in enabled:
-            continue
-        enabled.append(entry)
-    delta.setdefault("plugins", {})["enabled"] = enabled
+    plugins = delta.get("plugins") or {}
+    if not isinstance(plugins, dict):
+        raise SystemExit("plugins delta must be a mapping")
+    if "enabled" in plugins and not isinstance(plugins["enabled"], list):
+        raise SystemExit("plugins.enabled delta must be a list")
+    directives = delta.setdefault(LIST_PATCH_KEY, {})
+    if not isinstance(directives, dict):
+        raise SystemExit(f"{LIST_PATCH_KEY} delta must be a mapping")
+    patches = directives.setdefault("list_patches", {})
+    if not isinstance(patches, dict):
+        raise SystemExit(f"{LIST_PATCH_KEY}.list_patches delta must be a mapping")
+    patch = patches.setdefault("plugins.enabled", {})
+    if not isinstance(patch, dict):
+        raise SystemExit("plugins.enabled list patch must be a mapping")
+    additions = patch.setdefault("add", [])
+    removals = patch.setdefault("remove", [])
+    if not isinstance(additions, list) or not isinstance(removals, list):
+        raise SystemExit("plugins.enabled list patch values must be lists")
+    role_plugin = f"tts/{name}"
+    additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
+    additions.append(role_plugin)
+    removals[:] = [entry for entry in removals if entry != role_plugin]
+    if "tts/voxxy" not in removals:
+        removals.append("tts/voxxy")
     tts = delta.setdefault("tts", {})
     if not isinstance(tts, dict):
         raise SystemExit("tts delta must be a mapping")
@@ -293,12 +360,17 @@ elif mode == "voice":
     provider["voice"] = value
 else:
     raise SystemExit("unsupported profile config delta update")
-atomic_write(
-    delta_path,
-    "# Override-only delta for this Hermes profile.\n"
-    "# Contains configuration and secret references only; secret values remain in 1Password.\n"
-    + yaml.safe_dump(delta, sort_keys=False),
-)
+existing_comments = []
+if delta_path.is_file() and not delta_path.is_symlink():
+    for line in delta_path.read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("#") and line not in existing_comments:
+            existing_comments.append(line)
+standard_comments = [
+    "# Override-only delta for this Hermes profile.",
+    "# Contains configuration and secret references only; secret values remain in 1Password.",
+]
+comments = [*standard_comments, *(line for line in existing_comments if line not in standard_comments)]
+atomic_write(delta_path, "\n".join(comments) + "\n" + yaml.safe_dump(delta, sort_keys=False))
 header = (
     "# GENERATED FILE -- DO NOT EDIT.\n"
     "# source: fleet config.yaml + profile config.delta.yaml\n"
@@ -316,6 +388,11 @@ profile_onepassword_ref_set() {
 profile_voice_contract_set() {
   # profile_voice_contract_set PROFILE_HOME PLUGIN VOICE
   profile_config_delta_update "$1" voice "$2" "$3"
+}
+
+profile_channel_enabled_set() {
+  # profile_channel_enabled_set PROFILE_HOME telegram|slack true|false
+  profile_config_delta_update "$1" channel-enabled "$2" "$3"
 }
 
 profile_onepassword_ref_exists() {
@@ -340,8 +417,12 @@ PYEOF
 
 profile_onepassword_ref_validate() {
   # profile_onepassword_ref_validate PROFILE_HOME ENV_NAME
+  # Return 0 when the reference resolves, 2 when no syntactically valid
+  # mapping exists, and 75 when a valid mapping cannot currently be checked
+  # (for example, transient 1Password auth/network failure).  Callers must not
+  # destroy durable wiring on 75.
   local reference helper="$ROLE_DIR/.scripts/store-onepassword-secret.py"
-  [[ -f "$helper" ]] || return 1
+  [[ -f "$helper" ]] || return 75
   reference="$(python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
 import pathlib, sys
 try:
@@ -353,8 +434,11 @@ except Exception:
 print(ref if isinstance(ref, str) and ref.startswith("op://") else "", end="")
 PYEOF
 )"
-  [[ -n "$reference" ]] || return 1
-  python3 -I "$helper" --validate-reference "$reference" >/dev/null 2>&1
+  [[ -n "$reference" ]] || return 2
+  if python3 -I "$helper" --validate-reference "$reference" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 75
 }
 
 # ─── Distributable config (~/.config/hermes-agent-template/config.toml) ──────
@@ -588,6 +672,167 @@ systemctl_user_unit_state() {
       [[ -n "$first_line" ]] || first_line="exit $rc with no state"
       printf 'error|%s' "$first_line" ;;
   esac
+}
+
+# Read-only live health checks for the unit states lifecycle scripts persist in
+# role.yaml.  They deliberately include process result, main exit status,
+# restart count, and activation/substate; `is-active` alone can briefly report
+# success for a launcher that is already on its way to exit 78.
+systemctl_user_show() {
+  # systemctl_user_show UNIT PROPERTY...
+  local unit="$1" output rc first_line
+  shift
+  local -a arguments=(--user show "$unit" --no-pager)
+  local property
+  for property in "$@"; do arguments+=("--property=$property"); done
+  set +e
+  output="$(LC_ALL=C systemctl "${arguments[@]}" 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -ne 0 ]]; then
+    first_line="${output%%$'\n'*}"
+    first_line="${first_line//$'\t'/ }"
+    first_line="${first_line//|/}"
+    [[ -n "$first_line" ]] || first_line="exit $rc with no state"
+    printf 'error|%s' "$first_line"
+    return 0
+  fi
+  printf 'ok|%s' "$output"
+}
+
+systemd_service_health_snapshot() {
+  # systemd_service_health_snapshot UNIT running|oneshot
+  local unit="$1" kind="$2" active enabled shown payload
+  local load_state="" active_state="" sub_state="" result=""
+  local exec_status="" restarts="" key value
+  active="$(systemctl_user_unit_state is-active "$unit")"
+  enabled="$(systemctl_user_unit_state is-enabled "$unit")"
+  [[ "$active" == "ok|active" ]] \
+    || { printf 'error|activity=%s' "${active#*|}"; return 0; }
+  [[ "$enabled" =~ ^ok\|(enabled|enabled-runtime)$ ]] \
+    || { printf 'error|enablement=%s' "${enabled#*|}"; return 0; }
+  shown="$(systemctl_user_show "$unit" LoadState ActiveState SubState Result ExecMainStatus NRestarts)"
+  [[ "$shown" == ok\|* ]] || { printf '%s' "$shown"; return 0; }
+  payload="${shown#ok|}"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LoadState) load_state="$value" ;;
+      ActiveState) active_state="$value" ;;
+      SubState) sub_state="$value" ;;
+      Result) result="$value" ;;
+      ExecMainStatus) exec_status="$value" ;;
+      NRestarts) restarts="$value" ;;
+    esac
+  done <<< "$payload"
+  [[ "$load_state" == loaded && "$active_state" == active \
+     && "$result" == success && "$exec_status" == 0 \
+     && "$restarts" =~ ^[0-9]+$ ]] \
+    || { printf 'error|load=%s active=%s sub=%s result=%s status=%s restarts=%s' \
+         "$load_state" "$active_state" "$sub_state" "$result" "$exec_status" "$restarts"; return 0; }
+  if [[ "$kind" == running && "$sub_state" != running ]]; then
+    printf 'error|substate=%s' "$sub_state"
+    return 0
+  fi
+  printf 'ok|%s' "$restarts"
+}
+
+systemd_timer_health_snapshot() {
+  # systemd_timer_health_snapshot TIMER HEARTBEAT_SERVICE
+  local timer="$1" service="$2" active enabled shown payload
+  local load_state="" active_state="" sub_state="" key value
+  local svc_shown svc_payload svc_load="" svc_active="" svc_sub=""
+  local svc_result="" svc_status="" svc_restarts=""
+  active="$(systemctl_user_unit_state is-active "$timer")"
+  enabled="$(systemctl_user_unit_state is-enabled "$timer")"
+  [[ "$active" == "ok|active" ]] \
+    || { printf 'error|timer-activity=%s' "${active#*|}"; return 0; }
+  [[ "$enabled" =~ ^ok\|(enabled|enabled-runtime)$ ]] \
+    || { printf 'error|timer-enablement=%s' "${enabled#*|}"; return 0; }
+  shown="$(systemctl_user_show "$timer" LoadState ActiveState SubState)"
+  [[ "$shown" == ok\|* ]] || { printf '%s' "$shown"; return 0; }
+  payload="${shown#ok|}"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LoadState) load_state="$value" ;;
+      ActiveState) active_state="$value" ;;
+      SubState) sub_state="$value" ;;
+    esac
+  done <<< "$payload"
+  [[ "$load_state" == loaded && "$active_state" == active \
+     && "$sub_state" =~ ^(waiting|running|elapsed)$ ]] \
+    || { printf 'error|timer-load=%s active=%s sub=%s' "$load_state" "$active_state" "$sub_state"; return 0; }
+
+  # Inspect the latest oneshot result separately from the timer.  An inactive
+  # (dead) service with Result=success/ExecMainStatus=0 is the healthy steady
+  # state between ticks; failed/78 is never accepted.
+  svc_shown="$(systemctl_user_show "$service" LoadState ActiveState SubState Result ExecMainStatus NRestarts)"
+  [[ "$svc_shown" == ok\|* ]] || { printf '%s' "$svc_shown"; return 0; }
+  svc_payload="${svc_shown#ok|}"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LoadState) svc_load="$value" ;;
+      ActiveState) svc_active="$value" ;;
+      SubState) svc_sub="$value" ;;
+      Result) svc_result="$value" ;;
+      ExecMainStatus) svc_status="$value" ;;
+      NRestarts) svc_restarts="$value" ;;
+    esac
+  done <<< "$svc_payload"
+  [[ "$svc_load" == loaded && "$svc_active" =~ ^(inactive|active|activating)$ \
+     && "$svc_sub" =~ ^(dead|exited|running|start)$ \
+     && "$svc_result" == success && "$svc_status" == 0 \
+     && "$svc_restarts" =~ ^[0-9]+$ ]] \
+    || { printf 'error|heartbeat-load=%s active=%s sub=%s result=%s status=%s restarts=%s' \
+         "$svc_load" "$svc_active" "$svc_sub" "$svc_result" "$svc_status" "$svc_restarts"; return 0; }
+  printf 'ok|%s:%s:%s' "$sub_state" "$svc_result" "$svc_restarts"
+}
+
+systemd_gateway_deferred_snapshot() {
+  local unit="$1" active enabled
+  active="$(systemctl_user_unit_state is-active "$unit")"
+  enabled="$(systemctl_user_unit_state is-enabled "$unit")"
+  if [[ "$active" == "ok|inactive" \
+     && "$enabled" =~ ^ok\|(disabled|masked|masked-runtime)$ ]]; then
+    printf 'ok|deferred'
+  else
+    printf 'error|enablement=%s activity=%s' "${enabled#*|}" "${active#*|}"
+  fi
+}
+
+systemd_wait_for_stable_health() {
+  # systemd_wait_for_stable_health CHECK_FUNCTION ARGS...
+  local checker="$1"
+  shift
+  local attempts="${SYSTEMD_STABILIZATION_ATTEMPTS:-6}"
+  local required="${SYSTEMD_STABLE_SAMPLES:-3}"
+  local interval="${SYSTEMD_STABILIZATION_INTERVAL_SECONDS:-1}"
+  [[ "$attempts" =~ ^[1-9][0-9]*$ && "$required" =~ ^[1-9][0-9]*$ \
+     && "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] \
+    || { printf 'error|invalid stabilization settings'; return 1; }
+  local sample="" previous="" stable=0 attempt
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    sample="$($checker "$@")"
+    if [[ "$sample" == ok\|* ]]; then
+      if [[ "$sample" == "$previous" ]]; then
+        stable=$((stable + 1))
+      else
+        previous="$sample"
+        stable=1
+      fi
+      if (( stable >= required )); then
+        printf '%s' "$sample"
+        return 0
+      fi
+    else
+      previous=""
+      stable=0
+    fi
+    if (( attempt < attempts )) && [[ "$interval" != 0 ]]; then
+      sleep "$interval"
+    fi
+  done
+  printf '%s' "${sample:-error|no health sample}"
+  return 1
 }
 
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).

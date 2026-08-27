@@ -109,14 +109,35 @@ fi
 # Role metadata alone is not sufficient: a stale done marker must never revive
 # a credential-less crash loop.
 gateway_ready=0
+gateway_validation_unavailable=0
 if [[ "$(yaml_get telegram.provisioning_status)" == "verified" ]] \
-   && profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
-  gateway_ready=1
+   && profile_onepassword_ref_exists "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
+  telegram_reference_rc=0
+  profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN \
+    || telegram_reference_rc=$?
+  if [[ $telegram_reference_rc -eq 0 ]]; then
+    gateway_ready=1
+  elif [[ $telegram_reference_rc -eq 75 ]]; then
+    gateway_validation_unavailable=1
+  fi
 fi
 if [[ "$(yaml_get slack.provisioning_status)" == "verified" ]] \
-   && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
-   && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN; then
-  gateway_ready=1
+   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_BOT_TOKEN \
+   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_APP_TOKEN; then
+  slack_bot_reference_rc=0
+  slack_app_reference_rc=0
+  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
+    || slack_bot_reference_rc=$?
+  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN \
+    || slack_app_reference_rc=$?
+  if [[ $slack_bot_reference_rc -eq 0 && $slack_app_reference_rc -eq 0 ]]; then
+    gateway_ready=1
+  elif [[ $slack_bot_reference_rc -eq 75 || $slack_app_reference_rc -eq 75 ]]; then
+    gateway_validation_unavailable=1
+  fi
+fi
+if [[ $gateway_ready -eq 0 && $gateway_validation_unavailable -eq 1 ]]; then
+  die "channel 1Password validation is temporarily unavailable; preserving existing gateway state for retry"
 fi
 
 # Singleton-runtime contract: units set HERMES_HOME to the agent's NAMED PROFILE
@@ -253,16 +274,15 @@ UNIT
 if systemd_user_available; then
   systemctl --user daemon-reload
   if systemctl --user enable --now "$HB_TIMER" >/dev/null 2>&1; then
-    hb_active_result="$(systemctl_user_unit_state is-active "$HB_TIMER")"
-    hb_enabled_result="$(systemctl_user_unit_state is-enabled "$HB_TIMER")"
-    if [[ "$hb_active_result" == "ok|active" \
-       && "$hb_enabled_result" =~ ^ok\|(enabled|enabled-runtime)$ ]]; then
+    if hb_health="$(systemd_wait_for_stable_health \
+        systemd_timer_health_snapshot "$HB_TIMER" "$HB_SVC")"; then
       yaml_upsert_block_value service_state heartbeat active
-      log "    heartbeat enabled + active: $HB_TIMER"
+      log "    heartbeat enabled + active with healthy latest result: $HB_TIMER"
     else
+      systemctl --user disable --now "$HB_TIMER" >/dev/null 2>&1 || true
       yaml_upsert_block_value service_state heartbeat error
       clear_done 70-systemd
-      die "heartbeat did not become enabled + active ($hb_enabled_result, $hb_active_result)"
+      die "heartbeat did not stabilize healthy: $hb_health"
     fi
   else
     yaml_upsert_block_value service_state heartbeat error
@@ -272,16 +292,16 @@ if systemd_user_available; then
 
   if [[ $gateway_ready -eq 1 ]]; then
     if systemctl --user enable --now "$GW_UNIT" >/dev/null 2>&1; then
-      gw_active_result="$(systemctl_user_unit_state is-active "$GW_UNIT")"
-      gw_enabled_result="$(systemctl_user_unit_state is-enabled "$GW_UNIT")"
-      if [[ "$gw_active_result" == "ok|active" \
-         && "$gw_enabled_result" =~ ^ok\|(enabled|enabled-runtime)$ ]]; then
+      if gw_health="$(systemd_wait_for_stable_health \
+          systemd_service_health_snapshot "$GW_UNIT" running)"; then
         yaml_upsert_block_value service_state gateway active
-        log "    credentialed gateway enabled + active: $GW_UNIT"
+        log "    credentialed gateway enabled + active and stabilized: $GW_UNIT"
       else
+        systemctl --user disable --now "$GW_UNIT" >/dev/null 2>&1 || true
+        systemctl --user reset-failed "$GW_UNIT" >/dev/null 2>&1 || true
         yaml_upsert_block_value service_state gateway error
         clear_done 70-systemd
-        die "credentialed gateway did not become enabled + active ($gw_enabled_result, $gw_active_result)"
+        die "credentialed gateway did not stabilize healthy: $gw_health"
       fi
     else
       yaml_upsert_block_value service_state gateway error
@@ -292,16 +312,14 @@ if systemd_user_available; then
     systemctl --user disable --now "$GW_UNIT" >/dev/null 2>&1 \
       || die "could not enforce deferred gateway disablement: $GW_UNIT"
     systemctl --user reset-failed "$GW_UNIT" >/dev/null 2>&1 || true
-    gw_active_result="$(systemctl_user_unit_state is-active "$GW_UNIT")"
-    gw_enabled_result="$(systemctl_user_unit_state is-enabled "$GW_UNIT")"
-    if [[ "$gw_active_result" == "ok|inactive" \
-       && "$gw_enabled_result" =~ ^ok\|(disabled|masked|masked-runtime)$ ]]; then
+    gw_deferred_health="$(systemd_gateway_deferred_snapshot "$GW_UNIT")"
+    if [[ "$gw_deferred_health" == "ok|deferred" ]]; then
       yaml_upsert_block_value service_state gateway deferred
       log "    gateway deferred: disabled + inactive until a channel credential is verified"
     else
       yaml_upsert_block_value service_state gateway error
       clear_done 70-systemd
-      die "gateway deferral was not proven disabled + inactive ($gw_enabled_result, $gw_active_result)"
+      die "gateway deferral was not proven disabled + inactive ($gw_deferred_health)"
     fi
   fi
 else

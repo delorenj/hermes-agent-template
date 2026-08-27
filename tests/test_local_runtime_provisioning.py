@@ -5,6 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).parents[1]
 PROFILE_SCRIPT = ROOT / "template" / ".scripts" / "10-hermes-profile.sh"
@@ -50,7 +52,7 @@ runtime:
     profiles = home / ".hermes" / "profiles"
     profiles.mkdir(parents=True)
     (home / ".hermes" / "config.yaml").write_text(
-        "plugins:\n  enabled:\n    - tts/voxxy\n"
+        "plugins:\n  enabled:\n    - fleet/core-one\n    - tts/voxxy\n"
         "tts:\n  provider: voxxy\n  voice: rick\n",
         encoding="utf-8",
     )
@@ -219,9 +221,45 @@ def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> N
     assert (profile / "plugins" / "tts" / "vox").resolve() == plugin.resolve()
     generated = (profile / "config.yaml").read_text(encoding="utf-8")
     assert "tts/voxxy" not in generated
+    assert "fleet/core-one" in generated
     assert "provider: vox\n" in generated
     assert "voice: carlin\n" in generated
     assert not Path(env["HERMES_LOG"]).exists()
+
+    delta_path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
+    assert "plugins" not in delta
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
+        "add": ["tts/vox"],
+        "remove": ["tts/voxxy"],
+    }
+
+    fleet_base = Path(env["HOME"]) / ".hermes" / "config.yaml"
+    fleet_base.write_text(
+        "plugins:\n  enabled:\n    - fleet/core-two\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: rick\n",
+        encoding="utf-8",
+    )
+    rerun = _run(role, env)
+    assert rerun.returncode == 0, rerun.stderr
+    rerendered = (profile / "config.yaml").read_text(encoding="utf-8")
+    assert "fleet/core-two" in rerendered
+    assert "fleet/core-one" not in rerendered
+    assert "tts/voxxy" not in rerendered
+
+    delta["plugins"] = {"enabled": ["operator/only"]}
+    delta_path.write_text(
+        "# operator exclusion must survive\n"
+        + yaml.safe_dump(delta, sort_keys=False),
+        encoding="utf-8",
+    )
+    excluded = _run(role, env)
+    assert excluded.returncode == 0, excluded.stderr
+    excluded_generated = yaml.safe_load(
+        (profile / "config.yaml").read_text(encoding="utf-8")
+    )
+    assert excluded_generated["plugins"]["enabled"] == ["operator/only", "tts/vox"]
+    assert "# operator exclusion must survive" in delta_path.read_text(encoding="utf-8")
 
 
 def test_step20_preserves_shared_config_behind_profile_symlink(tmp_path: Path) -> None:

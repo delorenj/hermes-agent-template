@@ -49,6 +49,11 @@ PYEOF
 }
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+slack_status="$(yaml_get slack.provisioning_status)"
+if [[ "$slack_status" != "verified" ]]; then
+  profile_channel_enabled_set "$PROFILE_HOME" slack false \
+    || die "Slack could not be disabled in the profile override"
+fi
 
 truthy() {
   case "${1,,}" in
@@ -57,27 +62,41 @@ truthy() {
   esac
 }
 
-if [[ "${SKIP_SLACK:-0}" == "1" ]]; then
-  if [[ "$(yaml_get slack.provisioning_status)" == "verified" ]] \
-     && already_done 31-slack \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN; then
-    log "[31] slack — SKIPPED; existing verified 1Password wiring preserved"
-  else
-    slack_yaml_update provisioning_status deferred
-    clear_done 31-slack
-    log "[31] slack — DEFERRED (SKIP_SLACK=1; no verified 1Password reference pair)"
+# Preserve and reconcile durable wiring across transient 1Password outages.
+# An explicit token remains an intentional rotation request and bypasses this
+# adoption path.
+if [[ -z "${SLACK_BOT_TOKEN:-}" && -z "${SLACK_APP_TOKEN:-}" \
+      && "$slack_status" == "verified" ]] \
+   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_BOT_TOKEN \
+   && profile_onepassword_ref_exists "$PROFILE_HOME" SLACK_APP_TOKEN; then
+  slack_bot_reference_rc=0
+  slack_app_reference_rc=0
+  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
+    || slack_bot_reference_rc=$?
+  profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN \
+    || slack_app_reference_rc=$?
+  if [[ $slack_bot_reference_rc -eq 0 && $slack_app_reference_rc -eq 0 ]]; then
+    profile_channel_enabled_set "$PROFILE_HOME" slack true \
+      || die "Slack could not be enabled in the profile override"
+    mark_done 31-slack
+    log "[31] slack — existing verified 1Password wiring reconciled"
+    exit 0
   fi
+  if [[ $slack_bot_reference_rc -eq 75 || $slack_app_reference_rc -eq 75 ]]; then
+    die "Slack 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+  fi
+fi
+
+if [[ "${SKIP_SLACK:-0}" == "1" ]]; then
+  profile_channel_enabled_set "$PROFILE_HOME" slack false \
+    || die "Slack could not be disabled in the profile override"
+  slack_yaml_update provisioning_status deferred
+  clear_done 31-slack
+  log "[31] slack — DEFERRED (SKIP_SLACK=1; no verified 1Password reference pair)"
   exit 0
 fi
 
 if already_done 31-slack; then
-  if [[ "$(yaml_get slack.provisioning_status)" == "verified" ]] \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN; then
-    log "[31] slack already wired through verified 1Password references — skipping"
-    exit 0
-  fi
   clear_done 31-slack
   log "[31] stale Slack completion marker cleared — reconciling credentials"
 fi
@@ -88,6 +107,8 @@ have_app=0
 [[ -n "$SLACK_APP_TOKEN" ]] && have_app=1
 
 if ! truthy "${ENABLE_SLACK:-0}" && (( ! have_bot && ! have_app )); then
+  profile_channel_enabled_set "$PROFILE_HOME" slack false \
+    || die "Slack could not be disabled in the profile override"
   slack_yaml_update provisioning_status deferred
   log "[31] slack — deferred (opt in with ENABLE_SLACK=1 or supply both Slack tokens)"
   exit 0
@@ -110,8 +131,8 @@ fi
 
 [[ -n "$SLACK_BOT_TOKEN" && -n "$SLACK_APP_TOKEN" ]] \
   || die "Slack provisioning requires both SLACK_BOT_TOKEN and SLACK_APP_TOKEN"
-[[ "$SLACK_BOT_TOKEN" == xoxb-* ]] || die "SLACK_BOT_TOKEN must be a Bot User OAuth token (xoxb-...)"
-[[ "$SLACK_APP_TOKEN" == xapp-* ]] || die "SLACK_APP_TOKEN must be an App-Level Socket Mode token (xapp-...)"
+[[ "$SLACK_BOT_TOKEN" =~ ^xoxb-[A-Za-z0-9-]+$ ]] || die "SLACK_BOT_TOKEN must be a Bot User OAuth token (xoxb-...)"
+[[ "$SLACK_APP_TOKEN" =~ ^xapp-[A-Za-z0-9-]+$ ]] || die "SLACK_APP_TOKEN must be an App-Level Socket Mode token (xapp-...)"
 
 SLACK_ALLOWED_USERS="${SLACK_ALLOWED_USERS//[[:space:]]/}"
 if [[ -n "$SLACK_ALLOWED_USERS" && "$SLACK_ALLOWED_USERS" != "*" \
@@ -125,10 +146,12 @@ mkdir -p "$RUNTIME"
 [[ ! -L "$ENVF" ]] || die "refusing to write Slack credentials through symlink: $ENVF"
 
 log "[31] verifying Slack bot identity via auth.test"
-auth_response=$(curl -fsS \
-  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -X POST "https://slack.com/api/auth.test") \
+auth_response="$({
+  printf '%s\n' 'url = "https://slack.com/api/auth.test"'
+  printf 'header = "Authorization: Bearer %s"\n' "$SLACK_BOT_TOKEN"
+  printf '%s\n' 'header = "Content-Type: application/x-www-form-urlencoded"'
+  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error'
+} | curl --config -)" \
   || die "Slack auth.test request failed"
 
 identity=$(printf '%s' "$auth_response" | python3 -c '
@@ -151,12 +174,12 @@ IFS=$'\t' read -r slack_team_id slack_team_name slack_bot_user_id slack_bot_id s
 # Reject credential reuse, token rotation onto an identity owned by another
 # agent, and credentials parked in shared env files. The scan, durable identity
 # claim, and profile credential write share one fleet-wide flock.
-export SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS
 fleet_lock_acquire
 trap 'fleet_lock_release' EXIT
-python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" \
+python3 /dev/fd/3 "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" \
   "$slack_team_id" "$slack_bot_user_id" "$slack_bot_id" \
-  "$ROLE_DIR" "$PROFILE_NAME" "$slack_team_name" "$slack_bot_username" <<'PYEOF'
+  "$ROLE_DIR" "$PROFILE_NAME" "$slack_team_name" "$slack_bot_username" \
+  3<<'PYEOF' <<<"${SLACK_BOT_TOKEN}"$'\n'"${SLACK_APP_TOKEN}"
 import errno
 import os
 import pathlib
@@ -181,8 +204,10 @@ except ImportError:
     team_name,
     bot_username,
 ) = sys.argv[1:]
-bot_token = os.environ["SLACK_BOT_TOKEN"]
-app_token = os.environ["SLACK_APP_TOKEN"]
+credential_lines = sys.stdin.read().splitlines()
+if len(credential_lines) != 2 or not all(credential_lines):
+    raise SystemExit("Slack ownership scan received an invalid credential pair")
+bot_token, app_token = credential_lines
 target = pathlib.Path(target_path).resolve(strict=False)
 
 def env_values(path):
@@ -315,9 +340,12 @@ profile_onepassword_ref_set "$PROFILE_HOME" SLACK_BOT_TOKEN "$slack_bot_referenc
   || die "Slack bot 1Password reference could not be mapped into the named profile"
 profile_onepassword_ref_set "$PROFILE_HOME" SLACK_APP_TOKEN "$slack_app_reference" \
   || die "Slack app 1Password reference could not be mapped into the named profile"
+profile_channel_enabled_set "$PROFILE_HOME" slack true \
+  || die "Slack could not be enabled in the profile override"
 
 # Keep only the non-secret allow-list in runtime/.env and scrub literals left
 # by any older template.
+export SLACK_ALLOWED_USERS
 python3 - "$ENVF" <<'PYEOF'
 import errno
 import json

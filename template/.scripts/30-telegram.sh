@@ -48,25 +48,41 @@ PYEOF
 
 telegram_status="$(yaml_get telegram.provisioning_status)"
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+if [[ "$telegram_status" != "verified" ]]; then
+  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
+    || die "Telegram could not be disabled in the profile override"
+fi
+
+# A valid durable mapping survives a transient 1Password outage.  If the
+# caller did not explicitly supply a rotation value, adopt/revalidate the
+# existing wiring even when an old run lost its done marker.
+if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && "$telegram_status" == "verified" ]] \
+   && profile_onepassword_ref_exists "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
+  telegram_reference_rc=0
+  profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN \
+    || telegram_reference_rc=$?
+  if [[ $telegram_reference_rc -eq 0 ]]; then
+    profile_channel_enabled_set "$PROFILE_HOME" telegram true \
+      || die "Telegram could not be enabled in the profile override"
+    mark_done 30-telegram
+    log "[30] telegram — existing verified 1Password wiring reconciled"
+    exit 0
+  fi
+  if [[ $telegram_reference_rc -eq 75 ]]; then
+    die "Telegram 1Password reference validation is temporarily unavailable; preserved existing verified wiring for retry"
+  fi
+fi
 
 if [[ "${SKIP_TELEGRAM:-0}" == "1" ]]; then
-  if [[ "$telegram_status" == "verified" ]] && already_done 30-telegram \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
-    log "[30] telegram — SKIPPED; existing verified wiring preserved"
-  else
-    telegram_yaml_update provisioning_status deferred
-    clear_done 30-telegram
-    log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; no verified 1Password reference)"
-  fi
+  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
+    || die "Telegram could not be disabled in the profile override"
+  telegram_yaml_update provisioning_status deferred
+  clear_done 30-telegram
+  log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; no verified 1Password reference)"
   exit 0
 fi
 
 if already_done 30-telegram; then
-  if [[ "$telegram_status" == "verified" ]] \
-     && profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
-    log "[30] telegram already wired through a verified 1Password reference — skipping"
-    exit 0
-  fi
   clear_done 30-telegram
   log "[30] stale deferred completion marker cleared — reconciling Telegram"
 fi
@@ -96,6 +112,8 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" && -t 0 ]]; then
 fi
 
 if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+  profile_channel_enabled_set "$PROFILE_HOME" telegram false \
+    || die "Telegram could not be disabled in the profile override"
   telegram_yaml_update provisioning_status deferred
   clear_done 30-telegram
   warn "    no token provided; Telegram step deferred"
@@ -104,11 +122,16 @@ if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ]]; then
 fi
 
 # Sanity check
-if [[ ! "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:.+ ]]; then
+if [[ ! "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]]; then
   die "token doesn't look like a Telegram bot token"
 fi
 log "    verifying token..."
-info=$(curl -fsS "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getMe") \
+# Keep the credential out of process argv and environment. curl reads its
+# complete request description from an anonymous stdin pipe.
+info="$({
+  printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$TELEGRAM_BOT_TOKEN"
+  printf '%s\n' 'fail' 'silent' 'show-error'
+} | curl --config -)" \
   || die "Telegram getMe request failed"
 identity=$(printf '%s' "$info" | python3 -c '
 import json, sys
@@ -141,11 +164,11 @@ fi
 # Reject token reuse, token rotation onto an identity owned by another agent,
 # and credentials parked in shared fleet/root env files. The scan, durable
 # identity claim, and profile credential write share one fleet-wide flock.
-export TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS
 fleet_lock_acquire
 trap 'fleet_lock_release' EXIT
-python3 - "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" "$bot_id" \
-  "$ROLE_DIR" "$PROFILE_NAME" "$bot_username" <<'PYEOF'
+python3 /dev/fd/3 "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" "$bot_id" \
+  "$ROLE_DIR" "$PROFILE_NAME" "$bot_username" \
+  3<<'PYEOF' <<<"$TELEGRAM_BOT_TOKEN"
 import errno
 import os
 import pathlib
@@ -167,7 +190,11 @@ except ImportError:
     profile_name,
     bot_username,
 ) = sys.argv[1:]
-token = os.environ["TELEGRAM_BOT_TOKEN"]
+token = sys.stdin.read()
+if token.endswith("\n"):
+    token = token[:-1]
+if not token:
+    raise SystemExit("Telegram ownership scan received no credential")
 target = pathlib.Path(target_path).resolve(strict=False)
 
 def env_token(path):
@@ -284,6 +311,8 @@ telegram_reference="$(store_onepassword_secret \
   || die "Telegram credential could not be stored in 1Password"
 profile_onepassword_ref_set "$PROFILE_HOME" TELEGRAM_BOT_TOKEN "$telegram_reference" \
   || die "Telegram 1Password reference could not be mapped into the named profile"
+profile_channel_enabled_set "$PROFILE_HOME" telegram true \
+  || die "Telegram could not be enabled in the profile override"
 
 # Keep only the non-secret allow-list in the ignored runtime env, and remove a
 # stale literal token if an older template ever wrote one here.

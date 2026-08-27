@@ -68,12 +68,19 @@ def _fake_curl(tmp_path: Path) -> Path:
     curl.write_text(
         """#!/usr/bin/env python3
 import json
+import pathlib
+import re
 import sys
 
-args = sys.argv[1:]
-assert "https://slack.com/api/auth.test" in args
-header = args[args.index("-H") + 1]
-assert header.startswith("Authorization: Bearer xoxb-")
+assert sys.argv[1:] == ["--config", "-"]
+config = sys.stdin.read()
+assert 'url = "https://slack.com/api/auth.test"' in config
+match = re.search(r'Authorization: Bearer ([A-Za-z0-9-]+)', config)
+assert match
+token = match.group(1)
+assert token.startswith("xoxb-")
+assert token.encode() not in pathlib.Path("/proc/self/cmdline").read_bytes()
+assert token.encode() not in pathlib.Path("/proc/self/environ").read_bytes()
 print(json.dumps({
     "ok": True,
     "team_id": "T123",
@@ -118,7 +125,10 @@ def _run(
     fleet_home = home / ".hermes"
     profile = fleet_home / "profiles" / profile_name
     profile.mkdir(parents=True, exist_ok=True)
-    (fleet_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
+    (fleet_home / "config.yaml").write_text(
+        "plugins: {}\nplatforms:\n  slack:\n    enabled: true\n",
+        encoding="utf-8",
+    )
     delta = profile / "config.delta.yaml"
     if not delta.exists():
         delta.write_text("{}\n", encoding="utf-8")
@@ -150,6 +160,10 @@ def test_slack_is_deferred_by_default_and_ignores_shared_fleet_tokens(tmp_path: 
     assert not (runtime / ".env").exists()
     assert not (role / ".scripts" / ".done-31-slack").exists()
     assert "xoxb-shared" in fleet.read_text(encoding="utf-8")
+    generated = home / ".hermes" / "profiles" / "demo-pm" / "config.yaml"
+    assert yaml.safe_load(generated.read_text(encoding="utf-8"))["platforms"][
+        "slack"
+    ]["enabled"] is False
 
 
 def test_explicit_noninteractive_enable_requires_both_tokens(tmp_path: Path) -> None:
@@ -211,6 +225,7 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
     assert APP_TOKEN not in delta_text
     generated = (profile / "config.yaml").read_text(encoding="utf-8")
     assert BOT_TOKEN not in generated and APP_TOKEN not in generated
+    assert yaml.safe_load(generated)["platforms"]["slack"]["enabled"] is True
 
     slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
     assert slack == {
@@ -221,6 +236,50 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
         "bot_id": "B123BOT",
         "bot_username": "demo-pm",
     }
+
+
+def test_transient_onepassword_outage_preserves_verified_slack_wiring_and_recovers(
+    tmp_path: Path,
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+
+    first = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+    assert first.returncode == 0, first.stderr
+
+    role_before = (role / "role.yaml").read_bytes()
+    delta_path = home / ".hermes" / "profiles" / "demo-pm" / "config.delta.yaml"
+    delta_before = delta_path.read_bytes()
+    marker = role / ".scripts" / ".done-31-slack"
+    assert marker.is_file()
+
+    (home / ".fake-onepassword-outage").touch()
+    outage = _run(role, registry, home, bindir)
+
+    assert outage.returncode != 0
+    assert "temporarily unavailable" in outage.stderr
+    assert (role / "role.yaml").read_bytes() == role_before
+    assert delta_path.read_bytes() == delta_before
+    assert marker.is_file()
+    assert BOT_TOKEN not in outage.stdout + outage.stderr
+    assert APP_TOKEN not in outage.stdout + outage.stderr
+
+    (home / ".fake-onepassword-outage").unlink()
+    recovered = _run(role, registry, home, bindir)
+
+    assert recovered.returncode == 0, recovered.stderr
+    assert "existing verified 1Password wiring reconciled" in recovered.stderr
+    assert (role / "role.yaml").read_bytes() == role_before
+    assert delta_path.read_bytes() == delta_before
+    assert marker.is_file()
 
 
 def test_rejects_reused_pair_without_disclosing_tokens(tmp_path: Path) -> None:
