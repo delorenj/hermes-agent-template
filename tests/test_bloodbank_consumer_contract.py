@@ -438,13 +438,15 @@ case "$*" in
   *"is-system-running"*) echo running; exit 0 ;;
   *"daemon-reload"*) exit 0 ;;
   *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
+  *"start hermes-demo-pm-heartbeat.service"*) exit 0 ;;
   *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
   *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.timer"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.service"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
+      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
   *"disable --now hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"reset-failed hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo inactive; exit 3 ;;
@@ -477,6 +479,84 @@ exit 1
     states = role_data["service_state"]
     assert states == {"gateway": "deferred", "heartbeat": "active"}
     assert role_data["reconcile"] == {"enabled": True, "explicit_opt_out": False}
+
+
+def test_heartbeat_delayed_exit_78_is_observed_across_full_stabilization_window(
+    tmp_path: Path,
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    env.update(
+        {
+            "SYSTEMD_STABILIZATION_ATTEMPTS": "6",
+            "SYSTEMD_STABLE_SAMPLES": "3",
+            "SYSTEMD_STABILIZATION_INTERVAL_SECONDS": "0",
+        }
+    )
+    marker = role / ".scripts" / ".done-70-systemd"
+    marker.touch()
+    shutil.copy2(SCRIPTS / "99-summary.sh", role / ".scripts" / "99-summary.sh")
+    fake_bin = tmp_path / "delayed-failure-bin"
+    fake_bin.mkdir()
+    samples = tmp_path / "heartbeat-samples"
+    systemctl = fake_bin / "systemctl"
+    systemctl.write_text(
+        """#!/usr/bin/env bash
+case "$*" in
+  *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
+  *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
+  *"is-system-running"*) echo running; exit 0 ;;
+  *"daemon-reload"*) exit 0 ;;
+  *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
+  *"start hermes-demo-pm-heartbeat.service"*) exit 0 ;;
+  *"disable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
+  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.timer"*)
+    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
+  *"show hermes-demo-pm-heartbeat.service"*)
+    count=0
+    [[ ! -f "$HEARTBEAT_SAMPLES" ]] || count="$(cat "$HEARTBEAT_SAMPLES")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$HEARTBEAT_SAMPLES"
+    if (( count <= 3 )); then
+      printf '%s\n' 'LoadState=loaded' 'ActiveState=activating' 'SubState=start' \
+        'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
+        'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=0'
+    else
+      printf '%s\n' 'LoadState=loaded' 'ActiveState=failed' 'SubState=failed' \
+        'Result=exit-code' 'ExecMainStatus=78' 'NRestarts=1' \
+        'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=400'
+    fi
+    exit 0 ;;
+esac
+exit 1
+""",
+        encoding="utf-8",
+    )
+    systemctl.chmod(0o755)
+    env.update(
+        {
+            "PATH": f"{fake_bin}:{env['PATH']}",
+            "HEARTBEAT_SAMPLES": str(samples),
+        }
+    )
+
+    result = _run(role, "70-systemd.sh", env)
+
+    assert result.returncode != 0
+    assert "heartbeat did not stabilize healthy" in result.stderr
+    assert "status=78" in result.stderr
+    assert samples.read_text(encoding="utf-8").strip() == "6"
+    role_data = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
+    assert role_data["service_state"]["heartbeat"] == "error"
+    assert role_data["service_state"]["gateway"] != "active"
+    assert not marker.exists()
+
+    summary = _run(role, "99-summary.sh", env)
+    assert summary.returncode == 0, summary.stderr
+    assert "Mode:           INCOMPLETE" in summary.stderr
+    assert "Mode:           OPERATIONAL" not in summary.stderr
 
 
 def test_gateway_that_exits_78_never_persists_or_summarizes_as_operational(
@@ -523,13 +603,15 @@ case "$*" in
   *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
   *"is-system-running"*) echo running; exit 0 ;;
   *"daemon-reload"*|*"enable --now"*|*"disable --now"*|*"reset-failed"*) exit 0 ;;
+  *"start hermes-demo-pm-heartbeat.service"*) exit 0 ;;
   *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
   *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.timer"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.service"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
+      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo active; exit 0 ;;
   *"is-enabled hermes-demo-pm-gateway.service"*) echo enabled; exit 0 ;;
   *"show hermes-demo-pm-gateway.service"*)

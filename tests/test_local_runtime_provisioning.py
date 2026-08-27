@@ -262,6 +262,68 @@ def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> N
     assert "# operator exclusion must survive" in delta_path.read_text(encoding="utf-8")
 
 
+def test_profile_voice_update_thaws_legacy_frozen_plugin_snapshot(
+    tmp_path: Path,
+) -> None:
+    _project, role, env = _fixture(tmp_path)
+    plugin = tmp_path / "vox-plugin"
+    plugin.mkdir()
+    env["VOX_PLUGIN_DIR"] = str(plugin)
+    fleet_home = Path(env["HOME"]) / ".hermes"
+    profile = fleet_home / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
+    delta_path = profile / "config.delta.yaml"
+    delta_path.write_text(
+        "# retain local voice note\n"
+        "plugins:\n"
+        "  enabled:\n"
+        "    - fleet/core-one\n"
+        "    - operator/extra\n"
+        "    - tts/vox\n"
+        "  local_metadata: keep\n"
+        "tts:\n"
+        "  provider: vox\n"
+        "  voice: carlin\n"
+        "  vox:\n"
+        "    voice: carlin\n",
+        encoding="utf-8",
+    )
+    (profile / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - fleet/core-one\n    - operator/extra\n    - tts/vox\n"
+        "tts:\n  provider: vox\n  voice: carlin\n  vox:\n    voice: carlin\n",
+        encoding="utf-8",
+    )
+
+    first = _run(role, env)
+    assert first.returncode == 0, first.stderr
+    delta_text = delta_path.read_text(encoding="utf-8")
+    delta = yaml.safe_load(delta_text)
+    assert delta["plugins"] == {"local_metadata": "keep"}
+    assert delta["x-pjangler-merge"]["migrations"][
+        "plugins_enabled_snapshot_thawed"
+    ] is True
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
+        "add": ["operator/extra", "tts/vox"],
+        "remove": ["tts/voxxy"],
+    }
+    assert "# retain local voice note" in delta_text
+
+    (fleet_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - fleet/core-two\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: newer\n",
+        encoding="utf-8",
+    )
+    second = _run(role, env)
+    assert second.returncode == 0, second.stderr
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["plugins"]["enabled"] == [
+        "fleet/core-two",
+        "operator/extra",
+        "tts/vox",
+    ]
+    assert "fleet/core-one" not in generated["plugins"]["enabled"]
+
+
 def test_step20_preserves_shared_config_behind_profile_symlink(tmp_path: Path) -> None:
     _project, role, env = _fixture(tmp_path)
     role_yaml = role / "role.yaml"

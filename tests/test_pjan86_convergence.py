@@ -332,7 +332,8 @@ case "$*" in
     printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.service"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
+      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo inactive; exit 3 ;;
   *"is-enabled hermes-demo-pm-gateway.service"*) echo disabled; exit 1 ;;
 esac
@@ -392,7 +393,8 @@ case "$*" in
     printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
   *"show hermes-demo-pm-heartbeat.service"*)
     printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0'; exit 0 ;;
+      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
+      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo active; exit 0 ;;
   *"is-enabled hermes-demo-pm-gateway.service"*) echo enabled; exit 0 ;;
   *"show hermes-demo-pm-gateway.service"*)

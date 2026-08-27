@@ -171,6 +171,34 @@ print("\t".join(str(v).replace("\t", " ").replace("\n", " ") for v in values))
 ') || die "Slack bot identity verification failed"
 IFS=$'\t' read -r slack_team_id slack_team_name slack_bot_user_id slack_bot_id slack_bot_username <<< "$identity"
 
+# Socket Mode requires a separately authenticated app-level token. A valid bot
+# token says nothing about the xapp credential, so prove that credential can
+# open a connection before claiming ownership or persisting either secret. The
+# token and Slack's returned WebSocket URL stay on anonymous pipes: neither is
+# exposed through curl argv, child environments, logs, or durable files.
+log "[31] verifying Slack Socket Mode app token via apps.connections.open"
+if ! {
+  printf '%s\n' 'url = "https://slack.com/api/apps.connections.open"'
+  printf 'header = "Authorization: Bearer %s"\n' "$SLACK_APP_TOKEN"
+  printf '%s\n' 'header = "Content-Type: application/x-www-form-urlencoded"'
+  printf '%s\n' 'request = "POST"' 'fail' 'silent' 'show-error'
+} | curl --config - | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    raise SystemExit("Slack apps.connections.open returned an invalid response")
+if not isinstance(data, dict) or not data.get("ok"):
+    error = str(data.get("error") if isinstance(data, dict) else "unknown_error")
+    safe = "".join(c for c in error if c.isalnum() or c in "_-." )[:80]
+    raise SystemExit("Slack apps.connections.open rejected the app token ({})".format(safe or "unknown_error"))
+url = data.get("url")
+if not isinstance(url, str) or not url.startswith("wss://"):
+    raise SystemExit("Slack apps.connections.open response omitted a Socket Mode URL")
+'; then
+  die "Slack Socket Mode app-token verification failed"
+fi
+
 # Reject credential reuse, token rotation onto an identity owned by another
 # agent, and credentials parked in shared env files. The scan, durable identity
 # claim, and profile credential write share one fleet-wide flock.

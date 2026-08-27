@@ -274,6 +274,15 @@ UNIT
 if systemd_user_available; then
   systemctl --user daemon-reload
   if systemctl --user enable --now "$HB_TIMER" >/dev/null 2>&1; then
+    # The timer's first scheduled tick can be a minute away. Run the oneshot
+    # once now so deployment proves the heartbeat command itself completed;
+    # timer activity alone is not an operational postcondition.
+    if ! systemctl --user start "$HB_SVC" >/dev/null 2>&1; then
+      systemctl --user disable --now "$HB_TIMER" >/dev/null 2>&1 || true
+      yaml_upsert_block_value service_state heartbeat error
+      clear_done 70-systemd
+      die "required heartbeat oneshot failed its deployment probe: $HB_SVC"
+    fi
     if hb_health="$(systemd_wait_for_stable_health \
         systemd_timer_health_snapshot "$HB_TIMER" "$HB_SVC")"; then
       yaml_upsert_block_value service_state heartbeat active

@@ -682,22 +682,50 @@ PYEOF
     # updating the override source, then rerender; never mutate generated
     # config.yaml through `hermes config set`.
     if [[ $VOX_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
-      config_status="$(python3 - "$profile_dir/config.yaml" "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
+      config_status="$(python3 - "$profile_dir/config.yaml" "$profile_dir/config.delta.yaml" \
+          "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
 import pathlib, sys
-
-path = pathlib.Path(sys.argv[1])
-plugin, voice = sys.argv[2], sys.argv[3]
-if not path.exists():
-    print('missing')
+try:
+    import yaml
+except ImportError:
+    print("invalid|invalid|invalid|invalid")
     raise SystemExit(0)
-text = path.read_text()
-provider = 'ok' if f'provider: {plugin}' in text else 'other'
-enabled = 'ok' if f'tts/{plugin}' in text else 'no'
-voice_ok = 'ok' if f'voice: {voice}' in text else 'other'
-print(f'{provider}|{enabled}|{voice_ok}')
+
+path, delta_path = map(pathlib.Path, sys.argv[1:3])
+plugin, voice = sys.argv[3:5]
+if not path.is_file() or path.is_symlink():
+    print("missing|missing|missing|missing")
+    raise SystemExit(0)
+try:
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8")) or {}
+except Exception:
+    print("invalid|invalid|invalid|invalid")
+    raise SystemExit(0)
+if not isinstance(config, dict) or not isinstance(delta, dict):
+    print("invalid|invalid|invalid|invalid")
+    raise SystemExit(0)
+plugins = config.get("plugins") or {}
+if isinstance(plugins, dict):
+    enabled_values = plugins.get("enabled") or []
+else:
+    enabled_values = []
+tts = config.get("tts") or {}
+if not isinstance(tts, dict):
+    tts = {}
+provider = "ok" if tts.get("provider") == plugin else "other"
+enabled = "ok" if isinstance(enabled_values, list) and f"tts/{plugin}" in enabled_values else "no"
+provider_config = tts.get(plugin) or {}
+actual_voice = provider_config.get("voice") if isinstance(provider_config, dict) else None
+actual_voice = actual_voice or tts.get("voice")
+voice_ok = "ok" if actual_voice == voice else "other"
+delta_plugins = delta.get("plugins") or {}
+explicit = delta_plugins.get("enabled") if isinstance(delta_plugins, dict) else None
+legacy = "legacy" if isinstance(explicit, list) and f"tts/{plugin}" in explicit else "ok"
+print(f"{provider}|{enabled}|{voice_ok}|{legacy}")
 PYEOF
 )"
-      if [[ "$config_status" != "ok|ok|ok" ]]; then
+      if [[ "$config_status" != "ok|ok|ok|ok" ]]; then
         if [[ "$APPLY" -eq 1 ]]; then
           if python3 - "$FLEET_HOME/config.yaml" "$profile_dir/config.delta.yaml" \
               "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
@@ -732,6 +760,35 @@ removals = patch.setdefault("remove", [])
 if not isinstance(additions, list) or not isinstance(removals, list):
     raise SystemExit("plugins.enabled list patch values must be lists")
 role_plugin = f"tts/{plugin}"
+if not all(isinstance(entry, str) for entry in [*additions, *removals]):
+    raise SystemExit("plugins.enabled list patch values must be string lists")
+explicit_enabled = plugins.get("enabled")
+if isinstance(explicit_enabled, list) and role_plugin in explicit_enabled:
+    if not all(isinstance(entry, str) for entry in explicit_enabled):
+        raise SystemExit("plugins.enabled delta must contain strings")
+    base_plugins = base.get("plugins") or {}
+    if not isinstance(base_plugins, dict):
+        raise SystemExit("base plugins must be a mapping")
+    base_enabled = base_plugins.get("enabled") or []
+    if not isinstance(base_enabled, list) or not all(
+        isinstance(entry, str) for entry in base_enabled
+    ):
+        raise SystemExit("base plugins.enabled must be a string list")
+    for entry in explicit_enabled:
+        if (
+            entry not in base_enabled
+            and entry not in {role_plugin, "tts/voxxy"}
+            and entry not in removals
+            and entry not in additions
+        ):
+            additions.append(entry)
+    plugins.pop("enabled")
+    if not plugins:
+        delta.pop("plugins", None)
+    migrations = directives.setdefault("migrations", {})
+    if not isinstance(migrations, dict):
+        raise SystemExit("x-pjangler-merge.migrations delta must be a mapping")
+    migrations["plugins_enabled_snapshot_thawed"] = True
 additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
 additions.append(role_plugin)
 removals[:] = [entry for entry in removals if entry != role_plugin]

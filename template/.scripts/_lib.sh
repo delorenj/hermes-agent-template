@@ -343,6 +343,41 @@ elif mode == "voice":
     if not isinstance(additions, list) or not isinstance(removals, list):
         raise SystemExit("plugins.enabled list patch values must be lists")
     role_plugin = f"tts/{name}"
+    if not all(isinstance(entry, str) for entry in [*additions, *removals]):
+        raise SystemExit("plugins.enabled list patch values must be string lists")
+
+    # 52d9445 materialized base plugins into the profile delta. Recognize that
+    # generated legacy shape by its role-owned Vox entry, remove the replacement
+    # list, and retain only entries that were not inherited from the current
+    # fleet base as additive operator/role intent. Explicit operator replacement
+    # lists without the generated Vox member remain untouched.
+    explicit_enabled = plugins.get("enabled")
+    if isinstance(explicit_enabled, list) and role_plugin in explicit_enabled:
+        if not all(isinstance(entry, str) for entry in explicit_enabled):
+            raise SystemExit("plugins.enabled delta must contain strings")
+        base_plugins = base.get("plugins") or {}
+        if not isinstance(base_plugins, dict):
+            raise SystemExit("base plugins must be a mapping")
+        base_enabled = base_plugins.get("enabled") or []
+        if not isinstance(base_enabled, list) or not all(
+            isinstance(entry, str) for entry in base_enabled
+        ):
+            raise SystemExit("base plugins.enabled must be a string list")
+        for entry in explicit_enabled:
+            if (
+                entry not in base_enabled
+                and entry not in {role_plugin, "tts/voxxy"}
+                and entry not in removals
+                and entry not in additions
+            ):
+                additions.append(entry)
+        plugins.pop("enabled")
+        if not plugins:
+            delta.pop("plugins", None)
+        migrations = directives.setdefault("migrations", {})
+        if not isinstance(migrations, dict):
+            raise SystemExit(f"{LIST_PATCH_KEY}.migrations delta must be a mapping")
+        migrations["plugins_enabled_snapshot_thawed"] = True
     additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
     additions.append(role_plugin)
     removals[:] = [entry for entry in removals if entry != role_plugin]
@@ -742,6 +777,7 @@ systemd_timer_health_snapshot() {
   local load_state="" active_state="" sub_state="" key value
   local svc_shown svc_payload svc_load="" svc_active="" svc_sub=""
   local svc_result="" svc_status="" svc_restarts=""
+  local svc_started="" svc_exited=""
   active="$(systemctl_user_unit_state is-active "$timer")"
   enabled="$(systemctl_user_unit_state is-enabled "$timer")"
   [[ "$active" == "ok|active" ]] \
@@ -765,7 +801,9 @@ systemd_timer_health_snapshot() {
   # Inspect the latest oneshot result separately from the timer.  An inactive
   # (dead) service with Result=success/ExecMainStatus=0 is the healthy steady
   # state between ticks; failed/78 is never accepted.
-  svc_shown="$(systemctl_user_show "$service" LoadState ActiveState SubState Result ExecMainStatus NRestarts)"
+  svc_shown="$(systemctl_user_show "$service" LoadState ActiveState SubState Result \
+    ExecMainStatus NRestarts ExecMainStartTimestampMonotonic \
+    ExecMainExitTimestampMonotonic)"
   [[ "$svc_shown" == ok\|* ]] || { printf '%s' "$svc_shown"; return 0; }
   svc_payload="${svc_shown#ok|}"
   while IFS='=' read -r key value; do
@@ -776,15 +814,27 @@ systemd_timer_health_snapshot() {
       Result) svc_result="$value" ;;
       ExecMainStatus) svc_status="$value" ;;
       NRestarts) svc_restarts="$value" ;;
+      ExecMainStartTimestampMonotonic) svc_started="$value" ;;
+      ExecMainExitTimestampMonotonic) svc_exited="$value" ;;
     esac
   done <<< "$svc_payload"
-  [[ "$svc_load" == loaded && "$svc_active" =~ ^(inactive|active|activating)$ \
-     && "$svc_sub" =~ ^(dead|exited|running|start)$ \
+  # A oneshot is healthy only after its main process has exited successfully.
+  # systemd initializes Result=success/ExecMainStatus=0 before the first exit,
+  # so accepting activating/start would turn a pre-exit sample into a false
+  # completion claim. Monotonic start/exit timestamps prove a real invocation
+  # completed and also make a new invocation visible to the stability window.
+  [[ "$svc_load" == loaded && "$svc_active" == inactive \
+     && "$svc_sub" == dead \
      && "$svc_result" == success && "$svc_status" == 0 \
-     && "$svc_restarts" =~ ^[0-9]+$ ]] \
-    || { printf 'error|heartbeat-load=%s active=%s sub=%s result=%s status=%s restarts=%s' \
-         "$svc_load" "$svc_active" "$svc_sub" "$svc_result" "$svc_status" "$svc_restarts"; return 0; }
-  printf 'ok|%s:%s:%s' "$sub_state" "$svc_result" "$svc_restarts"
+     && "$svc_restarts" =~ ^[0-9]+$ \
+     && "$svc_started" =~ ^[1-9][0-9]*$ \
+     && "$svc_exited" =~ ^[1-9][0-9]*$ \
+     && "$svc_exited" -ge "$svc_started" ]] \
+    || { printf 'error|heartbeat-load=%s active=%s sub=%s result=%s status=%s restarts=%s started=%s exited=%s' \
+         "$svc_load" "$svc_active" "$svc_sub" "$svc_result" "$svc_status" \
+         "$svc_restarts" "$svc_started" "$svc_exited"; return 0; }
+  printf 'ok|timer=%s:result=%s:status=%s:restarts=%s:started=%s:exited=%s' \
+    "$sub_state" "$svc_result" "$svc_status" "$svc_restarts" "$svc_started" "$svc_exited"
 }
 
 systemd_gateway_deferred_snapshot() {
@@ -809,21 +859,27 @@ systemd_wait_for_stable_health() {
   [[ "$attempts" =~ ^[1-9][0-9]*$ && "$required" =~ ^[1-9][0-9]*$ \
      && "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { printf 'error|invalid stabilization settings'; return 1; }
-  local sample="" previous="" stable=0 attempt
+  (( attempts >= required )) \
+    || { printf 'error|stabilization attempts must cover required samples'; return 1; }
+  local sample="" previous="" last_error="" stable=0 attempt
+  local ever_healthy=0 unstable_after_health=0
   for ((attempt = 1; attempt <= attempts; attempt++)); do
     sample="$($checker "$@")"
     if [[ "$sample" == ok\|* ]]; then
-      if [[ "$sample" == "$previous" ]]; then
+      if [[ -z "$previous" ]]; then
+        previous="$sample"
+        stable=1
+      elif [[ "$sample" == "$previous" ]]; then
         stable=$((stable + 1))
       else
+        (( ever_healthy == 0 )) || unstable_after_health=1
         previous="$sample"
         stable=1
       fi
-      if (( stable >= required )); then
-        printf '%s' "$sample"
-        return 0
-      fi
+      ever_healthy=1
     else
+      [[ -z "$sample" ]] || last_error="$sample"
+      (( ever_healthy == 0 )) || unstable_after_health=1
       previous=""
       stable=0
     fi
@@ -831,7 +887,14 @@ systemd_wait_for_stable_health() {
       sleep "$interval"
     fi
   done
-  printf '%s' "${sample:-error|no health sample}"
+  # Never return early: every configured sample belongs to the declared
+  # observation window. Once a unit looked healthy, a later failure, restart,
+  # or invocation timestamp change makes the whole window unstable.
+  if (( stable >= required && unstable_after_health == 0 )); then
+    printf '%s' "$sample"
+    return 0
+  fi
+  printf '%s' "${last_error:-${sample:-error|no health sample}}"
   return 1
 }
 

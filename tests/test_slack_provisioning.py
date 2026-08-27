@@ -68,27 +68,39 @@ def _fake_curl(tmp_path: Path) -> Path:
     curl.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import pathlib
 import re
 import sys
 
 assert sys.argv[1:] == ["--config", "-"]
 config = sys.stdin.read()
-assert 'url = "https://slack.com/api/auth.test"' in config
 match = re.search(r'Authorization: Bearer ([A-Za-z0-9-]+)', config)
 assert match
 token = match.group(1)
-assert token.startswith("xoxb-")
-assert token.encode() not in pathlib.Path("/proc/self/cmdline").read_bytes()
-assert token.encode() not in pathlib.Path("/proc/self/environ").read_bytes()
-print(json.dumps({
-    "ok": True,
-    "team_id": "T123",
-    "team": "Example Workspace",
-    "user_id": "U123BOT",
-    "bot_id": "B123BOT",
-    "user": "demo-pm",
-}))
+cmdline = pathlib.Path("/proc/self/cmdline").read_bytes()
+environ = pathlib.Path("/proc/self/environ").read_bytes()
+for raw in ("xoxb-profile-only-secret", "xapp-profile-only-secret"):
+    assert raw.encode() not in cmdline
+    assert raw.encode() not in environ
+if 'url = "https://slack.com/api/auth.test"' in config:
+    assert token.startswith("xoxb-")
+    print(json.dumps({
+        "ok": True,
+        "team_id": "T123",
+        "team": "Example Workspace",
+        "user_id": "U123BOT",
+        "bot_id": "B123BOT",
+        "user": "demo-pm",
+    }))
+elif 'url = "https://slack.com/api/apps.connections.open"' in config:
+    assert token.startswith("xapp-")
+    if os.environ.get("FAKE_SLACK_APP_AUTH_FAILURE") == "1":
+        print(json.dumps({"ok": False, "error": "invalid_auth"}))
+    else:
+        print(json.dumps({"ok": True, "url": "wss://wss-primary.slack.test/link"}))
+else:
+    raise AssertionError("unexpected Slack API endpoint")
 """,
         encoding="utf-8",
     )
@@ -203,6 +215,7 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
     )
 
     assert result.returncode == 0, result.stderr
+    assert "verifying Slack Socket Mode app token via apps.connections.open" in result.stderr
     env_file = runtime / ".env"
     env_text = env_file.read_text(encoding="utf-8")
     assert "SLACK_BOT_TOKEN" not in env_text
@@ -236,6 +249,41 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
         "bot_id": "B123BOT",
         "bot_username": "demo-pm",
     }
+
+
+def test_bot_auth_success_without_app_auth_never_enables_or_stores_slack(
+    tmp_path: Path,
+) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    result = _run(
+        role,
+        registry,
+        home,
+        _fake_curl(tmp_path),
+        {
+            "SLACK_BOT_TOKEN": BOT_TOKEN,
+            "SLACK_APP_TOKEN": APP_TOKEN,
+            "FAKE_SLACK_APP_AUTH_FAILURE": "1",
+        },
+    )
+
+    assert result.returncode != 0
+    assert "apps.connections.open rejected the app token (invalid_auth)" in result.stderr
+    assert "Socket Mode app-token verification failed" in result.stderr
+    assert BOT_TOKEN not in result.stdout + result.stderr
+    assert APP_TOKEN not in result.stdout + result.stderr
+    assert not (role / ".scripts" / ".done-31-slack").exists()
+    assert not (runtime / ".env").exists()
+    delta_path = home / ".hermes" / "profiles" / "demo-pm" / "config.delta.yaml"
+    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
+    assert delta["platforms"]["slack"]["enabled"] is False
+    assert "secrets" not in delta
+    slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
+    assert slack["provisioning_status"] == "deferred"
+    assert not (home / ".fake-onepassword").exists()
 
 
 def test_transient_onepassword_outage_preserves_verified_slack_wiring_and_recovers(
