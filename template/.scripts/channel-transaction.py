@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import errno
+import importlib.util
 import json
 import os
 import pathlib
@@ -21,6 +22,23 @@ import tempfile
 from dataclasses import dataclass
 
 import yaml
+
+
+def load_profile_lock_module():
+    source = pathlib.Path(__file__).parent / "lib" / "profile-config-lock.py"
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f"trusted profile config lock helper is unavailable: {source}")
+    spec = importlib.util.spec_from_file_location(
+        "pjangler_profile_config_lock", source
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load profile config lock helper: {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PROFILE_LOCK = load_profile_lock_module()
 
 
 LIST_PATCH_KEY = "x-pjangler-merge"
@@ -323,7 +341,7 @@ def parse_pairs(values: list[list[str]], expected: tuple[str, ...], label: str) 
     return pairs
 
 
-def commit(args: argparse.Namespace) -> None:
+def commit_locked(args: argparse.Namespace) -> None:
     channel = args.channel
     profile = pathlib.Path(args.profile)
     if profile.is_symlink() or not profile.is_dir():
@@ -354,6 +372,7 @@ def commit(args: argparse.Namespace) -> None:
         marker_path: 0o600,
     }
     originals = {path: snapshot(path, mode) for path, mode in modes.items()}
+    PROFILE_LOCK.test_snapshot_barrier(f"channel:{channel}")
     base = load_mapping(base_path)
     delta = load_mapping(delta_path, required=False)
     onepassword = delta.setdefault("secrets", {}).setdefault("onepassword", {})
@@ -408,6 +427,18 @@ def commit(args: argparse.Namespace) -> None:
                 f"{type(rollback_exc).__name__}"
             )
         fail(f"{type(exc).__name__}; all local channel files restored")
+
+
+def commit(args: argparse.Namespace) -> None:
+    # The channel step holds REGISTRY_FILE.lock before invoking this helper.
+    # The global order is registry lock -> profile lock; config-only writers
+    # take only the profile lock and no path may invert that order.
+    profile = pathlib.Path(args.profile)
+    try:
+        with PROFILE_LOCK.ProfileConfigLock(profile):
+            commit_locked(args)
+    except PROFILE_LOCK.ProfileConfigLockError as exc:
+        fail(str(exc))
 
 
 def parser() -> argparse.ArgumentParser:

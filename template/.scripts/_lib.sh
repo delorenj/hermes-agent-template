@@ -238,6 +238,9 @@ profile_config_delta_update() {
   # profile_config_delta_update PROFILE_HOME secret-ref-pair ENV REF ENV REF
   # profile_config_delta_update PROFILE_HOME channel-enabled telegram|slack true|false
   # profile_config_delta_update PROFILE_HOME voice PLUGIN VOICE
+  local profile_lock_tool="$ROLE_DIR/.scripts/lib/profile-config-lock.py"
+  [[ -f "$profile_lock_tool" && ! -L "$profile_lock_tool" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
   if [[ "${2:-}" == "voice" ]]; then
     [[ $# -eq 4 ]] || die "voice requires a profile, plugin, and voice"
     local voice_tool="$ROLE_DIR/.scripts/lib/voice-config.py"
@@ -251,14 +254,26 @@ profile_config_delta_update() {
       --voice "$4"
     return
   fi
-  python3 - "$@" <<'PYEOF'
-import copy, os, pathlib, re, sys, tempfile
+  python3 - "$profile_lock_tool" "$@" <<'PYEOF'
+import atexit, copy, importlib.util, os, pathlib, re, sys, tempfile
 try:
     import yaml
 except ImportError:
     raise SystemExit("PyYAML is required for Hermes profile config")
 
-profile = pathlib.Path(sys.argv[1])
+lock_source = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("pjangler_profile_config_lock", lock_source)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"cannot load profile config lock helper: {lock_source}")
+profile_lock_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(profile_lock_module)
+profile = pathlib.Path(sys.argv[2])
+profile_lock = profile_lock_module.ProfileConfigLock(profile)
+try:
+    profile_lock.acquire()
+except profile_lock_module.ProfileConfigLockError as exc:
+    raise SystemExit(str(exc)) from exc
+atexit.register(profile_lock.release)
 # A profile root is a security boundary.  Never follow the legacy symlink form:
 # even a read would escape the named profile and a later atomic replace could
 # mutate shared/runtime state.  Migration must happen in the lifecycle step.
@@ -269,7 +284,7 @@ if profile.is_symlink():
     )
 if not profile.is_dir():
     raise SystemExit(f"required profile root is unavailable: {profile}")
-args = sys.argv[2:]
+args = sys.argv[3:]
 if not args:
     raise SystemExit("profile config update mode is required")
 mode = args[0]
@@ -527,6 +542,9 @@ channel_transaction_telegram() {
   # channel_transaction_telegram PROFILE_HOME RUNTIME_ENV REF USERNAME BOT_ID ALLOWED
   local helper="$ROLE_DIR/.scripts/channel-transaction.py"
   [[ -f "$helper" && ! -L "$helper" ]] || die "trusted channel transaction helper is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
   python3 -I "$helper" \
     --channel telegram \
     --profile "$1" \
@@ -548,6 +566,9 @@ channel_transaction_slack() {
   # channel_transaction_slack PROFILE ENV BOT_REF APP_REF TEAM_ID TEAM_NAME USER_ID BOT_ID USERNAME ALLOWED
   local helper="$ROLE_DIR/.scripts/channel-transaction.py"
   [[ -f "$helper" && ! -L "$helper" ]] || die "trusted channel transaction helper is missing"
+  [[ -f "$ROLE_DIR/.scripts/lib/profile-config-lock.py" \
+      && ! -L "$ROLE_DIR/.scripts/lib/profile-config-lock.py" ]] \
+    || die "trusted PM profile config lock helper is unavailable"
   python3 -I "$helper" \
     --channel slack \
     --profile "$1" \

@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import importlib.util
 import os
 import shutil
 import sys
@@ -59,6 +60,29 @@ try:
     import yaml
 except ImportError:  # pragma: no cover
     sys.exit("PyYAML required: pip install pyyaml")
+
+
+def load_profile_lock_module():
+    source = (
+        Path(__file__).resolve().parent.parent
+        / "template"
+        / ".scripts"
+        / "lib"
+        / "profile-config-lock.py"
+    )
+    if source.is_symlink() or not source.is_file():
+        sys.exit(f"FATAL: trusted profile config lock helper is unavailable: {source}")
+    spec = importlib.util.spec_from_file_location(
+        "pjangler_profile_config_lock", source
+    )
+    if spec is None or spec.loader is None:
+        sys.exit(f"FATAL: cannot load profile config lock helper: {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PROFILE_LOCK = load_profile_lock_module()
 
 HERMES_HOME = Path(os.environ.get("HERMES_FLEET_HOME", Path.home() / ".hermes"))
 BASE = HERMES_HOME / "config.yaml"
@@ -344,47 +368,48 @@ def cmd_init(args) -> int:
             print(f"backup -> {loc}\n")
 
     for pdir in targets:
-        cfg_path = pdir / "config.yaml"
-        delta_path = pdir / "config.delta.yaml"
-        is_link = cfg_path.is_symlink()
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            cfg_path = pdir / "config.yaml"
+            delta_path = pdir / "config.delta.yaml"
+            is_link = cfg_path.is_symlink()
 
-        if delta_path.exists():
-            delta = load_yaml(delta_path)
-            origin = "existing delta"
-        elif is_link:
-            # Symlinked to the base: identical by definition, so no overrides.
-            delta = {}
-            origin = "symlink -> base (empty delta)"
-        else:
-            current = load_yaml(cfg_path)
-            raw_delta = minimal_delta(current, base)
-            delta = minimal_delta(current, base, history=history)
-            dropped = len(dump_yaml(raw_delta).splitlines()) - len(
-                dump_yaml(delta).splitlines() if delta else []
+            if delta_path.exists():
+                delta = load_yaml(delta_path)
+                origin = "existing delta"
+            elif is_link:
+                # Symlinked to the base: identical by definition, so no overrides.
+                delta = {}
+                origin = "symlink -> base (empty delta)"
+            else:
+                current = load_yaml(cfg_path)
+                raw_delta = minimal_delta(current, base)
+                delta = minimal_delta(current, base, history=history)
+                dropped = len(dump_yaml(raw_delta).splitlines()) - len(
+                    dump_yaml(delta).splitlines() if delta else []
+                )
+                origin = "recovered from current config"
+                if dropped > 0:
+                    origin += f", {dropped} stale line(s) pruned"
+
+            merged = deep_merge(base, delta)
+            lines = len(dump_yaml(delta).splitlines()) if delta else 0
+            gained = len(merged) - len(load_yaml(cfg_path)) if not is_link else 0
+
+            print(f"{pdir.name:36s} delta={lines:>3d} lines  ({origin})")
+            if gained > 0:
+                print(f"{'':36s}   +{gained} top-level keys inherited from base")
+
+            if args.dry_run:
+                continue
+            delta_path.write_text(
+                "# Override-only delta for this Hermes profile.\n"
+                "# Merged over ~/.hermes/config.yaml to produce config.yaml.\n"
+                "# Empty/missing == identical to the fleet base.\n\n"
+                + (dump_yaml(delta) if delta else "{}\n"),
+                encoding="utf-8",
             )
-            origin = "recovered from current config"
-            if dropped > 0:
-                origin += f", {dropped} stale line(s) pruned"
-
-        merged = deep_merge(base, delta)
-        lines = len(dump_yaml(delta).splitlines()) if delta else 0
-        gained = len(merged) - len(load_yaml(cfg_path)) if not is_link else 0
-
-        print(f"{pdir.name:36s} delta={lines:>3d} lines  ({origin})")
-        if gained > 0:
-            print(f"{'':36s}   +{gained} top-level keys inherited from base")
-
-        if args.dry_run:
-            continue
-        delta_path.write_text(
-            "# Override-only delta for this Hermes profile.\n"
-            "# Merged over ~/.hermes/config.yaml to produce config.yaml.\n"
-            "# Empty/missing == identical to the fleet base.\n\n"
-            + (dump_yaml(delta) if delta else "{}\n"),
-            encoding="utf-8",
-        )
-        os.chmod(delta_path, 0o600)
-        write_generated(cfg_path, merged)
+            os.chmod(delta_path, 0o600)
+            write_generated(cfg_path, merged)
     return 0
 
 
@@ -396,10 +421,14 @@ def cmd_render(args) -> int:
         if loc:
             print(f"backup -> {loc}\n")
     for pdir in targets:
-        delta, _cur, expected, _link = profile_state(pdir, base)
-        print(f"render {pdir.name:36s} ({len(dump_yaml(delta).splitlines()) if delta else 0} delta lines)")
-        if not args.dry_run:
-            write_generated(pdir / "config.yaml", expected)
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            delta, _cur, expected, _link = profile_state(pdir, base)
+            print(
+                f"render {pdir.name:36s} "
+                f"({len(dump_yaml(delta).splitlines()) if delta else 0} delta lines)"
+            )
+            if not args.dry_run:
+                write_generated(pdir / "config.yaml", expected)
     return 0
 
 
@@ -407,16 +436,21 @@ def cmd_check(args) -> int:
     base = load_yaml(BASE)
     drifted = []
     for pdir in _select(args):
-        delta, current, expected, is_link = profile_state(pdir, base)
-        if is_link:
-            drifted.append((pdir.name, "config.yaml is a SYMLINK (no override capability)"))
-        elif not (pdir / "config.delta.yaml").exists():
-            drifted.append((pdir.name, "no config.delta.yaml (not under inheritance)"))
-        elif current != expected:
-            keys = sorted(
-                k for k in set(current) | set(expected) if current.get(k) != expected.get(k)
-            )
-            drifted.append((pdir.name, f"drift in: {', '.join(keys[:6])}"))
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            delta, current, expected, is_link = profile_state(pdir, base)
+            if is_link:
+                drifted.append(
+                    (pdir.name, "config.yaml is a SYMLINK (no override capability)")
+                )
+            elif not (pdir / "config.delta.yaml").exists():
+                drifted.append((pdir.name, "no config.delta.yaml (not under inheritance)"))
+            elif current != expected:
+                keys = sorted(
+                    k
+                    for k in set(current) | set(expected)
+                    if current.get(k) != expected.get(k)
+                )
+                drifted.append((pdir.name, f"drift in: {', '.join(keys[:6])}"))
     if drifted:
         print("PROFILE CONFIG DRIFT:\n")
         for name, why in drifted:
@@ -435,30 +469,35 @@ def cmd_absorb(args) -> int:
         if loc:
             print(f"backup -> {loc}\n")
     for pdir in targets:
-        cfg_path = pdir / "config.yaml"
-        if cfg_path.is_symlink():
-            print(f"skip   {pdir.name:36s} (symlink -- run init first)")
-            continue
-        old_delta = load_yaml(pdir / "config.delta.yaml")
-        current = load_yaml(cfg_path)
-        directive = copy.deepcopy(old_delta.get(LIST_PATCH_KEY))
-        effective_base = deep_merge(
-            base, {LIST_PATCH_KEY: directive} if directive is not None else {}
-        )
-        new_delta = minimal_delta(current, effective_base)
-        if directive is not None:
-            new_delta[LIST_PATCH_KEY] = directive
-        if new_delta == old_delta:
-            print(f"clean  {pdir.name}")
-            continue
-        added = sorted(set(new_delta) - set(old_delta))
-        print(f"absorb {pdir.name:36s} +{len(added)} key(s): {', '.join(added[:6]) or '(nested)'}")
-        if not args.dry_run:
-            (pdir / "config.delta.yaml").write_text(
-                "# Override-only delta for this Hermes profile.\n\n" + dump_yaml(new_delta),
-                encoding="utf-8",
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            cfg_path = pdir / "config.yaml"
+            if cfg_path.is_symlink():
+                print(f"skip   {pdir.name:36s} (symlink -- run init first)")
+                continue
+            old_delta = load_yaml(pdir / "config.delta.yaml")
+            current = load_yaml(cfg_path)
+            directive = copy.deepcopy(old_delta.get(LIST_PATCH_KEY))
+            effective_base = deep_merge(
+                base, {LIST_PATCH_KEY: directive} if directive is not None else {}
             )
-            os.chmod(pdir / "config.delta.yaml", 0o600)
+            new_delta = minimal_delta(current, effective_base)
+            if directive is not None:
+                new_delta[LIST_PATCH_KEY] = directive
+            if new_delta == old_delta:
+                print(f"clean  {pdir.name}")
+                continue
+            added = sorted(set(new_delta) - set(old_delta))
+            print(
+                f"absorb {pdir.name:36s} +{len(added)} key(s): "
+                f"{', '.join(added[:6]) or '(nested)'}"
+            )
+            if not args.dry_run:
+                (pdir / "config.delta.yaml").write_text(
+                    "# Override-only delta for this Hermes profile.\n\n"
+                    + dump_yaml(new_delta),
+                    encoding="utf-8",
+                )
+                os.chmod(pdir / "config.delta.yaml", 0o600)
     return 0
 
 
@@ -467,19 +506,20 @@ def cmd_status(args) -> int:
     print(f"{'profile':36s} {'mode':10s} {'delta':>5s}  {'state'}")
     print("-" * 78)
     for pdir in _select(args):
-        delta, current, expected, is_link = profile_state(pdir, base)
-        has_delta = (pdir / "config.delta.yaml").exists()
-        mode = "symlink" if is_link else ("delta" if has_delta else "standalone")
-        n = len(dump_yaml(delta).splitlines()) if delta else 0
-        if is_link:
-            state = "cannot override base"
-        elif not has_delta:
-            state = f"NOT inheriting base ({len(current)} own keys)"
-        elif current != expected:
-            state = "DRIFT"
-        else:
-            state = "ok"
-        print(f"{pdir.name:36s} {mode:10s} {n:>5d}  {state}")
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            delta, current, expected, is_link = profile_state(pdir, base)
+            has_delta = (pdir / "config.delta.yaml").exists()
+            mode = "symlink" if is_link else ("delta" if has_delta else "standalone")
+            n = len(dump_yaml(delta).splitlines()) if delta else 0
+            if is_link:
+                state = "cannot override base"
+            elif not has_delta:
+                state = f"NOT inheriting base ({len(current)} own keys)"
+            elif current != expected:
+                state = "DRIFT"
+            else:
+                state = "ok"
+            print(f"{pdir.name:36s} {mode:10s} {n:>5d}  {state}")
     return 0
 
 
@@ -617,7 +657,10 @@ def main() -> int:
     args = ap.parse_args()
     if not BASE.exists():
         sys.exit(f"FATAL: fleet base not found: {BASE}")
-    return args.func(args)
+    try:
+        return args.func(args)
+    except PROFILE_LOCK.ProfileConfigLockError as exc:
+        sys.exit(f"FATAL: {exc}")
 
 
 if __name__ == "__main__":

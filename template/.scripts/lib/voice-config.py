@@ -13,6 +13,7 @@ import argparse
 import copy
 import errno
 import hashlib
+import importlib.util
 import json
 import os
 import pathlib
@@ -22,6 +23,23 @@ import tempfile
 from dataclasses import dataclass
 
 import yaml
+
+
+def load_profile_lock_module():
+    source = pathlib.Path(__file__).with_name("profile-config-lock.py")
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f"trusted profile config lock helper is unavailable: {source}")
+    spec = importlib.util.spec_from_file_location(
+        "pjangler_profile_config_lock", source
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load profile config lock helper: {source}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+PROFILE_LOCK = load_profile_lock_module()
 
 
 LIST_PATCH_KEY = "x-pjangler-merge"
@@ -453,39 +471,48 @@ def paths(args: argparse.Namespace) -> tuple[pathlib.Path, pathlib.Path, pathlib
 
 
 def reconcile(args: argparse.Namespace) -> int:
-    base_path, delta_path, generated_path = paths(args)
-    base = load_mapping(base_path)
-    delta_original = snapshot(delta_path, 0o600)
-    generated_original = snapshot(generated_path, 0o600)
-    delta = load_mapping(delta_path, required=False)
-    reconcile_delta(delta, args.plugin, args.voice)
-    delta_content = render_delta(delta, delta_original.content)
-    generated_content = render_generated(base, delta)
-    try:
-        atomic_write(delta_path, delta_content)
-        atomic_write(generated_path, generated_content)
-    except BaseException:
-        restore(generated_path, generated_original)
-        restore(delta_path, delta_original)
-        raise
+    profile = pathlib.Path(args.delta).parent
+    with PROFILE_LOCK.ProfileConfigLock(profile):
+        base_path, delta_path, generated_path = paths(args)
+        base = load_mapping(base_path)
+        delta_original = snapshot(delta_path, 0o600)
+        generated_original = snapshot(generated_path, 0o600)
+        PROFILE_LOCK.test_snapshot_barrier("voice")
+        delta = load_mapping(delta_path, required=False)
+        reconcile_delta(delta, args.plugin, args.voice)
+        delta_content = render_delta(delta, delta_original.content)
+        generated_content = render_generated(base, delta)
+        try:
+            atomic_write(delta_path, delta_content)
+            atomic_write(generated_path, generated_content)
+        except BaseException:
+            restore(generated_path, generated_original)
+            restore(delta_path, delta_original)
+            raise
     return 0
 
 
 def check(args: argparse.Namespace) -> int:
     try:
-        base_path, delta_path, generated_path = paths(args)
-        base = load_mapping(base_path)
-        original_delta = load_mapping(delta_path, required=False)
-        expected_delta = copy.deepcopy(original_delta)
-        reconcile_delta(expected_delta, args.plugin, args.voice)
-        generated = load_mapping(generated_path, required=False)
-        if expected_delta == original_delta and generated == merge(base, expected_delta):
-            print("ok")
-        else:
-            print("drift")
+        profile = pathlib.Path(args.delta).parent
+        with PROFILE_LOCK.ProfileConfigLock(profile):
+            base_path, delta_path, generated_path = paths(args)
+            base = load_mapping(base_path)
+            original_delta = load_mapping(delta_path, required=False)
+            expected_delta = copy.deepcopy(original_delta)
+            reconcile_delta(expected_delta, args.plugin, args.voice)
+            generated = load_mapping(generated_path, required=False)
+            if expected_delta == original_delta and generated == merge(
+                base, expected_delta
+            ):
+                print("ok")
+            else:
+                print("drift")
     except UnresolvedLegacySnapshot as exc:
         print(f"manual|{exc}")
     except ContractError as exc:
+        print(f"manual|{exc}")
+    except PROFILE_LOCK.ProfileConfigLockError as exc:
         print(f"manual|{exc}")
     return 0
 
@@ -510,6 +537,8 @@ def main() -> int:
     except UnresolvedLegacySnapshot as exc:
         raise SystemExit(f"unresolved legacy plugin drift: {exc}") from exc
     except ContractError as exc:
+        raise SystemExit(str(exc)) from exc
+    except PROFILE_LOCK.ProfileConfigLockError as exc:
         raise SystemExit(str(exc)) from exc
 
 

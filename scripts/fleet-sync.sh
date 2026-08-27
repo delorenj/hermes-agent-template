@@ -37,10 +37,12 @@ HEARTBEAT_TEMPLATE="$SCRIPT_DIR/../template/.scripts/heartbeat.sh"
 FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
 FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
 VOICE_CONFIG_TOOL="$SCRIPT_DIR/../template/.scripts/lib/voice-config.py"
+PROFILE_CONFIG_LOCK_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/profile-config-lock.py"
 PROFILE_CONFIG_TOOL="$SCRIPT_DIR/hermes-profile-config.py"
 if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
    || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" \
    || ! -f "$VOICE_CONFIG_TOOL" || -L "$VOICE_CONFIG_TOOL" \
+   || ! -f "$PROFILE_CONFIG_LOCK_SOURCE" || -L "$PROFILE_CONFIG_LOCK_SOURCE" \
    || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" \
    || ! -f "$PROFILE_CONFIG_TOOL" || -L "$PROFILE_CONFIG_TOOL" ]]; then
   echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
@@ -169,6 +171,54 @@ CONTESTED_DIRS="$(read_registry | cut -d $'\x1f' -f2 | sort | uniq -d)"
 
 note() {  # note <agent> <status> <message>
   printf '%-34s %-7s %s\n' "$1" "$2" "$3"
+}
+
+seed_profile_delta() {  # seed_profile_delta <real profile dir>; prints seeded|exists
+  python3 - "$PROFILE_CONFIG_LOCK_SOURCE" "$1" <<'PYEOF'
+import importlib.util
+import os
+import pathlib
+import tempfile
+import sys
+
+lock_source = pathlib.Path(sys.argv[1])
+profile = pathlib.Path(sys.argv[2])
+spec = importlib.util.spec_from_file_location("pjangler_profile_config_lock", lock_source)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"fleet-sync: cannot load profile config lock helper: {lock_source}")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+try:
+    with module.ProfileConfigLock(profile):
+        if profile.is_symlink() or not profile.is_dir():
+            raise SystemExit(f"fleet-sync: profile root must be a real directory: {profile}")
+        target = profile / "config.delta.yaml"
+        if target.is_symlink():
+            raise SystemExit(f"fleet-sync: refusing config delta symlink: {target}")
+        if target.exists():
+            if not target.is_file():
+                raise SystemExit(f"fleet-sync: config delta is not a regular file: {target}")
+            print("exists")
+            raise SystemExit(0)
+        fd, temporary = tempfile.mkstemp(prefix=".config.delta.yaml.seed-", dir=profile)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("# Override-only delta for this Hermes profile.\n{}\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            os.chmod(target, 0o600)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+        print("seeded")
+except module.ProfileConfigLockError as exc:
+    raise SystemExit(f"fleet-sync: {exc}") from exc
+PYEOF
 }
 
 systemctl_user_unit_state() {  # systemctl_user_unit_state <is-active|is-enabled> <unit>
@@ -323,7 +373,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     continue
   fi
   fleet_assets_eligible=1
-  for fleet_asset in fleet-env.sh parse-fleet-env.py voice-config.py; do
+  for fleet_asset in fleet-env.sh parse-fleet-env.py profile-config-lock.py voice-config.py; do
     source_asset="$SCRIPT_DIR/../template/.scripts/lib/$fleet_asset"
     target_asset="$role_lib_dir/$fleet_asset"
     if [[ -L "$target_asset" ]]; then
@@ -365,6 +415,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     for attestation in \
       "$FLEET_ENV_LIBRARY_SOURCE|$role_lib_dir/fleet-env.sh" \
       "$FLEET_ENV_PARSER_SOURCE|$role_lib_dir/parse-fleet-env.py" \
+      "$PROFILE_CONFIG_LOCK_SOURCE|$role_lib_dir/profile-config-lock.py" \
       "$VOICE_CONFIG_TOOL|$role_lib_dir/voice-config.py" \
       "$HEARTBEAT_TEMPLATE|$heartbeat_target"
     do
@@ -544,11 +595,15 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     # config.yaml -> fleet-base symlink.
     if [[ ! -f "$profile_dir/config.delta.yaml" || -L "$profile_dir/config.delta.yaml" ]]; then
       if [[ $APPLY -eq 1 && ! -e "$profile_dir/config.delta.yaml" ]]; then
-        printf '%s\n' '# Override-only delta for this Hermes profile.' '{}' \
-          > "$profile_dir/config.delta.yaml"
-        chmod 600 "$profile_dir/config.delta.yaml"
-        note "$agent_id" FIXED "empty config.delta.yaml seeded"
-        changed=1; FIXED=$((FIXED + 1))
+        if seed_result="$(seed_profile_delta "$profile_dir")"; then
+          if [[ "$seed_result" == "seeded" ]]; then
+            note "$agent_id" FIXED "empty config.delta.yaml seeded"
+            changed=1; FIXED=$((FIXED + 1))
+          fi
+        else
+          note "$agent_id" DRIFT "config.delta.yaml seed lock/write failed"
+          DRIFT=$((DRIFT + 1))
+        fi
       else
         note "$agent_id" DRIFT "config.delta.yaml missing or unsafe (MANUAL: establish override source)"
         DRIFT=$((DRIFT + 1))
