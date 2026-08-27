@@ -25,6 +25,7 @@ def test_host_local_runtime_payloads_are_not_tracked() -> None:
     forbidden = re.compile(
         r"(?:^|/)(?:\.omo/run-continuation/|\.codegraph/[^/]+\.(?:pid|sock|socket)$)"
         r"|(?:^|/)(?:sessions?|runtime-state)/"
+        r"|(?:^|/)__pycache__/|\.py[co]$"
         r"|(?:^|/)[^/]+\.(?:pid|sock|socket)$"
     )
 

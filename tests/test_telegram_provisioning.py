@@ -16,6 +16,8 @@ TELEGRAM_SCRIPT = ROOT / "template" / ".scripts" / "30-telegram.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
 LIB_DIR = ROOT / "template" / ".scripts" / "lib"
 REGISTRY_SCRIPT = ROOT / "template" / ".scripts" / "80-registry.sh"
+STORE_HELPER = ROOT / "template" / ".scripts" / "store-onepassword-secret.py"
+FAKE_OP = ROOT / "tests" / "support" / "fake-op.py"
 
 BOT_TOKEN = "123456:profile-only-secret"
 OTHER_TOKEN = "654321:different-profile-secret"
@@ -29,6 +31,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     runtime.mkdir()
     shutil.copy2(TELEGRAM_SCRIPT, scripts / TELEGRAM_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
+    shutil.copy2(STORE_HELPER, scripts / STORE_HELPER.name)
     shutil.copytree(LIB_DIR, scripts / LIB_DIR.name)
     (role / "role.yaml").write_text(
         """repo: demo
@@ -85,6 +88,9 @@ print(json.dumps({"ok": True, "result": {"id": 424242, "username": "verified_dem
     hermes = bindir / "hermes"
     hermes.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
     hermes.chmod(0o755)
+    op = bindir / "op"
+    shutil.copy2(FAKE_OP, op)
+    op.chmod(0o755)
     return bindir
 
 
@@ -107,9 +113,18 @@ def _run(
             "HERMES_BIN": str(bindir / "hermes"),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "REGISTRY_FILE": str(registry),
+            "UNRELATED_PROVIDER_SECRET": "must-not-reach-op",
         }
     )
     env.update(overrides or {})
+    profile_name = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["profile"]
+    fleet_home = home / ".hermes"
+    profile = fleet_home / "profiles" / profile_name
+    profile.mkdir(parents=True, exist_ok=True)
+    (fleet_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
+    delta = profile / "config.delta.yaml"
+    if not delta.exists():
+        delta.write_text("{}\n", encoding="utf-8")
     return subprocess.run(
         ["bash", str(role / ".scripts" / "30-telegram.sh")],
         env=env,
@@ -195,7 +210,7 @@ def test_local_only_marker_does_not_block_later_telegram_activation(tmp_path: Pa
     assert deferred.returncode == 0, deferred.stderr
     assert not marker.exists()
     assert unrelated.exists()
-    assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "disabled"
+    assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "deferred"
 
     activated = _run(
         role,
@@ -214,7 +229,7 @@ def test_local_only_marker_does_not_block_later_telegram_activation(tmp_path: Pa
     assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "verified"
 
 
-def test_explicit_token_writes_only_private_runtime_env_and_identity(tmp_path: Path) -> None:
+def test_explicit_token_stores_only_reference_and_nonsecret_policy(tmp_path: Path) -> None:
     role, runtime, registry = _make_role(tmp_path)
     home = tmp_path / "home"
     fleet = home / ".hermes" / "fleet.env"
@@ -234,12 +249,18 @@ def test_explicit_token_writes_only_private_runtime_env_and_identity(tmp_path: P
     assert result.returncode == 0, result.stderr
     env_file = runtime / ".env"
     env_text = env_file.read_text(encoding="utf-8")
-    assert f'TELEGRAM_BOT_TOKEN="{BOT_TOKEN}"' in env_text
+    assert "TELEGRAM_BOT_TOKEN" not in env_text
     assert 'TELEGRAM_ALLOWED_USERS="111,222"' in env_text
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert shared.read_text(encoding="utf-8") == "PROVIDER_KEY=keep-me\n"
     assert fleet.read_text(encoding="utf-8") == "TELEGRAM_ALLOWED_USERS=111,222\n"
     assert BOT_TOKEN not in result.stdout + result.stderr
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text(encoding="utf-8"))
+    reference = delta["secrets"]["onepassword"]["env"]["TELEGRAM_BOT_TOKEN"]
+    assert reference == "op://DeLoSecrets/hermes-agent-demo-pm-telegram-bot-token/password"
+    assert BOT_TOKEN not in (profile / "config.delta.yaml").read_text(encoding="utf-8")
+    assert BOT_TOKEN not in (profile / "config.yaml").read_text(encoding="utf-8")
 
     telegram = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]
     assert telegram == {
@@ -267,7 +288,7 @@ def test_credential_parent_fsync_failure_is_reported_and_retryable(tmp_path: Pat
     assert failed.returncode != 0
     assert "injected parent directory fsync failure" in failed.stderr
     env_file = runtime / ".env"
-    assert f'TELEGRAM_BOT_TOKEN="{BOT_TOKEN}"' in env_file.read_text(encoding="utf-8")
+    assert "TELEGRAM_BOT_TOKEN" not in env_file.read_text(encoding="utf-8")
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert BOT_TOKEN not in failed.stdout + failed.stderr
     assert "demo-pm" in yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]

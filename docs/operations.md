@@ -26,10 +26,10 @@ invocations).
 | 00 banner | Print identity | n/a |
 | 01 config | Seed `~/.config/hermes-agent-template/config.toml` from the shipped example if absent (see [Configuration](#configuration)) | n/a |
 | 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
-| 10 hermes profile | `hermes profile create <repo>-<role> --clone --no-alias` + mirror skills/plugins/hooks from default + symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `/home/delorenj/.agents/skills`; PM roles also seed `VOX_URL` in profile `.env` | n/a |
+| 10 hermes profile | Create a clean named profile without cloning credentials; hard-validate and symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `~/.agents/skills`; reject legacy raw channel credentials for approval-gated migration | n/a |
 | 20 local runtime | Populate missing files from role-local `.runtime-scaffold/` into ignored `./runtime/`, then audit/apply `pj migrate hermes.runtime-singleton`; the named profile remains a real directory | `SKIP_RUNTIME_REPO=1` |
-| 30 telegram | Verify an invocation-supplied, profile-dedicated BotFather token; reject fleet reuse; write only to runtime/.env | `SKIP_TELEGRAM=1` |
-| 31 slack | Disabled/deferred by default; verify a dedicated app+bot pair with `auth.test` and write it only to runtime/.env when explicitly enabled | `SKIP_SLACK=1` |
+| 30 telegram | Verify an invocation-supplied, profile-dedicated BotFather token; reject fleet reuse; store it in 1Password and map only an `op://` reference | `SKIP_TELEGRAM=1` |
+| 31 slack | Deferred by default; verify a dedicated app+bot pair with `auth.test`, store both in 1Password, and map references only | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Compatibility checkpoint for fleet-shared routing; installs no files, dependencies, or services | `SKIP_BLOODBANK=1` remains a no-op |
 | 70 systemd | Install user units: profile gateway and board-reconciliation heartbeat timer | `SKIP_SYSTEMD=1` |
@@ -38,6 +38,10 @@ invocations).
 
 Every step is idempotent — re-running the entire provisioning is safe. Each
 step writes a `.done-NN-*` marker; delete that marker to force a re-run.
+PM reconciliation defaults on. A deliberate checkpoint-only deployment sets
+both `reconcile.enabled: false` and `reconcile.explicit_opt_out: true`; this
+sentinel preserves the choice while legacy default-off manifests migrate to
+the operational default.
 
 ## Configuration
 
@@ -61,8 +65,12 @@ hermes_git_sha = "0408fec7a153e6c32c064acd2b8053917f1525f1"
 oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
 canonical_skills_dir = "/path/to/.agents/skills"
-voxxy_plugin_dir = "~/code/voxxy/plugins/tts/voxxy"
+vox_plugin_name = "vox"
+vox_plugin_dir = "~/code/voxxy/plugins/tts/vox"
+vox_voice = "carlin"
 vox_url = "https://vox.delo.sh"
+onepassword_vault = "DeLoSecrets"
+onepassword_item_prefix = "hermes-agent"
 
 [plane]
 base = "https://plane.example.com"
@@ -187,15 +195,16 @@ that strict boolean to `true` in the role's `role.yaml`, then rerun
    TELEGRAM_BOT_TOKEN='<bot-id>:<secret>' \
      TELEGRAM_ALLOWED_USERS='<your-user-id>' \
      SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
-   systemctl --user restart hermes-<agent-id>-gateway.service
+   ./.scripts/70-systemd.sh
    ```
 
 The token is captured before shared fleet configuration is loaded, verified
 through Telegram `getMe`, checked against local token and bot-identity owners,
-and atomically written only to the profile's gitignored `runtime/.env` with
-mode `0600`. `~/.hermes/fleet.env` and `~/.hermes/.env` must not contain
-`TELEGRAM_BOT_TOKEN`; the manifest and registry store only verified bot
-identity metadata. `TELEGRAM_ALLOWED_USERS` is non-secret and may be shared.
+and stored directly in the configured 1Password vault. Only its `op://`
+reference is mapped into `secrets.onepassword.env` in the named profile delta;
+no dotenv file may contain `TELEGRAM_BOT_TOKEN`. The manifest and registry
+store only verified bot identity metadata. `TELEGRAM_ALLOWED_USERS` is
+non-secret and may be shared.
 
 ### Slack app and bot (opt-in)
 
@@ -211,14 +220,15 @@ ENABLE_SLACK=1 \
   SLACK_APP_TOKEN='xapp-...' \
   SLACK_ALLOWED_USERS='U01ABC2DEF3' \
   ./.scripts/31-slack.sh
-systemctl --user restart hermes-<agent-id>-gateway.service
+./.scripts/70-systemd.sh
 ```
 
 The step calls Slack's read-only `auth.test` endpoint for the bot token, checks
 the local fleet for token or bot-identity reuse, and records only the verified
-workspace/bot identity in `role.yaml` and the fleet registry. Tokens are
-atomically written to the agent's gitignored `runtime/.env` with mode `0600`.
-They must never be placed in `~/.hermes/.env` or `~/.hermes/fleet.env`.
+workspace/bot identity in `role.yaml` and the fleet registry. Tokens are stored
+in 1Password and only their `op://` references are mapped into the named
+profile. They must never be placed in `runtime/.env`, `~/.hermes/.env`, or
+`~/.hermes/fleet.env`.
 
 `SLACK_ALLOWED_USERS` is non-secret and may instead be set in `fleet.env` as a
 shared policy. An empty allow-list is safe but denies all inbound Slack users.
@@ -267,7 +277,7 @@ extract the verified archive at the project root, run
 `pj migrate hermes.runtime-singleton /absolute/path/to/project`, and confirm
 the named profile is a real directory before enabling the services.
 
-### Inject encrypted systemd credentials from 1Password
+### Inject an encrypted model credential from 1Password
 
 The commands below stream secrets directly from 1Password into
 `systemd-creds`; they do not create a plaintext file. Set `model.key_env` in
@@ -278,17 +288,15 @@ AGENT=example-director
 CRED_DIR="$HOME/.config/hermes-agent/credentials"
 install -d -m 0700 "$CRED_DIR"
 env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
-  | systemd-creds encrypt --user --name=telegram_bot_token - \
-      "$CRED_DIR/${AGENT}-telegram-bot-token.cred"
-env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
   | systemd-creds encrypt --user --name=model_api_key - \
       "$CRED_DIR/${AGENT}-model-api-key.cred"
-chmod 0600 "$CRED_DIR/${AGENT}-"*.cred
+chmod 0600 "$CRED_DIR/${AGENT}-model-api-key.cred"
 ```
 
 Re-run `.scripts/70-systemd.sh`; it reconciles the unit definitions even after
 a completed installation, so no marker deletion is required. Never print,
-decrypt to disk, or commit either credential.
+decrypt to disk, or commit the credential. Channel credentials use the native
+Hermes `secrets.onepassword.env` reference mapping instead of systemd files.
 
 ## Retire an agent (preserves runtime by default)
 
@@ -358,7 +366,7 @@ Pure-local runtime changes are not synchronized by the heartbeat.
   store there.
 
 ### Profile dir contains nested `profiles/profiles/...`
-- That was a `--clone-all` bug; current provisioning uses `--clone`. Preserve
+- That was a `--clone-all` bug; current provisioning creates a clean profile without cloning. Preserve
   the profile and runtime, inspect the unexpected nesting, and move only the
   confirmed redundant entries to a quarantine directory for review.
 

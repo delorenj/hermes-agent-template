@@ -30,8 +30,8 @@ telegram:
   bot_username: {{ bot_handle | tojson }}
   bot_id: ""
 
-# Slack is opt-in. Credentials live only in runtime/.env; this block records
-# safe provisioning state and the verified auth.test identity.
+# Slack is opt-in. Credentials live in 1Password and the profile maps only
+# op:// references; this block records safe state and auth.test identity.
 slack:
   provisioning_status: "deferred"
   team_id: ""
@@ -46,7 +46,6 @@ slack:
 ticket_provider:
   name: {{ ticket_provider | tojson }}
   board_id: ""
-  board_url: ""
 {%- if ticket_provider == 'linear' %}
   team: ""        # Linear team key, e.g. DEL  (set before first sentinel run)
   project: ""     # optional Linear project name to scope milestones/issues
@@ -63,7 +62,8 @@ ticket_provider:
 
 # Board-reconciliation knobs for the heartbeat sentinel pass.
 reconcile:
-  enabled: false             # heartbeat runs the autonomous board-reconciliation pass ONLY when true; default off = checkpoint-only
+  enabled: {{ reconcile_enabled | tojson }}  # default on for PM operation; set false as the explicit checkpoint-only opt-out
+  explicit_opt_out: {% if reconcile_enabled %}false{% else %}true{% endif %}  # distinguishes operator choice from the legacy default-off manifest
   grace_hours: 0             # 0 = no human-approval wait (adversarially-reviewed review-lane = done); set >0 to require a wait
   auto_review: true          # autonomous adversarial review (act, do not wait) on/off
 
@@ -83,6 +83,13 @@ bloodbank:
   gateway_scope: fleet
   target_agent_id: {{ agent_id | tojson }}
   producer: {{ ("hermes-agent:" ~ agent_id) | tojson }}
+
+# Reconciled by 70-systemd.sh. These are lifecycle observations, not desired
+# state: gateway stays deferred until a dedicated chat credential is verified;
+# heartbeat is independent and drives PM board reconciliation by default.
+service_state:
+  gateway: "pending"
+  heartbeat: "pending"
 
 # Pure-local role-owned state. HERMES_HOME itself is the named profile directory
 # above; the legacy GitHub identity remains metadata-only for locating old

@@ -60,6 +60,9 @@ bloodbank:
   gateway_scope: fleet
   target_agent_id: "demo-pm"
   producer: "hermes-agent:demo-pm"
+service_state:
+  gateway: "pending"
+  heartbeat: "pending"
 plane:
   workspace: "test"
   identifier: ""
@@ -228,6 +231,8 @@ exit 1
     assert f"StandardOutput=append:{role / 'runtime' / 'logs' / 'gateway.systemd.log'}" in rendered
     assert 'Description="Hermes' not in rendered
     assert "HERMES_OAUTH_FILE" not in rendered
+    states = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["service_state"]
+    assert states == {"gateway": "deferred", "heartbeat": "installed"}
 
     verification = subprocess.run(
         [
@@ -392,14 +397,14 @@ exit 1
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
     gateway = (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
     heartbeat = (unit_dir / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
-    assert f'LoadCredentialEncrypted="telegram_bot_token:{telegram_cred}"' in gateway
+    assert f'LoadCredentialEncrypted="telegram_bot_token:{telegram_cred}"' not in gateway
     assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in gateway
     assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in heartbeat
     assert "DIRECTOR_LITELLM_KEY" not in gateway + heartbeat
     assert "encrypted-placeholder" not in gateway + heartbeat
 
 
-def test_systemd_done_marker_still_retires_legacy_consumer(tmp_path: Path) -> None:
+def test_no_credential_gateway_is_deferred_while_heartbeat_runs_on_rerun(tmp_path: Path) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
@@ -429,7 +434,13 @@ case "$*" in
     if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
   *"is-system-running"*) echo running; exit 0 ;;
   *"daemon-reload"*) exit 0 ;;
-  *"enable --now "*) exit 0 ;;
+  *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
+  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
+  *"disable --now hermes-demo-pm-gateway.service"*) exit 0 ;;
+  *"reset-failed hermes-demo-pm-gateway.service"*) exit 0 ;;
+  *"is-active hermes-demo-pm-gateway.service"*) echo inactive; exit 3 ;;
+  *"is-enabled hermes-demo-pm-gateway.service"*) echo disabled; exit 1 ;;
 esac
 exit 1
 """,
@@ -451,6 +462,13 @@ exit 1
     assert "disable --now hermes-demo-pm-consumer.service" in log.read_text(encoding="utf-8")
     assert "reconciling unit definitions" in result.stderr
     assert "Hermes Gateway" in (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
+    calls = log.read_text(encoding="utf-8")
+    assert "enable --now hermes-demo-pm-gateway.service" not in calls
+    assert "disable --now hermes-demo-pm-gateway.service" in calls
+    role_data = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
+    states = role_data["service_state"]
+    assert states == {"gateway": "deferred", "heartbeat": "active"}
+    assert role_data["reconcile"] == {"enabled": True, "explicit_opt_out": False}
 
 
 def test_systemd_preserves_legacy_consumer_when_disable_fails(tmp_path: Path) -> None:
@@ -566,6 +584,8 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
     assert entry["systemd"] == {
         "gateway_unit": "hermes-demo-pm-gateway.service",
         "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
+        "gateway_state": "pending",
+        "heartbeat_state": "pending",
     }
     assert "consumer_unit" not in entry["systemd"]
 

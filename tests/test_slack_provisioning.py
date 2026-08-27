@@ -15,6 +15,8 @@ SLACK_SCRIPT = ROOT / "template" / ".scripts" / "31-slack.sh"
 LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
 LIB_DIR = ROOT / "template" / ".scripts" / "lib"
 REGISTRY_SCRIPT = ROOT / "template" / ".scripts" / "80-registry.sh"
+STORE_HELPER = ROOT / "template" / ".scripts" / "store-onepassword-secret.py"
+FAKE_OP = ROOT / "tests" / "support" / "fake-op.py"
 
 BOT_TOKEN = "xoxb-profile-only-secret"
 APP_TOKEN = "xapp-profile-only-secret"
@@ -28,6 +30,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     runtime.mkdir()
     shutil.copy2(SLACK_SCRIPT, scripts / SLACK_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
+    shutil.copy2(STORE_HELPER, scripts / STORE_HELPER.name)
     shutil.copytree(LIB_DIR, scripts / LIB_DIR.name)
     (role / "role.yaml").write_text(
         """repo: demo
@@ -83,6 +86,9 @@ print(json.dumps({
         encoding="utf-8",
     )
     curl.chmod(0o755)
+    op = bindir / "op"
+    shutil.copy2(FAKE_OP, op)
+    op.chmod(0o755)
     return bindir
 
 
@@ -104,9 +110,18 @@ def _run(
             "PATH": f"{bindir}:{env['PATH']}",
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "REGISTRY_FILE": str(registry),
+            "UNRELATED_PROVIDER_SECRET": "must-not-reach-op",
         }
     )
     env.update(overrides or {})
+    profile_name = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["profile"]
+    fleet_home = home / ".hermes"
+    profile = fleet_home / "profiles" / profile_name
+    profile.mkdir(parents=True, exist_ok=True)
+    (fleet_home / "config.yaml").write_text("plugins: {}\n", encoding="utf-8")
+    delta = profile / "config.delta.yaml"
+    if not delta.exists():
+        delta.write_text("{}\n", encoding="utf-8")
     return subprocess.run(
         ["bash", str(role / ".scripts" / "31-slack.sh")],
         env=env,
@@ -156,7 +171,7 @@ def test_explicit_noninteractive_enable_requires_both_tokens(tmp_path: Path) -> 
     assert not (runtime / ".env").exists()
 
 
-def test_both_tokens_verify_and_write_only_private_runtime_env(tmp_path: Path) -> None:
+def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) -> None:
     role, runtime, registry = _make_role(tmp_path)
     home = tmp_path / "home"
     fleet = home / ".hermes" / "fleet.env"
@@ -176,14 +191,26 @@ def test_both_tokens_verify_and_write_only_private_runtime_env(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     env_file = runtime / ".env"
     env_text = env_file.read_text(encoding="utf-8")
-    assert f'SLACK_BOT_TOKEN="{BOT_TOKEN}"' in env_text
-    assert f'SLACK_APP_TOKEN="{APP_TOKEN}"' in env_text
+    assert "SLACK_BOT_TOKEN" not in env_text
+    assert "SLACK_APP_TOKEN" not in env_text
     assert 'SLACK_ALLOWED_USERS="U111,U222"' in env_text
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert shared.read_text(encoding="utf-8") == "PROVIDER_KEY=keep-me\n"
     assert fleet.read_text(encoding="utf-8") == "SLACK_ALLOWED_USERS=U111,U222\n"
     assert BOT_TOKEN not in result.stdout + result.stderr
     assert APP_TOKEN not in result.stdout + result.stderr
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    delta_text = (profile / "config.delta.yaml").read_text(encoding="utf-8")
+    delta = yaml.safe_load(delta_text)
+    references = delta["secrets"]["onepassword"]["env"]
+    assert references == {
+        "SLACK_BOT_TOKEN": "op://DeLoSecrets/hermes-agent-demo-pm-slack-bot-token/password",
+        "SLACK_APP_TOKEN": "op://DeLoSecrets/hermes-agent-demo-pm-slack-app-token/password",
+    }
+    assert BOT_TOKEN not in delta_text
+    assert APP_TOKEN not in delta_text
+    generated = (profile / "config.yaml").read_text(encoding="utf-8")
+    assert BOT_TOKEN not in generated and APP_TOKEN not in generated
 
     slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
     assert slack == {

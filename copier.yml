@@ -13,8 +13,8 @@
 #   2. Creates ignored local state at agents/hermes/<role>/runtime/ and delegates
 #      named-profile wiring to `pj migrate hermes.runtime-singleton`
 #   4. Creates a Plane project in 33god workspace
-#   6. Prompts for a BotFather Telegram token, stores in ignored runtime state
-#   7. Optionally wires a dedicated Slack app+bot pair into runtime/.env
+#   6. Verifies a BotFather token, stores it in 1Password, and maps an op:// reference
+#   7. Optionally does the same for a dedicated Slack app+bot pair
 #   8. Records fleet-shared Bloodbank routing identity (no profile consumer)
 #   9. Installs a profile gateway + heartbeat timer (reconcile + checkpoint)
 #  10. Appends to ~/.hermes/agents-registry.yaml
@@ -34,6 +34,10 @@ _envops:
   variable_end_string: "}}"
   comment_start_string: "{#"
   comment_end_string: "#}"
+_exclude:
+  - "**/__pycache__"
+  - "**/*.pyc"
+  - "**/*.pyo"
 
 # ─── Questions (only what we can't derive) ───────────────────────────────
 
@@ -111,6 +115,11 @@ soul_tone:
     - formal
     - terse
 
+reconcile_enabled:
+  type: bool
+  help: "Run autonomous PM ticket-board reconciliation from the heartbeat timer"
+  default: true
+
 # ─── Derived (never asked) ───────────────────────────────────────────────
 
 agent_id:
@@ -169,5 +178,9 @@ _tasks:
   - "./.scripts/99-summary.sh"
 
 _skip_if_exists:
-  - hermes
+  # role.yaml contains verified channel identities and explicit operator
+  # choices (including reconcile_enabled=false).  A forced Copier refresh must
+  # preserve those durable values; the idempotent tasks below reconcile any
+  # newly-required fields and lifecycle assets around them.
+  - role.yaml
   - runtime

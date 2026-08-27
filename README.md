@@ -43,12 +43,12 @@ The template will:
 
 1. Seed `~/.config/hermes-agent-template/config.toml` from the shipped example (see [Configuration](#configuration))
 2. Ensure `~/.hermes/fleet.env` exists (single source of truth for shared Hermes binary/repo/registry)
-3. Create the hermes profile `<repo>-pm` via `hermes profile create --clone`
-4. Create ignored local state at `agents/hermes/pm/runtime/` (== HERMES_HOME)
-5. Populate missing files from the runtime scaffold (config.yaml, SOUL.md, memories)
+3. Create a clean Hermes profile `<repo>-pm` without cloning the default profile's credentials
+4. Create ignored role-owned state at `agents/hermes/pm/runtime/`; HERMES_HOME remains the named profile
+5. Populate missing files from the runtime scaffold (SOUL.md, memories, and role state)
 6. Refuse any stale project gitlink or `.gitmodules` mapping for that runtime
-7. Verify a profile-dedicated BotFather token and store it only in `runtime/.env`
-8. Defer Slack by default, or verify and store an explicitly supplied dedicated Slack app+bot pair in `runtime/.env`
+7. Verify a profile-dedicated BotFather token, store it in 1Password, and map only its `op://` reference
+8. Defer Slack by default, or wire a dedicated app+bot pair through the same reference-only contract
 9. Create a Plane project in your configured workspace
 10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
 11. Install systemd `--user` units: profile gateway and board-reconciliation heartbeat timer
@@ -133,13 +133,12 @@ exists. Retirement fails closed: a user-manager/query error, failed disable, or
 anything short of explicit `inactive` plus `disabled` leaves the unit file and
 registry metadata intact and reports unhealthy drift.
 
-Telegram and Slack ownership checks, identity claims, runtime credential
+Telegram and Slack ownership checks, identity claims, 1Password reference
 writes, and registry upserts serialize on `${registry_file}.lock`. The lock is
 held by `flock`, so a crashed process cannot leave a stale logical lock; registry
 writes use an atomic replace, sync the containing directory where supported, and
-keep both registry and lock at mode `0600`. Profile credential replacements use
-the same file-plus-parent durability boundary and remain safe to retry when a
-durability sync reports an error.
+keep both registry and lock at mode `0600`. Profile delta replacements use an
+atomic write and remain safe to retry when a durability sync reports an error.
 
 ## Reviewed Hermes runtime publication
 
@@ -176,10 +175,10 @@ shared Hermes provider OAuth store, including `openai-codex`; `HERMES_FLEET_CODE
 is the shared Codex CLI/app-server config/auth home.
 
 Telegram bot tokens and Slack bot/app tokens are deliberately excluded from
-this shared layer. They belong only in the enabled agent's `runtime/.env` and
-are checked for local profile ownership during provisioning; fleet config may
-carry the non-secret `TELEGRAM_ALLOWED_USERS` and `SLACK_ALLOWED_USERS`
-policies as a convenience.
+this shared layer and every on-disk dotenv file. Provisioning writes them to
+the configured 1Password vault and maps only `op://` references through the
+named profile's `secrets.onepassword.env`; fleet config may carry the
+non-secret allow-list policies as a convenience.
 
 To retrofit existing wrappers and user systemd units:
 

@@ -167,8 +167,13 @@ case "$OP" in
   resolve)
     [ -n "$WS" ] || die "workspace not set (.project.json ticket_provider.workspace or PLANE_WORKSPACE)"
     [ -n "$PROJ" ] || die "project not set (.project.json ticket_provider.board_id; run 42-ticket-provider.sh)"
-    printf '{"provider":"plane","board_id":"%s","board_url":"%s/%s/projects/%s/issues/"}\n' \
-      "$PROJ" "$BASE" "$WS" "$PROJ"
+    PROJECT_DETAIL="$(api GET "projects/$PROJ/")"
+    LIVE_IDENTIFIER="$(printf '%s' "$PROJECT_DETAIL" | python3 -c 'import sys,json
+try: print(str(json.load(sys.stdin).get("identifier") or ""))
+except Exception: print("")')"
+    [ -n "$LIVE_IDENTIFIER" ] || die "live Plane project omitted its authoritative identifier"
+    printf '{"provider":"plane","board_id":"%s","board_url":"%s/%s/projects/%s/issues/","identifier":"%s"}\n' \
+      "$PROJ" "$BASE" "$WS" "$PROJ" "$LIVE_IDENTIFIER"
     ;;
 
   active_milestone)
@@ -265,13 +270,23 @@ pid=next((p["id"] for p in rows if str(p.get("name","")).strip().lower()==name),
 if not pid and ident:
     pid=next((p["id"] for p in rows if (p.get("identifier") or "").upper()==ident), "")
 print(pid)')"
+    LIVE_IDENTIFIER=""
     if [ -n "$EXIST" ]; then PID="$EXIST"; else
-      PID="$(api POST "projects/" \
-        "$(python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[1],"identifier":sys.argv[2],"description":sys.argv[3]}))' "$NAME" "$IDENT" "$DESC")" \
-        | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')"
+      CREATED="$(api POST "projects/" \
+        "$(python3 -c 'import json,sys; print(json.dumps({"name":sys.argv[1],"identifier":sys.argv[2],"description":sys.argv[3]}))' "$NAME" "$IDENT" "$DESC")")"
+      PID="$(printf '%s' "$CREATED" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')"
+      LIVE_IDENTIFIER="$(printf '%s' "$CREATED" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("identifier","") or "")')"
     fi
     [ -n "$PID" ] || die "create_board failed"
-    printf '{"board_id":"%s","board_url":"%s/%s/projects/%s/issues/"}\n' "$PID" "$BASE" "$WS" "$PID"
+    if [ -z "$LIVE_IDENTIFIER" ]; then
+      DETAIL="$(api GET "projects/$PID/")"
+      LIVE_IDENTIFIER="$(printf '%s' "$DETAIL" | python3 -c 'import sys,json
+try: print(str(json.load(sys.stdin).get("identifier") or ""))
+except Exception: print("")')"
+    fi
+    [ -n "$LIVE_IDENTIFIER" ] || die "live Plane project omitted its authoritative identifier"
+    printf '{"board_id":"%s","board_url":"%s/%s/projects/%s/issues/","identifier":"%s"}\n' \
+      "$PID" "$BASE" "$WS" "$PID" "$LIVE_IDENTIFIER"
     ;;
 
   create_issue)

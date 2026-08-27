@@ -113,6 +113,7 @@ ticket_provider:
 printf '%s\n' "$*" >> "$PROVIDER_CALL_LOG"
 case "$*" in
   *'/projects/?per_page=200'*) printf '%s\n' '[{"id":"granted-board","name":"Demo"}]' ;;
+  *'/projects/granted-board/'*) printf '%s\n' '{"id":"granted-board","name":"Demo","identifier":"LIVE"}' ;;
   *) printf '%s\n' '{}' ;;
 esac
 """,
@@ -514,10 +515,13 @@ def test_explicit_board_grant_reaches_real_provider_adapter(tmp_path: Path) -> N
     assert call_log.read_text(encoding="utf-8").strip(), "positive grant must reach fake curl"
     manifest = json.loads((project / ".project.json").read_text(encoding="utf-8"))
     assert manifest["ticket_provider"]["board_id"] == "granted-board"
+    assert manifest["ticket_provider"]["identifier"] == "LIVE"
+    assert manifest["ticket_provider"]["state"] == "linked"
+    assert "board_url" not in manifest["ticket_provider"]
     assert manifest["agents"]["demo-pm"] == {
         "role": "pm",
         "role_dir": "agents/hermes/pm",
-        "provisioning_state": "provisioned",
+        "provisioning_state": "linked",
     }
     role_manifest = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
     assert role_manifest["model"]["name"] == "inherited-model"
@@ -525,6 +529,40 @@ def test_explicit_board_grant_reaches_real_provider_adapter(tmp_path: Path) -> N
     assert role_manifest["ticket_provider"]["workspace"] == "test-space"
     assert role_manifest["plane"]["workspace"] == "test-space"
     assert (role / ".scripts" / ".done-42-ticket-provider").exists()
+
+
+def test_done_marker_rerun_canonicalizes_live_plane_binding_and_preserves_unrelated_keys(
+    tmp_path: Path,
+) -> None:
+    project, role, env, _call_log = _fixture(tmp_path)
+    manifest_path = project / ".project.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["ticket_provider"].update(
+        {
+            "board_id": "granted-board",
+            "identifier": "STALE",
+            "state": "planned",
+            "board_url": "https://stale.invalid/split-brain",
+        }
+    )
+    manifest["unrelated"] = {"preserve": [1, 2, 3]}
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (role / ".scripts" / ".done-42-ticket-provider").touch()
+    env["SKIP_PLANE"] = "0"
+
+    result = _run(role, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert updated["ticket_provider"] == {
+        "type": "plane",
+        "workspace": "test-space",
+        "identifier": "LIVE",
+        "board_id": "granted-board",
+        "state": "linked",
+    }
+    assert updated["unrelated"] == {"preserve": [1, 2, 3]}
+    assert "revalidating canonical board binding" in result.stderr
 
 
 def test_skip_plane_scrubs_fleet_rehydrated_provider_authority_from_children(

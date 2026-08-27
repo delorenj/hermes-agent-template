@@ -106,6 +106,257 @@ p.write_text("".join(lines), encoding="utf-8")
 PYEOF
 }
 
+# Upsert one scalar below a top-level mapping without requiring the mapping to
+# have existed in an older rendered role.yaml. This is intentionally narrower
+# than a general YAML editor: lifecycle scripts use it only for safe, generated
+# status metadata such as service_state.gateway.
+yaml_upsert_block_value() {
+  # yaml_upsert_block_value PARENT KEY VALUE [string|bool]
+  python3 - "$ROLE_YAML" "$1" "$2" "$3" "${4:-string}" <<'PYEOF'
+import json, pathlib, re, sys
+
+path, parent, key, value, kind = sys.argv[1:6]
+if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", item) for item in (parent, key)):
+    raise SystemExit("yaml_upsert_block_value: unsafe key")
+if kind == "bool":
+    if value not in {"true", "false"}:
+        raise SystemExit("yaml_upsert_block_value: invalid boolean")
+    rendered_value = value
+elif kind == "string":
+    rendered_value = json.dumps(value, ensure_ascii=False)
+else:
+    raise SystemExit("yaml_upsert_block_value: unsupported scalar type")
+p = pathlib.Path(path)
+text = p.read_text(encoding="utf-8")
+match = re.search(
+    rf"(?ms)^{re.escape(parent)}:\s*\n(?P<body>(?:^[ \t]+.*\n?)*)", text
+)
+replacement = f"  {key}: {rendered_value}"
+if match:
+    body = match.group("body")
+    body, count = re.subn(
+        rf"(?m)^[ \t]+{re.escape(key)}:\s*.*$", replacement, body, count=1
+    )
+    if count == 0:
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += replacement + "\n"
+    text = text[: match.start("body")] + body + text[match.end("body") :]
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += f"\n{parent}:\n{replacement}\n"
+p.write_text(text, encoding="utf-8")
+PYEOF
+}
+
+# Test whether an ignored dotenv file contains one non-empty exact assignment.
+# Values remain inside the child process and are never printed or imported into
+# the provisioning shell.
+dotenv_has_nonempty() {
+  python3 - "$1" "$2" <<'PYEOF'
+import pathlib, re, sys
+
+path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+if not re.fullmatch(r"[A-Z][A-Z0-9_]*", key) or not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+for raw in path.read_text(encoding="utf-8").splitlines():
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("export "):
+        line = line[7:].lstrip()
+    name, sep, value = line.partition("=")
+    if not sep or name.strip() != key:
+        continue
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    raise SystemExit(0 if value else 1)
+raise SystemExit(1)
+PYEOF
+}
+
+# Persist one process-only value to 1Password. The helper prints only the
+# resulting op:// reference; the value crosses stdin and an anonymous pipe.
+store_onepassword_secret() {
+  # store_onepassword_secret ITEM_NAME VALUE
+  local item="$1" value="$2" vault
+  vault="${HERMES_ONEPASSWORD_VAULT:-$(config_get fleet.onepassword_vault 'DeLoSecrets')}"
+  [[ -n "$vault" ]] || die "fleet.onepassword_vault is required for channel credentials"
+  [[ -f "$ROLE_DIR/.scripts/store-onepassword-secret.py" ]] \
+    || die "trusted 1Password storage helper is missing"
+  printf '%s' "$value" \
+    | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" "$vault" "$item"
+}
+
+# Update one supported profile override and immediately regenerate config.yaml
+# from fleet base + delta.  Keeping both operations in one helper prevents the
+# first deploy and fleet-sync paths from disagreeing about which file is the
+# source of truth.
+profile_config_delta_update() {
+  # profile_config_delta_update PROFILE_HOME secret-ref ENV_NAME OP_REFERENCE
+  # profile_config_delta_update PROFILE_HOME voice PLUGIN VOICE
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import os, pathlib, re, sys, tempfile
+try:
+    import yaml
+except ImportError:
+    raise SystemExit("PyYAML is required for Hermes profile config")
+
+profile = pathlib.Path(sys.argv[1])
+mode, name, value = sys.argv[2:5]
+base_path = profile.parent.parent / "config.yaml"
+delta_path = profile / "config.delta.yaml"
+generated_path = profile / "config.yaml"
+
+def load(path):
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"required config source is unavailable: {path}")
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise SystemExit(f"config source must be a mapping: {path}")
+    return data
+
+def merge(base, override):
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = merge(result[key], value)
+        elif key in result and isinstance(result[key], dict) and value is None:
+            continue
+        else:
+            result[key] = value
+    return result
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink():
+            path.unlink()
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        try: os.unlink(temporary)
+        except FileNotFoundError: pass
+        raise
+
+base = load(base_path)
+if delta_path.exists():
+    delta = load(delta_path)
+else:
+    delta = {}
+if mode == "secret-ref":
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+        raise SystemExit("invalid secret environment variable name")
+    if not value.startswith("op://") or any(ch in value for ch in "\r\n\0"):
+        raise SystemExit("invalid 1Password reference")
+    onepassword = delta.setdefault("secrets", {}).setdefault("onepassword", {})
+    if not isinstance(onepassword, dict):
+        raise SystemExit("secrets.onepassword delta must be a mapping")
+    onepassword["enabled"] = True
+    env = onepassword.setdefault("env", {})
+    if not isinstance(env, dict):
+        raise SystemExit("secrets.onepassword.env delta must be a mapping")
+    env[name] = value
+elif mode == "voice":
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+        raise SystemExit("invalid TTS plugin name")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
+        raise SystemExit("invalid TTS voice name")
+    base_enabled = (base.get("plugins") or {}).get("enabled") or []
+    delta_enabled = (delta.get("plugins") or {}).get("enabled") or []
+    if not isinstance(base_enabled, list) or not isinstance(delta_enabled, list):
+        raise SystemExit("plugins.enabled must be a list")
+    enabled = []
+    for entry in [*base_enabled, *delta_enabled, f"tts/{name}"]:
+        if entry == "tts/voxxy" or entry in enabled:
+            continue
+        enabled.append(entry)
+    delta.setdefault("plugins", {})["enabled"] = enabled
+    tts = delta.setdefault("tts", {})
+    if not isinstance(tts, dict):
+        raise SystemExit("tts delta must be a mapping")
+    tts.pop("voxxy", None)
+    tts["provider"] = name
+    tts["voice"] = value
+    provider = tts.setdefault(name, {})
+    if not isinstance(provider, dict):
+        raise SystemExit(f"tts.{name} delta must be a mapping")
+    provider["voice"] = value
+else:
+    raise SystemExit("unsupported profile config delta update")
+atomic_write(
+    delta_path,
+    "# Override-only delta for this Hermes profile.\n"
+    "# Contains configuration and secret references only; secret values remain in 1Password.\n"
+    + yaml.safe_dump(delta, sort_keys=False),
+)
+header = (
+    "# GENERATED FILE -- DO NOT EDIT.\n"
+    "# source: fleet config.yaml + profile config.delta.yaml\n"
+)
+atomic_write(generated_path, header + yaml.safe_dump(merge(base, delta), sort_keys=False))
+PYEOF
+}
+
+# Record an env-var -> op:// mapping without accepting a raw value.
+profile_onepassword_ref_set() {
+  # profile_onepassword_ref_set PROFILE_HOME ENV_NAME OP_REFERENCE
+  profile_config_delta_update "$1" secret-ref "$2" "$3"
+}
+
+profile_voice_contract_set() {
+  # profile_voice_contract_set PROFILE_HOME PLUGIN VOICE
+  profile_config_delta_update "$1" voice "$2" "$3"
+}
+
+profile_onepassword_ref_exists() {
+  # profile_onepassword_ref_exists PROFILE_HOME ENV_NAME
+  python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
+import pathlib, re, sys
+try:
+    import yaml
+except ImportError:
+    raise SystemExit(1)
+path = pathlib.Path(sys.argv[1])
+if not path.is_file() or path.is_symlink():
+    raise SystemExit(1)
+try:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    ref = data["secrets"]["onepassword"]["env"].get(sys.argv[2], "")
+except (KeyError, TypeError, ValueError, yaml.YAMLError):
+    raise SystemExit(1)
+raise SystemExit(0 if isinstance(ref, str) and ref.startswith("op://") else 1)
+PYEOF
+}
+
+profile_onepassword_ref_validate() {
+  # profile_onepassword_ref_validate PROFILE_HOME ENV_NAME
+  local reference helper="$ROLE_DIR/.scripts/store-onepassword-secret.py"
+  [[ -f "$helper" ]] || return 1
+  reference="$(python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
+import pathlib, sys
+try:
+    import yaml
+    data = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
+    ref = data["secrets"]["onepassword"]["env"].get(sys.argv[2], "")
+except Exception:
+    ref = ""
+print(ref if isinstance(ref, str) and ref.startswith("op://") else "", end="")
+PYEOF
+)"
+  [[ -n "$reference" ]] || return 1
+  python3 -I "$helper" --validate-reference "$reference" >/dev/null 2>&1
+}
+
 # ─── Distributable config (~/.config/hermes-agent-template/config.toml) ──────
 # Single source of truth for environment-specific defaults so this template can
 # be handed to someone else without editing any script. Ship config.example.toml

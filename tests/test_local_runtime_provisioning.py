@@ -49,6 +49,11 @@ runtime:
     home = tmp_path / "home"
     profiles = home / ".hermes" / "profiles"
     profiles.mkdir(parents=True)
+    (home / ".hermes" / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: rick\n",
+        encoding="utf-8",
+    )
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     hermes = fake_bin / "hermes"
@@ -83,7 +88,7 @@ exit 0
             "PJANGLER_LOG": str(tmp_path / "pjangler.log"),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "RUNTIME_SCAFFOLD_DIR": str(scaffold),
-            "VOXXY_PLUGIN_DIR": str(tmp_path / "missing-voxxy"),
+            "VOX_PLUGIN_DIR": str(tmp_path / "missing-vox"),
         }
     )
     return project, role, env
@@ -115,12 +120,7 @@ def test_provisioner_creates_ignored_local_runtime_without_git(tmp_path: Path) -
     calls = Path(env["PJANGLER_LOG"]).read_text(encoding="utf-8")
     assert "migrate hermes.runtime-singleton" in calls
     assert "--dry-run --json" in calls
-    hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
-    assert hermes_calls == [
-        f"{profile}|config set plugins.enabled.0 tts/voxxy",
-        f"{profile}|config set tts.provider voxxy",
-        f"{profile}|config set tts.voice rick",
-    ]
+    assert not Path(env["HERMES_LOG"]).exists()
     assert subprocess.run(
         ["git", "check-ignore", "-q", "agents/hermes/pm/runtime/"],
         cwd=project,
@@ -164,7 +164,8 @@ def test_active_provisioner_has_no_runtime_repo_or_submodule_mutation() -> None:
     ):
         assert forbidden not in script
     assert "stale .gitmodules mapping" in script
-    assert 'cp -an "$TMP/." "$RUNTIME_LOCAL/"' in script
+    assert 'cp -an "$TMP/." "$RUNTIME_LOCAL/"' not in script
+    assert "os.path.lexists(destination)" in script
     assert "migrate hermes.runtime-singleton" in script
     assert 'ln -sfn "$RUNTIME_LOCAL" "$PROFILE_HOME"' not in script
     assert "config set terminal.cwd" not in script
@@ -185,7 +186,7 @@ def test_provisioner_never_replaces_existing_named_profile(tmp_path: Path) -> No
     assert sentinel.read_text(encoding="utf-8") == "preserve\n"
 
 
-def test_required_named_profile_config_failure_is_not_suppressed_or_marked_done(
+def test_runtime_provisioner_never_mutates_generated_profile_config_with_hermes(
     tmp_path: Path,
 ) -> None:
     _project, role, env = _fixture(tmp_path)
@@ -193,15 +194,34 @@ def test_required_named_profile_config_failure_is_not_suppressed_or_marked_done(
 
     result = _run(role, env)
 
-    assert result.returncode != 0
-    assert "required Hermes config write failed" in result.stderr
-    assert "named profile terminal.cwd" not in result.stderr
-    assert not (role / ".scripts" / ".done-20-runtime-repo").exists()
+    assert result.returncode == 0, result.stderr
+    assert (role / ".scripts" / ".done-20-runtime-repo").exists()
+    assert not Path(env["HERMES_LOG"]).exists()
+
+
+def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> None:
+    _project, role, env = _fixture(tmp_path)
+    plugin = tmp_path / "vox-plugin"
+    plugin.mkdir()
+    env["VOX_PLUGIN_DIR"] = str(plugin)
     profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
-    hermes_calls = Path(env["HERMES_LOG"]).read_text(encoding="utf-8").splitlines()
-    assert hermes_calls == [
-        f"{profile}|config set plugins.enabled.0 tts/voxxy",
-    ]
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: rick\n",
+        encoding="utf-8",
+    )
+
+    result = _run(role, env)
+
+    assert result.returncode == 0, result.stderr
+    assert "PM voice verified: provider=vox voice=carlin" in result.stderr
+    assert (profile / "plugins" / "tts" / "vox").resolve() == plugin.resolve()
+    generated = (profile / "config.yaml").read_text(encoding="utf-8")
+    assert "tts/voxxy" not in generated
+    assert "provider: vox\n" in generated
+    assert "voice: carlin\n" in generated
+    assert not Path(env["HERMES_LOG"]).exists()
 
 
 def test_step20_preserves_shared_config_behind_profile_symlink(tmp_path: Path) -> None:

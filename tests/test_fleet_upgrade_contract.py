@@ -15,6 +15,12 @@ HEARTBEAT = ROOT / "template" / ".scripts" / "heartbeat.sh"
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
     home = tmp_path / "home"
+    fleet_home = home / ".hermes"
+    profile = fleet_home / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
+    (fleet_home / "config.yaml").write_text("fleet: true\n", encoding="utf-8")
+    (profile / "config.delta.yaml").write_text("{}\n", encoding="utf-8")
+    (profile / "config.yaml").write_text("fleet: true\n", encoding="utf-8")
     role = tmp_path / "role"
     runtime = role / "runtime"
     runtime.mkdir(parents=True)
@@ -63,10 +69,12 @@ case "$*" in
     touch "$SYSTEMCTL_RETIRED"; exit 0 ;;
   *"is-active hermes-demo-pm-consumer.service"*)
     [[ "$SYSTEMCTL_MODE" == "active-query-error" ]] && { echo "Failed to connect to bus" >&2; exit 1; }
-    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo inactive; exit 3; else echo active; exit 0; fi ;;
+    if [[ ! -e "$SYSTEMCTL_CONSUMER" ]]; then echo inactive; exit 4;
+    elif [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo inactive; exit 3; else echo active; exit 0; fi ;;
   *"is-enabled hermes-demo-pm-consumer.service"*)
     [[ "$SYSTEMCTL_MODE" == "enabled-query-error" ]] && { echo "Failed to connect to bus" >&2; exit 1; }
-    if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
+    if [[ ! -e "$SYSTEMCTL_CONSUMER" ]]; then echo not-found; exit 4;
+    elif [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
   *"daemon-reload"*) exit 0 ;;
 esac
 exit 1
@@ -82,6 +90,7 @@ exit 1
             "HERMES_FLEET_REGISTRY_FILE": str(registry),
             "HERMES_FLEET_HOME": str(home / ".hermes"),
             "SYSTEMCTL_RETIRED": str(retired),
+            "SYSTEMCTL_CONSUMER": str(consumer),
             "SYSTEMCTL_MODE": "success",
         }
     )
@@ -114,6 +123,18 @@ def test_fleet_audit_reports_and_apply_retires_legacy_consumer(tmp_path: Path) -
     assert "consumer_unit" not in entry["systemd"]
     assert stat.S_IMODE(registry.stat().st_mode) == 0o600
     assert (role / ".scripts" / "heartbeat.sh").read_bytes() == HEARTBEAT.read_bytes()
+
+    converged = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert converged.returncode == 0, converged.stdout + converged.stderr
+    assert "config.yaml" not in converged.stdout
+    profile = Path(env["HERMES_FLEET_HOME"]) / "profiles" / "demo-pm"
+    assert not (profile / "config.yaml").is_symlink()
 
 
 def test_fleet_apply_preserves_unit_and_metadata_when_disable_fails(tmp_path: Path) -> None:

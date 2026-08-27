@@ -54,6 +54,15 @@ def test_plane_provider_reads_only_workspace_key_as_inert_dotenv(tmp_path: Path)
     env.pop("PLANE_API_KEY", None)
     env.pop("PLANE_TEST_SPACE_API_KEY", None)
     env["HERMES_FLEET_ENV"] = str(fleet_env)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' '{\"id\":\"15258893-0206-4e8f-aea6-340eb217988c\",\"identifier\":\"LIVE\"}'\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     result = subprocess.run(
         ["sh", str(provider), "resolve"],
         cwd=repo,
@@ -67,6 +76,7 @@ def test_plane_provider_reads_only_workspace_key_as_inert_dotenv(tmp_path: Path)
         "provider": "plane",
         "board_id": board_id,
         "board_url": f"https://plane.delo.sh/test-space/projects/{board_id}/issues/",
+        "identifier": "LIVE",
     }
     assert not marker.exists()
 
@@ -110,6 +120,12 @@ def test_plane_provider_resolves_workspace_1password_reference(tmp_path: Path) -
         encoding="utf-8",
     )
     fake_op.chmod(0o755)
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env sh\nprintf '%s\\n' '{\"id\":\"15258893-0206-4e8f-aea6-340eb217988c\",\"identifier\":\"LIVE\"}'\n",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
 
     env = os.environ.copy()
     env.pop("PLANE_API_KEY", None)
@@ -126,5 +142,10 @@ def test_plane_provider_resolves_workspace_1password_reference(tmp_path: Path) -
         check=True,
     )
 
-    assert json.loads(result.stdout)["board_id"] == board_id
+    assert json.loads(result.stdout) == {
+        "provider": "plane",
+        "board_id": board_id,
+        "board_url": f"https://plane.delo.sh/test-space/projects/{board_id}/issues/",
+        "identifier": "LIVE",
+    }
     assert op_log.read_text(encoding="utf-8") == secret_ref

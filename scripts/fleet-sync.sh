@@ -18,8 +18,9 @@ set -euo pipefail
 # ~/.hermes/profiles/<name> MUST be a real directory, NOT a symlink to the
 # runtime. Hermes derives profile identity from the UNRESOLVED HERMES_HOME
 # path, so a symlinked profile dir makes get_active_profile_name() report
-# "default" and disables shared fleet auth. Shared entries (config.yaml, .env,
-# skills) symlink up to the fleet root; owned entries (memories, sessions,
+# "default" and disables shared fleet auth. Shared entries (.env, skills)
+# symlink up to the fleet root; config.yaml is a generated real file rendered
+# from the fleet base plus config.delta.yaml; owned entries (memories, sessions,
 # state.db, ...) symlink back into <role_dir>/runtime.
 #
 # Default is a DRY-RUN drift report (exit 1 when drift exists, 0 when clean).
@@ -35,9 +36,11 @@ WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
 HEARTBEAT_TEMPLATE="$SCRIPT_DIR/../template/.scripts/heartbeat.sh"
 FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
 FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
+PROFILE_CONFIG_TOOL="$SCRIPT_DIR/hermes-profile-config.py"
 if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
    || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" \
-   || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" ]]; then
+   || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" \
+   || ! -f "$PROFILE_CONFIG_TOOL" || -L "$PROFILE_CONFIG_TOOL" ]]; then
   echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
   exit 2
 fi
@@ -77,28 +80,28 @@ PROFILES_DIR="$FLEET_HOME/profiles"
 SYSTEMD_USER_DIR="${HERMES_FLEET_SYSTEMD_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 VOX_URL_VALUE="${VOX_URL:-$(cfg fleet.vox_url 'https://vox.delo.sh')}"
 
-# Voxxy TTS is an OPTIONAL capability, and the plugin was renamed voxxy -> vox.
+# Vox TTS is an OPTIONAL capability. The checkout may still be named voxxy,
+# but every runtime/provider/voice claim uses the canonical vox/carlin names.
 # Resolve the name and dir from explicit config first, then from known layouts
 # in the voxxy checkout. When voxxy is not installed at all, that is a missing
 # optional dependency reported ONCE — not per-agent drift, which previously
 # buried every real finding under 20+ lines of noise.
 VOX_PLUGIN_NAME="${VOX_PLUGIN_NAME:-$(cfg fleet.vox_plugin_name vox)}"
-VOX_VOICE="${VOX_VOICE:-$(cfg fleet.vox_voice rick)}"
-VOXXY_PLUGIN_DIR="${VOXXY_PLUGIN_DIR:-$(cfg fleet.voxxy_plugin_dir "")}"
-if [[ -z "$VOXXY_PLUGIN_DIR" || ! -d "$VOXXY_PLUGIN_DIR" ]]; then
+VOX_VOICE="${VOX_VOICE:-$(cfg fleet.vox_voice carlin)}"
+VOX_PLUGIN_DIR="${VOX_PLUGIN_DIR:-$(cfg fleet.vox_plugin_dir "")}"
+if [[ -z "$VOX_PLUGIN_DIR" || ! -d "$VOX_PLUGIN_DIR" ]]; then
   for candidate in \
     "$FLEET_HOME/plugins/$VOX_PLUGIN_NAME" \
-    "$HOME/code/voxxy/plugins/tts/$VOX_PLUGIN_NAME" \
-    "$HOME/code/voxxy/plugins/tts/voxxy"
+    "$HOME/code/voxxy/plugins/tts/$VOX_PLUGIN_NAME"
   do
-    [[ -n "$candidate" && -d "$candidate" ]] && { VOXXY_PLUGIN_DIR="$candidate"; break; }
+    [[ -n "$candidate" && -d "$candidate" ]] && { VOX_PLUGIN_DIR="$candidate"; break; }
   done
 fi
-VOXXY_AVAILABLE=0
-[[ -n "$VOXXY_PLUGIN_DIR" && -d "$VOXXY_PLUGIN_DIR" ]] && VOXXY_AVAILABLE=1
+VOX_AVAILABLE=0
+[[ -n "$VOX_PLUGIN_DIR" && -d "$VOX_PLUGIN_DIR" ]] && VOX_AVAILABLE=1
 
 # Singleton-runtime profile contract (mirrors src/parity/rules.ts).
-SHARED_PROFILE_ENTRIES=(config.yaml .env skills)
+SHARED_PROFILE_ENTRIES=(.env skills)
 OWNED_PROFILE_ENTRIES=(memories sessions workspace logs cron plans hooks pairing audio_cache image_cache)
 OWNED_PROFILE_FILES=(SOUL.md state.db kanban.db)
 
@@ -531,6 +534,38 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     for entry in "${OWNED_PROFILE_FILES[@]}"; do
       ensure_profile_link "$entry" "$profile_dir/$entry" "$runtime/$entry" file
     done
+
+    # config.yaml is GENERATED and must be a real file. Its only sources of
+    # truth are the fleet base and this profile's config.delta.yaml. A healthy
+    # dry run therefore checks semantic equality and never asks for the legacy
+    # config.yaml -> fleet-base symlink.
+    if [[ ! -f "$profile_dir/config.delta.yaml" || -L "$profile_dir/config.delta.yaml" ]]; then
+      if [[ $APPLY -eq 1 && ! -e "$profile_dir/config.delta.yaml" ]]; then
+        printf '%s\n' '# Override-only delta for this Hermes profile.' '{}' \
+          > "$profile_dir/config.delta.yaml"
+        chmod 600 "$profile_dir/config.delta.yaml"
+        note "$agent_id" FIXED "empty config.delta.yaml seeded"
+        changed=1; FIXED=$((FIXED + 1))
+      else
+        note "$agent_id" DRIFT "config.delta.yaml missing or unsafe (MANUAL: establish override source)"
+        DRIFT=$((DRIFT + 1))
+      fi
+    fi
+    if [[ -f "$profile_dir/config.delta.yaml" && ! -L "$profile_dir/config.delta.yaml" ]]; then
+      if ! HERMES_FLEET_HOME="$FLEET_HOME" \
+          python3 "$PROFILE_CONFIG_TOOL" check --profile "$profile_name" >/dev/null 2>&1; then
+        if [[ $APPLY -eq 1 ]]; then
+          HERMES_FLEET_HOME="$FLEET_HOME" \
+            python3 "$PROFILE_CONFIG_TOOL" render --profile "$profile_name" >/dev/null \
+            || { note "$agent_id" DRIFT "base+delta config render failed"; DRIFT=$((DRIFT + 1)); continue; }
+          note "$agent_id" FIXED "config.yaml rendered from fleet base + delta"
+          changed=1; FIXED=$((FIXED + 1))
+        else
+          note "$agent_id" DRIFT "config.yaml != deep_merge(fleet base, config.delta.yaml)"
+          DRIFT=$((DRIFT + 1))
+        fi
+      fi
+    fi
   fi
 
   # 3b. systemd units must point HERMES_HOME at that profile dir. This is the
@@ -581,12 +616,12 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   # raw runtime instead puts it somewhere Hermes never reads.
   role_name="$(basename "$role_dir")"
   if [[ "$role_name" == "pm" && -d "$runtime" ]]; then
-    if [[ $VOXXY_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
+    if [[ $VOX_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
       plugin_link="$profile_dir/plugins/tts/$VOX_PLUGIN_NAME"
       if [[ -L "$plugin_link" ]]; then
-        if [[ "$(readlink -f "$plugin_link")" != "$(readlink -f "$VOXXY_PLUGIN_DIR")" ]]; then
+        if [[ "$(readlink -f "$plugin_link")" != "$(readlink -f "$VOX_PLUGIN_DIR")" ]]; then
           if [[ $APPLY -eq 1 ]]; then
-            ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
+            ln -sfn "$VOX_PLUGIN_DIR" "$plugin_link"
             note "$agent_id" FIXED "profile $VOX_PLUGIN_NAME plugin relinked"
             changed=1; FIXED=$((FIXED + 1))
           else
@@ -600,7 +635,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
       else
         if [[ $APPLY -eq 1 ]]; then
           mkdir -p "$profile_dir/plugins/tts"
-          ln -sfn "$VOXXY_PLUGIN_DIR" "$plugin_link"
+          ln -sfn "$VOX_PLUGIN_DIR" "$plugin_link"
           note "$agent_id" FIXED "profile $VOX_PLUGIN_NAME plugin linked"
           changed=1; FIXED=$((FIXED + 1))
         else
@@ -643,11 +678,10 @@ PYEOF
       esac
     fi
 
-    # The effective config is the one under the agent's real HERMES_HOME. Under
-    # the singleton contract that file symlinks to the fleet root, so this reads
-    # (and enforces) the shared PM voice contract rather than writing a stray
-    # config.yaml into the repo runtime that nothing ever loads.
-    if [[ $VOXXY_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
+    # The effective config is generated from base + delta. Enforce PM voice by
+    # updating the override source, then rerender; never mutate generated
+    # config.yaml through `hermes config set`.
+    if [[ $VOX_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
       config_status="$(python3 - "$profile_dir/config.yaml" "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
 import pathlib, sys
 
@@ -665,12 +699,57 @@ PYEOF
 )"
       if [[ "$config_status" != "ok|ok|ok" ]]; then
         if [[ "$APPLY" -eq 1 ]]; then
-          hermes_bin="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}"
-          HERMES_HOME="$profile_dir" "$hermes_bin" config set "plugins.enabled.0" "tts/$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
-          HERMES_HOME="$profile_dir" "$hermes_bin" config set tts.provider "$VOX_PLUGIN_NAME" >/dev/null 2>&1 || true
-          HERMES_HOME="$profile_dir" "$hermes_bin" config set "tts.$VOX_PLUGIN_NAME.voice" "$VOX_VOICE" >/dev/null 2>&1 || true
-          note "$agent_id" FIXED "TTS config enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
-          changed=1; FIXED=$((FIXED + 1))
+          if python3 - "$FLEET_HOME/config.yaml" "$profile_dir/config.delta.yaml" \
+              "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
+import os, pathlib, sys, tempfile
+try:
+    import yaml
+except ImportError:
+    raise SystemExit("PyYAML is required")
+base_path, delta_path = map(pathlib.Path, sys.argv[1:3])
+plugin, voice = sys.argv[3:5]
+base = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
+delta = yaml.safe_load(delta_path.read_text(encoding="utf-8")) or {}
+if not isinstance(base, dict) or not isinstance(delta, dict):
+    raise SystemExit("base and delta must be mappings")
+enabled = [
+    entry for entry in ((base.get("plugins") or {}).get("enabled") or [])
+    if entry != "tts/voxxy"
+]
+for entry in ((delta.get("plugins") or {}).get("enabled") or []):
+    if entry != "tts/voxxy" and entry not in enabled:
+        enabled.append(entry)
+if f"tts/{plugin}" not in enabled:
+    enabled.append(f"tts/{plugin}")
+delta.setdefault("plugins", {})["enabled"] = enabled
+tts = delta.setdefault("tts", {})
+tts.pop("voxxy", None)
+tts["provider"] = plugin
+tts.setdefault(plugin, {})["voice"] = voice
+tts["voice"] = voice
+fd, temporary = tempfile.mkstemp(prefix=f".{delta_path.name}.", dir=delta_path.parent)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write("# Override-only delta for this Hermes profile.\n")
+        handle.write(yaml.safe_dump(delta, sort_keys=False))
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(temporary, delta_path)
+except BaseException:
+    try: os.unlink(temporary)
+    except FileNotFoundError: pass
+    raise
+PYEOF
+          then
+            HERMES_FLEET_HOME="$FLEET_HOME" \
+              python3 "$PROFILE_CONFIG_TOOL" render --profile "$profile_name" >/dev/null \
+              || { note "$agent_id" DRIFT "Vox delta saved but config render failed"; DRIFT=$((DRIFT + 1)); continue; }
+            note "$agent_id" FIXED "TTS delta enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
+            changed=1; FIXED=$((FIXED + 1))
+          else
+            note "$agent_id" DRIFT "TTS delta update failed"
+            DRIFT=$((DRIFT + 1))
+          fi
         else
           note "$agent_id" DRIFT "TTS config not $VOX_PLUGIN_NAME/$VOX_VOICE in $profile_dir/config.yaml ($config_status)"
           DRIFT=$((DRIFT + 1))
@@ -701,10 +780,10 @@ if [[ -d "$PROFILES_DIR" ]]; then
   done
 fi
 
-# Voxxy is optional; say so once instead of once per PM.
-if [[ $VOXXY_AVAILABLE -eq 0 ]]; then
+# Vox is optional; say so once instead of once per PM.
+if [[ $VOX_AVAILABLE -eq 0 ]]; then
   echo
-  echo "note: voxxy TTS plugin not installed (looked for plugins/tts/$VOX_PLUGIN_NAME)."
+  echo "note: Vox TTS plugin not installed (looked for plugins/tts/$VOX_PLUGIN_NAME)."
   echo "      PM voice checks skipped — this is an optional capability, not drift."
 fi
 

@@ -159,7 +159,7 @@ headers = {
         text = (ROOT / "template" / ".scripts" / "20-runtime-repo.sh").read_text()
         scan_positions = [index for index in range(len(text)) if text.startswith("secret-scan.py", index)]
         self.assertTrue(scan_positions, "20-runtime-repo.sh must invoke secret-scan.py")
-        self.assertLess(scan_positions[0], text.index('cp -an "$TMP/." "$RUNTIME_LOCAL/"'))
+        self.assertLess(scan_positions[0], text.index('python3 - "$TMP" "$RUNTIME_LOCAL"'))
 
     def test_runtime_bootstrap_does_not_publish_runtime_to_a_remote(self) -> None:
         # Guards the FR4 boundary the reporter branch predated: provisioning must

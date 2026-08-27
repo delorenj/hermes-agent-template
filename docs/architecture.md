@@ -56,7 +56,7 @@ truth, provisioning never writes a project-specific `terminal.cwd` into it.
 The manual wrapper, gateway, and heartbeat launcher instead export
 `TERMINAL_CWD` as a process-local value resolved from the role's Git root.
 
-## Per-agent gateway route and encrypted credentials
+## Per-agent gateway route and secret references
 
 `role.yaml` may set `model.name`, `provider`, `base_url`, `api_mode`, and
 `key_env`. The generated systemd gateway launcher translates only those
@@ -64,12 +64,12 @@ non-secret values into explicit `hermes gateway run` flags. Session `/model`
 and channel overrides still take precedence. `key_env` is a variable name,
 never a key value.
 
-For systemd user services, encrypted files named
-`<agent>-telegram-bot-token.cred` and `<agent>-model-api-key.cred` under
-`~/.config/hermes-agent/credentials/` are loaded with
-`LoadCredentialEncrypted`. Decrypted bytes exist only in systemd's volatile
-credential directory and the launched process environment. Ignored
-`runtime/.env` remains a backward-compatible fallback.
+For systemd user services, an optional encrypted model credential named
+`<agent>-model-api-key.cred` under `~/.config/hermes-agent/credentials/` may be
+loaded with `LoadCredentialEncrypted`. Chat-channel credentials are stored in
+1Password and resolved natively by Hermes from the named profile's
+`secrets.onepassword.env` mapping. Raw chat tokens are forbidden in every
+dotenv file, including ignored `runtime/.env`.
 
 ## Durability boundary
 
@@ -101,9 +101,9 @@ The BotFather token is an invocation-only provisioning input: shared
 `fleet.env` may carry the non-secret allow-list policy but is never allowed to
 supply `TELEGRAM_BOT_TOKEN`. Provisioning verifies `getMe`, rejects a token or
 bot identity already owned anywhere in the local fleet, atomically writes the
-credential only to the profile's mode-`0600` `runtime/.env`, and records only
-safe identity metadata in `role.yaml` and the registry. Hermes' scoped runtime
-lock remains a second line of defense against duplicate pollers.
+credential in 1Password, maps only its `op://` reference into the named profile,
+and records safe identity metadata in `role.yaml` and the registry. Hermes'
+scoped runtime lock remains a second line of defense against duplicate pollers.
 
 ## One app and bot per Slack-enabled agent
 
@@ -114,11 +114,11 @@ bot token; provisioning rejects token reuse and a verified bot identity already
 owned by another registry entry.
 
 The bot token is verified through Slack's read-only `auth.test` endpoint.
-Credentials live only in the agent's mode-`0600`, gitignored `runtime/.env`.
-The shared `~/.hermes/.env`, `fleet.env`, `role.yaml`, and fleet registry never
-contain Slack tokens: manifests and registry entries retain only provisioning
-status, workspace identity, and bot identity. The non-secret allowed-user
-policy may be inherited from fleet config.
+Credentials live only in 1Password; the named profile contains `op://`
+references under `secrets.onepassword.env`. The shared `~/.hermes/.env`,
+`fleet.env`, ignored `runtime/.env`, `role.yaml`, and fleet registry never
+contain Slack tokens. The non-secret allowed-user policy may be inherited from
+fleet config.
 
 ## One Plane project per agent
 

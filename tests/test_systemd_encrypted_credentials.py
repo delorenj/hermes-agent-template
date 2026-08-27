@@ -99,7 +99,7 @@ def test_launcher_reads_volatile_credentials_and_forwards_only_key_name(
     assert result.returncode == 0, result.stderr
     assert "runtime-secret" not in result.stdout + result.stderr
     observed = json.loads(Path(env["CAPTURE_PATH"]).read_text(encoding="utf-8"))
-    assert observed["telegram"] == "telegram-runtime-secret"
+    assert observed["telegram"] is None
     assert observed["model_key"] == "model-runtime-secret"
     assert observed["home"].endswith("/.hermes/profiles/demo-director")
     assert observed["terminal_cwd"] == str(role.parents[2])
@@ -142,7 +142,7 @@ def test_launcher_rejects_key_values_in_role_manifest(tmp_path: Path) -> None:
     assert "invalid credential environment name" in result.stderr
 
 
-def test_launcher_keeps_ignored_environment_file_fallback(tmp_path: Path) -> None:
+def test_launcher_scrubs_channel_env_but_preserves_model_env_fallback(tmp_path: Path) -> None:
     role, env = _role(tmp_path)
     env["TELEGRAM_BOT_TOKEN"] = "runtime-env-telegram"
     env["DIRECTOR_LITELLM_KEY"] = "runtime-env-model"
@@ -157,5 +157,5 @@ def test_launcher_keeps_ignored_environment_file_fallback(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr
     observed = json.loads(Path(env["CAPTURE_PATH"]).read_text(encoding="utf-8"))
-    assert observed["telegram"] == "runtime-env-telegram"
+    assert observed["telegram"] is None
     assert observed["model_key"] == "runtime-env-model"

@@ -47,21 +47,24 @@ PYEOF
 }
 
 telegram_status="$(yaml_get telegram.provisioning_status)"
+PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 
 if [[ "${SKIP_TELEGRAM:-0}" == "1" ]]; then
-  if [[ "$telegram_status" == "verified" ]] && already_done 30-telegram; then
+  if [[ "$telegram_status" == "verified" ]] && already_done 30-telegram \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
     log "[30] telegram — SKIPPED; existing verified wiring preserved"
   else
-    telegram_yaml_update provisioning_status disabled
+    telegram_yaml_update provisioning_status deferred
     clear_done 30-telegram
-    log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; completion marker cleared)"
+    log "[30] telegram — DEFERRED (SKIP_TELEGRAM=1; no verified 1Password reference)"
   fi
   exit 0
 fi
 
 if already_done 30-telegram; then
-  if [[ "$telegram_status" == "verified" ]]; then
-    log "[30] telegram already wired — skipping"
+  if [[ "$telegram_status" == "verified" ]] \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" TELEGRAM_BOT_TOKEN; then
+    log "[30] telegram already wired through a verified 1Password reference — skipping"
     exit 0
   fi
   clear_done 30-telegram
@@ -272,7 +275,18 @@ except BaseException:
     raise
 PYEOF
 
-# Atomically replace only Telegram fields in the profile-local runtime file.
+# Persist the credential directly to 1Password and map only its op:// reference
+# into the named profile's override config. The raw token never reaches a file.
+ONEPASSWORD_ITEM_PREFIX="${HERMES_ONEPASSWORD_ITEM_PREFIX:-$(config_get fleet.onepassword_item_prefix 'hermes-agent')}"
+telegram_reference="$(store_onepassword_secret \
+  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-telegram-bot-token" \
+  "$TELEGRAM_BOT_TOKEN")" \
+  || die "Telegram credential could not be stored in 1Password"
+profile_onepassword_ref_set "$PROFILE_HOME" TELEGRAM_BOT_TOKEN "$telegram_reference" \
+  || die "Telegram 1Password reference could not be mapped into the named profile"
+
+# Keep only the non-secret allow-list in the ignored runtime env, and remove a
+# stale literal token if an older template ever wrote one here.
 export TELEGRAM_ALLOWED_USERS
 python3 - "$ENVF" <<'PYEOF'
 import errno
@@ -293,10 +307,7 @@ for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS"):
 text = text.rstrip("\n")
 if text:
     text += "\n"
-text += "".join(
-    f"{key}={json.dumps(os.environ.get(key, ''))}\n"
-    for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USERS")
-)
+text += f"TELEGRAM_ALLOWED_USERS={json.dumps(os.environ.get('TELEGRAM_ALLOWED_USERS', ''))}\n"
 
 def fsync_parent(target):
     unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
@@ -344,9 +355,5 @@ telegram_yaml_update \
 fleet_lock_release
 trap - EXIT
 
-# Enable telegram toolset for the profile
-env HERMES_HOME="$RUNTIME" "$HERMES_BIN" tools enable telegram hermes-telegram 2>/dev/null \
-  || warn "    couldn't auto-enable telegram toolset; run: $ROLE_DIR/hermes tools"
-
-log "    wired @$bot_username (id=$bot_id)"
+log "    wired @$bot_username (id=$bot_id) through 1Password reference"
 mark_done 30-telegram

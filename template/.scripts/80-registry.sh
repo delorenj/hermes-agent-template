@@ -40,7 +40,8 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$PLANE_WORKSPACE" "$PLANE_PROJECT_ID" "$(yaml_get plane.identifier)" \
   "$RUNTIME_REPO" "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
-  "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" <<'PYEOF'
+  "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" \
+  "$(yaml_get service_state.gateway)" "$(yaml_get service_state.heartbeat)" <<'PYEOF'
 import datetime
 import errno
 import os
@@ -56,7 +57,8 @@ except ImportError:
  slack_status, slack_team_id, slack_team_name, slack_user_id, slack_bot_id,
  slack_username, bloodbank_enabled, bloodbank_scope, bloodbank_target, plane_ws, plane_id,
  plane_ident, runtime_repo, hermes_bin, hermes_repo, hermes_git_url,
- hermes_git_ref, hermes_git_sha, fleet_env, gw, heartbeat) = sys.argv[1:33]
+ hermes_git_ref, hermes_git_sha, fleet_env, gw, heartbeat,
+ gateway_state, heartbeat_state) = sys.argv[1:35]
 p = pathlib.Path(path)
 if p.is_symlink():
     raise SystemExit(f"refusing to update registry symlink: {p}")
@@ -101,7 +103,12 @@ data.setdefault("agents", {})[agent_id] = {
     "git_sha": hermes_git_sha,
     "fleet_env": fleet_env,
   },
-  "systemd": {"gateway_unit": gw, "heartbeat_timer": heartbeat},
+  "systemd": {
+    "gateway_unit": gw,
+    "heartbeat_timer": heartbeat,
+    "gateway_state": gateway_state,
+    "heartbeat_state": heartbeat_state,
+  },
   "provisioned_at": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
 }
 rendered = yaml.safe_dump(data, sort_keys=False)

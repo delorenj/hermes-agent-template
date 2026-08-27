@@ -48,6 +48,8 @@ path.write_text(text[: match.start("body")] + body + text[match.end("body") :], 
 PYEOF
 }
 
+PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
+
 truthy() {
   case "${1,,}" in
     1|true|yes|on) return 0 ;;
@@ -56,13 +58,29 @@ truthy() {
 }
 
 if [[ "${SKIP_SLACK:-0}" == "1" ]]; then
-  slack_yaml_update provisioning_status disabled
-  log "[31] slack — DISABLED (SKIP_SLACK=1)"
-  mark_done 31-slack
+  if [[ "$(yaml_get slack.provisioning_status)" == "verified" ]] \
+     && already_done 31-slack \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN; then
+    log "[31] slack — SKIPPED; existing verified 1Password wiring preserved"
+  else
+    slack_yaml_update provisioning_status deferred
+    clear_done 31-slack
+    log "[31] slack — DEFERRED (SKIP_SLACK=1; no verified 1Password reference pair)"
+  fi
   exit 0
 fi
 
-already_done 31-slack && { log "[31] slack already wired — skipping"; exit 0; }
+if already_done 31-slack; then
+  if [[ "$(yaml_get slack.provisioning_status)" == "verified" ]] \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_BOT_TOKEN \
+     && profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN; then
+    log "[31] slack already wired through verified 1Password references — skipping"
+    exit 0
+  fi
+  clear_done 31-slack
+  log "[31] stale Slack completion marker cleared — reconciling credentials"
+fi
 
 have_bot=0
 have_app=0
@@ -282,8 +300,24 @@ except BaseException:
     raise
 PYEOF
 
-# Atomically replace only the Slack fields in the profile-local runtime file.
-# Secrets stay out of argv and are never written to root .env or fleet.env.
+# Persist both credentials directly to 1Password, then map only op://
+# references into the named profile's override config.
+ONEPASSWORD_ITEM_PREFIX="${HERMES_ONEPASSWORD_ITEM_PREFIX:-$(config_get fleet.onepassword_item_prefix 'hermes-agent')}"
+slack_bot_reference="$(store_onepassword_secret \
+  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-bot-token" \
+  "$SLACK_BOT_TOKEN")" \
+  || die "Slack bot credential could not be stored in 1Password"
+slack_app_reference="$(store_onepassword_secret \
+  "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-app-token" \
+  "$SLACK_APP_TOKEN")" \
+  || die "Slack app credential could not be stored in 1Password"
+profile_onepassword_ref_set "$PROFILE_HOME" SLACK_BOT_TOKEN "$slack_bot_reference" \
+  || die "Slack bot 1Password reference could not be mapped into the named profile"
+profile_onepassword_ref_set "$PROFILE_HOME" SLACK_APP_TOKEN "$slack_app_reference" \
+  || die "Slack app 1Password reference could not be mapped into the named profile"
+
+# Keep only the non-secret allow-list in runtime/.env and scrub literals left
+# by any older template.
 python3 - "$ENVF" <<'PYEOF'
 import errno
 import json
@@ -299,13 +333,10 @@ path.parent.mkdir(parents=True, exist_ok=True)
 text = path.read_text(encoding="utf-8") if path.exists() else ""
 for key in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"):
     text = re.sub(rf"(?m)^\s*(?:export\s+)?#?\s*{key}\s*=.*(?:\n|$)", "", text)
-values = {key: os.environ.get(key, "") for key in (
-    "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"
-)}
 text = text.rstrip("\n")
 if text:
     text += "\n"
-text += "".join(f"{key}={json.dumps(value)}\n" for key, value in values.items())
+text += f"SLACK_ALLOWED_USERS={json.dumps(os.environ.get('SLACK_ALLOWED_USERS', ''))}\n"
 
 def fsync_parent(target):
     unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
