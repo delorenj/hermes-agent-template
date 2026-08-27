@@ -191,11 +191,25 @@ store_onepassword_secret() {
     | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" "$vault" "$item"
 }
 
-# Persist a credential pair with one atomic 1Password item update.  The helper
-# verifies both fields before returning either reference, so a failed rotation
-# cannot leave a profile pointing at one old and one new channel credential.
-store_onepassword_secret_pair() {
-  # store_onepassword_secret_pair ITEM_NAME FIELD_ONE VALUE_ONE FIELD_TWO VALUE_TWO
+# Stage one credential in a new immutable 1Password item. Output is two lines:
+# item id, then op:// reference. Nothing is active until the channel transaction
+# commits that reference.
+stage_onepassword_secret() {
+  # stage_onepassword_secret ITEM_PREFIX FIELD VALUE
+  local item="$1" field="$2" value="$3" vault
+  vault="${HERMES_ONEPASSWORD_VAULT:-$(config_get fleet.onepassword_vault 'DeLoSecrets')}"
+  [[ -n "$vault" ]] || die "fleet.onepassword_vault is required for channel credentials"
+  [[ -f "$ROLE_DIR/.scripts/store-onepassword-secret.py" ]] \
+    || die "trusted 1Password storage helper is missing"
+  printf '%s' "$value" \
+    | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" \
+        --store-staged "$vault" "$item" "$field"
+}
+
+# Stage a credential pair with one atomic 1Password item create. Output is
+# immutable item id followed by both verified op:// references.
+stage_onepassword_secret_pair() {
+  # stage_onepassword_secret_pair ITEM_NAME FIELD_ONE VALUE_ONE FIELD_TWO VALUE_TWO
   local item="$1" field_one="$2" value_one="$3" field_two="$4" value_two="$5" vault
   vault="${HERMES_ONEPASSWORD_VAULT:-$(config_get fleet.onepassword_vault 'DeLoSecrets')}"
   [[ -n "$vault" ]] || die "fleet.onepassword_vault is required for channel credentials"
@@ -204,6 +218,15 @@ store_onepassword_secret_pair() {
   printf '%s\n%s' "$value_one" "$value_two" \
     | python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" \
         --store-pair "$vault" "$item" "$field_one" "$field_two"
+}
+
+delete_staged_onepassword_item() {
+  # delete_staged_onepassword_item IMMUTABLE_ITEM_ID
+  local item_id="$1" vault
+  vault="${HERMES_ONEPASSWORD_VAULT:-$(config_get fleet.onepassword_vault 'DeLoSecrets')}"
+  [[ -n "$vault" && -n "$item_id" ]] || return 1
+  python3 -I "$ROLE_DIR/.scripts/store-onepassword-secret.py" \
+    --delete-item-id "$vault" "$item_id"
 }
 
 # Update one supported profile override and immediately regenerate config.yaml
@@ -215,6 +238,19 @@ profile_config_delta_update() {
   # profile_config_delta_update PROFILE_HOME secret-ref-pair ENV REF ENV REF
   # profile_config_delta_update PROFILE_HOME channel-enabled telegram|slack true|false
   # profile_config_delta_update PROFILE_HOME voice PLUGIN VOICE
+  if [[ "${2:-}" == "voice" ]]; then
+    [[ $# -eq 4 ]] || die "voice requires a profile, plugin, and voice"
+    local voice_tool="$ROLE_DIR/.scripts/lib/voice-config.py"
+    [[ -f "$voice_tool" && ! -L "$voice_tool" ]] \
+      || die "trusted PM voice config helper is unavailable"
+    python3 -I "$voice_tool" reconcile \
+      --base "$1/../../config.yaml" \
+      --delta "$1/config.delta.yaml" \
+      --generated "$1/config.yaml" \
+      --plugin "$3" \
+      --voice "$4"
+    return
+  fi
   python3 - "$@" <<'PYEOF'
 import copy, os, pathlib, re, sys, tempfile
 try:
@@ -376,95 +412,6 @@ elif mode == "channel-enabled":
     if not isinstance(channel, dict):
         raise SystemExit(f"platforms.{name} delta must be a mapping")
     channel["enabled"] = value == "true"
-elif mode == "voice":
-    if len(args) != 3:
-        raise SystemExit("voice requires a plugin and voice")
-    name, value = args[1:]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
-        raise SystemExit("invalid TTS plugin name")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", value):
-        raise SystemExit("invalid TTS voice name")
-    plugins = delta.get("plugins") or {}
-    if not isinstance(plugins, dict):
-        raise SystemExit("plugins delta must be a mapping")
-    if "enabled" in plugins and not isinstance(plugins["enabled"], list):
-        raise SystemExit("plugins.enabled delta must be a list")
-    directives = delta.setdefault(LIST_PATCH_KEY, {})
-    if not isinstance(directives, dict):
-        raise SystemExit(f"{LIST_PATCH_KEY} delta must be a mapping")
-    patches = directives.setdefault("list_patches", {})
-    if not isinstance(patches, dict):
-        raise SystemExit(f"{LIST_PATCH_KEY}.list_patches delta must be a mapping")
-    patch = patches.setdefault("plugins.enabled", {})
-    if not isinstance(patch, dict):
-        raise SystemExit("plugins.enabled list patch must be a mapping")
-    additions = patch.setdefault("add", [])
-    removals = patch.setdefault("remove", [])
-    if not isinstance(additions, list) or not isinstance(removals, list):
-        raise SystemExit("plugins.enabled list patch values must be lists")
-    role_plugin = f"tts/{name}"
-    if not all(isinstance(entry, str) for entry in [*additions, *removals]):
-        raise SystemExit("plugins.enabled list patch values must be string lists")
-
-    # 52d9445 materialized a fleet plugin snapshot into some profile deltas.
-    # The list alone cannot distinguish that generated snapshot from an
-    # intentional operator replacement.  Thaw only with durable historical
-    # provenance naming the exact inherited entries; an unmarked list is
-    # preserved verbatim (fail closed, manual migration).
-    explicit_enabled = plugins.get("enabled")
-    if explicit_enabled is not None and not isinstance(explicit_enabled, list):
-        raise SystemExit("plugins.enabled delta must be a list")
-    migrations = directives.get("migrations", {})
-    if not isinstance(migrations, dict):
-        raise SystemExit(f"{LIST_PATCH_KEY}.migrations delta must be a mapping")
-    snapshot = migrations.get("plugins_enabled_snapshot")
-    if snapshot is not None:
-        if not isinstance(snapshot, dict):
-            raise SystemExit("plugins_enabled_snapshot migration must be a mapping")
-        source = snapshot.get("source")
-        state = snapshot.get("state", "pending")
-        inherited = snapshot.get("inherited")
-        if source != "pjangler-52d9445":
-            raise SystemExit("plugins_enabled_snapshot migration has unknown provenance")
-        if not isinstance(inherited, list) or not inherited or not all(
-            isinstance(entry, str) for entry in inherited
-        ):
-            raise SystemExit("plugins_enabled_snapshot.inherited must be a non-empty string list")
-        if state == "pending":
-            if not isinstance(explicit_enabled, list) or not all(
-                isinstance(entry, str) for entry in explicit_enabled
-            ):
-                raise SystemExit("provenance-backed plugin snapshot is missing its replacement list")
-            inherited_set = set(inherited)
-            for entry in explicit_enabled:
-                if (
-                    entry not in inherited_set
-                    and entry not in {role_plugin, "tts/voxxy"}
-                    and entry not in removals
-                    and entry not in additions
-                ):
-                    additions.append(entry)
-            plugins.pop("enabled")
-            if not plugins:
-                delta.pop("plugins", None)
-            snapshot["state"] = "completed"
-        elif state != "completed":
-            raise SystemExit("plugins_enabled_snapshot migration state must be pending or completed")
-    additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
-    additions.append(role_plugin)
-    removals[:] = [entry for entry in removals if entry != role_plugin]
-    if "tts/voxxy" not in removals:
-        removals.append("tts/voxxy")
-    tts = delta.setdefault("tts", {})
-    if not isinstance(tts, dict):
-        raise SystemExit("tts delta must be a mapping")
-    tts.pop("voxxy", None)
-    tts["provider"] = name
-    tts["voice"] = value
-    provider = tts.setdefault(name, {})
-    if not isinstance(provider, dict):
-        raise SystemExit(f"tts.{name} delta must be a mapping")
-    provider["voice"] = value
 else:
     raise SystemExit("unsupported profile config delta update")
 existing_comments = []
@@ -534,6 +481,22 @@ raise SystemExit(0 if isinstance(ref, str) and ref.startswith("op://") else 1)
 PYEOF
 }
 
+profile_onepassword_ref_get() {
+  # profile_onepassword_ref_get PROFILE_HOME ENV_NAME
+  python3 - "$1/config.delta.yaml" "$2" <<'PYEOF'
+import pathlib, sys
+try:
+    import yaml
+    data = yaml.safe_load(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
+    reference = data["secrets"]["onepassword"]["env"].get(sys.argv[2], "")
+except Exception:
+    reference = ""
+if not isinstance(reference, str) or not reference.startswith("op://"):
+    raise SystemExit(1)
+print(reference)
+PYEOF
+}
+
 profile_onepassword_ref_validate() {
   # profile_onepassword_ref_validate PROFILE_HOME ENV_NAME
   # Return 0 when the reference resolves, 2 when no syntactically valid
@@ -558,6 +521,52 @@ PYEOF
     return 0
   fi
   return 75
+}
+
+channel_transaction_telegram() {
+  # channel_transaction_telegram PROFILE_HOME RUNTIME_ENV REF USERNAME BOT_ID ALLOWED
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  [[ -f "$helper" && ! -L "$helper" ]] || die "trusted channel transaction helper is missing"
+  python3 -I "$helper" \
+    --channel telegram \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-30-telegram" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --allowed-value "$6" \
+    --reference TELEGRAM_BOT_TOKEN "$3" \
+    --metadata provisioning_status verified \
+    --metadata bot_username "$4" \
+    --metadata bot_id "$5"
+}
+
+channel_transaction_slack() {
+  # channel_transaction_slack PROFILE ENV BOT_REF APP_REF TEAM_ID TEAM_NAME USER_ID BOT_ID USERNAME ALLOWED
+  local helper="$ROLE_DIR/.scripts/channel-transaction.py"
+  [[ -f "$helper" && ! -L "$helper" ]] || die "trusted channel transaction helper is missing"
+  python3 -I "$helper" \
+    --channel slack \
+    --profile "$1" \
+    --role-yaml "$ROLE_YAML" \
+    --registry "$REGISTRY_FILE" \
+    --runtime-env "$2" \
+    --done-marker "$ROLE_DIR/.scripts/.done-31-slack" \
+    --agent-id "$AGENT_ID" \
+    --role-dir "$ROLE_DIR" \
+    --profile-name "$PROFILE_NAME" \
+    --allowed-value "${10}" \
+    --reference SLACK_BOT_TOKEN "$3" \
+    --reference SLACK_APP_TOKEN "$4" \
+    --metadata provisioning_status verified \
+    --metadata team_id "$5" \
+    --metadata team_name "$6" \
+    --metadata bot_user_id "$7" \
+    --metadata bot_id "$8" \
+    --metadata bot_username "$9"
 }
 
 # ─── Distributable config (~/.config/hermes-agent-template/config.toml) ──────

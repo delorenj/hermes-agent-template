@@ -54,6 +54,10 @@ PYEOF
 
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 profile_root_require_real "$PROFILE_HOME"
+RUNTIME="$ROLE_DIR/runtime"
+ENVF="$RUNTIME/.env"
+mkdir -p "$RUNTIME"
+[[ ! -L "$ENVF" ]] || die "refusing to write Slack credentials through symlink: $ENVF"
 slack_status="$(yaml_get slack.provisioning_status)"
 if [[ "$slack_status" != "verified" ]]; then
   profile_channel_enabled_set "$PROFILE_HOME" slack false \
@@ -81,9 +85,20 @@ if [[ -z "${SLACK_BOT_TOKEN:-}" && -z "${SLACK_APP_TOKEN:-}" \
   profile_onepassword_ref_validate "$PROFILE_HOME" SLACK_APP_TOKEN \
     || slack_app_reference_rc=$?
   if [[ $slack_bot_reference_rc -eq 0 && $slack_app_reference_rc -eq 0 ]]; then
-    profile_channel_enabled_set "$PROFILE_HOME" slack true \
-      || die "Slack could not be enabled in the profile override"
-    mark_done 31-slack
+    slack_bot_reference="$(profile_onepassword_ref_get "$PROFILE_HOME" SLACK_BOT_TOKEN)" \
+      || die "Slack verified bot reference could not be read for reconciliation"
+    slack_app_reference="$(profile_onepassword_ref_get "$PROFILE_HOME" SLACK_APP_TOKEN)" \
+      || die "Slack verified app reference could not be read for reconciliation"
+    fleet_lock_acquire
+    trap 'fleet_lock_release' EXIT
+    channel_transaction_slack \
+      "$PROFILE_HOME" "$ENVF" "$slack_bot_reference" "$slack_app_reference" \
+      "$(yaml_get slack.team_id)" "$(yaml_get slack.team_name)" \
+      "$(yaml_get slack.bot_user_id)" "$(yaml_get slack.bot_id)" \
+      "$(yaml_get slack.bot_username)" "${SLACK_ALLOWED_USERS:-}" \
+      || die "Slack verified wiring reconciliation transaction failed"
+    fleet_lock_release
+    trap - EXIT
     log "[31] slack — existing verified 1Password wiring reconciled"
     exit 0
   fi
@@ -102,8 +117,7 @@ if [[ "${SKIP_SLACK:-0}" == "1" ]]; then
 fi
 
 if already_done 31-slack; then
-  clear_done 31-slack
-  log "[31] stale Slack completion marker cleared — reconciling credentials"
+  log "[31] existing completion marker preserved while Slack is reconciled"
 fi
 
 have_bot=0
@@ -144,11 +158,6 @@ if [[ -n "$SLACK_ALLOWED_USERS" && "$SLACK_ALLOWED_USERS" != "*" \
       && ! "$SLACK_ALLOWED_USERS" =~ ^[UW][A-Z0-9]+(,[UW][A-Z0-9]+)*$ ]]; then
   die "SLACK_ALLOWED_USERS must be '*' or comma-separated Slack member IDs"
 fi
-
-RUNTIME="$ROLE_DIR/runtime"
-ENVF="$RUNTIME/.env"
-mkdir -p "$RUNTIME"
-[[ ! -L "$ENVF" ]] || die "refusing to write Slack credentials through symlink: $ENVF"
 
 log "[31] verifying Slack bot identity via auth.test"
 auth_response="$({
@@ -258,12 +267,10 @@ python3 /dev/fd/3 "$REGISTRY_FILE" "$FLEET_ENV" "$ENVF" "$AGENT_ID" \
   "$slack_team_id" "$slack_bot_user_id" "$slack_bot_id" \
   "$ROLE_DIR" "$PROFILE_NAME" "$slack_team_name" "$slack_bot_username" \
   3<<'PYEOF' <<<"${SLACK_BOT_TOKEN}"$'\n'"${SLACK_APP_TOKEN}"
-import errno
 import os
 import pathlib
 import re
 import sys
-import tempfile
 try:
     import yaml  # type: ignore
 except ImportError:
@@ -356,149 +363,49 @@ for owner, path in owners:
     if values.get("SLACK_APP_TOKEN") == app_token:
         raise SystemExit(f"Slack app token is already assigned to {owner}")
 
-claim = agents.setdefault(agent_id, {})
-if not isinstance(claim, dict):
-    raise SystemExit(f"registry entry for {agent_id} is not a mapping")
-claim["role_dir"] = role_dir
-claim["profile_name"] = profile_name
-claim["slack"] = {
-    "provisioning_status": "verified",
-    "team_id": team_id,
-    "team_name": team_name,
-    "bot_user_id": user_id,
-    "bot_id": bot_id,
-    "bot_username": bot_username,
-}
-registry.parent.mkdir(parents=True, exist_ok=True)
-rendered = yaml.safe_dump(data, sort_keys=False)
-
-def fsync_parent(target):
-    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        directory_fd = os.open(target.parent, flags)
-    except OSError as exc:
-        if exc.errno in unsupported:
-            return
-        raise
-    try:
-        try:
-            os.fsync(directory_fd)
-        except OSError as exc:
-            if exc.errno not in unsupported:
-                raise
-    finally:
-        os.close(directory_fd)
-
-fd, temporary = tempfile.mkstemp(prefix=f".{registry.name}.slack-", dir=registry.parent)
-try:
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(rendered)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, registry)
-    os.chmod(registry, 0o600)
-    fsync_parent(registry)
-except BaseException:
-    try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    raise
+# Read-only by design. The channel transaction repeats the identity conflict
+# check under this same lock immediately before its recoverable registry write.
 PYEOF
 
 # Stage both credentials in one new 1Password item, verify both fields, then
 # switch both profile refs with one atomic delta update.  A failed rotation
 # leaves the previously active pair untouched.
 ONEPASSWORD_ITEM_PREFIX="${HERMES_ONEPASSWORD_ITEM_PREFIX:-$(config_get fleet.onepassword_item_prefix 'hermes-agent')}"
-slack_pair_references="$(store_onepassword_secret_pair \
+slack_stage="$(stage_onepassword_secret_pair \
   "${ONEPASSWORD_ITEM_PREFIX}-${AGENT_ID}-slack-credentials" \
   slack_bot_token "$SLACK_BOT_TOKEN" \
   slack_app_token "$SLACK_APP_TOKEN")" \
   || die "Slack credential pair could not be staged and verified in 1Password"
-if [[ "$slack_pair_references" != *$'\n'* ]]; then
+if [[ "$slack_stage" != *$'\n'*$'\n'* ]]; then
   die "Slack credential-pair storage returned an invalid reference set"
 fi
+slack_staged_item_id="${slack_stage%%$'\n'*}"
+slack_pair_references="${slack_stage#*$'\n'}"
 slack_bot_reference="${slack_pair_references%%$'\n'*}"
 slack_app_reference="${slack_pair_references#*$'\n'}"
 [[ "$slack_app_reference" != *$'\n'* ]] \
   || die "Slack credential-pair storage returned too many references"
-profile_onepassword_ref_pair_set \
-  "$PROFILE_HOME" \
-  SLACK_BOT_TOKEN "$slack_bot_reference" \
-  SLACK_APP_TOKEN "$slack_app_reference" \
-  || die "Slack 1Password reference pair could not be atomically mapped into the named profile"
-profile_channel_enabled_set "$PROFILE_HOME" slack true \
-  || die "Slack could not be enabled in the profile override"
-
-# Keep only the non-secret allow-list in runtime/.env and scrub literals left
-# by any older template.
-export SLACK_ALLOWED_USERS
-python3 - "$ENVF" <<'PYEOF'
-import errno
-import json
-import os
-import pathlib
-import re
-import tempfile
-
-path = pathlib.Path(__import__("sys").argv[1])
-if path.is_symlink():
-    raise SystemExit(f"refusing to write Slack credentials through symlink: {path}")
-path.parent.mkdir(parents=True, exist_ok=True)
-text = path.read_text(encoding="utf-8") if path.exists() else ""
-for key in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"):
-    text = re.sub(rf"(?m)^\s*(?:export\s+)?#?\s*{key}\s*=.*(?:\n|$)", "", text)
-text = text.rstrip("\n")
-if text:
-    text += "\n"
-text += f"SLACK_ALLOWED_USERS={json.dumps(os.environ.get('SLACK_ALLOWED_USERS', ''))}\n"
-
-def fsync_parent(target):
-    unsupported = {errno.EINVAL, getattr(errno, "ENOTSUP", errno.EINVAL), errno.ENOSYS}
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    try:
-        directory_fd = os.open(target.parent, flags)
-    except OSError as exc:
-        if exc.errno in unsupported:
-            return
-        raise
-    try:
-        try:
-            os.fsync(directory_fd)
-        except OSError as exc:
-            if exc.errno not in unsupported:
-                raise
-    finally:
-        os.close(directory_fd)
-
-fd, temporary = tempfile.mkstemp(prefix=".env.slack-", dir=path.parent)
-try:
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temporary, path)
-    os.chmod(path, 0o600)
-    fsync_parent(path)
-except BaseException:
-    try:
-        os.unlink(temporary)
-    except FileNotFoundError:
-        pass
-    raise
-PYEOF
 unset SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
-slack_yaml_update \
-  provisioning_status verified \
-  team_id "$slack_team_id" \
-  team_name "$slack_team_name" \
-  bot_user_id "$slack_bot_user_id" \
-  bot_id "$slack_bot_id" \
-  bot_username "$slack_bot_username"
+slack_transaction_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ -n "${slack_staged_item_id:-}" ]]; then
+    delete_staged_onepassword_item "$slack_staged_item_id" >/dev/null 2>&1 \
+      || warn "    staged Slack item cleanup failed; archive manually by immutable item id"
+  fi
+  fleet_lock_release
+  exit "$rc"
+}
+trap slack_transaction_exit EXIT
+
+channel_transaction_slack \
+  "$PROFILE_HOME" "$ENVF" "$slack_bot_reference" "$slack_app_reference" \
+  "$slack_team_id" "$slack_team_name" "$slack_bot_user_id" \
+  "$slack_bot_id" "$slack_bot_username" "$SLACK_ALLOWED_USERS" \
+  || die "Slack local credential transaction failed"
+
+slack_staged_item_id=""
 
 fleet_lock_release
 trap - EXIT
@@ -507,4 +414,3 @@ if [[ -z "$SLACK_ALLOWED_USERS" ]]; then
   warn "    Slack is wired but denies all inbound users until SLACK_ALLOWED_USERS is set"
 fi
 log "    verified Slack bot $slack_bot_username in $slack_team_name (profile-local credentials)"
-mark_done 31-slack

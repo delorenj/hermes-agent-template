@@ -16,6 +16,7 @@ LIB_SCRIPT = ROOT / "template" / ".scripts" / "_lib.sh"
 LIB_DIR = ROOT / "template" / ".scripts" / "lib"
 REGISTRY_SCRIPT = ROOT / "template" / ".scripts" / "80-registry.sh"
 STORE_HELPER = ROOT / "template" / ".scripts" / "store-onepassword-secret.py"
+TRANSACTION_HELPER = ROOT / "template" / ".scripts" / "channel-transaction.py"
 FAKE_OP = ROOT / "tests" / "support" / "fake-op.py"
 
 BOT_TOKEN = "xoxb-profile-only-secret"
@@ -33,6 +34,7 @@ def _make_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     shutil.copy2(SLACK_SCRIPT, scripts / SLACK_SCRIPT.name)
     shutil.copy2(LIB_SCRIPT, scripts / LIB_SCRIPT.name)
     shutil.copy2(STORE_HELPER, scripts / STORE_HELPER.name)
+    shutil.copy2(TRANSACTION_HELPER, scripts / TRANSACTION_HELPER.name)
     shutil.copytree(LIB_DIR, scripts / LIB_DIR.name)
     (role / "role.yaml").write_text(
         """repo: demo
@@ -108,26 +110,29 @@ assert token.encode() not in cmdline
 assert token.encode() not in environ
 if 'url = "https://slack.com/api/auth.test"' in config:
     assert token.startswith("xoxb-")
+    rotated = token == "xoxb-rotated-profile-secret"
     print(json.dumps({
         "ok": True,
-        "team_id": "T123",
-        "team": "Example Workspace",
-        "user_id": "U123BOT",
-        "bot_id": "B123BOT",
-        "user": "demo-pm",
+        "team_id": "T456" if rotated else "T123",
+        "team": "Rotated Workspace" if rotated else "Example Workspace",
+        "user_id": "U456BOT" if rotated else "U123BOT",
+        "bot_id": "B456BOT" if rotated else "B123BOT",
+        "user": "rotated-pm" if rotated else "demo-pm",
     }))
 elif 'url = "https://slack.com/api/bots.info"' in config:
     assert token.startswith("xoxb-")
     if os.environ.get("FAKE_SLACK_BOTS_INFO_MISSING_SCOPE") == "1":
         print(json.dumps({"ok": False, "error": "missing_scope", "needed": "users:read"}))
     else:
-        print(json.dumps({"ok": True, "bot": {"app_id": "A123APP"}}))
+        app_id = "A456APP" if token == "xoxb-rotated-profile-secret" else "A123APP"
+        print(json.dumps({"ok": True, "bot": {"app_id": app_id}}))
 elif 'url = "https://slack.com/api/apps.connections.open"' in config:
     assert token.startswith("xapp-")
     if os.environ.get("FAKE_SLACK_APP_AUTH_FAILURE") == "1":
         print(json.dumps({"ok": False, "error": "invalid_auth"}))
     else:
-        app_id = "A999OTHER" if os.environ.get("FAKE_SLACK_APP_MISMATCH") == "1" else "A123APP"
+        default_app_id = "A456APP" if token == "xapp-rotated-profile-secret" else "A123APP"
+        app_id = "A999OTHER" if os.environ.get("FAKE_SLACK_APP_MISMATCH") == "1" else default_app_id
         print(json.dumps({"ok": True, "url": f"wss://wss-primary.slack.test/link?ticket=test&app_id={app_id}"}))
 else:
     raise AssertionError("unexpected Slack API endpoint")
@@ -305,9 +310,7 @@ def test_both_tokens_store_references_and_only_nonsecret_policy(tmp_path: Path) 
     references = delta["secrets"]["onepassword"]["env"]
     bot_reference = references["SLACK_BOT_TOKEN"]
     app_reference = references["SLACK_APP_TOKEN"]
-    assert bot_reference.startswith(
-        "op://DeLoSecrets/hermes-agent-demo-pm-slack-credentials-v-"
-    )
+    assert bot_reference.startswith("op://DeLoSecrets/fakeitem")
     assert bot_reference.endswith("/slack_bot_token")
     assert app_reference.endswith("/slack_app_token")
     assert bot_reference.rsplit("/", 1)[0] == app_reference.rsplit("/", 1)[0]
@@ -422,7 +425,7 @@ def test_independently_valid_slack_tokens_from_different_apps_are_rejected(
     assert not (home / ".fake-onepassword").exists()
 
 
-def test_slack_pair_rotation_is_atomic_when_second_field_write_fails(
+def test_distinct_slack_identity_rotation_rolls_back_when_second_field_verification_fails(
     tmp_path: Path,
 ) -> None:
     role, _runtime, registry = _make_role(tmp_path)
@@ -439,11 +442,15 @@ def test_slack_pair_rotation_is_atomic_when_second_field_write_fails(
     assert first.returncode == 0, first.stderr
     profile = home / ".hermes" / "profiles" / "demo-pm"
     delta_before = (profile / "config.delta.yaml").read_bytes()
+    generated_before = (profile / "config.yaml").read_bytes()
     role_before = (role / "role.yaml").read_bytes()
+    registry_before = registry.read_bytes()
+    marker = role / ".scripts" / ".done-31-slack"
+    marker_before = marker.read_bytes()
     item_paths_before = sorted((home / ".fake-onepassword").glob("*.json"))
     assert len(item_paths_before) == 1
     item_before = item_paths_before[0].read_bytes()
-    (home / ".fake-onepassword-reject-field").write_text(
+    (home / ".fake-onepassword-fail-read-field").write_text(
         "slack_app_token\n", encoding="utf-8"
     )
 
@@ -461,7 +468,10 @@ def test_slack_pair_rotation_is_atomic_when_second_field_write_fails(
     assert rotated.returncode != 0
     assert "credential pair could not be staged" in rotated.stderr
     assert (profile / "config.delta.yaml").read_bytes() == delta_before
+    assert (profile / "config.yaml").read_bytes() == generated_before
     assert (role / "role.yaml").read_bytes() == role_before
+    assert registry.read_bytes() == registry_before
+    assert marker.read_bytes() == marker_before
     item_paths_after = sorted((home / ".fake-onepassword").glob("*.json"))
     assert item_paths_after == item_paths_before
     assert item_paths_after[0].read_bytes() == item_before
@@ -512,6 +522,117 @@ def test_transient_onepassword_outage_preserves_verified_slack_wiring_and_recove
     assert (role / "role.yaml").read_bytes() == role_before
     assert delta_path.read_bytes() == delta_before
     assert marker.is_file()
+
+
+def test_tokenless_slack_rerun_reconciles_registry_then_is_byte_identical(
+    tmp_path: Path,
+) -> None:
+    role, _runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    first = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+    assert first.returncode == 0, first.stderr
+    data = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    data["registry_extension"] = {"preserve": True}
+    data["agents"]["demo-pm"]["slack"] = {
+        "provisioning_status": "deferred",
+        "operator_extension": "keep-me",
+    }
+    registry.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+    reconciled = _run(role, registry, home, bindir)
+
+    assert reconciled.returncode == 0, reconciled.stderr
+    parsed = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    assert parsed["registry_extension"] == {"preserve": True}
+    assert parsed["agents"]["demo-pm"]["slack"] == {
+        "provisioning_status": "verified",
+        "operator_extension": "keep-me",
+        "team_id": "T123",
+        "team_name": "Example Workspace",
+        "bot_user_id": "U123BOT",
+        "bot_id": "B123BOT",
+        "bot_username": "demo-pm",
+    }
+    registry_after = registry.read_bytes()
+
+    converged = _run(role, registry, home, bindir)
+
+    assert converged.returncode == 0, converged.stderr
+    assert registry.read_bytes() == registry_after
+
+
+def test_registry_write_failure_rolls_back_all_slack_files_byte_exactly(
+    tmp_path: Path,
+) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    bindir = _fake_curl(tmp_path)
+    first = _run(
+        role,
+        registry,
+        home,
+        bindir,
+        {"SLACK_BOT_TOKEN": BOT_TOKEN, "SLACK_APP_TOKEN": APP_TOKEN},
+    )
+    assert first.returncode == 0, first.stderr
+    profile = home / ".hermes" / "profiles" / "demo-pm"
+    marker = role / ".scripts" / ".done-31-slack"
+    before = {
+        "delta": (profile / "config.delta.yaml").read_bytes(),
+        "generated": (profile / "config.yaml").read_bytes(),
+        "role": (role / "role.yaml").read_bytes(),
+        "registry": registry.read_bytes(),
+        "marker": marker.read_bytes(),
+        "env": (runtime / ".env").read_bytes(),
+    }
+    old_items = {
+        path.name: path.read_bytes()
+        for path in (home / ".fake-onepassword").glob("*.json")
+    }
+    assert len(old_items) == 1
+    lock = Path(f"{registry}.lock")
+    lock.touch()
+    lock.chmod(0o600)
+    (tmp_path / ".slack-early-child").touch()
+    tmp_path.chmod(0o500)
+    try:
+        failed = _run(
+            role,
+            registry,
+            home,
+            bindir,
+            {
+                "SLACK_BOT_TOKEN": ROTATED_BOT_TOKEN,
+                "SLACK_APP_TOKEN": ROTATED_APP_TOKEN,
+            },
+        )
+    finally:
+        tmp_path.chmod(0o700)
+
+    assert failed.returncode != 0
+    assert "all local channel files restored" in failed.stderr
+    assert (profile / "config.delta.yaml").read_bytes() == before["delta"]
+    assert (profile / "config.yaml").read_bytes() == before["generated"]
+    assert (role / "role.yaml").read_bytes() == before["role"]
+    assert registry.read_bytes() == before["registry"]
+    assert marker.read_bytes() == before["marker"]
+    assert (runtime / ".env").read_bytes() == before["env"]
+    assert {
+        path.name: path.read_bytes()
+        for path in (home / ".fake-onepassword").glob("*.json")
+    } == old_items
+    combined = failed.stdout + failed.stderr
+    for token in (BOT_TOKEN, APP_TOKEN, ROTATED_BOT_TOKEN, ROTATED_APP_TOKEN):
+        assert token not in combined
 
 
 def test_rejects_reused_pair_without_disclosing_tokens(tmp_path: Path) -> None:

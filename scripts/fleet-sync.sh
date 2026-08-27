@@ -36,9 +36,11 @@ WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
 HEARTBEAT_TEMPLATE="$SCRIPT_DIR/../template/.scripts/heartbeat.sh"
 FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
 FLEET_ENV_PARSER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/parse-fleet-env.py"
+VOICE_CONFIG_TOOL="$SCRIPT_DIR/../template/.scripts/lib/voice-config.py"
 PROFILE_CONFIG_TOOL="$SCRIPT_DIR/hermes-profile-config.py"
 if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
    || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" \
+   || ! -f "$VOICE_CONFIG_TOOL" || -L "$VOICE_CONFIG_TOOL" \
    || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" \
    || ! -f "$PROFILE_CONFIG_TOOL" || -L "$PROFILE_CONFIG_TOOL" ]]; then
   echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
@@ -321,7 +323,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     continue
   fi
   fleet_assets_eligible=1
-  for fleet_asset in fleet-env.sh parse-fleet-env.py; do
+  for fleet_asset in fleet-env.sh parse-fleet-env.py voice-config.py; do
     source_asset="$SCRIPT_DIR/../template/.scripts/lib/$fleet_asset"
     target_asset="$role_lib_dir/$fleet_asset"
     if [[ -L "$target_asset" ]]; then
@@ -363,6 +365,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     for attestation in \
       "$FLEET_ENV_LIBRARY_SOURCE|$role_lib_dir/fleet-env.sh" \
       "$FLEET_ENV_PARSER_SOURCE|$role_lib_dir/parse-fleet-env.py" \
+      "$VOICE_CONFIG_TOOL|$role_lib_dir/voice-config.py" \
       "$HEARTBEAT_TEMPLATE|$heartbeat_target"
     do
       source_asset="${attestation%%|*}"
@@ -682,183 +685,43 @@ PYEOF
     # updating the override source, then rerender; never mutate generated
     # config.yaml through `hermes config set`.
     if [[ $VOX_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
-      config_status="$(python3 - "$profile_dir/config.yaml" "$profile_dir/config.delta.yaml" \
-          "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
-import pathlib, sys
-try:
-    import yaml
-except ImportError:
-    print("invalid|invalid|invalid|invalid")
-    raise SystemExit(0)
-
-path, delta_path = map(pathlib.Path, sys.argv[1:3])
-plugin, voice = sys.argv[3:5]
-if not path.is_file() or path.is_symlink():
-    print("missing|missing|missing|missing")
-    raise SystemExit(0)
-try:
-    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    delta = yaml.safe_load(delta_path.read_text(encoding="utf-8")) or {}
-except Exception:
-    print("invalid|invalid|invalid|invalid")
-    raise SystemExit(0)
-if not isinstance(config, dict) or not isinstance(delta, dict):
-    print("invalid|invalid|invalid|invalid")
-    raise SystemExit(0)
-plugins = config.get("plugins") or {}
-if isinstance(plugins, dict):
-    enabled_values = plugins.get("enabled") or []
-else:
-    enabled_values = []
-tts = config.get("tts") or {}
-if not isinstance(tts, dict):
-    tts = {}
-provider = "ok" if tts.get("provider") == plugin else "other"
-enabled = "ok" if isinstance(enabled_values, list) and f"tts/{plugin}" in enabled_values else "no"
-provider_config = tts.get(plugin) or {}
-actual_voice = provider_config.get("voice") if isinstance(provider_config, dict) else None
-actual_voice = actual_voice or tts.get("voice")
-voice_ok = "ok" if actual_voice == voice else "other"
-delta_plugins = delta.get("plugins") or {}
-explicit = delta_plugins.get("enabled") if isinstance(delta_plugins, dict) else None
-directive = delta.get("x-pjangler-merge") or {}
-migrations = directive.get("migrations") if isinstance(directive, dict) else None
-snapshot = migrations.get("plugins_enabled_snapshot") if isinstance(migrations, dict) else None
-if snapshot is None:
-    migration = "ok"
-elif not isinstance(snapshot, dict):
-    migration = "invalid"
-elif snapshot.get("state", "pending") == "pending" and isinstance(explicit, list):
-    migration = "pending"
-elif snapshot.get("state") == "completed":
-    migration = "ok"
-else:
-    migration = "invalid"
-print(f"{provider}|{enabled}|{voice_ok}|{migration}")
-PYEOF
-)"
-      if [[ "$config_status" != "ok|ok|ok|ok" ]]; then
-        if [[ "$APPLY" -eq 1 ]]; then
-          if python3 - "$FLEET_HOME/config.yaml" "$profile_dir/config.delta.yaml" \
-              "$VOX_PLUGIN_NAME" "$VOX_VOICE" <<'PYEOF'
-import os, pathlib, sys, tempfile
-try:
-    import yaml
-except ImportError:
-    raise SystemExit("PyYAML is required")
-base_path, delta_path = map(pathlib.Path, sys.argv[1:3])
-plugin, voice = sys.argv[3:5]
-base = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
-delta_text = delta_path.read_text(encoding="utf-8")
-delta = yaml.safe_load(delta_text) or {}
-if not isinstance(base, dict) or not isinstance(delta, dict):
-    raise SystemExit("base and delta must be mappings")
-plugins = delta.get("plugins") or {}
-if not isinstance(plugins, dict):
-    raise SystemExit("plugins delta must be a mapping")
-if "enabled" in plugins and not isinstance(plugins["enabled"], list):
-    raise SystemExit("plugins.enabled delta must be a list")
-directives = delta.setdefault("x-pjangler-merge", {})
-if not isinstance(directives, dict):
-    raise SystemExit("x-pjangler-merge delta must be a mapping")
-patches = directives.setdefault("list_patches", {})
-if not isinstance(patches, dict):
-    raise SystemExit("x-pjangler-merge.list_patches delta must be a mapping")
-patch = patches.setdefault("plugins.enabled", {})
-if not isinstance(patch, dict):
-    raise SystemExit("plugins.enabled list patch must be a mapping")
-additions = patch.setdefault("add", [])
-removals = patch.setdefault("remove", [])
-if not isinstance(additions, list) or not isinstance(removals, list):
-    raise SystemExit("plugins.enabled list patch values must be lists")
-role_plugin = f"tts/{plugin}"
-if not all(isinstance(entry, str) for entry in [*additions, *removals]):
-    raise SystemExit("plugins.enabled list patch values must be string lists")
-explicit_enabled = plugins.get("enabled")
-if explicit_enabled is not None and not isinstance(explicit_enabled, list):
-    raise SystemExit("plugins.enabled delta must be a list")
-migrations = directives.get("migrations", {})
-if not isinstance(migrations, dict):
-    raise SystemExit("x-pjangler-merge.migrations delta must be a mapping")
-snapshot = migrations.get("plugins_enabled_snapshot")
-if snapshot is not None:
-    if not isinstance(snapshot, dict):
-        raise SystemExit("plugins_enabled_snapshot migration must be a mapping")
-    source = snapshot.get("source")
-    state = snapshot.get("state", "pending")
-    inherited = snapshot.get("inherited")
-    if source != "pjangler-52d9445":
-        raise SystemExit("plugins_enabled_snapshot migration has unknown provenance")
-    if not isinstance(inherited, list) or not inherited or not all(
-        isinstance(entry, str) for entry in inherited
-    ):
-        raise SystemExit("plugins_enabled_snapshot.inherited must be a non-empty string list")
-    if state == "pending":
-        if not isinstance(explicit_enabled, list) or not all(
-            isinstance(entry, str) for entry in explicit_enabled
-        ):
-            raise SystemExit("provenance-backed plugin snapshot is missing its replacement list")
-        inherited_set = set(inherited)
-        for entry in explicit_enabled:
-            if (
-                entry not in inherited_set
-                and entry not in {role_plugin, "tts/voxxy"}
-                and entry not in removals
-                and entry not in additions
-            ):
-                additions.append(entry)
-        plugins.pop("enabled")
-        if not plugins:
-            delta.pop("plugins", None)
-        snapshot["state"] = "completed"
-    elif state != "completed":
-        raise SystemExit("plugins_enabled_snapshot migration state must be pending or completed")
-additions[:] = [entry for entry in additions if entry not in {role_plugin, "tts/voxxy"}]
-additions.append(role_plugin)
-removals[:] = [entry for entry in removals if entry != role_plugin]
-if "tts/voxxy" not in removals:
-    removals.append("tts/voxxy")
-tts = delta.setdefault("tts", {})
-tts.pop("voxxy", None)
-tts["provider"] = plugin
-tts.setdefault(plugin, {})["voice"] = voice
-tts["voice"] = voice
-fd, temporary = tempfile.mkstemp(prefix=f".{delta_path.name}.", dir=delta_path.parent)
-try:
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        comments = []
-        for line in delta_text.splitlines():
-            if line.lstrip().startswith("#") and line not in comments:
-                comments.append(line)
-        standard = "# Override-only delta for this Hermes profile."
-        handle.write(standard + "\n")
-        for line in comments:
-            if line != standard:
-                handle.write(line + "\n")
-        handle.write(yaml.safe_dump(delta, sort_keys=False))
-        handle.flush(); os.fsync(handle.fileno())
-    os.replace(temporary, delta_path)
-except BaseException:
-    try: os.unlink(temporary)
-    except FileNotFoundError: pass
-    raise
-PYEOF
-          then
-            HERMES_FLEET_HOME="$FLEET_HOME" \
-              python3 "$PROFILE_CONFIG_TOOL" render --profile "$profile_name" >/dev/null \
-              || { note "$agent_id" DRIFT "Vox delta saved but config render failed"; DRIFT=$((DRIFT + 1)); continue; }
-            note "$agent_id" FIXED "TTS delta enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
-            changed=1; FIXED=$((FIXED + 1))
+      config_status="$(python3 -I "$VOICE_CONFIG_TOOL" check \
+        --base "$FLEET_HOME/config.yaml" \
+        --delta "$profile_dir/config.delta.yaml" \
+        --generated "$profile_dir/config.yaml" \
+        --plugin "$VOX_PLUGIN_NAME" \
+        --voice "$VOX_VOICE")"
+      case "$config_status" in
+        ok) ;;
+        manual\|*)
+          note "$agent_id" DRIFT "${config_status#manual|} (MANUAL: resolve plugin provenance)"
+          DRIFT=$((DRIFT + 1))
+          ;;
+        drift)
+          if [[ "$APPLY" -eq 1 ]]; then
+            if python3 -I "$VOICE_CONFIG_TOOL" reconcile \
+              --base "$FLEET_HOME/config.yaml" \
+              --delta "$profile_dir/config.delta.yaml" \
+              --generated "$profile_dir/config.yaml" \
+              --plugin "$VOX_PLUGIN_NAME" \
+              --voice "$VOX_VOICE"
+            then
+              note "$agent_id" FIXED "TTS delta enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
+              changed=1; FIXED=$((FIXED + 1))
+            else
+              note "$agent_id" DRIFT "TTS delta update failed; Vox not verified"
+              DRIFT=$((DRIFT + 1))
+            fi
           else
-            note "$agent_id" DRIFT "TTS delta update failed"
+            note "$agent_id" DRIFT "TTS config/delta requires reconciliation -> $VOX_PLUGIN_NAME/$VOX_VOICE"
             DRIFT=$((DRIFT + 1))
           fi
-        else
-          note "$agent_id" DRIFT "TTS config not $VOX_PLUGIN_NAME/$VOX_VOICE in $profile_dir/config.yaml ($config_status)"
+          ;;
+        *)
+          note "$agent_id" DRIFT "unexpected PM voice check result; Vox not verified"
           DRIFT=$((DRIFT + 1))
-        fi
-      fi
+          ;;
+      esac
     fi
   fi
 

@@ -73,7 +73,20 @@ if len(sys.argv) == 3 and sys.argv[1] == "--validate-reference":
         fail("the configured reference did not resolve")
     raise SystemExit(0)
 
+if len(sys.argv) == 4 and sys.argv[1] == "--delete-item-id":
+    vault, item_id = sys.argv[2:]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._ -]{0,126}", vault):
+        fail("vault name contains unsupported characters")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id):
+        fail("invalid immutable item id")
+    deleted = op_run(["item", "delete", item_id, "--vault", vault, "--archive"])
+    if deleted.returncode != 0:
+        fail("staged item cleanup was rejected")
+    raise SystemExit(0)
+
 pair_mode = len(sys.argv) == 6 and sys.argv[1] == "--store-pair"
+single_staged_mode = len(sys.argv) == 5 and sys.argv[1] == "--store-staged"
+staged_mode = pair_mode or single_staged_mode
 if pair_mode:
     vault, item, field_one, field_two = sys.argv[2:]
     if field_one == field_two or not all(
@@ -81,10 +94,15 @@ if pair_mode:
         for field in (field_one, field_two)
     ):
         fail("pair field names are invalid or not distinct")
+elif single_staged_mode:
+    vault, item, field_one = sys.argv[2:]
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", field_one):
+        fail("staged field name is invalid")
 else:
     if len(sys.argv) != 3:
         fail(
-            "usage: store-onepassword-secret.py <vault> <item> or "
+            "usage: store-onepassword-secret.py <vault> <item>, "
+            "--store-staged <vault> <item-prefix> <field>, or "
             "--store-pair <vault> <item-prefix> <field-one> <field-two>"
         )
     vault, item = sys.argv[1:]
@@ -98,9 +116,10 @@ if pair_mode:
     if len(values) != 2 or not all(values):
         fail("credential pair input must contain exactly two non-empty lines")
     secrets = [(field_one, values[0]), (field_two, values[1])]
-    if len(item) > 105:
-        fail("pair item prefix is too long for a versioned item")
-    item = f"{item}-v-{uuid.uuid4().hex[:16]}"
+elif single_staged_mode:
+    if payload.endswith("\n"):
+        payload = payload[:-1]
+    secrets = [(field_one, payload)]
 else:
     if payload.endswith("\n"):
         payload = payload[:-1]
@@ -108,7 +127,10 @@ else:
 if any(not value or any(ch in value for ch in "\r\n\0") for _, value in secrets):
     fail("refusing to store an empty or multiline value")
 
-if pair_mode:
+if staged_mode:
+    if len(item) > 105:
+        fail("item prefix is too long for a versioned item")
+    item = f"{item}-v-{uuid.uuid4().hex[:16]}"
     document = {
         "title": item,
         "category": "PASSWORD",
@@ -128,24 +150,34 @@ if pair_mode:
                 "purpose": "NOTES",
                 "label": "notesPlain",
                 "value": (
-                    "Managed by hermes-agent-template as an atomic staged pair; "
+                    "Managed by hermes-agent-template as a staged credential; "
                     "rotate through the provisioner."
                 ),
             }
         ],
     }
     stored = op_run(
-        ["item", "create", "--vault", vault, "-"],
+        ["item", "create", "--vault", vault, "--format=json", "-"],
         payload=json.dumps(document),
     )
     if stored.returncode != 0:
-        fail("op rejected the staged credential-pair update")
-    references = [f"op://{vault}/{item}/{field}" for field, _ in secrets]
+        fail("op rejected the staged credential update")
+    try:
+        created = json.loads(stored.stdout)
+        item_id = str(created.get("id") or "")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        fail("op item create returned invalid JSON")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", item_id):
+        fail("op item create omitted an immutable item id")
+    references = [f"op://{vault}/{item_id}/{field}" for field, _ in secrets]
     for reference, (_, expected) in zip(references, secrets, strict=True):
         verified = op_run(["read", "--", reference])
         if verified.returncode != 0 or verified.stdout.rstrip("\n") != expected:
-            fail("a staged credential-pair field did not verify")
-    print("\n".join(references))
+            # The item is not active until the caller commits its refs. Archive
+            # this failed stage by immutable id; never guess/delete by title.
+            op_run(["item", "delete", item_id, "--vault", vault, "--archive"])
+            fail("a staged credential field did not verify; cleanup attempted")
+    print("\n".join([item_id, *references]))
     raise SystemExit(0)
 
 listed = op_run(["item", "list", "--vault", vault, "--format=json"])

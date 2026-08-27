@@ -43,9 +43,9 @@ elif args[:2] == ["item", "create"]:
         reject_field.unlink()
         if any(field.get("id") == rejected for field in document.get("fields", [])):
             raise SystemExit(73)
-    document["id"] = document["title"]
+    document["id"] = f"fakeitem{len(documents()) + 1:04d}"
     (store / f"{document['id']}.json").write_text(json.dumps(document), encoding="utf-8")
-    print("{}")
+    print(json.dumps(document))
 elif args[:2] == ["item", "get"]:
     found = locate(args[2])
     if not found:
@@ -58,11 +58,21 @@ elif args[:2] == ["item", "edit"]:
     document = json.load(sys.stdin)
     found[0].write_text(json.dumps(document), encoding="utf-8")
     print("{}")
+elif args[:2] == ["item", "delete"]:
+    found = locate(args[2])
+    if not found:
+        raise SystemExit(1)
+    found[0].unlink()
+    print("{}")
 elif args[:1] == ["read"]:
     if (home / ".fake-onepassword-outage").exists():
         raise SystemExit(75)
     reference = args[-1]
     _vault, item, field = reference.removeprefix("op://").split("/", 2)
+    fail_field = home / ".fake-onepassword-fail-read-field"
+    if fail_field.exists() and fail_field.read_text(encoding="utf-8").strip() == field:
+        fail_field.unlink()
+        raise SystemExit(74)
     found = locate(item)
     if not found:
         raise SystemExit(1)

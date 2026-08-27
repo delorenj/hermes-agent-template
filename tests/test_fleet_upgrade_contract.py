@@ -12,6 +12,36 @@ ROOT = Path(__file__).parents[1]
 FLEET_SYNC = ROOT / "scripts" / "fleet-sync.sh"
 HEARTBEAT = ROOT / "template" / ".scripts" / "heartbeat.sh"
 
+LEGACY_52D_UNMARKED_DELTA = """# Override-only delta for this Hermes profile.
+# Contains configuration and secret references only; secret values remain in 1Password.
+plugins:
+  enabled:
+  - bloodbank-platform
+  - copilot-provider
+  - fal
+  - gemini-provider
+  - google_meet
+  - kimi-coding-provider
+  - ntfy-platform
+  - openai-codex
+  - openrouter
+  - self-hosted
+  - slack-platform
+  - teams-platform
+  - teams_pipeline
+  - telegram-platform
+  - tts/vox
+  - web-brave-free
+  - web-tavily
+  - operator/extra
+  operator_metadata: preserve-me
+tts:
+  provider: vox
+  voice: carlin
+  vox:
+    voice: carlin
+"""
+
 
 def _fixture(tmp_path: Path) -> tuple[dict[str, str], Path, Path, Path]:
     home = tmp_path / "home"
@@ -216,12 +246,168 @@ def test_fleet_vox_delta_uses_list_patch_and_preserves_base_flow_and_exclusions(
     assert excluded.returncode == 0, excluded.stdout + excluded.stderr
     delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
     assert delta["plugins"]["enabled"] == ["operator/only", "tts/vox"]
+    assert delta["x-pjangler-merge"]["migrations"][
+        "plugins_enabled_52d9445"
+    ] == {
+        "source": "pjangler-52d9445",
+        "state": "completed",
+        "mode": "explicit-replacement",
+    }
     assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]["add"] == [
         "tts/vox"
     ]
     generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
     assert generated["plugins"]["enabled"] == ["operator/only", "tts/vox"]
     assert "# explicit operator exclusion" in delta_path.read_text(encoding="utf-8")
+
+
+def test_fleet_migrates_byte_exact_unmarked_52d_snapshot_after_base_advanced(
+    tmp_path: Path,
+) -> None:
+    env, registry, _consumer, role = _fixture(tmp_path)
+    pm_role = tmp_path / "pm"
+    role.rename(pm_role)
+    registry_data = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    registry_data["agents"]["demo-pm"]["role_dir"] = str(pm_role)
+    registry.write_text(yaml.safe_dump(registry_data, sort_keys=False), encoding="utf-8")
+    fleet_home = Path(env["HERMES_FLEET_HOME"])
+    base = fleet_home / "config.yaml"
+    # First contact happens only after the fleet has retired bloodbank/coplay
+    # and gained orca-status/vox. The current base cannot be used to guess what
+    # the unmarked 52d replacement inherited.
+    base.write_text(
+        "plugins:\n  enabled:\n"
+        "    - fal\n"
+        "    - gemini-provider\n"
+        "    - google_meet\n"
+        "    - kimi-coding-provider\n"
+        "    - ntfy-platform\n"
+        "    - openai-codex\n"
+        "    - openrouter\n"
+        "    - orca-status\n"
+        "    - self-hosted\n"
+        "    - slack-platform\n"
+        "    - teams-platform\n"
+        "    - teams_pipeline\n"
+        "    - telegram-platform\n"
+        "    - tts/vox\n"
+        "    - vox\n"
+        "    - web-brave-free\n"
+        "    - web-tavily\n"
+        "tts:\n  provider: vox\n  voice: carlin\n  vox:\n    voice: carlin\n",
+        encoding="utf-8",
+    )
+    profile = fleet_home / "profiles" / "demo-pm"
+    delta_path = profile / "config.delta.yaml"
+    delta_path.write_bytes(LEGACY_52D_UNMARKED_DELTA.encode("utf-8"))
+    plugin = tmp_path / "vox-plugin"
+    plugin.mkdir()
+    env["VOX_PLUGIN_DIR"] = str(plugin)
+
+    first = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert first.returncode == 0, first.stdout + first.stderr
+    delta_text = delta_path.read_text(encoding="utf-8")
+    delta = yaml.safe_load(delta_text)
+    assert delta["plugins"] == {"operator_metadata": "preserve-me"}
+    migration = delta["x-pjangler-merge"]["migrations"][
+        "plugins_enabled_52d9445"
+    ]
+    assert migration == {
+        "source": "pjangler-52d9445",
+        "state": "completed",
+        "mode": "inherited-snapshot",
+        "sealed_base_id": "delo-fleet-52d9445-generated-2026-08",
+        "sealed_base_sha256": "99656898b5bc80a24c42cdf0720abb9042d86bd8415fbbab534282d245dd618e",
+    }
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
+        "add": ["operator/extra", "tts/vox"],
+        "remove": ["tts/voxxy"],
+    }
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    enabled = generated["plugins"]["enabled"]
+    assert "bloodbank-platform" not in enabled
+    assert "copilot-provider" not in enabled
+    assert "orca-status" in enabled
+    assert "vox" in enabled
+    assert "operator/extra" in enabled
+    assert "tts/vox" in enabled
+
+    base.write_text(
+        "plugins:\n  enabled:\n    - fleet/current-two\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: newer\n",
+        encoding="utf-8",
+    )
+    second = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert second.returncode == 0, second.stdout + second.stderr
+    generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
+    assert generated["plugins"]["enabled"] == [
+        "fleet/current-two",
+        "operator/extra",
+        "tts/vox",
+    ]
+
+    converged = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert converged.returncode == 0, converged.stdout + converged.stderr
+
+
+def test_fleet_preserves_ambiguous_unmarked_plugin_list_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    env, registry, _consumer, role = _fixture(tmp_path)
+    pm_role = tmp_path / "pm"
+    role.rename(pm_role)
+    registry_data = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    registry_data["agents"]["demo-pm"]["role_dir"] = str(pm_role)
+    registry.write_text(yaml.safe_dump(registry_data, sort_keys=False), encoding="utf-8")
+    fleet_home = Path(env["HERMES_FLEET_HOME"])
+    (fleet_home / "config.yaml").write_text(
+        "plugins:\n  enabled:\n    - fleet/current\n    - tts/voxxy\n"
+        "tts:\n  provider: voxxy\n  voice: old\n",
+        encoding="utf-8",
+    )
+    profile = fleet_home / "profiles" / "demo-pm"
+    delta_path = profile / "config.delta.yaml"
+    ambiguous = (
+        b"# do not rewrite unresolved operator state\n"
+        b"plugins:\n  enabled:\n    - fal\n    - operator/only\n    - tts/vox\n"
+    )
+    delta_path.write_bytes(ambiguous)
+    plugin = tmp_path / "vox-plugin"
+    plugin.mkdir()
+    env["VOX_PLUGIN_DIR"] = str(plugin)
+
+    result = subprocess.run(
+        ["bash", str(FLEET_SYNC), "--apply", "--no-restart", "--agent", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert delta_path.read_bytes() == ambiguous
+    assert "partially matches sealed 52d history" in result.stdout
+    assert "MANUAL: resolve plugin provenance" in result.stdout
+    assert "TTS delta enforced" not in result.stdout
 
 
 def test_fleet_thaws_only_provenance_backed_snapshot_after_base_already_changed(
