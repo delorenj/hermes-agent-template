@@ -4,46 +4,39 @@ Status: Sentinel engine protocol (provider-agnostic)
 
 ## Purpose
 
-Local workflow events are the machine-readable timeline of the sentinel loop.
-The board remains the human command center; issue evidence files remain the
-close gate; this JSONL spool lets Hermes, dashboards, and future agents observe
-what happened.
+The board remains the human command center and issue evidence files remain the
+close gate. Neither depends on an event trail: `bin/issue-close-gate.sh` and
+`bin/issue-autonomous-review.sh` report their verdicts on stdout/stderr and via
+their exit codes, and publish nothing.
+
+The `repo.issue.*` family the sentinel loop used to mint was retired on
+2026-08-28. It was never published to NATS and never consumed by anything, and
+its shape was invalid twice over: it embedded the repo slug inside the type
+(`bloodbank.v1.repo.<repo>.issue.…`) and `issue` is not in the Bloodbank §7
+entity allowlist. There is no correct version of it to migrate to, so it is
+gone rather than renamed.
 
 ## Emitter
+
+`bin/emit-event.py` stays as a dependency-free local emitter for a family a
+future pass genuinely needs:
 
 ```bash
 .scripts/sentinel/bin/emit-event.py <event_type> --field key=value [...]
 ```
 
-Appends to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`
-(git-ignored dev spool) using the Hermes CloudEvents envelope shape. Event types
-use the project repo lane `bloodbank.v1.repo.<repo>.<entity>.<action>`, where
-`<repo>` comes from `role.yaml`.
+It appends to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`
+(git-ignored dev spool) using the Hermes CloudEvents envelope shape. Nothing in
+the engine calls it today.
 
-## Event types
+## Naming, before you add one
 
-| Event type | When | Required data |
-| --- | --- | --- |
-| `…repo.<repo>.issue.evidence.created` | Evidence file created | `issue`, `evidence_file` |
-| `…repo.<repo>.issue.gate.passed` | Close gate passes | `issue`, `evidence_file` |
-| `…repo.<repo>.issue.gate.failed` | Close gate fails | `issue`, `evidence_file` |
-| `…repo.<repo>.issue.autonomous_review.decided` | An independent adversarial review clears a review-lane ticket; the loop acts on the verdict autonomously and treats `accepted` tickets as done (left in the review lane) | `issue`, `decision` (`accepted`/`held`), `drift`, `close_gate`, `reviewer_agent`, `evidence_file`, `report_file` |
-| `…repo.<repo>.issue.review_rollback.recorded` | A review-accepted ticket is moved back to active because a dependent proved it broken | `issue`, `surfaced_by`, `reason` |
-| `…repo.<repo>.issue.truthcheck.flagged` | Status/evidence mismatch found | `issue`, `reason` |
+Event types are exactly four tokens — `bloodbank.<domain>.<entity>.<action>` —
+with `<domain>` and `<entity>` drawn from the allowlists in
+`~/code/33GOD/bloodbank/docs/event-naming.md` (§6/§7). Repo and agent identity
+go in `data.repo` / `actor.agent_id`, never in a type or subject token. Schema
+revision lives in `dataschema`/`schemaref`, never in the type.
 
-## Rules
-
-- Emit events for consequential transitions; do not invent types casually.
-- Event emission never replaces the board update or issue evidence.
-- If emission fails, continue and report the trail is incomplete.
-- Autonomous acceptance is legitimate only when
-  `issue.autonomous_review.decided` is emitted with `decision=accepted` and
-  `close_gate=pass` by `bin/issue-autonomous-review.sh`. That script will not
-  emit an `accepted` decision while the close gate fails or drift is `significant`.
-
-## Canonical BloodBank
-
-These project-local repo-lane events are BloodBank-*style*. Promote a type to a
-canonical NATS subject only after adding its JSON Schema to the BloodBank schema
-tree and passing validation. The local emitter does not require NATS so the loop
-stays reliable offline.
+Add a family when something will actually consume it — register the schema in
+the BloodBank schema tree first, then emit. A type nobody reads is a type that
+rots into the wrong shape.

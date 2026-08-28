@@ -156,7 +156,7 @@ systemctl --user start hermes-${AGENT}-gateway.service
 | Telegram | DM `@<repo>_<role>_bot` (once Telegram is wired) |
 | Slack | DM or mention the verified per-agent Slack bot (once Slack is wired) |
 | Local CLI | `./agents/hermes/<role>/hermes chat "..."` |
-| Bloodbank | Publish to `bloodbank.cmd.v1.agent.invocation.start` with `data.target_agent_id = <agent_id>` |
+| Bloodbank | Publish to `bloodbank.cmd.agent.invocation.start` with `data.target_agent_id = <agent_id>` |
 
 ## Inspect fleet state
 
