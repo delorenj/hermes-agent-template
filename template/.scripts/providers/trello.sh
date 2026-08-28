@@ -144,6 +144,25 @@ print(json.dumps({"id":c.get("id",""),"key":c.get("id",""),"title":c.get("name",
     api PUT "cards/$ID" "idList=$LID" | python3 -c 'import sys,json; c=json.load(sys.stdin); print("ok "+c.get("id",""))'
     ;;
 
+  describe_board)
+    # Read-only board lookup against an EXPLICIT workspace argument, mirroring
+    # the Plane op, so no ambient binding can send the query somewhere else.
+    # Trello mints NO project key, so `identifier` is ALWAYS empty here: an
+    # empty identifier is this provider's authoritative answer, not a lookup
+    # failure, and callers must never promote it to a confirmed value.
+    DWS="${1:?usage: describe_board <workspace> <board_id>}"
+    DBID="${2:?usage: describe_board <workspace> <board_id>}"
+    api GET "boards/$DBID" "fields=id,name,idOrganization" \
+      | WS="$DWS" BID="$DBID" python3 -c 'import sys, json, os
+b = json.load(sys.stdin)
+print(json.dumps({
+    "board_id": str(b.get("id") or os.environ["BID"]),
+    "identifier": "",
+    "workspace": str(b.get("idOrganization") or os.environ["WS"]),
+    "name": str(b.get("name") or ""),
+}))'
+    ;;
+
   create_board)
     NAME="${1:?usage: create_board <name> <ident> <desc>}"
     EXIST="$(api GET "members/me/boards" "fields=name" | NM="$NAME" python3 -c 'import sys,json,os

@@ -90,7 +90,7 @@ case "$OP" in
     [ -n "$TEAM" ] || die "ticket_provider.team (Linear team key) not set in role.yaml"
     gql 'query($k:String!){ teams(filter:{key:{eq:$k}}){nodes{id key name}} }' \
         "$(printf '{"k":"%s"}' "$TEAM")" \
-      | python3 -c 'import sys,json; d=json.load(sys.stdin); t=(d.get("teams",{}).get("nodes") or [{}])[0]; print(json.dumps({"provider":"linear","board_id":t.get("id",""),"board_url":"https://linear.app/team/"+t.get("key","")}))'
+      | python3 -c 'import sys,json; d=json.load(sys.stdin); t=(d.get("teams",{}).get("nodes") or [{}])[0]; print(json.dumps({"provider":"linear","board_id":t.get("id",""),"board_url":"https://linear.app/team/"+t.get("key",""),"identifier":t.get("key","")}))'
     ;;
 
   active_milestone)
@@ -167,6 +167,29 @@ print(pick.get("id",""))')"
         "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"s":sys.argv[2]}))' "$ID" "$STATE_ID")" \
       | python3 -c 'import sys,json; u=json.load(sys.stdin).get("issueUpdate",{});
 print(("ok " + (u.get("issue") or {}).get("identifier","")) if u.get("success") else "FAILED"); sys.exit(0 if u.get("success") else 1)'
+    ;;
+
+  describe_board)
+    # Read-only team lookup by id, against an EXPLICIT workspace argument so no
+    # ambient binding can answer for the wrong org. Linear's team KEY is a real
+    # authoritative identifier — it prefixes every issue — so it is read back
+    # from Linear itself and never proposed locally.
+    DWS="${1:?usage: describe_board <workspace> <board_id>}"
+    DBID="${2:?usage: describe_board <workspace> <board_id>}"
+    gql 'query($id:String!){ team(id:$id){ id key name } organization{ urlKey } }' \
+        "$(printf '{"id":"%s"}' "$DBID")" \
+      | WS="$DWS" BID="$DBID" python3 -c 'import sys, json, os
+d = json.load(sys.stdin)
+t = d.get("team") or {}
+ident = str(t.get("key") or "")
+if not ident:
+    raise SystemExit("linear: team %s reported no authoritative key" % os.environ["BID"])
+print(json.dumps({
+    "board_id": str(t.get("id") or os.environ["BID"]),
+    "identifier": ident,
+    "workspace": str((d.get("organization") or {}).get("urlKey") or os.environ["WS"]),
+    "name": str(t.get("name") or ""),
+}))'
     ;;
 
   create_board)

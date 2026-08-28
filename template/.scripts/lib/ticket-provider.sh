@@ -19,6 +19,15 @@
 #                                     backlog|unstarted|started|in_review|completed|
 #                                     cancelled
 #   create_board <name> <id> <d>  -> JSON {board_id, board_url}
+#   describe_board <ws> <board_id>
+#                                 -> JSON {board_id, identifier, workspace,
+#                                          name}
+#                                    Read-only lookup against an EXPLICIT
+#                                    workspace, so no ambient binding can send
+#                                    the query elsewhere. `identifier` is
+#                                    whatever the provider itself reports, and
+#                                    is empty when the provider mints none
+#                                    (Trello). Never a locally-computed guess.
 #   create_issue [--if-absent] <title> [desc]
 #                                 -> JSON {issue_id, key, issue_url, created}
 #                                    Files a new ticket on the bound board.

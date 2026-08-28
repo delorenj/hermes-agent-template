@@ -35,6 +35,7 @@ Every adapter must implement these operations.
 | `comment` | `<id> <body>` | Prints the new comment id. |
 | `transition` | `<id> <normalized-state>` | Moves the issue to a normalized state. |
 | `create_board` | `<name> <ident> <desc>` | JSON `{board_id, board_url}`. Creates or reuses the board. |
+| `describe_board` | `<workspace> <board_id>` | JSON `{board_id, identifier, workspace, name}`. Read-only lookup against an explicit workspace. `identifier` is whatever the provider itself reports — empty when the provider mints none (Trello) — and is never a locally-computed guess. |
 | `create_issue` | `[--if-absent] <title> [description]` | JSON `{issue_id, key, issue_url, created}`. Files a new ticket on the bound board. |
 
 The `transition` operation accepts only the normalized states from
