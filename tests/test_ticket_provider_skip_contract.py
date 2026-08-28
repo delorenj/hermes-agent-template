@@ -555,13 +555,25 @@ def test_done_marker_rerun_canonicalizes_live_plane_binding_and_preserves_unrela
 
     assert result.returncode == 0, result.stdout + result.stderr
     updated = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert updated["ticket_provider"] == {
+    provider = updated["ticket_provider"]
+    # Two separate claims, two separate stamps. Plane resolved the board (so
+    # board_confirmed_at is what "linked" rests on) AND handed back its own key
+    # (so identifier_source is "provider", dated by identifier_fetched_at).
+    stamps = {
+        key: provider.pop(key)
+        for key in ("identifier_fetched_at", "board_confirmed_at")
+        if key in provider
+    }
+    assert provider == {
         "type": "plane",
         "workspace": "test-space",
         "identifier": "LIVE",
+        "identifier_source": "provider",
         "board_id": "granted-board",
         "state": "linked",
     }
+    assert sorted(stamps) == ["board_confirmed_at", "identifier_fetched_at"]
+    assert all(value.endswith("Z") for value in stamps.values()), stamps
     assert updated["unrelated"] == {"preserve": [1, 2, 3]}
     assert "revalidating canonical board binding" in result.stderr
 
