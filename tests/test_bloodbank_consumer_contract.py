@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -166,6 +167,24 @@ fi
     wrapper.chmod(0o755)
     env["PATH"] = f"{wrapper_dir}:{env['PATH']}"
     env["FAIL_PARENT_FSYNC"] = str(parent)
+
+
+def test_runtime_scaffolds_carry_no_retired_version_token() -> None:
+    """The scaffold is copied verbatim into every new agent runtime.
+
+    A version token surviving here re-fans the retired grammar into every repo
+    provisioned after the migration, so pin it at the source.
+    """
+    retired = re.compile(r"bloodbank\.(?:evt\.|cmd\.|rpy\.)?v[0-9]+\.")
+    for scaffold in (ROOT / "runtime-scaffold", ROOT / "template" / ".runtime-scaffold"):
+        for path in sorted(scaffold.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            assert not retired.search(text), f"retired version token in {path}"
 
 
 def test_future_runtime_scaffolds_have_no_profile_consumer_or_inbox() -> None:
