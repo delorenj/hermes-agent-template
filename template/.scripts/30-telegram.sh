@@ -11,6 +11,16 @@ INVOCATION_TELEGRAM_ALLOWED_USERS="${TELEGRAM_ALLOWED_USERS-}"
 # fleet state, and no child involved in setup should inherit a raw token.
 unset TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWED_USERS
 
+# Every channel write lands in the host-global profile root that 10-hermes-profile.sh
+# creates. When that step is deferred the root does not exist yet, so there is no
+# honest Telegram state to record -- not even the disabled state, which is itself a
+# write into the profile. Defer with it. This guard must precede _lib.sh because that
+# library creates the role log and reads fleet configuration.
+if [[ "${SKIP_HOST_STATE:-0}" == "1" ]]; then
+  printf '%s\n' '[30] telegram — DEFERRED (SKIP_HOST_STATE=1)' >&2
+  exit 0
+fi
+
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env

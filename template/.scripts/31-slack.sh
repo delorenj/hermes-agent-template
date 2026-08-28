@@ -13,6 +13,16 @@ INVOCATION_ENABLE_SLACK="${ENABLE_SLACK-${WIRE_SLACK-}}"
 # credentials (or accidentally treat the invocation policy as fleet state).
 unset SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_ALLOWED_USERS ENABLE_SLACK WIRE_SLACK
 
+# Every channel write lands in the host-global profile root that 10-hermes-profile.sh
+# creates. When that step is deferred the root does not exist yet, so there is no
+# honest Slack state to record -- not even the disabled state, which is itself a
+# write into the profile. Defer with it. This guard must precede _lib.sh because that
+# library creates the role log and reads fleet configuration.
+if [[ "${SKIP_HOST_STATE:-0}" == "1" ]]; then
+  printf '%s\n' '[31] slack — DEFERRED (SKIP_HOST_STATE=1)' >&2
+  exit 0
+fi
+
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
