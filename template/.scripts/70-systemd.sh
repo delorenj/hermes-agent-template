@@ -205,11 +205,21 @@ chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" "$ROLE_DIR/.scripts/checkpoint.
   || die "named profile is not a real directory; run: pj migrate hermes.runtime-singleton '$REPO_ROOT'"
 
 # Gateway unit
+#
+# StartLimit* belongs in [Unit], not [Service] — systemd only still parses it
+# under [Service] for backwards compatibility. Without it, Restart=on-failure
+# retries forever and a gateway that can never start (bad token, bad config)
+# sits in `activating` indefinitely instead of settling into `failed`, so
+# `systemctl --user --failed` never lists it and neither the sentinel nor a
+# human ever sees the crashloop. That is exactly how the fleet accumulated
+# 10,427 invisible restarts. 5 tries in 5 minutes, then stop and report failed.
 cat > "$SYS_DIR/$GW_UNIT" <<UNIT
 [Unit]
 Description=$GW_DESCRIPTION
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
