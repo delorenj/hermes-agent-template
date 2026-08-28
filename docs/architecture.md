@@ -156,11 +156,15 @@ never in type or subject tokens.
 
 The gateway uses the canonical lifecycle already defined by those schemas:
 
-- `bloodbank.v1.conversation.turn.started`
-- `bloodbank.v1.agent.invocation.started`
-- one terminal invocation event: `bloodbank.v1.agent.invocation.completed` or
-  `bloodbank.v1.agent.invocation.failed`
-- `bloodbank.v1.conversation.turn.completed`
+- `bloodbank.conversation.turn.started`
+- `bloodbank.agent.invocation.started`
+- one terminal invocation event: `bloodbank.agent.invocation.completed` or
+  `bloodbank.agent.invocation.failed`
+- `bloodbank.conversation.turn.completed`
+
+The type carries no version token. Schema revision is tracked out of band, in
+`dataschema` / `schemaref`; a breaking payload change earns a new action or
+entity, never a `v<n>` segment in the type or the subject.
 
 There are no separate `received` or `accepted` lifecycle events. A JetStream
 command is acknowledged only after Hermes processing completion and terminal

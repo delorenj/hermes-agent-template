@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -166,6 +167,24 @@ fi
     wrapper.chmod(0o755)
     env["PATH"] = f"{wrapper_dir}:{env['PATH']}"
     env["FAIL_PARENT_FSYNC"] = str(parent)
+
+
+def test_runtime_scaffolds_carry_no_retired_version_token() -> None:
+    """The scaffold is copied verbatim into every new agent runtime.
+
+    A version token surviving here re-fans the retired grammar into every repo
+    provisioned after the migration, so pin it at the source.
+    """
+    retired = re.compile(r"bloodbank\.(?:evt\.|cmd\.|rpy\.)?v[0-9]+\.")
+    for scaffold in (ROOT / "runtime-scaffold", ROOT / "template" / ".runtime-scaffold"):
+        for path in sorted(scaffold.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            assert not retired.search(text), f"retired version token in {path}"
 
 
 def test_future_runtime_scaffolds_have_no_profile_consumer_or_inbox() -> None:
@@ -969,15 +988,27 @@ def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
 
 
 def test_documented_gateway_lifecycle_matches_canonical_bloodbank_contract() -> None:
+    """The doc must teach the shape the live gateway actually emits.
+
+    Positive literals alone let the doc drift ahead of or behind the bus while
+    still passing, so the retired shape is pinned as ABSENT too: a version
+    token anywhere in the doc fails here rather than being re-taught to every
+    agent rendered from this template.
+    """
     architecture = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
 
     for event_type in (
-        "bloodbank.v1.conversation.turn.started",
-        "bloodbank.v1.agent.invocation.started",
-        "bloodbank.v1.agent.invocation.completed",
-        "bloodbank.v1.agent.invocation.failed",
-        "bloodbank.v1.conversation.turn.completed",
+        "bloodbank.conversation.turn.started",
+        "bloodbank.agent.invocation.started",
+        "bloodbank.agent.invocation.completed",
+        "bloodbank.agent.invocation.failed",
+        "bloodbank.conversation.turn.completed",
     ):
         assert event_type in architecture
+    retired = re.compile(r"bloodbank\.(?:evt\.|cmd\.|rpy\.)?v[0-9]+\.")
+    assert not retired.search(architecture), (
+        "docs/architecture.md teaches a retired versioned event type; "
+        "the contract carries schema revision in dataschema/schemaref, not in the type"
+    )
     assert "There are no separate `received` or `accepted` lifecycle events" in architecture
     assert "acknowledged only after Hermes processing completion" in architecture
