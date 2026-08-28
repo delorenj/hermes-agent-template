@@ -154,8 +154,12 @@ print(next((b["id"] for b in rows if b.get("name","").lower()==nm), ""))')"
         | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))')"
     fi
     [ -n "$BID" ] || die "create_board failed"
-    api GET "boards/$BID" "fields=url" | BID="$BID" python3 -c 'import sys,json,os
-b=json.load(sys.stdin); print(json.dumps({"board_id":os.environ["BID"],"board_url":b.get("url","")}))'
+    # Trello assigns no project key, so the caller's prefix IS the identity and
+    # this adapter is the only thing that can confirm it. Echo it back: the
+    # create_board envelope always carries the identifier the board is bound
+    # under, so no caller ever has to invent one.
+    api GET "boards/$BID" "fields=url" | BID="$BID" IDENT="${2:-}" python3 -c 'import sys,json,os
+b=json.load(sys.stdin); print(json.dumps({"board_id":os.environ["BID"],"board_url":b.get("url",""),"identifier":os.environ.get("IDENT","")}))'
     ;;
 
   create_issue)
