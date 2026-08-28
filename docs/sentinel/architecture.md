@@ -149,33 +149,24 @@ Deferring operator QA buys speed, and the safety valve is a downstream regressio
 rollback. If a later dependent proves a review-accepted feature is **actually
 broken**, the loop moves that feature back to active (`started` if a worker takes
 it now, else `unstarted`) as a prerequisite of the dependent, comments naming the
-dependent and the symptom, and emits
+dependent and the symptom, and records the rollback in the ticket comment and the
+issue evidence file. The dependent stays blocked on the prerequisite until the
+fix lands. This is expected and healthy — it is the trade for deferring operator
+QA, not a failure of the review.
 
-```text
-bloodbank.v1.repo.<repo>.issue.review_rollback.recorded
-```
+### Decision record
 
-carrying `{issue, surfaced_by, reason}`. The dependent stays blocked on the
-prerequisite until the fix lands. This is expected and healthy — it is the trade
-for deferring operator QA, not a failure of the review.
+Every adversarial-review decision, whether `accepted` or `held`, is carried by
+the script's exit code (`0` accepted, `3` held), its stdout/stderr, the review
+report, and the ticket comment it posts. The durable accountability trail is the
+review report plus the issue evidence file in the repo — both of which the
+operator can read without a bus.
 
-### Decision events
-
-Every adversarial-review decision, whether `accepted` or `held`, emits a local
-BloodBank-style event:
-
-```text
-bloodbank.v1.repo.<repo>.issue.autonomous_review.decided
-```
-
-The event carries `issue`, `decision`, `drift`, `close_gate`, `reviewer_agent`,
-`evidence_file`, and `report_file`. Together with the
-`issue.review_rollback.recorded` event it forms the operator's queryable
-accountability trail for every autonomous decision. The emitter is
-`template/.scripts/sentinel/bin/emit-event.py`, and the event types are
-documented in `template/.scripts/sentinel/docs/bloodbank-events.md`. Events
-append to `_bmad-output/implementation-artifacts/bloodbank-events.jsonl`, a
-local spool that doesn't require NATS, so the loop stays reliable offline.
+No event is published. The `repo.issue.*` family this engine used to mint was
+retired: it was never published to NATS, never consumed, and its shape was
+invalid twice over (repo slug inside a type token, and `issue` is not a
+Bloodbank entity). See `template/.scripts/sentinel/docs/bloodbank-events.md`
+for the naming rules to follow if a future pass genuinely needs a family here.
 
 ## How the parts connect
 
