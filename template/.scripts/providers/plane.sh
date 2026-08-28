@@ -160,8 +160,9 @@ pick=(named or grouped or [{}])[0]
 print(pick.get("id",""))'
 }
 
-# All Plane ops require the API key; fail fast and clean before any pipe.
-need_key
+# All Plane ops except the explicit-workspace read below require the bound
+# workspace API key; fail fast and clean before any pipe.
+case "$OP" in describe_board) ;; *) need_key ;; esac
 
 case "$OP" in
   resolve)
@@ -255,6 +256,36 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
     [ -n "$SID" ] || die "no Plane state for normalized '$TARGET'"
     api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" \
       | python3 -c 'import sys,json; d=json.load(sys.stdin); print("ok "+str(d.get("sequence_id","")) )'
+    ;;
+
+  describe_board)
+    # Read-only board lookup against an EXPLICIT workspace argument, so the
+    # .project.json / role.yaml / env workspace precedence can never silently
+    # query the wrong workspace. Emits Plane's own identifier, never a guess.
+    DWS="${1:?usage: describe_board <workspace> <board_id>}"
+    DBID="${2:?usage: describe_board <workspace> <board_id>}"
+    DKEYVAR="$(workspace_key "$DWS")"
+    DKEY="$(printenv "$DKEYVAR" 2>/dev/null || true)"
+    if [ -z "$DKEY" ] && [ -f "$FLEET_ENV" ]; then
+      DKEY="$(dotenv_value "$FLEET_ENV" "$DKEYVAR")"
+    fi
+    [ -n "$DKEY" ] || DKEY="${PLANE_API_KEY:-}"
+    DKEY="$(resolve_secret_value "$DKEY")"
+    [ -n "$DKEY" ] || die "no Plane API key for workspace '$DWS' (looked for $DKEYVAR)"
+    DETAIL="$(curl -fsS "$BASE/api/v1/workspaces/$DWS/projects/$DBID/" \
+      -H "X-API-Key: $DKEY" -H "User-Agent: curl/8.0")" \
+      || die "describe_board failed for $DWS/$DBID"
+    printf '%s' "$DETAIL" | WS="$DWS" BID="$DBID" python3 -c 'import sys, json, os
+d = json.load(sys.stdin)
+ident = str(d.get("identifier") or "")
+if not ident:
+    raise SystemExit("plane: live Plane project omitted its authoritative identifier")
+print(json.dumps({
+    "board_id": str(d.get("id") or os.environ["BID"]),
+    "identifier": ident,
+    "workspace": os.environ["WS"],
+    "name": str(d.get("name") or ""),
+}))'
     ;;
 
   create_board)

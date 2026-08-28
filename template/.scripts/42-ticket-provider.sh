@@ -229,10 +229,12 @@ fi
 PROVIDER="${ROLE_PROVIDER:-${SOT_TYPE:-plane}}"
 log "[42] no board in .project.json — bootstrapping a repo board (provider: $PROVIDER)"
 
-# Repo-based identity, matching CommonProject's scheme (slug[:4] uppercased).
-RAW=$(printf '%s' "$REPO" | tr -cd '[:alnum:]' | tr '[:lower:]' '[:upper:]')
-while [ ${#RAW} -lt 2 ]; do RAW="${RAW}X"; done
-IDENT="${SOT_IDENT:-${RAW:0:4}}"
+# Identifier PROPOSAL for a brand-new board only. It is sent to the provider in
+# the create request and is NEVER persisted as though it were confirmed: every
+# write below uses LIVE_IDENT, read back from the provider's own response.
+PROPOSED_RAW=$(printf '%s' "$REPO" | tr -cd '[:alnum:]' | tr '[:lower:]' '[:upper:]')
+while [ ${#PROPOSED_RAW} -lt 2 ]; do PROPOSED_RAW="${PROPOSED_RAW}X"; done
+PROPOSED_IDENT="${SOT_IDENT:-${PROPOSED_RAW:0:4}}"
 # Board NAME = repo name, separators->space, title-cased. NOT display_name —
 # display_name carries the role suffix and must never become the board name.
 NAME="$(printf '%s' "$REPO" | tr '_-' '  ' | python3 -c 'import sys; print(" ".join(w[:1].upper()+w[1:] for w in sys.stdin.read().split()))')"
@@ -242,7 +244,7 @@ case "$PROVIDER" in
   linear)
     if [[ -z "${LINEAR_API_KEY:-}" ]]; then
       warn "[42] LINEAR_API_KEY not set; set role.yaml/.project.json ticket_provider.team and re-run ./.scripts/42-ticket-provider.sh"
-      pj_write 1 linear "" "" "$IDENT" "$SOT_TEAM"
+      pj_write 1 linear "" "" "$PROPOSED_IDENT" "$SOT_TEAM"
       mark_done 42-ticket-provider; exit 0
     fi
     OUT="$(tp resolve 2>/dev/null || true)"
@@ -253,11 +255,11 @@ except Exception: print("")')"
 try: print(json.load(sys.stdin).get("board_url",""))
 except Exception: print("")')"
     if [ -n "$BID" ]; then
-      mirror_to_role_yaml linear "$BID" "" "$IDENT" "$SOT_TEAM"
-      pj_write 1 linear "$BID" "" "$IDENT" "$SOT_TEAM"
+      mirror_to_role_yaml linear "$BID" "" "$PROPOSED_IDENT" "$SOT_TEAM"
+      pj_write 1 linear "$BID" "" "$PROPOSED_IDENT" "$SOT_TEAM"
     else
       warn "[42] linear resolve returned no board; set ticket_provider.team and re-run"
-      pj_write 1 linear "" "" "$IDENT" "$SOT_TEAM"
+      pj_write 1 linear "" "" "$PROPOSED_IDENT" "$SOT_TEAM"
     fi
     ;;
 
@@ -265,10 +267,12 @@ except Exception: print("")')"
     KEYVAR=PLANE_API_KEY; [ "$PROVIDER" = trello ] && KEYVAR=TRELLO_KEY
     if [[ -z "${!KEYVAR:-}" ]]; then
       warn "[42] $KEYVAR not set; skipping board creation. Set creds and re-run ./.scripts/42-ticket-provider.sh"
-      pj_write 1 "$PROVIDER" "" "${SOT_WS:-$PLANE_WORKSPACE}" "$IDENT" ""
+      # Deferred: no board was created, so there is no confirmed identifier.
+      # Persist nothing rather than freezing the proposal into .project.json.
+      pj_write 1 "$PROVIDER" "" "${SOT_WS:-$PLANE_WORKSPACE}" "" ""
       mark_done 42-ticket-provider; exit 0
     fi
-    OUT="$(tp create_board "$NAME" "$IDENT" "$DESC")" || die "create_board failed for $PROVIDER"
+    OUT="$(tp create_board "$NAME" "$PROPOSED_IDENT" "$DESC")" || die "create_board failed for $PROVIDER"
     BID="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("board_id",""))')"
     BURL="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("board_url",""))')"
     LIVE_IDENT="$(printf '%s' "$OUT" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("identifier","") or "")')"
@@ -276,7 +280,7 @@ except Exception: print("")')"
     [ "$PROVIDER" = trello ] && WS=""
     [ "$PROVIDER" != plane ] || [ -n "$LIVE_IDENT" ] \
       || die "created/bound Plane board has no authoritative live identifier"
-    [ -n "$LIVE_IDENT" ] || LIVE_IDENT="$IDENT"
+    [ -n "$LIVE_IDENT" ] || LIVE_IDENT="$PROPOSED_IDENT"
     mirror_to_role_yaml "$PROVIDER" "$BID" "$WS" "$LIVE_IDENT" ""
     pj_write 1 "$PROVIDER" "$BID" "$WS" "$LIVE_IDENT" ""
     ;;
