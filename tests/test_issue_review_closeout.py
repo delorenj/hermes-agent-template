@@ -152,7 +152,7 @@ def run_review(
         }
     )
     proc = subprocess.run(
-        ["bash", str(script), ISSUE, str(report), *args],
+        [str(script), ISSUE, str(report), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -162,6 +162,14 @@ def run_review(
     )
     observed = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
     return proc, observed
+
+
+def test_shipped_sentinel_entrypoints_are_executable() -> None:
+    for entrypoint in (AUTONOMOUS_REVIEW, CLOSE_GATE):
+        assert entrypoint.stat().st_mode & 0o111 == 0o111, (
+            f"{entrypoint.relative_to(ROOT)} must ship executable"
+        )
+        assert os.access(entrypoint, os.X_OK)
 
 
 def test_close_failure_emits_no_acceptance_or_completion_claim(tmp_path: Path) -> None:
@@ -257,7 +265,7 @@ def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
         / CLOSE_GATE.name
     )
     passing = subprocess.run(
-        ["sh", str(gate), ISSUE, str(tmp_path)],
+        [str(gate), ISSUE, str(tmp_path)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -283,7 +291,7 @@ def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
         encoding="utf-8",
     )
     failing = subprocess.run(
-        ["sh", str(gate), ISSUE, str(tmp_path)],
+        [str(gate), ISSUE, str(tmp_path)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
