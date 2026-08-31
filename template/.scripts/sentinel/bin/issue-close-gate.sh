@@ -13,8 +13,12 @@ fi
 ISSUE="$1"
 case "$ISSUE" in *[!A-Za-z0-9_-]*) printf 'Invalid issue id: %s\n' "$ISSUE" >&2; exit 2 ;; esac
 
+BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+ROLE_YAML="$BIN_DIR/../../../role.yaml"
+REPO_SLUG="$(sed -n 's/^[[:space:]]*repo:[[:space:]]*//p' "$ROLE_YAML" 2>/dev/null | head -n1 | tr -d '"' | tr -d '\r')"
 ROOT="${2:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
+REPO_SLUG="${REPO_SLUG:-$(basename "$ROOT")}"
 
 FILE="_bmad-output/implementation-artifacts/issue-evidence/$ISSUE.md"
 FAIL=0
@@ -45,5 +49,4 @@ if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
 
-REPO_SLUG="$(basename "$ROOT")"
 printf 'CLOSE GATE: PASS for %s (repo: %s)\n' "$ISSUE" "$REPO_SLUG"

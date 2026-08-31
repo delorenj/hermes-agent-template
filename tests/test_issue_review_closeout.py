@@ -209,7 +209,7 @@ def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
     )
     assert passing.returncode == 0, passing.stderr
     assert passing.stdout.strip() == (
-        f"CLOSE GATE: PASS for {ISSUE} (repo: {tmp_path.name})"
+        f"CLOSE GATE: PASS for {ISSUE} (repo: closeout-fixture)"
     )
 
     evidence = (
