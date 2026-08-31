@@ -87,25 +87,29 @@ if [[ "$DECISION" == "held" ]]; then
   exit 3
 fi
 
-printf 'AUTONOMOUS REVIEW: ACCEPTED - treat as done (no human wait) for %s (reviewer: %s | drift: %s | gate: %s)\n' \
-  "$ISSUE" "$REVIEWER" "$DRIFT" "$GATE"
-
 if [[ "$CLOSE" -eq 1 ]]; then
   # Optional operator QA sweep: close through the ticket-provider adapter.
   PROV="$(yget name)"; PROV="${PROV:-}"
-  if TICKET_PROVIDER="$PROV" bash -c '. "$1"; tp transition "$2" completed' _ "$SCRIPTS_DIR/lib/ticket-provider.sh" "$ISSUE"; then
-    printf 'Ticket %s transitioned to completed via adapter.\n' "$ISSUE"
-    TICKET_PROVIDER="$PROV" bash -c '. "$1"; tp comment "$2" "$3"' _ "$SCRIPTS_DIR/lib/ticket-provider.sh" "$ISSUE" \
-      "Autonomously accepted by $REVIEWER under the independent adversarial-review protocol (drift: $DRIFT, gate: $GATE, grace ${GRACE_HOURS}h informational). Treated as done; review report: $REPORT." >/dev/null 2>&1 || true
-  else
-    printf 'Adapter transition failed; issue left open.\n' >&2
+  if ! TICKET_PROVIDER="$PROV" bash -c '. "$1"; tp transition "$2" completed' _ "$SCRIPTS_DIR/lib/ticket-provider.sh" "$ISSUE" \
+    >/dev/null 2>&1; then
+    printf 'AUTONOMOUS REVIEW: CLOSE FAILED for %s - adapter transition failed; issue left open.\n' "$ISSUE" >&2
     exit 1
   fi
+
+  # Acceptance is an assertion about the completed operation on this path, so
+  # no acceptance-shaped output may escape until the adapter has succeeded.
+  printf 'AUTONOMOUS REVIEW: ACCEPTED - treat as done (no human wait) for %s (reviewer: %s | drift: %s | gate: %s)\n' \
+    "$ISSUE" "$REVIEWER" "$DRIFT" "$GATE"
+  printf 'Ticket %s transitioned to completed via adapter.\n' "$ISSUE"
+  TICKET_PROVIDER="$PROV" bash -c '. "$1"; tp comment "$2" "$3"' _ "$SCRIPTS_DIR/lib/ticket-provider.sh" "$ISSUE" \
+    "Autonomously accepted by $REVIEWER under the independent adversarial-review protocol (drift: $DRIFT, gate: $GATE, grace ${GRACE_HOURS}h informational). Treated as done; review report: $REPORT." >/dev/null 2>&1 || true
 else
   # Accepted: the loop autonomously treats the ticket as done and leaves it in
   # the review lane (deferred-QA queue). Record the autonomous acceptance via the
   # adapter -- no approval request, no "waiting on the operator".
   PROV="$(yget name)"; PROV="${PROV:-}"
+  printf 'AUTONOMOUS REVIEW: ACCEPTED - treat as done (no human wait) for %s (reviewer: %s | drift: %s | gate: %s)\n' \
+    "$ISSUE" "$REVIEWER" "$DRIFT" "$GATE"
   TICKET_PROVIDER="$PROV" bash -c '. "$1"; tp comment "$2" "$3"' _ "$SCRIPTS_DIR/lib/ticket-provider.sh" "$ISSUE" \
     "Autonomously accepted by $REVIEWER under the independent adversarial-review protocol (drift: $DRIFT, gate: $GATE, grace ${GRACE_HOURS}h informational). Treated as done; stays in the review lane (deferred-QA queue). Review report: $REPORT." >/dev/null 2>&1 || true
   printf 'Accepted: ticket stays in the review lane (deferred-QA queue); the loop moves on.\n'

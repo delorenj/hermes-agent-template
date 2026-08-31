@@ -45,4 +45,5 @@ if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
 
-printf 'CLOSE GATE: PASS for %s\n' "$ISSUE"
+REPO_SLUG="$(basename "$ROOT")"
+printf 'CLOSE GATE: PASS for %s (repo: %s)\n' "$ISSUE" "$REPO_SLUG"
