@@ -208,6 +208,53 @@ def requests(path: Path) -> list[dict[str, str]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+def test_plane_comment_returns_only_a_proven_nonblank_comment_id(
+    tmp_path: Path,
+) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[
+            response(
+                "POST",
+                "/issues/issue-uuid/comments/",
+                {"id": "comment-uuid", "issue": "issue-uuid"},
+            )
+        ],
+    )
+
+    result = run_provider(provider, env, "comment", "issue-uuid", "Accepted")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "comment-uuid"
+    assert [entry["method"] for entry in requests(request_log)] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        None,
+        [],
+        {"id": ""},
+        {"id": "comment-uuid", "issue": "different-issue"},
+    ],
+    ids=["empty-object", "null", "list", "empty-id", "wrong-issue"],
+)
+def test_plane_comment_rejects_unproven_success_envelopes(
+    tmp_path: Path, payload: object
+) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[response("POST", "/issues/issue-uuid/comments/", payload)],
+    )
+
+    result = run_provider(provider, env, "comment", "issue-uuid", "Accepted")
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert [entry["method"] for entry in requests(request_log)] == ["POST"]
+
+
 def test_active_milestone_does_not_promote_an_expired_cycle(tmp_path: Path) -> None:
     provider, env, _ = stage_provider(
         tmp_path,

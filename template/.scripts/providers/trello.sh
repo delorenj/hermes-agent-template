@@ -140,7 +140,18 @@ print(json.dumps({"id":c.get("id",""),"key":c.get("id",""),"title":c.get("name",
   comment)
     ID="${1:?usage: comment <id> <body>}"; BODY="${2:?}"
     api POST "cards/$ID/actions/comments" "text=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$BODY")" \
-      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
+      | EXPECTED_ID="$ID" python3 -c 'import sys,json,os
+action=json.load(sys.stdin)
+if not isinstance(action,dict):
+    raise SystemExit("trello: comment response was not an action object")
+action_id=action.get("id")
+if not isinstance(action_id,str) or not action_id.strip():
+    raise SystemExit("trello: comment response omitted its action id")
+data=action.get("data")
+card=data.get("card") if isinstance(data,dict) else None
+if not isinstance(card,dict) or str(card.get("id") or "").strip()!=os.environ["EXPECTED_ID"]:
+    raise SystemExit("trello: comment response did not identify the requested card")
+print(action_id.strip())'
     ;;
 
   transition)

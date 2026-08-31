@@ -497,7 +497,21 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
     ID="${1:?usage: comment <id> <body>}"; BODY="${2:?}"
     api POST "projects/$PROJ/issues/$ID/comments/" \
       "$(python3 -c 'import json,sys; print(json.dumps({"comment_html":"<p>"+sys.argv[1]+"</p>"}))' "$BODY")" \
-      | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id",""))'
+      | EXPECTED_ID="$ID" python3 -c 'import sys,json,os
+comment=json.load(sys.stdin)
+if not isinstance(comment,dict):
+    raise SystemExit("plane: comment response was not an object")
+comment_id=comment.get("id")
+if not isinstance(comment_id,str) or not comment_id.strip():
+    raise SystemExit("plane: comment response omitted its comment id")
+for key in ("issue", "issue_id"):
+    if key not in comment:
+        continue
+    linked=comment[key]
+    linked_id=linked.get("id") if isinstance(linked,dict) else linked
+    if not isinstance(linked_id,str) or linked_id.strip()!=os.environ["EXPECTED_ID"]:
+        raise SystemExit("plane: comment response identified a different issue")
+print(comment_id.strip())'
     ;;
 
   transition)

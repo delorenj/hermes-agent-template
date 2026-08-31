@@ -278,6 +278,71 @@ def test_linear_transition_reports_ok_only_for_exact_mutation_readback(
     assert len(requests) == 2
 
 
+def test_linear_comment_returns_only_a_proven_nonblank_comment_id(
+    tmp_path: Path,
+) -> None:
+    def responder(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        assert "commentCreate" in query
+        assert variables == {"id": "issue-207", "b": "Accepted"}
+        return {
+            "commentCreate": {
+                "success": True,
+                "comment": {
+                    "id": "comment-207",
+                    "issue": {"id": "issue-207"},
+                },
+            }
+        }
+
+    with linear_endpoint(responder) as (endpoint, requests):
+        provider, env = stage_linear(tmp_path, endpoint)
+        result = run_provider(provider, env, "comment", "issue-207", "Accepted")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "comment-207"
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize(
+    "created",
+    [
+        {},
+        None,
+        {"success": True, "comment": None},
+        {"success": True, "comment": {}},
+        {
+            "success": False,
+            "comment": {"id": "comment-207", "issue": {"id": "issue-207"}},
+        },
+        {
+            "success": True,
+            "comment": {"id": "comment-207", "issue": {"id": "wrong-issue"}},
+        },
+    ],
+    ids=[
+        "empty-object",
+        "null-envelope",
+        "null-comment",
+        "missing-id",
+        "success-false",
+        "wrong-issue",
+    ],
+)
+def test_linear_comment_rejects_unproven_success_envelopes(
+    tmp_path: Path, created: object
+) -> None:
+    def responder(_query: str, _variables: dict[str, Any]) -> dict[str, Any]:
+        return {"commentCreate": created}
+
+    with linear_endpoint(responder) as (endpoint, requests):
+        provider, env = stage_linear(tmp_path, endpoint)
+        result = run_provider(provider, env, "comment", "issue-207", "Accepted")
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert len(requests) == 1
+
+
 TRELLO_CURL = r"""#!/usr/bin/env python3
 import json
 import os
@@ -292,6 +357,8 @@ with open(os.environ["TRELLO_TEST_LOG"], "a", encoding="utf-8") as stream:
     stream.write(json.dumps({"method": method, "path": path, "url": url}) + "\n")
 if path.endswith("/boards/board-uuid/lists"):
     payload = os.environ["TRELLO_TEST_LISTS"]
+elif method == "POST" and path.endswith("/cards/card-207/actions/comments"):
+    payload = os.environ["TRELLO_TEST_COMMENT"]
 elif method == "PUT" and path.endswith("/cards/card-207"):
     payload = os.environ.get("TRELLO_TEST_PUT", '{"id":"card-207"}')
 elif method == "GET" and path.endswith("/cards/card-207"):
@@ -344,6 +411,9 @@ ticket_provider:
     env["TRELLO_TEST_LISTS"] = json.dumps(lists)
     env["TRELLO_TEST_READBACK"] = json.dumps(
         readback or {"id": "card-207", "idList": "done-list"}
+    )
+    env["TRELLO_TEST_COMMENT"] = json.dumps(
+        {"id": "action-207", "data": {"card": {"id": "card-207"}}}
     )
     return provider, env, log
 
@@ -409,3 +479,47 @@ def test_trello_transition_reports_ok_only_after_exact_live_readback(
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok card-207"
     assert [row["method"] for row in trello_requests(log)] == ["GET", "PUT", "GET"]
+
+
+def test_trello_comment_returns_only_a_proven_nonblank_action_id(
+    tmp_path: Path,
+) -> None:
+    provider, env, log = stage_trello(tmp_path, lists=[])
+
+    result = run_provider(provider, env, "comment", "card-207", "Accepted")
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "action-207"
+    assert [row["method"] for row in trello_requests(log)] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        None,
+        [],
+        {"id": ""},
+        {"id": "action-207", "data": {"card": None}},
+        {"id": "action-207", "data": {"card": {"id": "wrong-card"}}},
+    ],
+    ids=[
+        "empty-object",
+        "null",
+        "list",
+        "empty-id",
+        "malformed-card",
+        "wrong-card",
+    ],
+)
+def test_trello_comment_rejects_unproven_success_envelopes(
+    tmp_path: Path, payload: object
+) -> None:
+    provider, env, log = stage_trello(tmp_path, lists=[])
+    env["TRELLO_TEST_COMMENT"] = json.dumps(payload)
+
+    result = run_provider(provider, env, "comment", "card-207", "Accepted")
+
+    assert result.returncode != 0
+    assert result.stdout == ""
+    assert [row["method"] for row in trello_requests(log)] == ["POST"]

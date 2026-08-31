@@ -85,11 +85,25 @@ tp() {
     printf 'adapter comment failed noisily\n' >&2
     return 29
   fi
+  if [[ "$action" == "comment" ]]; then
+    [[ "${TP_COMMENT_RESULT:-pass}" == "empty" ]] || printf 'fixture-comment-id\n'
+  fi
 }
 """
 
+DEFAULT_ROLE_YAML = """repo: closeout-fixture
+name: deliberately-wrong-top-level-provider
+reconcile:
+  auto_review: true
+  grace_hours: 0
+ticket_provider:
+  name: fixture
+"""
 
-def stage_role(tmp_path: Path) -> tuple[Path, Path, Path]:
+
+def stage_role(
+    tmp_path: Path, *, role_yaml: str = DEFAULT_ROLE_YAML
+) -> tuple[Path, Path, Path]:
     subprocess.run(
         ["git", "init", "--quiet"],
         cwd=tmp_path,
@@ -109,17 +123,7 @@ def stage_role(tmp_path: Path) -> tuple[Path, Path, Path]:
         json.dumps({"project_slug": "closeout-fixture"}),
         encoding="utf-8",
     )
-    (role / "role.yaml").write_text(
-        """repo: closeout-fixture
-name: deliberately-wrong-top-level-provider
-reconcile:
-  auto_review: true
-  grace_hours: 0
-ticket_provider:
-  name: fixture
-""",
-        encoding="utf-8",
-    )
+    (role / "role.yaml").write_text(role_yaml, encoding="utf-8")
 
     evidence_dir = (
         tmp_path
@@ -140,8 +144,9 @@ def run_review(
     *args: str,
     transition_result: str = "pass",
     comment_result: str = "pass",
+    role_yaml: str = DEFAULT_ROLE_YAML,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    script, report, calls = stage_role(tmp_path)
+    script, report, calls = stage_role(tmp_path, role_yaml=role_yaml)
     env = dict(os.environ)
     env.update(
         {
@@ -220,6 +225,26 @@ def test_close_comment_failure_reports_transition_succeeded_without_acceptance(
     assert "noisy adapter" not in combined
 
 
+def test_close_rc_zero_empty_comment_is_unproven_without_acceptance(
+    tmp_path: Path,
+) -> None:
+    proc, calls = run_review(tmp_path, "--close", comment_result="empty")
+
+    assert proc.returncode == 1
+    assert calls[0] == f"transition\t{ISSUE}\tcompleted"
+    assert calls[1].startswith(f"comment\t{ISSUE}\tAutonomously accepted by fixture-reviewer")
+    assert len(calls) == 2, "an ambiguous comment write must never be retried"
+    combined = proc.stdout + proc.stderr
+    assert combined.strip() == (
+        f"AUTONOMOUS REVIEW: CLOSE INCOMPLETE for {ISSUE} - transition succeeded, "
+        "but acceptance comment returned no id; comment write unproven and issue "
+        "may already be completed."
+    )
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+    assert "treat as done" not in combined
+    assert "transitioned to completed" not in combined
+
+
 def test_default_acceptance_stays_in_review_without_completion_transition(
     tmp_path: Path,
 ) -> None:
@@ -248,6 +273,70 @@ def test_default_comment_failure_emits_no_acceptance(tmp_path: Path) -> None:
     assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
     assert "treat as done" not in combined
     assert "noisy adapter" not in combined
+
+
+def test_default_rc_zero_empty_comment_is_unproven_without_acceptance(
+    tmp_path: Path,
+) -> None:
+    proc, calls = run_review(tmp_path, comment_result="empty")
+
+    assert proc.returncode == 1
+    assert len(calls) == 1, "an ambiguous comment write must never be retried"
+    assert calls[0].startswith(f"comment\t{ISSUE}\tAutonomously accepted by fixture-reviewer")
+    combined = proc.stdout + proc.stderr
+    assert combined.strip() == (
+        f"AUTONOMOUS REVIEW: COMMENT UNPROVEN for {ISSUE} - acceptance comment "
+        "returned no id; issue left in review."
+    )
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+    assert "treat as done" not in combined
+
+
+def test_reconcile_false_is_not_bypassed_by_earlier_unrelated_true(
+    tmp_path: Path,
+) -> None:
+    role_yaml = """repo: closeout-fixture
+other:
+  auto_review: true
+  grace_hours: 99
+reconcile:
+  auto_review: false # authoritative autonomous-review switch
+  grace_hours: 7 # informational wait window
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    assert proc.returncode == 3
+    assert proc.stderr.strip() == (
+        "Autonomous review is disabled (reconcile.auto_review=false)."
+    )
+    assert calls == []
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_reconcile_true_and_grace_ignore_earlier_unrelated_false_values(
+    tmp_path: Path,
+) -> None:
+    role_yaml = """repo: closeout-fixture
+other:
+  auto_review: false
+  grace_hours: 99
+reconcile:
+  auto_review: true # authoritative autonomous-review switch
+  grace_hours: 7 # informational wait window
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 1
+    assert "grace 7h informational" in calls[0]
+    assert "grace 99h" not in calls[0]
+    assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
 
 
 def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
@@ -405,4 +494,104 @@ def test_close_gate_uses_basename_only_when_manifest_is_absent(tmp_path: Path) -
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == (
         f"CLOSE GATE: PASS for {ISSUE} (repo: {tmp_path.name})"
+    )
+
+
+def stage_relative_gate_target(
+    tmp_path: Path, *, manifest: str, role_repo: str
+) -> Path:
+    _, _, _ = stage_role(tmp_path)
+    role_yaml = tmp_path / "agents" / "hermes" / "pm" / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "repo: closeout-fixture", f"repo: {role_repo}"
+        ),
+        encoding="utf-8",
+    )
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / ".project.json").write_text(manifest, encoding="utf-8")
+    evidence_dir = (
+        target
+        / "_bmad-output"
+        / "implementation-artifacts"
+        / "issue-evidence"
+    )
+    evidence_dir.mkdir(parents=True)
+    (evidence_dir / f"{ISSUE}.md").write_text(EVIDENCE, encoding="utf-8")
+    return (
+        tmp_path
+        / "agents"
+        / "hermes"
+        / "pm"
+        / ".scripts"
+        / "sentinel"
+        / "bin"
+        / CLOSE_GATE.name
+    )
+
+
+def test_close_gate_relative_root_reads_exact_manifest_for_repo_mismatch(
+    tmp_path: Path,
+) -> None:
+    gate = stage_relative_gate_target(
+        tmp_path,
+        manifest=json.dumps({"project_slug": "different-project"}),
+        role_repo="target",
+    )
+
+    result = subprocess.run(
+        [str(gate), ISSUE, "target"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "disagrees with target project slug different-project" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_relative_root_cannot_bypass_malformed_manifest(
+    tmp_path: Path,
+) -> None:
+    gate = stage_relative_gate_target(tmp_path, manifest="{", role_repo="target")
+
+    result = subprocess.run(
+        [str(gate), ISSUE, "target"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "malformed project manifest" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_relative_root_passes_with_matching_exact_manifest(
+    tmp_path: Path,
+) -> None:
+    gate = stage_relative_gate_target(
+        tmp_path,
+        manifest=json.dumps({"project_slug": "closeout-fixture"}),
+        role_repo="closeout-fixture",
+    )
+
+    result = subprocess.run(
+        [str(gate), ISSUE, "target"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"CLOSE GATE: PASS for {ISSUE} (repo: closeout-fixture)"
     )

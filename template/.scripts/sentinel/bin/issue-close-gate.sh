@@ -18,6 +18,7 @@ ROLE_YAML="$BIN_DIR/../../../role.yaml"
 ROLE_REPO="$(sed -n 's/^repo:[[:space:]]*//p' "$ROLE_YAML" 2>/dev/null | head -n1 | tr -d '"' | tr -d '\r')"
 ROOT="${2:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
+ROOT="$(pwd -P)"
 PROJECT_MANIFEST="$ROOT/.project.json"
 if [ -e "$PROJECT_MANIFEST" ] || [ -L "$PROJECT_MANIFEST" ]; then
   [ -f "$PROJECT_MANIFEST" ] || {

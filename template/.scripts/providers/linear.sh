@@ -191,9 +191,23 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("identifier",""),"title":i.get
 
   comment)
     ID="${1:?usage: comment <id> <body>}"; BODY="${2:?usage: comment <id> <body>}"
-    gql 'mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ comment{id} success } }' \
+    gql 'mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id,body:$b}){ comment{id issue{id}} success } }' \
         "$(python3 -c 'import json,sys; print(json.dumps({"id":sys.argv[1],"b":sys.argv[2]}))' "$ID" "$BODY")" \
-      | python3 -c 'import sys,json; d=json.load(sys.stdin); print((d.get("commentCreate",{}).get("comment") or {}).get("id",""))'
+      | EXPECTED_ID="$ID" python3 -c 'import sys,json,os
+document=json.load(sys.stdin)
+created=document.get("commentCreate") if isinstance(document,dict) else None
+if not isinstance(created,dict) or created.get("success") is not True:
+    raise SystemExit("linear: commentCreate did not report success")
+comment=created.get("comment")
+if not isinstance(comment,dict):
+    raise SystemExit("linear: commentCreate response omitted its comment object")
+comment_id=comment.get("id")
+if not isinstance(comment_id,str) or not comment_id.strip():
+    raise SystemExit("linear: commentCreate response omitted its comment id")
+issue=comment.get("issue")
+if not isinstance(issue,dict) or str(issue.get("id") or "").strip()!=os.environ["EXPECTED_ID"]:
+    raise SystemExit("linear: commentCreate response did not identify the requested issue")
+print(comment_id.strip())'
     ;;
 
   transition)
