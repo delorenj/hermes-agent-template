@@ -20,13 +20,14 @@ ISSUE = "JIMB-207"
 EVIDENCE = f"""# {ISSUE} closeout fixture
 
 ## Issue
+- Worker: fixture-implementer
 Hermetic closeout behavior.
 
 ## Acceptance Criteria
 - The adapter controls completion.
 
 ## Repo Changes
-- Worker: fixture-implementer
+- Adapter and gate changes.
 
 ## Verification
 The focused closeout suite ran.
@@ -104,7 +105,11 @@ ticket_provider:
 
 
 def stage_role(
-    tmp_path: Path, *, role_yaml: str = DEFAULT_ROLE_YAML
+    tmp_path: Path,
+    *,
+    role_yaml: str = DEFAULT_ROLE_YAML,
+    report: str = REPORT,
+    evidence: str = EVIDENCE,
 ) -> tuple[Path, Path, Path]:
     subprocess.run(
         ["git", "init", "--quiet"],
@@ -134,11 +139,11 @@ def stage_role(
         / "issue-evidence"
     )
     evidence_dir.mkdir(parents=True)
-    (evidence_dir / f"{ISSUE}.md").write_text(EVIDENCE, encoding="utf-8")
-    report = tmp_path / "review.md"
-    report.write_text(REPORT, encoding="utf-8")
+    (evidence_dir / f"{ISSUE}.md").write_text(evidence, encoding="utf-8")
+    report_path = tmp_path / "review.md"
+    report_path.write_text(report, encoding="utf-8")
     calls = tmp_path / "provider-calls.tsv"
-    return bin_dir / AUTONOMOUS_REVIEW.name, report, calls
+    return bin_dir / AUTONOMOUS_REVIEW.name, report_path, calls
 
 
 def run_review(
@@ -147,9 +152,13 @@ def run_review(
     transition_result: str = "pass",
     comment_result: str = "pass",
     role_yaml: str = DEFAULT_ROLE_YAML,
+    report: str = REPORT,
+    evidence: str = EVIDENCE,
     env_overrides: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
-    script, report, calls = stage_role(tmp_path, role_yaml=role_yaml)
+    script, report_path, calls = stage_role(
+        tmp_path, role_yaml=role_yaml, report=report, evidence=evidence
+    )
     env = dict(os.environ)
     env.update(
         {
@@ -163,7 +172,7 @@ def run_review(
     env.pop("RECONCILE_GRACE_HOURS", None)
     env.update(env_overrides or {})
     proc = subprocess.run(
-        [str(script), ISSUE, str(report), *args],
+        [str(script), ISSUE, str(report_path), *args],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -173,6 +182,28 @@ def run_review(
     )
     observed = calls.read_text(encoding="utf-8").splitlines() if calls.exists() else []
     return proc, observed
+
+
+def run_gate(tmp_path: Path, evidence: str = EVIDENCE) -> subprocess.CompletedProcess[str]:
+    _, _, _ = stage_role(tmp_path, evidence=evidence)
+    gate = (
+        tmp_path
+        / "agents"
+        / "hermes"
+        / "pm"
+        / ".scripts"
+        / "sentinel"
+        / "bin"
+        / CLOSE_GATE.name
+    )
+    return subprocess.run(
+        [str(gate), ISSUE, str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def test_shipped_sentinel_entrypoints_are_executable() -> None:
@@ -745,3 +776,214 @@ def test_close_gate_relative_root_passes_with_matching_exact_manifest(
     assert result.stdout.strip() == (
         f"CLOSE GATE: PASS for {ISSUE} (repo: closeout-fixture)"
     )
+
+
+def report_with(
+    *,
+    reviewer: str = "## Reviewer\n- Reviewer agent: fixture-reviewer\n- Independent of implementer: yes",
+    baseline: str = "## Locked Intent Baseline\n- Completion must be truthful.",
+    drift: str = "## Drift Assessment\n- Drift assessment: none",
+    findings: str = "## Adversarial Findings\n- Critical/high findings: none",
+    decision: str = "## Decision\n- Decision: accept",
+) -> str:
+    return (
+        "# Independent review fixture\n\n"
+        + "\n\n".join([reviewer, baseline, drift, findings, decision])
+        + "\n"
+    )
+
+
+def test_report_lookalike_accept_cannot_override_authoritative_hold(
+    tmp_path: Path,
+) -> None:
+    report = report_with(
+        baseline="## Locked Intent Baseline\n- Completion must be truthful.\n- Decision: accept",
+        decision="## Decision\n- Decision: hold",
+    )
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "reviewer decision is not 'accept' (got 'hold')" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_lookalike_drift_none_cannot_override_authoritative_significant(
+    tmp_path: Path,
+) -> None:
+    report = report_with(
+        drift="## Drift Assessment\n- Drift assessment: significant",
+        findings="## Adversarial Findings\n- Critical/high findings: none\n- Drift assessment: none",
+    )
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "significant drift from locked intent" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_lookalike_findings_none_cannot_override_authoritative_high(
+    tmp_path: Path,
+) -> None:
+    report = report_with(
+        findings="## Adversarial Findings\n- Critical/high findings: 1 high: unsafe mutation retry",
+        decision="## Decision\n- Decision: accept\n- Critical/high findings: none",
+    )
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "unresolved critical/high findings" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_duplicate_section_holds_before_provider_calls(tmp_path: Path) -> None:
+    report = report_with() + "\n## Decision\n- Decision: accept\n"
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "duplicate Decision sections" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_duplicate_field_holds_before_provider_calls(tmp_path: Path) -> None:
+    report = report_with(decision="## Decision\n- Decision: accept\n- Decision: accept")
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "must contain exactly one 'Decision:' field" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_missing_section_holds_before_provider_calls(tmp_path: Path) -> None:
+    report = report_with(findings="## Notes\n- Informal remarks only.")
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "report missing section Adversarial Findings" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_report_missing_field_holds_before_provider_calls(tmp_path: Path) -> None:
+    report = report_with(reviewer="## Reviewer\n- Reviewer agent: fixture-reviewer")
+
+    proc, calls = run_review(tmp_path, report=report)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "must contain exactly one 'Independent of implementer:' field" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_self_review_is_held_before_provider_calls(tmp_path: Path) -> None:
+    evidence = EVIDENCE.replace(
+        "- Worker: fixture-implementer", "- Worker: fixture-reviewer"
+    )
+
+    proc, calls = run_review(tmp_path, evidence=evidence)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "reviewer (fixture-reviewer) is the implementer" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_close_gate_lookalike_ledger_yes_cannot_override_authoritative_no(
+    tmp_path: Path,
+) -> None:
+    evidence = EVIDENCE.replace(
+        "Ledger updated: yes", "Ledger updated: no"
+    ).replace("None.", "None.\nLedger updated: yes")
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "Ledger update is not marked yes." in result.stderr
+    assert f"CLOSE GATE: FAIL for {ISSUE}" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_lookalike_close_ready_cannot_override_authoritative_hold(
+    tmp_path: Path,
+) -> None:
+    evidence = EVIDENCE.replace(
+        "Close recommendation: ready", "Close recommendation: hold"
+    ).replace("None.", "None.\nClose recommendation: ready")
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "Close recommendation is not ready." in result.stderr
+    assert f"CLOSE GATE: FAIL for {ISSUE}" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_duplicate_implementer_fails(tmp_path: Path) -> None:
+    evidence = EVIDENCE.replace(
+        "- Worker: fixture-implementer",
+        "- Worker: fixture-implementer\n- Worker: second-worker",
+    )
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "exactly one implementer identity" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_conflicting_implementer_spellings_fail(tmp_path: Path) -> None:
+    evidence = EVIDENCE.replace(
+        "- Worker: fixture-implementer",
+        "- Worker: fixture-implementer\n- Implemented by: someone-else",
+    )
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "exactly one implementer identity" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_missing_implementer_fails(tmp_path: Path) -> None:
+    evidence = EVIDENCE.replace("- Worker: fixture-implementer\n", "")
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "exactly one implementer identity" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_duplicate_section_fails(tmp_path: Path) -> None:
+    evidence = EVIDENCE + "\n## Ledger Update\nLedger updated: yes\n"
+
+    result = run_gate(tmp_path, evidence=evidence)
+
+    assert result.returncode == 1
+    assert "Duplicate required evidence section: Ledger Update" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_review_holds_when_authoritative_ledger_is_no_despite_lookalike(
+    tmp_path: Path,
+) -> None:
+    evidence = EVIDENCE.replace(
+        "Ledger updated: yes", "Ledger updated: no"
+    ).replace("None.", "None.\nLedger updated: yes")
+
+    proc, calls = run_review(tmp_path, evidence=evidence)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "close gate failed" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr

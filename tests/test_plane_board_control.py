@@ -179,8 +179,6 @@ raise SystemExit(int(chosen.get("curl_exit", 0)))
         "PLANE_READ_MAX_ATTEMPTS",
         "PLANE_429_RETRY_DELAY",
         "PLANE_429_MAX_DELAY",
-        "PLANE_MUTATION_MAX_ATTEMPTS",
-        "PLANE_MUTATION_RETRY_DELAY",
         "PLANE_MAX_PAGES",
     ):
         env.pop(name, None)
@@ -434,7 +432,6 @@ def test_transition_patches_exact_state_and_requires_readback(tmp_path: Path) ->
             response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
         ],
     )
-    env["PLANE_MUTATION_MAX_ATTEMPTS"] = "1"
 
     result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
 
@@ -563,16 +560,11 @@ def test_reads_fail_explicitly_when_rate_limit_never_clears(tmp_path: Path) -> N
     assert len(requests(request_log)) == 3
 
 
-def test_transition_confirms_landed_patch_before_repeating(tmp_path: Path) -> None:
+def test_transition_confirms_ambiguous_patch_via_exact_readback(tmp_path: Path) -> None:
     throttled_patch = response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7})
     throttled_patch["fail_times"] = 1
     throttled_patch["fail_status"] = 429
     throttled_patch["fail_headers"] = {"Retry-After": "0"}
-    readback = response("GET", "/issues/issue-uuid/", {})
-    readback["bodies"] = [
-        json.dumps({"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
-        json.dumps({"id": "issue-uuid", "sequence_id": 7, "state": "qa-state"}),
-    ]
     provider, env, request_log = stage_provider(
         tmp_path,
         in_review="Ready for QA",
@@ -583,18 +575,17 @@ def test_transition_confirms_landed_patch_before_repeating(tmp_path: Path) -> No
                 {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
             ),
             throttled_patch,
-            readback,
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "qa-state"}),
         ],
     )
-    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
 
     result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok 7"
     sent = requests(request_log)
-    assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET", "PATCH", "GET"]
-    assert json.loads(sent[3]["body"]) == {"state": "qa-state"}
+    assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET"]
+    assert json.loads(sent[1]["body"]) == {"state": "qa-state"}
 
 
 def test_transition_never_claims_completion_without_matching_readback(tmp_path: Path) -> None:
@@ -611,17 +602,97 @@ def test_transition_never_claims_completion_without_matching_readback(tmp_path: 
             response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
         ],
     )
-    env["PLANE_MUTATION_MAX_ATTEMPTS"] = "2"
-    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
 
     result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
 
     assert result.returncode != 0
     assert "read-back state" in result.stderr
+    assert "concurrent divergence" in result.stderr
     assert "refusing to claim" in result.stderr
     assert "ok" not in result.stdout
     sent = requests(request_log)
-    assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET", "PATCH", "GET"]
+    assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET"]
+
+
+def test_transition_ambiguous_patch_with_mismatch_readback_never_repatches(
+    tmp_path: Path,
+) -> None:
+    throttled_patch = response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7})
+    throttled_patch["fail_times"] = 1
+    throttled_patch["fail_status"] = 429
+    throttled_patch["fail_headers"] = {"Retry-After": "0"}
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        in_review="Ready for QA",
+        responses=[
+            response(
+                "GET",
+                "/states/",
+                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+            ),
+            throttled_patch,
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+        ],
+    )
+
+    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+
+    assert result.returncode != 0
+    assert "ambiguous" in result.stderr
+    assert "refusing to claim" in result.stderr
+    assert "ok" not in result.stdout
+    assert [entry["method"] for entry in requests(request_log)] == ["GET", "PATCH", "GET"]
+
+
+def test_transition_patch_transport_failure_with_mismatch_never_repatches(
+    tmp_path: Path,
+) -> None:
+    broken_patch = response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7})
+    broken_patch["curl_exit"] = 7
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        in_review="Ready for QA",
+        responses=[
+            response(
+                "GET",
+                "/states/",
+                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+            ),
+            broken_patch,
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+        ],
+    )
+
+    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+
+    assert result.returncode != 0
+    assert "ambiguous" in result.stderr
+    assert "ok" not in result.stdout
+    assert [entry["method"] for entry in requests(request_log)] == ["GET", "PATCH", "GET"]
+
+
+def test_transition_wrong_issue_readback_never_repatches(tmp_path: Path) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        in_review="Ready for QA",
+        responses=[
+            response(
+                "GET",
+                "/states/",
+                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+            ),
+            response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7}),
+            response("GET", "/issues/issue-uuid/", {"id": "different-issue", "sequence_id": 7, "state": "qa-state"}),
+        ],
+    )
+
+    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+
+    assert result.returncode != 0
+    assert "did not identify the requested issue" in result.stderr
+    assert "refusing to repeat the PATCH" in result.stderr
+    assert "ok" not in result.stdout
+    assert [entry["method"] for entry in requests(request_log)] == ["GET", "PATCH", "GET"]
 
 
 def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -> None:
@@ -656,7 +727,6 @@ def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -
             broken_readback,
         ],
     )
-    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
 
     result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
 
@@ -697,7 +767,6 @@ def test_transition_invalid_json_readback_never_repatches(tmp_path: Path) -> Non
             {"method": "GET", "path": "/issues/issue-uuid/", "body": "{"},
         ],
     )
-    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
 
     result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
 
@@ -906,8 +975,6 @@ def test_retry_after_delay_is_capped(tmp_path: Path) -> None:
         ("PLANE_READ_MAX_ATTEMPTS", "0"),
         ("PLANE_429_RETRY_DELAY", "-1"),
         ("PLANE_429_MAX_DELAY", "3601"),
-        ("PLANE_MUTATION_MAX_ATTEMPTS", "twice"),
-        ("PLANE_MUTATION_RETRY_DELAY", "-1"),
         ("PLANE_MAX_PAGES", "1001"),
     ],
 )

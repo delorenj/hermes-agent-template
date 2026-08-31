@@ -127,23 +127,159 @@ esac
 HOLD=""
 hold() { HOLD="${HOLD}${HOLD:+; }$1"; }
 
-for s in '^## Reviewer' '^## Locked Intent Baseline' '^## Drift Assessment' '^## Adversarial Findings' '^## Decision'; do
-  grep -q "$s" "$REPORT" || hold "report missing section ${s#^## }"
-done
-grep -qi '^- *Independent of implementer: *yes' "$REPORT" || hold "reviewer did not attest independence"
-REVIEWER="$(sed -n 's/^- *Reviewer agent: *//p' "$REPORT" | head -n1 | tr -d '\r')"; REVIEWER="${REVIEWER:-unknown}"
-IMPL="$(sed -n 's/^- *\(Worker\|Implemented by\): *//p' "$EVIDENCE" | head -n1 | tr -d '\r')"
+# Structural parse of the review report (and the evidence's implementer
+# identity): every required H2 exactly once, each authoritative field read
+# only as a direct field of its own section. Lookalike bullets or examples in
+# other sections can never stand in for -- or override -- the authoritative
+# value, and duplicate/missing/blank sections or fields are rejected here,
+# before any provider call.
+PARSED=""
+if ! PARSED="$(python3 - "$REPORT" "$EVIDENCE" <<'PY'
+import re
+import sys
+
+report_path, evidence_path = sys.argv[1], sys.argv[2]
+
+heading = re.compile(r"^(#{1,6})\s+(.*?)\s*$")
+
+
+def parse_sections(path):
+    with open(path, encoding="utf-8") as stream:
+        lines = stream.read().splitlines()
+    sections = {}
+    order = []
+    current = None
+    for line in lines:
+        match = heading.match(line)
+        if match and len(match.group(1)) <= 2:
+            current = match.group(2) if len(match.group(1)) == 2 else None
+            if current is not None:
+                sections.setdefault(current, [])
+                order.append(current)
+            continue
+        if current is not None:
+            sections[current].append(line)
+    return sections, order
+
+
+def direct_fields(sections, section, *names):
+    found = []
+    for line in sections.get(section, []):
+        for name in names:
+            match = re.fullmatch(
+                r"\s*(?:[-*+]\s+)?" + re.escape(name) + r"\s*:\s*(.*?)\s*", line
+            )
+            if match:
+                found.append(match.group(1))
+                break
+    return found
+
+
+errors = []
+out = {}
+
+sections, order = parse_sections(report_path)
+for name in (
+    "Reviewer",
+    "Locked Intent Baseline",
+    "Drift Assessment",
+    "Adversarial Findings",
+    "Decision",
+):
+    count = order.count(name)
+    if count == 0:
+        errors.append(f"report missing section {name}")
+    elif count > 1:
+        errors.append(f"report has duplicate {name} sections")
+
+
+def report_field(section, name):
+    if order.count(section) != 1:
+        return ""
+    found = direct_fields(sections, section, name)
+    if len(found) != 1:
+        errors.append(
+            f"report section {section} must contain exactly one"
+            f" '{name}:' field (found {len(found)})"
+        )
+        return ""
+    if not found[0]:
+        errors.append(f"report field '{name}:' in section {section} is blank")
+        return ""
+    return found[0]
+
+
+def first_token(value):
+    tokens = value.split()
+    return tokens[0].lower() if tokens else ""
+
+
+out["reviewer"] = report_field("Reviewer", "Reviewer agent")
+out["independent"] = first_token(report_field("Reviewer", "Independent of implementer"))
+out["drift"] = first_token(report_field("Drift Assessment", "Drift assessment"))
+out["findings"] = first_token(report_field("Adversarial Findings", "Critical/high findings"))
+out["decision"] = first_token(report_field("Decision", "Decision"))
+
+evidence_sections, evidence_order = parse_sections(evidence_path)
+implementer = ""
+if evidence_order.count("Issue") != 1:
+    errors.append(
+        "evidence must contain exactly one Issue section carrying the"
+        " implementer identity"
+    )
+else:
+    found = direct_fields(evidence_sections, "Issue", "Worker", "Implemented by")
+    if len(found) != 1:
+        errors.append(
+            "evidence section Issue must contain exactly one implementer"
+            " identity ('Worker:' / 'Implemented by:') field"
+            f" (found {len(found)})"
+        )
+    elif not found[0]:
+        errors.append("evidence implementer identity in section Issue is blank")
+    else:
+        implementer = found[0]
+out["implementer"] = implementer
+
+for key, value in out.items():
+    print("F\t{}\t{}".format(key, value.replace("\t", " ").replace("\n", " ")))
+for error in errors:
+    print(f"E\t{error}")
+PY
+)"; then
+  hold "review report could not be parsed"
+fi
+
+REVIEWER=""; INDEP=""; DRIFT=""; FINDINGS=""; DEC=""; IMPL=""
+while IFS="$(printf '\t')" read -r kind key value; do
+  case "$kind" in
+    E) hold "$key" ;;
+    F)
+      case "$key" in
+        reviewer) REVIEWER="$value" ;;
+        independent) INDEP="$value" ;;
+        drift) DRIFT="$value" ;;
+        findings) FINDINGS="$value" ;;
+        decision) DEC="$value" ;;
+        implementer) IMPL="$value" ;;
+      esac
+      ;;
+  esac
+done <<EOF
+$PARSED
+EOF
+REVIEWER="${REVIEWER:-unknown}"
+
+[[ "$INDEP" == "yes" ]] || hold "reviewer did not attest independence"
 [[ -n "$IMPL" && "$IMPL" == "$REVIEWER" ]] && hold "reviewer ($REVIEWER) is the implementer"
 
-DRIFT="$(sed -n 's/^- *Drift assessment: *//p' "$REPORT" | head -n1 | tr -d '\r' | tr 'A-Z' 'a-z' | awk '{print $1}')"
 case "$DRIFT" in
   none|minor) : ;;
   significant) hold "significant drift from locked intent" ;;
   *) hold "drift assessment missing/invalid ('${DRIFT:-none-found}')"; DRIFT="${DRIFT:-unknown}" ;;
 esac
-grep -qi '^- *Critical/high findings: *none' "$REPORT" || hold "unresolved critical/high findings (or line missing)"
+[[ "$FINDINGS" == "none" ]] || hold "unresolved critical/high findings (or field missing)"
 # Accept the keyword `accept` as clearing; tolerate the legacy `close`.
-DEC="$(sed -n 's/^- *Decision: *//p' "$REPORT" | head -n1 | tr -d '\r' | tr 'A-Z' 'a-z' | awk '{print $1}')"
 [[ "$DEC" == "accept" || "$DEC" == "close" ]] || hold "reviewer decision is not 'accept' (got '${DEC:-none}')"
 
 GATE=fail

@@ -13,11 +13,12 @@
 #
 # Rate limiting: reads retry HTTP 429 up to PLANE_READ_MAX_ATTEMPTS (default 4)
 # times, sleeping the server's Retry-After capped at PLANE_429_MAX_DELAY
-# (default 30s). Mutations are never retried in the transport layer; transition
-# re-checks the live issue before repeating a PATCH, at most
-# PLANE_MUTATION_MAX_ATTEMPTS (default 3) times, PLANE_MUTATION_RETRY_DELAY
-# (default 2s) apart. PLANE_MAX_PAGES bounds every paginated collection
-# (default 1000). All numeric overrides are validated before any request.
+# (default 30s). Mutations are never retried in the transport layer, and
+# transition sends at most ONE PATCH: without a version/precondition guard a
+# repeated PATCH can stomp a concurrent actor, so the live read-back after the
+# single attempt is the only success proof. PLANE_MAX_PAGES bounds every
+# paginated collection (default 1000). All numeric overrides are validated
+# before any request.
 #
 # Plane model:  project = board, cycle = milestone, state.group in
 #   backlog|unstarted|started|completed|cancelled.
@@ -137,8 +138,6 @@ API="$BASE/api/v1/workspaces/$WS"
 READ_MAX_ATTEMPTS="$(validated_uint PLANE_READ_MAX_ATTEMPTS "${PLANE_READ_MAX_ATTEMPTS:-4}" 1 20)"
 RETRY_DEFAULT_DELAY="$(validated_uint PLANE_429_RETRY_DELAY "${PLANE_429_RETRY_DELAY:-1}" 0 3600)"
 RETRY_MAX_DELAY="$(validated_uint PLANE_429_MAX_DELAY "${PLANE_429_MAX_DELAY:-30}" 0 3600)"
-MUTATION_MAX_ATTEMPTS="$(validated_uint PLANE_MUTATION_MAX_ATTEMPTS "${PLANE_MUTATION_MAX_ATTEMPTS:-3}" 1 20)"
-MUTATION_RETRY_DELAY="$(validated_uint PLANE_MUTATION_RETRY_DELAY "${PLANE_MUTATION_RETRY_DELAY:-2}" 0 3600)"
 MAX_PAGES="$(validated_uint PLANE_MAX_PAGES "${PLANE_MAX_PAGES:-1000}" 1 1000)"
 
 if [ -z "${PLANE_API_KEY:-}" ]; then
@@ -517,22 +516,23 @@ print(comment_id.strip())'
   transition)
     ID="${1:?usage: transition <id> <normalized-state>}"; TARGET="${2:?}"
     SID="$(resolve_state_id "$TARGET")"
-    # A PATCH is never repeated blindly: every attempt is followed by a live
-    # read-back, and a PATCH that failed at the transport layer but landed on
-    # the server is confirmed by that read-back instead of being re-sent. Only
-    # an exact read-back of the intended state id produces `ok`; anything else
-    # fails explicitly after a bounded number of attempts.
-    attempt=0
-    SEQUENCE=""
-    while :; do
-      [ "$attempt" -eq 0 ] || sleep "$MUTATION_RETRY_DELAY"
-      attempt=$((attempt + 1))
-      # Subshell: a transport-level die inside api must not kill the retry loop.
-      ( api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" ) >/dev/null || true
-      if ! READBACK="$(api GET "projects/$PROJ/issues/$ID/")"; then
-        die "transition read-back failed after PATCH attempt $attempt; refusing to repeat the PATCH"
-      fi
-      if ! READBACK_RESULT="$(printf '%s' "$READBACK" | EXPECTED_ID="$ID" EXPECTED_SID="$SID" python3 -c 'import sys,json,os
+    # Without a version or precondition guard, a repeated PATCH can stomp a
+    # concurrent actor, so exactly one PATCH mutation attempt is ever sent.
+    # The live read-back after that attempt is the only success proof: an exact
+    # same-issue match on the intended state id yields `ok`. A 2xx PATCH whose
+    # read-back disagrees is reported as concurrent divergence; an ambiguous
+    # (transport-level or non-2xx) PATCH may still be confirmed landed by an
+    # exact read-back. Any other read-back outcome fails without a second PATCH.
+    # Subshell: a transport-level die inside api must not kill this op.
+    if ( api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" ) >/dev/null; then
+      PATCH_2XX=1
+    else
+      PATCH_2XX=0
+    fi
+    if ! READBACK="$(api GET "projects/$PROJ/issues/$ID/")"; then
+      die "transition read-back failed after the single PATCH attempt; refusing to repeat the PATCH"
+    fi
+    if ! READBACK_RESULT="$(printf '%s' "$READBACK" | EXPECTED_ID="$ID" EXPECTED_SID="$SID" python3 -c 'import sys,json,os
 try:
     d=json.load(sys.stdin)
 except (TypeError, ValueError) as exc:
@@ -550,17 +550,23 @@ if actual == os.environ["EXPECTED_SID"]:
     print("match\t"+sequence)
 else:
     print("mismatch\t"+actual)')"; then
-        die "transition read-back could not be verified after PATCH attempt $attempt; refusing to repeat the PATCH"
-      fi
-      case "$READBACK_RESULT" in
-        match*) SEQUENCE="${READBACK_RESULT#*	}"; break ;;
-        mismatch*) : ;;
-        *) die "transition read-back returned an invalid verification outcome; refusing to repeat the PATCH" ;;
-      esac
-      [ "$attempt" -lt "$MUTATION_MAX_ATTEMPTS" ] \
-        || die "transition read-back state never matched intended state id $SID after $attempt PATCH attempt(s); refusing to claim the transition completed"
-    done
-    printf 'ok %s\n' "$SEQUENCE"
+      die "transition read-back could not be verified after the single PATCH attempt; refusing to repeat the PATCH"
+    fi
+    case "$READBACK_RESULT" in
+      match*)
+        printf 'ok %s\n' "${READBACK_RESULT#*	}"
+        ;;
+      mismatch*)
+        ACTUAL="${READBACK_RESULT#*	}"
+        if [ "$PATCH_2XX" -eq 1 ]; then
+          die "transition read-back state $ACTUAL did not match intended state id $SID after a 2xx PATCH response; concurrent divergence suspected; refusing to claim the transition completed"
+        fi
+        die "transition PATCH outcome was ambiguous and the read-back state $ACTUAL did not match intended state id $SID; refusing to claim the transition completed"
+        ;;
+      *)
+        die "transition read-back returned an invalid verification outcome; refusing to repeat the PATCH"
+        ;;
+    esac
     ;;
 
   describe_board)
