@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 TEMPLATE = ROOT / "template"
@@ -145,6 +147,7 @@ def run_review(
     transition_result: str = "pass",
     comment_result: str = "pass",
     role_yaml: str = DEFAULT_ROLE_YAML,
+    env_overrides: dict[str, str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     script, report, calls = stage_role(tmp_path, role_yaml=role_yaml)
     env = dict(os.environ)
@@ -156,6 +159,9 @@ def run_review(
             "TP_EXPECTED_PROVIDER": "fixture",
         }
     )
+    env.pop("RECONCILE_AUTO_REVIEW", None)
+    env.pop("RECONCILE_GRACE_HOURS", None)
+    env.update(env_overrides or {})
     proc = subprocess.run(
         [str(script), ISSUE, str(report), *args],
         cwd=tmp_path,
@@ -336,6 +342,150 @@ ticket_provider:
     assert len(calls) == 1
     assert "grace 7h informational" in calls[0]
     assert "grace 99h" not in calls[0]
+    assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [("true", True), ("on", True), ("false", False), ("off", False)],
+)
+def test_role_auto_review_accepts_only_explicit_boolean_tokens(
+    tmp_path: Path, value: str, enabled: bool
+) -> None:
+    role_yaml = f"""repo: closeout-fixture
+reconcile:
+  auto_review: {value} # authoritative autonomous-review switch
+  grace_hours: 0 # informational wait window
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    combined = proc.stdout + proc.stderr
+    if enabled:
+        assert proc.returncode == 0, proc.stderr
+        assert len(calls) == 1
+        assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
+    else:
+        assert proc.returncode == 3
+        assert calls == []
+        assert "Autonomous review is disabled" in proc.stderr
+        assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+
+
+@pytest.mark.parametrize("value", ["fasle", "no", "0"])
+def test_invalid_inline_commented_role_auto_review_fails_before_provider_call(
+    tmp_path: Path, value: str
+) -> None:
+    role_yaml = f"""repo: closeout-fixture
+reconcile:
+  auto_review: {value} # typo or unsupported YAML-like value
+  grace_hours: 0 # informational wait window
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "CONFIG INVALID" in proc.stderr
+    assert "reconcile.auto_review must be true|on|false|off" in proc.stderr
+    assert f"got '{value}'" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("value", "enabled"),
+    [(" TRUE ", True), ("On", True), (" FALSE ", False), ("Off", False)],
+)
+def test_environment_auto_review_tokens_are_trimmed_and_normalized(
+    tmp_path: Path, value: str, enabled: bool
+) -> None:
+    proc, calls = run_review(
+        tmp_path, env_overrides={"RECONCILE_AUTO_REVIEW": value}
+    )
+
+    combined = proc.stdout + proc.stderr
+    if enabled:
+        assert proc.returncode == 0, proc.stderr
+        assert len(calls) == 1
+        assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
+    else:
+        assert proc.returncode == 3
+        assert calls == []
+        assert "Autonomous review is disabled" in proc.stderr
+        assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+
+
+@pytest.mark.parametrize("value", ["fasle", "no", "0"])
+def test_invalid_environment_auto_review_fails_before_provider_call(
+    tmp_path: Path, value: str
+) -> None:
+    proc, calls = run_review(
+        tmp_path, env_overrides={"RECONCILE_AUTO_REVIEW": value}
+    )
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "CONFIG INVALID" in proc.stderr
+    assert f"got '{value}'" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("value", ["-1", "many"])
+def test_invalid_inline_commented_role_grace_fails_before_provider_call(
+    tmp_path: Path, value: str
+) -> None:
+    role_yaml = f"""repo: closeout-fixture
+reconcile:
+  auto_review: true # authoritative autonomous-review switch
+  grace_hours: {value} # invalid informational wait window
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "CONFIG INVALID" in proc.stderr
+    assert "reconcile.grace_hours must be a nonnegative integer" in proc.stderr
+    assert f"got '{value}'" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("value", ["-1", "many"])
+def test_invalid_environment_grace_fails_before_provider_call(
+    tmp_path: Path, value: str
+) -> None:
+    proc, calls = run_review(
+        tmp_path, env_overrides={"RECONCILE_GRACE_HOURS": value}
+    )
+
+    assert proc.returncode == 3
+    assert calls == []
+    assert "CONFIG INVALID" in proc.stderr
+    assert f"got '{value}'" in proc.stderr
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in proc.stdout + proc.stderr
+
+
+def test_missing_reconcile_values_retain_enabled_zero_grace_defaults(
+    tmp_path: Path,
+) -> None:
+    role_yaml = """repo: closeout-fixture
+reconcile:
+  # auto_review and grace_hours intentionally omitted
+ticket_provider:
+  name: fixture
+"""
+
+    proc, calls = run_review(tmp_path, role_yaml=role_yaml)
+
+    assert proc.returncode == 0, proc.stderr
+    assert len(calls) == 1
+    assert "grace 0h informational" in calls[0]
     assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
 
 

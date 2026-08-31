@@ -96,13 +96,31 @@ PY
 }
 # Informational only: recorded in the ticket comment, never a blocking wait.
 # Default 0 (no grace); an operator may set grace_hours>0 to reintroduce one.
-GRACE_HOURS="${RECONCILE_GRACE_HOURS:-$(role_mapping_value reconcile grace_hours)}"; GRACE_HOURS="${GRACE_HOURS:-0}"
-AUTO="$(role_mapping_value reconcile auto_review)"; AUTO="${RECONCILE_AUTO_REVIEW:-${AUTO:-true}}"
-AUTO="$(printf '%s' "$AUTO" | tr '[:upper:]' '[:lower:]')"
+ROLE_GRACE_HOURS="$(role_mapping_value reconcile grace_hours)"
+GRACE_HOURS="${RECONCILE_GRACE_HOURS:-$ROLE_GRACE_HOURS}"
+GRACE_HOURS="$(printf '%s' "${GRACE_HOURS:-0}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+case "$GRACE_HOURS" in
+  ''|*[!0-9]*)
+    printf "AUTONOMOUS REVIEW: CONFIG INVALID - reconcile.grace_hours must be a nonnegative integer (got '%s').\n" "$GRACE_HOURS" >&2
+    exit 3
+    ;;
+esac
+GRACE_HOURS="$(python3 -c 'import sys; print(int(sys.argv[1]))' "$GRACE_HOURS")"
 
-if [[ "$AUTO" == "false" || "$AUTO" == "off" ]]; then
-  printf 'Autonomous review is disabled (reconcile.auto_review=false).\n' >&2; exit 3
-fi
+ROLE_AUTO="$(role_mapping_value reconcile auto_review)"
+AUTO="${RECONCILE_AUTO_REVIEW:-$ROLE_AUTO}"
+AUTO="$(printf '%s' "${AUTO:-true}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+case "$AUTO" in
+  true|on) : ;;
+  false|off)
+    printf 'Autonomous review is disabled (reconcile.auto_review=%s).\n' "$AUTO" >&2
+    exit 3
+    ;;
+  *)
+    printf "AUTONOMOUS REVIEW: CONFIG INVALID - reconcile.auto_review must be true|on|false|off (got '%s').\n" "$AUTO" >&2
+    exit 3
+    ;;
+esac
 [[ -f "$REPORT" ]]   || { printf 'Missing review report file: %s\n' "$REPORT" >&2; exit 2; }
 [[ -f "$EVIDENCE" ]] || { printf 'Missing issue evidence file: %s\n' "$EVIDENCE" >&2; exit 2; }
 
