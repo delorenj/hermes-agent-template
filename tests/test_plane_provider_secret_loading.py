@@ -15,6 +15,20 @@ PROVIDER = (
     / "plane.sh"
 )
 
+STRICT_CURL = """#!/usr/bin/env python3
+import sys
+
+payload = '{"id":"15258893-0206-4e8f-aea6-340eb217988c","identifier":"LIVE"}'
+args = sys.argv[1:]
+outfile = args[args.index("-o") + 1]
+headerfile = args[args.index("-D") + 1]
+with open(outfile, "w", encoding="utf-8") as stream:
+    stream.write(payload)
+with open(headerfile, "w", encoding="utf-8") as stream:
+    stream.write("HTTP/1.1 200 OK\\r\\n")
+sys.stdout.write("200")
+"""
+
 
 def test_plane_provider_reads_only_workspace_key_as_inert_dotenv(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
@@ -57,10 +71,7 @@ def test_plane_provider_reads_only_workspace_key_as_inert_dotenv(tmp_path: Path)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     fake_curl = fake_bin / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env sh\nprintf '%s\\n' '{\"id\":\"15258893-0206-4e8f-aea6-340eb217988c\",\"identifier\":\"LIVE\"}'\n",
-        encoding="utf-8",
-    )
+    fake_curl.write_text(STRICT_CURL, encoding="utf-8")
     fake_curl.chmod(0o755)
     env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
     result = subprocess.run(
@@ -121,10 +132,7 @@ def test_plane_provider_resolves_workspace_1password_reference(tmp_path: Path) -
     )
     fake_op.chmod(0o755)
     fake_curl = fake_bin / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env sh\nprintf '%s\\n' '{\"id\":\"15258893-0206-4e8f-aea6-340eb217988c\",\"identifier\":\"LIVE\"}'\n",
-        encoding="utf-8",
-    )
+    fake_curl.write_text(STRICT_CURL, encoding="utf-8")
     fake_curl.chmod(0o755)
 
     env = os.environ.copy()

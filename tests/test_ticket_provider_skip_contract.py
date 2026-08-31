@@ -110,13 +110,28 @@ ticket_provider:
     call_log = tmp_path / "provider-calls.log"
     curl = fake_bin / "curl"
     curl.write_text(
-        """#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$PROVIDER_CALL_LOG"
-case "$*" in
-  *'/projects/?per_page=200'*) printf '%s\n' '[{"id":"granted-board","name":"Demo"}]' ;;
-  *'/projects/granted-board/'*) printf '%s\n' '{"id":"granted-board","name":"Demo","identifier":"LIVE"}' ;;
-  *) printf '%s\n' '{}' ;;
-esac
+        """#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+method = args[args.index("-X") + 1]
+url = next(arg for arg in args if arg.startswith("http"))
+outfile = args[args.index("-o") + 1]
+headerfile = args[args.index("-D") + 1]
+with open(os.environ["PROVIDER_CALL_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(" ".join(args) + "\\n")
+if "/projects/?per_page=200" in url:
+    payload = '[{"id":"granted-board","name":"Demo"}]'
+elif url.endswith("/projects/granted-board/"):
+    payload = '{"id":"granted-board","name":"Demo","identifier":"LIVE"}'
+else:
+    payload = "{}"
+with open(outfile, "w", encoding="utf-8") as stream:
+    stream.write(payload)
+with open(headerfile, "w", encoding="utf-8") as stream:
+    stream.write("HTTP/1.1 200 OK\\r\\n")
+sys.stdout.write("200")
 """,
         encoding="utf-8",
     )
@@ -603,19 +618,32 @@ def test_concurrent_board_bootstrap_converges_through_one_create_transaction(
     project, role, env, call_log = _fixture(tmp_path)
     fake_curl = Path(env["PATH"].split(":", 1)[0]) / "curl"
     fake_curl.write_text(
-        """#!/usr/bin/env bash
-printf '%s\n' "$*" >> "$PROVIDER_CALL_LOG"
-case "$*" in
-  *'/projects/?per_page=200'*) printf '%s\n' '[]' ;;
-  *'-X POST '*'/projects/'*)
-    printf '%s\n' create >> "${PROVIDER_CALL_LOG}.creates"
-    printf '%s\n' '{"id":"converged-board","identifier":"LIVE"}'
-    ;;
-  *'/projects/converged-board/'*)
-    printf '%s\n' '{"id":"converged-board","name":"Demo","identifier":"LIVE"}'
-    ;;
-  *) printf '%s\n' '{}' ;;
-esac
+        """#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+method = args[args.index("-X") + 1]
+url = next(arg for arg in args if arg.startswith("http"))
+outfile = args[args.index("-o") + 1]
+headerfile = args[args.index("-D") + 1]
+with open(os.environ["PROVIDER_CALL_LOG"], "a", encoding="utf-8") as stream:
+    stream.write(" ".join(args) + "\\n")
+if "/projects/?per_page=200" in url:
+    payload = "[]"
+elif method == "POST" and url.endswith("/projects/"):
+    with open(os.environ["PROVIDER_CALL_LOG"] + ".creates", "a", encoding="utf-8") as stream:
+        stream.write("create\\n")
+    payload = '{"id":"converged-board","identifier":"LIVE"}'
+elif "/projects/converged-board/" in url:
+    payload = '{"id":"converged-board","name":"Demo","identifier":"LIVE"}'
+else:
+    payload = "{}"
+with open(outfile, "w", encoding="utf-8") as stream:
+    stream.write(payload)
+with open(headerfile, "w", encoding="utf-8") as stream:
+    stream.write("HTTP/1.1 200 OK\\r\\n")
+sys.stdout.write("200")
 """,
         encoding="utf-8",
     )

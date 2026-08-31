@@ -3,8 +3,12 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import subprocess
+import time
+
+import pytest
 
 
 PROVIDER = (
@@ -67,6 +71,7 @@ def stage_provider(
 import json
 import os
 import sys
+import time
 
 argv = sys.argv[1:]
 method = "GET"
@@ -121,6 +126,8 @@ if chosen is None:
     sys.stderr.write(f"no fixture for {method} {url}\\n")
     raise SystemExit(22)
 
+time.sleep(float(chosen.get("sleep_seconds", 0)))
+
 state_path = os.environ.get("PLANE_TEST_STATE", "")
 counts = {}
 if state_path and os.path.exists(state_path):
@@ -155,8 +162,8 @@ if outfile:
 else:
     sys.stdout.write(payload)
 if writeout:
-    sys.stdout.write(writeout.replace("%{http_code}", str(status)))
-raise SystemExit(0)
+    sys.stdout.write(chosen.get("writeout_override", writeout.replace("%{http_code}", str(status))))
+raise SystemExit(int(chosen.get("curl_exit", 0)))
 """,
         encoding="utf-8",
     )
@@ -168,6 +175,15 @@ raise SystemExit(0)
     env["PLANE_TEST_RESPONSES"] = str(fixture)
     env["PLANE_TEST_REQUEST_LOG"] = str(request_log)
     env["PLANE_TEST_STATE"] = str(state)
+    for name in (
+        "PLANE_READ_MAX_ATTEMPTS",
+        "PLANE_429_RETRY_DELAY",
+        "PLANE_429_MAX_DELAY",
+        "PLANE_MUTATION_MAX_ATTEMPTS",
+        "PLANE_MUTATION_RETRY_DELAY",
+        "PLANE_MAX_PAGES",
+    ):
+        env.pop(name, None)
     return provider, env, request_log
 
 
@@ -559,3 +575,371 @@ def test_transition_never_claims_completion_without_matching_readback(tmp_path: 
     assert "ok" not in result.stdout
     sent = requests(request_log)
     assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET", "PATCH", "GET"]
+
+
+def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -> None:
+    broken_readback = response(
+        "GET",
+        "/issues/issue-uuid/",
+        {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"},
+    )
+    broken_readback["curl_exit"] = 28
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        in_review="Ready for QA",
+        responses=[
+            response(
+                "GET",
+                "/states/",
+                {
+                    "results": [
+                        {
+                            "id": "qa-state",
+                            "name": "Ready for QA",
+                            "group": "started",
+                        }
+                    ]
+                },
+            ),
+            response(
+                "PATCH",
+                "/issues/issue-uuid/",
+                {"id": "issue-uuid", "sequence_id": 7},
+            ),
+            broken_readback,
+        ],
+    )
+    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
+
+    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+
+    assert result.returncode != 0
+    assert "curl exit 28" in result.stderr
+    assert "refusing to repeat the PATCH" in result.stderr
+    assert "ok" not in result.stdout
+    assert [entry["method"] for entry in requests(request_log)] == [
+        "GET",
+        "PATCH",
+        "GET",
+    ]
+
+
+def test_transition_invalid_json_readback_never_repatches(tmp_path: Path) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        in_review="Ready for QA",
+        responses=[
+            response(
+                "GET",
+                "/states/",
+                {
+                    "results": [
+                        {
+                            "id": "qa-state",
+                            "name": "Ready for QA",
+                            "group": "started",
+                        }
+                    ]
+                },
+            ),
+            response(
+                "PATCH",
+                "/issues/issue-uuid/",
+                {"id": "issue-uuid", "sequence_id": 7},
+            ),
+            {"method": "GET", "path": "/issues/issue-uuid/", "body": "{"},
+        ],
+    )
+    env["PLANE_MUTATION_RETRY_DELAY"] = "0"
+
+    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+
+    assert result.returncode != 0
+    assert "not valid JSON" in result.stderr
+    assert "refusing to repeat the PATCH" in result.stderr
+    assert "ok" not in result.stdout
+    assert [entry["method"] for entry in requests(request_log)] == [
+        "GET",
+        "PATCH",
+        "GET",
+    ]
+
+
+def test_pagination_requires_cursor_when_another_page_is_claimed(tmp_path: Path) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[
+            response(
+                "GET",
+                "/cycles/",
+                {"results": [], "next_page_results": True, "next_cursor": ""},
+            )
+        ],
+    )
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert "without a cursor" in result.stderr
+    assert result.stdout == ""
+    assert len(requests(request_log)) == 1
+
+
+def test_pagination_url_encodes_opaque_cursor(tmp_path: Path) -> None:
+    second = response(
+        "GET",
+        "/cycles/",
+        {
+            "results": [
+                {
+                    "id": "cycle-2",
+                    "name": "Encoded cursor",
+                    "start_date": "2000-01-01",
+                    "end_date": "2999-12-31",
+                }
+            ],
+            "next_page_results": False,
+        },
+    )
+    second["query_contains"] = "cursor=a%2Fb%3Fc%3D"
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[
+            response(
+                "GET",
+                "/cycles/",
+                {
+                    "results": [],
+                    "next_page_results": True,
+                    "next_cursor": "a/b?c=",
+                },
+            ),
+            second,
+        ],
+    )
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["id"] == "cycle-2"
+    assert "cursor=a%2Fb%3Fc%3D" in requests(request_log)[1]["url"]
+
+
+def test_pagination_detects_non_adjacent_repeated_cursor(tmp_path: Path) -> None:
+    page_a = response(
+        "GET",
+        "/cycles/",
+        {"results": [], "next_page_results": True, "next_cursor": "B"},
+    )
+    page_a["query_contains"] = "cursor=A"
+    page_b = response(
+        "GET",
+        "/cycles/",
+        {"results": [], "next_page_results": True, "next_cursor": "A"},
+    )
+    page_b["query_contains"] = "cursor=B"
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[
+            response(
+                "GET",
+                "/cycles/",
+                {"results": [], "next_page_results": True, "next_cursor": "A"},
+            ),
+            page_a,
+            page_b,
+        ],
+    )
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert "cursor" in result.stderr and "repeated" in result.stderr
+    assert result.stdout == ""
+    assert len(requests(request_log)) == 3
+
+
+def test_pagination_max_page_guard_returns_no_partial_output(tmp_path: Path) -> None:
+    page_a = response(
+        "GET",
+        "/cycles/",
+        {"results": [], "next_page_results": True, "next_cursor": "B"},
+    )
+    page_a["query_contains"] = "cursor=A"
+    provider, env, request_log = stage_provider(
+        tmp_path,
+        responses=[
+            response(
+                "GET",
+                "/cycles/",
+                {"results": [], "next_page_results": True, "next_cursor": "A"},
+            ),
+            page_a,
+        ],
+    )
+    env["PLANE_MAX_PAGES"] = "2"
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert "PLANE_MAX_PAGES=2" in result.stderr
+    assert result.stdout == ""
+    assert len(requests(request_log)) == 2
+
+
+def test_curl_transport_exit_is_not_recast_as_http_success(tmp_path: Path) -> None:
+    transport_failure = response("GET", "/cycles/", {"results": []})
+    transport_failure["curl_exit"] = 28
+    provider, env, request_log = stage_provider(
+        tmp_path, responses=[transport_failure]
+    )
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert "curl exit 28" in result.stderr
+    assert result.stdout == ""
+    assert len(requests(request_log)) == 1
+
+
+@pytest.mark.parametrize("writeout", ["legacy-json-stdout", "000", "600"])
+def test_curl_requires_valid_numeric_http_status(
+    tmp_path: Path, writeout: str
+) -> None:
+    malformed_status = response("GET", "/cycles/", {"results": []})
+    malformed_status["writeout_override"] = writeout
+    provider, env, _ = stage_provider(tmp_path, responses=[malformed_status])
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert "invalid HTTP status" in result.stderr
+    assert result.stdout == ""
+
+
+def test_retry_after_http_date_is_parsed_instead_of_using_fallback(
+    tmp_path: Path,
+) -> None:
+    throttled = response("GET", "/cycles/", {"results": []})
+    throttled["fail_times"] = 1
+    throttled["fail_status"] = 429
+    throttled["fail_headers"] = {
+        "Retry-After": "Wed, 21 Oct 2015 07:28:00 GMT"
+    }
+    provider, env, _ = stage_provider(tmp_path, responses=[throttled])
+    env["PLANE_429_RETRY_DELAY"] = "3"
+
+    started = time.monotonic()
+    result = run_provider(provider, env, "active_milestone")
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 1.5, f"past HTTP-date used the 3s fallback ({elapsed:.2f}s)"
+
+
+def test_retry_after_delay_is_capped(tmp_path: Path) -> None:
+    throttled = response("GET", "/cycles/", {"results": []})
+    throttled["fail_times"] = 1
+    throttled["fail_status"] = 429
+    throttled["fail_headers"] = {"Retry-After": "999"}
+    provider, env, _ = stage_provider(tmp_path, responses=[throttled])
+    env["PLANE_429_MAX_DELAY"] = "0"
+
+    started = time.monotonic()
+    result = run_provider(provider, env, "active_milestone")
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 0, result.stderr
+    assert elapsed < 1.5, f"Retry-After exceeded configured cap ({elapsed:.2f}s)"
+
+
+@pytest.mark.parametrize(
+    ("setting", "value"),
+    [
+        ("PLANE_READ_MAX_ATTEMPTS", "0"),
+        ("PLANE_429_RETRY_DELAY", "-1"),
+        ("PLANE_429_MAX_DELAY", "3601"),
+        ("PLANE_MUTATION_MAX_ATTEMPTS", "twice"),
+        ("PLANE_MUTATION_RETRY_DELAY", "-1"),
+        ("PLANE_MAX_PAGES", "1001"),
+    ],
+)
+def test_invalid_numeric_override_fails_before_network(
+    tmp_path: Path, setting: str, value: str
+) -> None:
+    provider, env, request_log = stage_provider(
+        tmp_path, responses=[response("GET", "/cycles/", {"results": []})]
+    )
+    env[setting] = value
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert setting in result.stderr
+    assert not request_log.exists()
+
+
+@pytest.mark.parametrize("failure", ["invalid-json", "transport"])
+def test_all_plane_scratch_is_removed_on_error(
+    tmp_path: Path, failure: str
+) -> None:
+    if failure == "invalid-json":
+        fixture = {"method": "GET", "path": "/cycles/", "body": "{"}
+    else:
+        fixture = response("GET", "/cycles/", {"results": []})
+        fixture["curl_exit"] = 7
+    provider, env, _ = stage_provider(tmp_path, responses=[fixture])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env["TMPDIR"] = str(scratch)
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode != 0
+    assert list(scratch.iterdir()) == []
+
+
+def test_all_plane_scratch_is_removed_on_success(tmp_path: Path) -> None:
+    provider, env, _ = stage_provider(
+        tmp_path, responses=[response("GET", "/cycles/", {"results": []})]
+    )
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env["TMPDIR"] = str(scratch)
+
+    result = run_provider(provider, env, "active_milestone")
+
+    assert result.returncode == 0, result.stderr
+    assert list(scratch.iterdir()) == []
+
+
+def test_all_plane_scratch_is_removed_on_signal(tmp_path: Path) -> None:
+    slow = response("GET", "/cycles/", {"results": []})
+    slow["sleep_seconds"] = 30
+    provider, env, request_log = stage_provider(tmp_path, responses=[slow])
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    env["TMPDIR"] = str(scratch)
+
+    proc = subprocess.Popen(
+        ["sh", str(provider), "active_milestone"],
+        cwd=provider.parents[5],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if request_log.exists() and request_log.stat().st_size:
+            break
+        time.sleep(0.02)
+    else:
+        proc.kill()
+        raise AssertionError("provider never reached the slow curl fixture")
+
+    os.killpg(proc.pid, signal.SIGTERM)
+    proc.communicate(timeout=5)
+
+    assert list(scratch.iterdir()) == []

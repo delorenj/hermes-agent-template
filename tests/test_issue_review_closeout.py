@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -61,6 +62,10 @@ PROVIDER_SPY = r"""#!/usr/bin/env bash
 tp() {
   action="$1"
   shift
+  if [[ "${TICKET_PROVIDER:-}" != "${TP_EXPECTED_PROVIDER:-fixture}" ]]; then
+    printf 'wrong provider selection: %s\n' "${TICKET_PROVIDER:-<unset>}" >&2
+    return 23
+  fi
   {
     printf '%s' "$action"
     for value in "$@"; do printf '\t%s' "$value"; done
@@ -73,6 +78,12 @@ tp() {
     printf 'adapter says completed before failing\n'
     printf 'adapter transition failed noisily\n' >&2
     return 19
+  fi
+  if [[ "$action" == "comment" && "${TP_COMMENT_RESULT:-pass}" == "fail" ]]; then
+    # This acceptance-shaped adapter noise must never leak from a failed write.
+    printf 'AUTONOMOUS REVIEW: ACCEPTED by noisy adapter\n'
+    printf 'adapter comment failed noisily\n' >&2
+    return 29
   fi
 }
 """
@@ -94,8 +105,13 @@ def stage_role(tmp_path: Path) -> tuple[Path, Path, Path]:
     shutil.copy2(AUTONOMOUS_REVIEW, bin_dir / AUTONOMOUS_REVIEW.name)
     shutil.copy2(CLOSE_GATE, bin_dir / CLOSE_GATE.name)
     (lib_dir / "ticket-provider.sh").write_text(PROVIDER_SPY, encoding="utf-8")
+    (tmp_path / ".project.json").write_text(
+        json.dumps({"project_slug": "closeout-fixture"}),
+        encoding="utf-8",
+    )
     (role / "role.yaml").write_text(
         """repo: closeout-fixture
+name: deliberately-wrong-top-level-provider
 reconcile:
   auto_review: true
   grace_hours: 0
@@ -120,7 +136,10 @@ ticket_provider:
 
 
 def run_review(
-    tmp_path: Path, *args: str, transition_result: str = "pass"
+    tmp_path: Path,
+    *args: str,
+    transition_result: str = "pass",
+    comment_result: str = "pass",
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     script, report, calls = stage_role(tmp_path)
     env = dict(os.environ)
@@ -128,6 +147,8 @@ def run_review(
         {
             "TP_CALLS": str(calls),
             "TP_TRANSITION_RESULT": transition_result,
+            "TP_COMMENT_RESULT": comment_result,
+            "TP_EXPECTED_PROVIDER": "fixture",
         }
     )
     proc = subprocess.run(
@@ -171,6 +192,26 @@ def test_close_success_transitions_then_reports_and_comments_once(tmp_path: Path
     assert "CLOSE FAILED" not in proc.stdout + proc.stderr
 
 
+def test_close_comment_failure_reports_transition_succeeded_without_acceptance(
+    tmp_path: Path,
+) -> None:
+    proc, calls = run_review(tmp_path, "--close", comment_result="fail")
+
+    assert proc.returncode == 1
+    assert calls[0] == f"transition\t{ISSUE}\tcompleted"
+    assert calls[1].startswith(f"comment\t{ISSUE}\tAutonomously accepted by fixture-reviewer")
+    assert len(calls) == 2
+    combined = proc.stdout + proc.stderr
+    assert combined.strip() == (
+        f"AUTONOMOUS REVIEW: CLOSE INCOMPLETE for {ISSUE} - transition succeeded, "
+        "but acceptance comment failed; issue may already be completed."
+    )
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+    assert "treat as done" not in combined
+    assert "transitioned to completed" not in combined
+    assert "noisy adapter" not in combined
+
+
 def test_default_acceptance_stays_in_review_without_completion_transition(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +224,22 @@ def test_default_acceptance_stays_in_review_without_completion_transition(
     assert proc.stdout.count("AUTONOMOUS REVIEW: ACCEPTED") == 1
     assert "stays in the review lane" in proc.stdout
     assert "transitioned to completed" not in proc.stdout
+
+
+def test_default_comment_failure_emits_no_acceptance(tmp_path: Path) -> None:
+    proc, calls = run_review(tmp_path, comment_result="fail")
+
+    assert proc.returncode == 1
+    assert len(calls) == 1
+    assert calls[0].startswith(f"comment\t{ISSUE}\tAutonomously accepted by fixture-reviewer")
+    combined = proc.stdout + proc.stderr
+    assert combined.strip() == (
+        f"AUTONOMOUS REVIEW: COMMENT FAILED for {ISSUE} - acceptance comment "
+        "was not recorded; issue left in review."
+    )
+    assert "AUTONOMOUS REVIEW: ACCEPTED" not in combined
+    assert "treat as done" not in combined
+    assert "noisy adapter" not in combined
 
 
 def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
@@ -236,3 +293,108 @@ def test_close_gate_success_names_repo_and_failure_remains_fail_closed(
     assert failing.returncode == 1
     assert f"CLOSE GATE: FAIL for {ISSUE}" in failing.stderr
     assert "CLOSE GATE: PASS" not in failing.stdout + failing.stderr
+
+
+def test_close_gate_fails_when_installed_role_repo_disagrees_with_manifest(
+    tmp_path: Path,
+) -> None:
+    _, _, _ = stage_role(tmp_path)
+    gate = (
+        tmp_path
+        / "agents"
+        / "hermes"
+        / "pm"
+        / ".scripts"
+        / "sentinel"
+        / "bin"
+        / CLOSE_GATE.name
+    )
+    role_yaml = tmp_path / "agents" / "hermes" / "pm" / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "repo: closeout-fixture", "repo: different-project"
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["sh", str(gate), ISSUE, str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "disagrees with target project slug closeout-fixture" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_manifest_never_falls_back_when_slug_is_invalid(
+    tmp_path: Path,
+) -> None:
+    _, _, _ = stage_role(tmp_path)
+    gate = (
+        tmp_path
+        / "agents"
+        / "hermes"
+        / "pm"
+        / ".scripts"
+        / "sentinel"
+        / "bin"
+        / CLOSE_GATE.name
+    )
+    (tmp_path / ".project.json").write_text(
+        json.dumps({"ticket_provider": {"type": "fixture"}}),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["sh", str(gate), ISSUE, str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "has no non-blank project_slug" in result.stderr
+    assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
+
+
+def test_close_gate_uses_basename_only_when_manifest_is_absent(tmp_path: Path) -> None:
+    _, _, _ = stage_role(tmp_path)
+    gate = (
+        tmp_path
+        / "agents"
+        / "hermes"
+        / "pm"
+        / ".scripts"
+        / "sentinel"
+        / "bin"
+        / CLOSE_GATE.name
+    )
+    role_yaml = tmp_path / "agents" / "hermes" / "pm" / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "repo: closeout-fixture", f"repo: {tmp_path.name}"
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / ".project.json").unlink()
+
+    result = subprocess.run(
+        ["sh", str(gate), ISSUE, str(tmp_path)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == (
+        f"CLOSE GATE: PASS for {ISSUE} (repo: {tmp_path.name})"
+    )

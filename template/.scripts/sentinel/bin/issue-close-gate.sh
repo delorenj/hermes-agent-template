@@ -15,10 +15,38 @@ case "$ISSUE" in *[!A-Za-z0-9_-]*) printf 'Invalid issue id: %s\n' "$ISSUE" >&2;
 
 BIN_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 ROLE_YAML="$BIN_DIR/../../../role.yaml"
-REPO_SLUG="$(sed -n 's/^[[:space:]]*repo:[[:space:]]*//p' "$ROLE_YAML" 2>/dev/null | head -n1 | tr -d '"' | tr -d '\r')"
+ROLE_REPO="$(sed -n 's/^repo:[[:space:]]*//p' "$ROLE_YAML" 2>/dev/null | head -n1 | tr -d '"' | tr -d '\r')"
 ROOT="${2:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"
 cd "$ROOT"
-REPO_SLUG="${REPO_SLUG:-$(basename "$ROOT")}"
+PROJECT_MANIFEST="$ROOT/.project.json"
+if [ -e "$PROJECT_MANIFEST" ] || [ -L "$PROJECT_MANIFEST" ]; then
+  [ -f "$PROJECT_MANIFEST" ] || {
+    printf 'Project manifest is not a regular file: %s\n' "$PROJECT_MANIFEST" >&2
+    exit 1
+  }
+  REPO_SLUG="$(python3 - "$PROJECT_MANIFEST" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+try:
+    document = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"close gate: malformed project manifest {path}: {exc}")
+slug = document.get("project_slug") if isinstance(document, dict) else None
+if not isinstance(slug, str) or not slug.strip():
+    raise SystemExit(f"close gate: project manifest {path} has no non-blank project_slug")
+print(slug.strip())
+PY
+)" || exit 1
+else
+  REPO_SLUG="$(basename "$ROOT")"
+fi
+if [ -n "$ROLE_REPO" ] && [ "$ROLE_REPO" != "$REPO_SLUG" ]; then
+  printf 'Installed role repo %s disagrees with target project slug %s.\n' "$ROLE_REPO" "$REPO_SLUG" >&2
+  exit 1
+fi
 
 FILE="_bmad-output/implementation-artifacts/issue-evidence/$ISSUE.md"
 FAIL=0

@@ -16,7 +16,8 @@
 # (default 30s). Mutations are never retried in the transport layer; transition
 # re-checks the live issue before repeating a PATCH, at most
 # PLANE_MUTATION_MAX_ATTEMPTS (default 3) times, PLANE_MUTATION_RETRY_DELAY
-# (default 2s) apart.
+# (default 2s) apart. PLANE_MAX_PAGES bounds every paginated collection
+# (default 1000). All numeric overrides are validated before any request.
 #
 # Plane model:  project = board, cycle = milestone, state.group in
 #   backlog|unstarted|started|completed|cancelled.
@@ -34,6 +35,14 @@ FLEET_ENV="${HERMES_FLEET_ENV:-$HOME/.hermes/fleet.env}"
 
 die() { echo "plane: $*" >&2; exit 1; }
 need_key() { [ -n "${PLANE_API_KEY:-}" ] || die "PLANE_API_KEY is not set"; }
+
+validated_uint() {
+  setting="$1"; value="$2"; minimum="$3"; maximum="$4"
+  case "$value" in ''|*[!0-9]*) die "$setting must be an integer from $minimum through $maximum" ;; esac
+  [ "$value" -ge "$minimum" ] && [ "$value" -le "$maximum" ] \
+    || die "$setting must be an integer from $minimum through $maximum"
+  printf '%s' "$value"
+}
 
 workspace_key() {
   key="$(printf '%s' "${1:-default}" | tr '[:lower:]' '[:upper:]' | sed 's/[^A-Z0-9]/_/g')"
@@ -125,6 +134,13 @@ CALENDAR_TZ="$(pj_cfg timezone)"; [ -n "$CALENDAR_TZ" ] || CALENDAR_TZ="$(tp_cfg
 CALENDAR_TZ="${CALENDAR_TZ:-${TICKET_PROVIDER_TIMEZONE:-${TZ:-}}}"
 API="$BASE/api/v1/workspaces/$WS"
 
+READ_MAX_ATTEMPTS="$(validated_uint PLANE_READ_MAX_ATTEMPTS "${PLANE_READ_MAX_ATTEMPTS:-4}" 1 20)"
+RETRY_DEFAULT_DELAY="$(validated_uint PLANE_429_RETRY_DELAY "${PLANE_429_RETRY_DELAY:-1}" 0 3600)"
+RETRY_MAX_DELAY="$(validated_uint PLANE_429_MAX_DELAY "${PLANE_429_MAX_DELAY:-30}" 0 3600)"
+MUTATION_MAX_ATTEMPTS="$(validated_uint PLANE_MUTATION_MAX_ATTEMPTS "${PLANE_MUTATION_MAX_ATTEMPTS:-3}" 1 20)"
+MUTATION_RETRY_DELAY="$(validated_uint PLANE_MUTATION_RETRY_DELAY "${PLANE_MUTATION_RETRY_DELAY:-2}" 0 3600)"
+MAX_PAGES="$(validated_uint PLANE_MAX_PAGES "${PLANE_MAX_PAGES:-1000}" 1 1000)"
+
 if [ -z "${PLANE_API_KEY:-}" ]; then
   KEY="$(workspace_key "$WS")"
   PLANE_API_KEY="$(printenv "$KEY" 2>/dev/null || true)"
@@ -144,68 +160,98 @@ api() {
   need_key
   method="$1"; path="$2"; body="${3:-}"
   max_attempts=1
-  case "$method" in GET) max_attempts="${PLANE_READ_MAX_ATTEMPTS:-4}" ;; esac
+  case "$method" in GET) max_attempts="$READ_MAX_ATTEMPTS" ;; esac
+  api_scratch="$(mktemp -d "${TMPDIR:-/tmp}/plane-api.XXXXXX")" \
+    || die "could not create API scratch directory"
+  response_file="$api_scratch/response"
+  headers_file="$api_scratch/headers"
+  cleanup_api_scratch() {
+    rm -f "$response_file" "$headers_file"
+    rmdir "$api_scratch" 2>/dev/null || true
+  }
+  trap cleanup_api_scratch 0
+  trap 'cleanup_api_scratch; exit 129' HUP
+  trap 'cleanup_api_scratch; exit 130' INT
+  trap 'cleanup_api_scratch; exit 143' TERM
   attempt=0
   while :; do
     attempt=$((attempt + 1))
-    response_file="$(mktemp "${TMPDIR:-/tmp}/plane-api.XXXXXX")" || die "could not create response scratch file"
-    headers_file="$(mktemp "${TMPDIR:-/tmp}/plane-api-headers.XXXXXX")" || { rm -f "$response_file"; die "could not create response scratch file"; }
+    : > "$response_file"
+    : > "$headers_file"
+    curl_exit=0
     if [ -n "$body" ]; then
       captured="$(curl -sS -o "$response_file" -D "$headers_file" -w '%{http_code}' -X "$method" "$API/$path" \
         -H "X-API-Key: $PLANE_API_KEY" -H "Content-Type: application/json" \
         -H "User-Agent: curl/8.0" \
-        -d "$body")" || true
+        -d "$body")" || curl_exit=$?
     else
       captured="$(curl -sS -o "$response_file" -D "$headers_file" -w '%{http_code}' -X "$method" "$API/$path" \
         -H "X-API-Key: $PLANE_API_KEY" \
-        -H "User-Agent: curl/8.0")" || true
+        -H "User-Agent: curl/8.0")" || curl_exit=$?
+    fi
+    if [ "$curl_exit" -ne 0 ]; then
+      cleanup_api_scratch
+      trap - 0 HUP INT TERM
+      die "$method $path failed at transport (curl exit $curl_exit)"
     fi
     case "$captured" in
-      [0-9][0-9][0-9])
+      [1-5][0-9][0-9])
         status="$captured"
-        output="$(cat "$response_file")"
         ;;
       *)
-        if [ -s "$response_file" ] || [ -n "$captured" ]; then
-          # Legacy test doubles ignore -o/-w and print the body on stdout.
-          status=200
-          output="$captured"
-          [ -s "$response_file" ] && output="$(cat "$response_file")"
-        else
-          status=000
-          output=""
-        fi
+        cleanup_api_scratch
+        trap - 0 HUP INT TERM
+        die "$method $path returned invalid HTTP status ${captured:-empty}"
         ;;
     esac
+    output="$(cat "$response_file")"
     if [ "$status" = 429 ] && [ "$attempt" -lt "$max_attempts" ]; then
-      delay="$(python3 - "$headers_file" <<'PY'
+      delay="$(python3 - "$headers_file" "$RETRY_DEFAULT_DELAY" "$RETRY_MAX_DELAY" <<'PY'
+import datetime
+import email.utils
+import math
 import sys
 
-delay = ""
+raw = ""
 with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
     for line in stream:
         name, _, value = line.partition(":")
         if name.strip().lower() == "retry-after":
-            delay = value.strip()
-print(delay)
+            raw = value.strip()
+fallback = int(sys.argv[2])
+maximum = int(sys.argv[3])
+if raw.isdigit():
+    delay = int(raw)
+else:
+    try:
+        target = email.utils.parsedate_to_datetime(raw)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=datetime.timezone.utc)
+        delay = max(
+            0,
+            math.ceil(
+                (target - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+            ),
+        )
+    except (TypeError, ValueError, OverflowError):
+        delay = fallback
+print(min(delay, maximum))
 PY
 )"
-      case "$delay" in ''|*[!0-9]*) delay="${PLANE_429_RETRY_DELAY:-1}" ;; esac
-      max_delay="${PLANE_429_MAX_DELAY:-30}"
-      [ "$delay" -le "$max_delay" ] 2>/dev/null || delay="$max_delay"
-      rm -f "$response_file" "$headers_file"
       sleep "$delay"
       continue
     fi
     case "$status" in
       2*)
         printf '%s' "$output"
-        rm -f "$response_file" "$headers_file"
+        cleanup_api_scratch
+        trap - 0 HUP INT TERM
         return 0
         ;;
     esac
     detail="$(printf '%s' "$output" | head -c 300 | tr '\n' ' ')"
-    rm -f "$response_file" "$headers_file"
+    cleanup_api_scratch
+    trap - 0 HUP INT TERM
     die "$method $path failed (HTTP $status)${detail:+: $detail}"
   done
 }
@@ -215,22 +261,64 @@ PY
 # next_page_results flag; bare-list and single-page responses pass through.
 api_all() {
   path="$1"
-  pages_file="$(mktemp "${TMPDIR:-/tmp}/plane-pages.XXXXXX")" || die "could not create pagination scratch file"
+  page_scratch="$(mktemp -d "${TMPDIR:-/tmp}/plane-pages.XXXXXX")" \
+    || die "could not create pagination scratch directory"
+  pages_file="$page_scratch/pages"
+  cursors_file="$page_scratch/cursors"
+  : > "$pages_file"
+  : > "$cursors_file"
+  cleanup_page_scratch() {
+    rm -f "$pages_file" "$cursors_file"
+    rmdir "$page_scratch" 2>/dev/null || true
+  }
+  trap cleanup_page_scratch 0
+  trap 'cleanup_page_scratch; exit 129' HUP
+  trap 'cleanup_page_scratch; exit 130' INT
+  trap 'cleanup_page_scratch; exit 143' TERM
   cursor=""
+  page_count=0
   while :; do
+    page_count=$((page_count + 1))
+    [ "$page_count" -le "$MAX_PAGES" ] \
+      || die "pagination for $path exceeded PLANE_MAX_PAGES=$MAX_PAGES"
     case "$path" in *\?*) sep="&" ;; *) sep="?" ;; esac
-    if [ -n "$cursor" ]; then page_path="$path${sep}cursor=$cursor"; else page_path="$path"; fi
-    page="$(api GET "$page_path")" || { rm -f "$pages_file"; return 1; }
-    printf '%s\0' "$page" >> "$pages_file"
-    next="$(printf '%s' "$page" | python3 -c 'import sys,json
-d=json.load(sys.stdin)
-if isinstance(d,dict) and d.get("next_page_results"):
-    print(str(d.get("next_cursor") or ""))')"
-    [ -n "$next" ] || break
-    if [ "$next" = "$cursor" ]; then
-      rm -f "$pages_file"
-      die "plane: pagination cursor for $path did not advance"
+    if [ -n "$cursor" ]; then
+      encoded_cursor="$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$cursor")"
+      page_path="$path${sep}cursor=$encoded_cursor"
+    else
+      page_path="$path"
     fi
+    if ! page="$(api GET "$page_path")"; then
+      cleanup_page_scratch
+      trap - 0 HUP INT TERM
+      return 1
+    fi
+    printf '%s\0' "$page" >> "$pages_file"
+    page_meta="$(printf '%s' "$page" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+if isinstance(d,list):
+    print("done")
+elif isinstance(d,dict):
+    more=d.get("next_page_results", False)
+    if more is True:
+        cursor=str(d.get("next_cursor") or "")
+        if not cursor:
+            raise SystemExit("plane: pagination reported another page without a cursor")
+        print("next\t"+cursor)
+    else:
+        print("done")
+else:
+    raise SystemExit("plane: paginated endpoint returned neither an object nor a list")')"
+    case "$page_meta" in
+      done) break ;;
+      next*) next="${page_meta#*	}" ;;
+      *) die "invalid pagination metadata for $path" ;;
+    esac
+    cursor_fingerprint="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$next")"
+    if grep -Fqx "$cursor_fingerprint" "$cursors_file"; then
+      die "pagination cursor for $path repeated"
+    fi
+    printf '%s\n' "$cursor_fingerprint" >> "$cursors_file"
     cursor="$next"
   done
   python3 - "$pages_file" <<'PY'
@@ -249,7 +337,8 @@ for chunk in pathlib.Path(sys.argv[1]).read_bytes().split(b"\0"):
         rows.extend(d.get("results") or [])
 print(json.dumps(rows))
 PY
-  rm -f "$pages_file"
+  cleanup_page_scratch
+  trap - 0 HUP INT TERM
 }
 
 # Select the one date-current cycle. An empty result is explicit and must never
@@ -419,23 +508,43 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
     # the server is confirmed by that read-back instead of being re-sent. Only
     # an exact read-back of the intended state id produces `ok`; anything else
     # fails explicitly after a bounded number of attempts.
-    MAX_ATTEMPTS="${PLANE_MUTATION_MAX_ATTEMPTS:-3}"
-    RETRY_DELAY="${PLANE_MUTATION_RETRY_DELAY:-2}"
     attempt=0
     SEQUENCE=""
     while :; do
-      [ "$attempt" -eq 0 ] || sleep "$RETRY_DELAY"
+      [ "$attempt" -eq 0 ] || sleep "$MUTATION_RETRY_DELAY"
       attempt=$((attempt + 1))
       # Subshell: a transport-level die inside api must not kill the retry loop.
       ( api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" ) >/dev/null || true
-      SEQUENCE="$(api GET "projects/$PROJ/issues/$ID/" | EXPECTED_SID="$SID" python3 -c 'import sys,json,os
-d=json.load(sys.stdin); state=d.get("state", "")
+      if ! READBACK="$(api GET "projects/$PROJ/issues/$ID/")"; then
+        die "transition read-back failed after PATCH attempt $attempt; refusing to repeat the PATCH"
+      fi
+      if ! READBACK_RESULT="$(printf '%s' "$READBACK" | EXPECTED_ID="$ID" EXPECTED_SID="$SID" python3 -c 'import sys,json,os
+try:
+    d=json.load(sys.stdin)
+except (TypeError, ValueError) as exc:
+    raise SystemExit(f"plane: transition read-back was not valid JSON: {exc}")
+if not isinstance(d,dict) or str(d.get("id") or "") != os.environ["EXPECTED_ID"]:
+    raise SystemExit("plane: transition read-back did not identify the requested issue")
+state=d.get("state", "")
 actual=str(state.get("id") or "") if isinstance(state,dict) else str(state or "")
-if actual != os.environ["EXPECTED_SID"]:
-    raise SystemExit(1)
-print(str(d.get("sequence_id") or ""))')" && break
-      [ "$attempt" -lt "$MAX_ATTEMPTS" ] \
-        || die "plane: transition read-back state never matched intended state id $SID after $attempt PATCH attempt(s); refusing to claim the transition completed"
+if not actual:
+    raise SystemExit("plane: transition read-back omitted its state id")
+if actual == os.environ["EXPECTED_SID"]:
+    sequence=str(d.get("sequence_id") or "")
+    if not sequence:
+        raise SystemExit("plane: transition read-back omitted its sequence id")
+    print("match\t"+sequence)
+else:
+    print("mismatch\t"+actual)')"; then
+        die "transition read-back could not be verified after PATCH attempt $attempt; refusing to repeat the PATCH"
+      fi
+      case "$READBACK_RESULT" in
+        match*) SEQUENCE="${READBACK_RESULT#*	}"; break ;;
+        mismatch*) : ;;
+        *) die "transition read-back returned an invalid verification outcome; refusing to repeat the PATCH" ;;
+      esac
+      [ "$attempt" -lt "$MUTATION_MAX_ATTEMPTS" ] \
+        || die "transition read-back state never matched intended state id $SID after $attempt PATCH attempt(s); refusing to claim the transition completed"
     done
     printf 'ok %s\n' "$SEQUENCE"
     ;;
