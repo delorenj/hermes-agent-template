@@ -29,11 +29,11 @@ Every adapter must implement these operations.
 | Operation | Arguments | Output |
 | --- | --- | --- |
 | `resolve` | none | JSON `{provider, board_id, board_url}`. Validates credentials and board binding. |
-| `active_milestone` | none | JSON `{id, name, state}` for the current milestone, cycle, or board. |
-| `list_issues` | none | JSON array of `{id, key, title, state, state_type, updated_at, assignee, url}`. |
-| `get_issue` | `<id>` | JSON `{id, key, title, description, acceptance, state, state_type, comments, attachments}`. |
-| `comment` | `<id> <body>` | Prints the new comment id. |
-| `transition` | `<id> <normalized-state>` | Moves the issue to a normalized state. |
+| `active_milestone` | none | JSON `{id, name, state}` for the date-current milestone, cycle, or board; Plane evaluates calendar dates in `ticket_provider.timezone` and returns empty ids with `state: inactive` when none is current. |
+| `list_issues` | none | JSON array of `{id, key, title, state, state_type, updated_at, assignee, url, ...}`. Plane also includes `active_milestone_id`, `active_milestone_name`, and `in_active_milestone` on every project-wide row. |
+| `get_issue` | `<issue-ref>` | JSON `{id, key, title, description, acceptance, state, state_type, comments, attachments}`. |
+| `comment` | `<issue-ref> <body>` | Resolves an id or human key, then prints the new comment id. |
+| `transition` | `<issue-ref> <normalized-state>` | Resolves an id or human key, then moves the issue to a normalized state. |
 | `create_board` | `<name> <ident> <desc>` | JSON `{board_id, board_url}`. Creates or reuses the board. |
 | `describe_board` | `<workspace> <board_id>` | JSON `{board_id, identifier, workspace, name}`. Read-only lookup against an explicit workspace. `identifier` is whatever the provider itself reports — empty when the provider mints none (Trello) — and is never a locally-computed guess. |
 | `create_issue` | `[--if-absent] <title> [description]` | JSON `{issue_id, key, issue_url, created}`. Files a new ticket on the bound board. |
@@ -42,6 +42,26 @@ The `transition` operation accepts only the normalized states from
 [Architecture: normalized states](architecture.md#normalized-states):
 `backlog`, `unstarted`, `started`, `in_review`, `completed`, and `cancelled`. The adapter
 maps each to its back end's concrete state.
+
+The dispatcher resolves human issue keys to provider-native ids through the
+normalized `list_issues` contract before `get_issue`, `comment`, or `transition`.
+An absent or ambiguous reference fails before a write reaches the provider.
+Plane transitions resolve the exact configured state name and group, PATCH it,
+then read the issue back; only an exact state-id match produces `ok`.
+Plane cycle boundaries are project-calendar dates, not UTC dates. Configure an
+IANA name in `ticket_provider.timezone`; an empty value falls back to
+`TICKET_PROVIDER_TIMEZONE`, then `TZ`, then the host's local timezone. The
+adapter contains no customer-specific timezone literal.
+
+Plane list endpoints are followed through every page (`next_page_results` /
+`next_cursor`); a board answer never silently stops at page one. Reads are
+idempotent and retry HTTP 429 a bounded number of times
+(`PLANE_READ_MAX_ATTEMPTS`, default 4), sleeping the server's `Retry-After`
+capped by `PLANE_429_MAX_DELAY` (default 30s). Mutations are never retried at
+the transport layer: `transition` reads the live issue back after every PATCH
+and only repeats the PATCH when the read-back proves the previous one did not
+land (`PLANE_MUTATION_MAX_ATTEMPTS`, default 3). A transition whose read-back
+never confirms the intended state fails explicitly and never claims completion.
 
 The `create_issue` operation is the write counterpart to `list_issues`: it lets
 an orchestrator file a ticket for a gap it discovered instead of only reading
@@ -72,7 +92,9 @@ The repository includes three adapters with different verification status.
   so the adapter joins each issue against the project's states map; descriptions
   come from `description_html`. `get_issue` also hydrates attachment metadata
   from Plane's issue-attachments endpoint so triage can inspect attachments
-  before scoping work.
+  before scoping work. `list_issues` remains project-wide and annotates exact
+  membership in the date-current cycle; callers must not present the whole
+  project list as the visible current-cycle board.
 - **Trello** (`providers/trello.sh`) uses the Trello REST API with `key` and
   `token` query-parameter authentication. A board maps to both the project and
   the milestone, a list maps to the state, and a card maps to the issue. It's

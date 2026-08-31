@@ -7,8 +7,16 @@
 # Board binding (repo-root .project.json `ticket_provider:`):
 #   workspace: <workspace-slug>      (or env PLANE_WORKSPACE)
 #   board_id:  <project-uuid>        (set by create_board / 42-ticket-provider)
-#   state_map: { in_review: "In Review", completed: "Done",
-#                cancelled: "Cancelled" }   optional
+#   timezone:  <IANA timezone>       optional project calendar override
+#   state_map: { started: "In Progress", in_review: "In Review",
+#                completed: "Done", cancelled: "Cancelled" }   optional
+#
+# Rate limiting: reads retry HTTP 429 up to PLANE_READ_MAX_ATTEMPTS (default 4)
+# times, sleeping the server's Retry-After capped at PLANE_429_MAX_DELAY
+# (default 30s). Mutations are never retried in the transport layer; transition
+# re-checks the live issue before repeating a PATCH, at most
+# PLANE_MUTATION_MAX_ATTEMPTS (default 3) times, PLANE_MUTATION_RETRY_DELAY
+# (default 2s) apart.
 #
 # Plane model:  project = board, cycle = milestone, state.group in
 #   backlog|unstarted|started|completed|cancelled.
@@ -110,6 +118,11 @@ PROJ="$(pj_cfg board_id)"; [ -n "$PROJ" ] || PROJ="$(tp_cfg project)"; [ -n "$PR
 SM_IN_REVIEW="$(tp_cfg in_review)"; SM_IN_REVIEW="${SM_IN_REVIEW:-In Review}"
 SM_DONE="$(tp_cfg completed)"; SM_DONE="${SM_DONE:-Done}"
 SM_CANCELLED="$(tp_cfg cancelled)"; SM_CANCELLED="${SM_CANCELLED:-Cancelled}"
+SM_STARTED="$(tp_cfg started)"
+SM_UNSTARTED="$(tp_cfg unstarted)"
+SM_BACKLOG="$(tp_cfg backlog)"
+CALENDAR_TZ="$(pj_cfg timezone)"; [ -n "$CALENDAR_TZ" ] || CALENDAR_TZ="$(tp_cfg timezone)"
+CALENDAR_TZ="${CALENDAR_TZ:-${TICKET_PROVIDER_TIMEZONE:-${TZ:-}}}"
 API="$BASE/api/v1/workspaces/$WS"
 
 if [ -z "${PLANE_API_KEY:-}" ]; then
@@ -123,22 +136,155 @@ PLANE_API_KEY="$(resolve_secret_value "${PLANE_API_KEY:-}")"
 export PLANE_API_KEY
 
 # api METHOD PATH [JSON_BODY] — call Plane REST, print response body.
+# Reads (GET) are idempotent: on HTTP 429 they retry a bounded number of times,
+# sleeping the server's Retry-After (capped, default when absent). Mutations
+# are never retried here — a caller must check whether a failed mutation landed
+# before repeating it. Any non-2xx outcome dies with the explicit status.
 api() {
   need_key
   method="$1"; path="$2"; body="${3:-}"
-  if [ -n "$body" ]; then
-    curl -fsS -X "$method" "$API/$path" \
-      -H "X-API-Key: $PLANE_API_KEY" -H "Content-Type: application/json" \
-      -H "User-Agent: curl/8.0" \
-      -d "$body"
-  else
-    curl -fsS -X "$method" "$API/$path" \
-      -H "X-API-Key: $PLANE_API_KEY" \
-      -H "User-Agent: curl/8.0"
-  fi
+  max_attempts=1
+  case "$method" in GET) max_attempts="${PLANE_READ_MAX_ATTEMPTS:-4}" ;; esac
+  attempt=0
+  while :; do
+    attempt=$((attempt + 1))
+    response_file="$(mktemp "${TMPDIR:-/tmp}/plane-api.XXXXXX")" || die "could not create response scratch file"
+    headers_file="$(mktemp "${TMPDIR:-/tmp}/plane-api-headers.XXXXXX")" || { rm -f "$response_file"; die "could not create response scratch file"; }
+    if [ -n "$body" ]; then
+      captured="$(curl -sS -o "$response_file" -D "$headers_file" -w '%{http_code}' -X "$method" "$API/$path" \
+        -H "X-API-Key: $PLANE_API_KEY" -H "Content-Type: application/json" \
+        -H "User-Agent: curl/8.0" \
+        -d "$body")" || true
+    else
+      captured="$(curl -sS -o "$response_file" -D "$headers_file" -w '%{http_code}' -X "$method" "$API/$path" \
+        -H "X-API-Key: $PLANE_API_KEY" \
+        -H "User-Agent: curl/8.0")" || true
+    fi
+    case "$captured" in
+      [0-9][0-9][0-9])
+        status="$captured"
+        output="$(cat "$response_file")"
+        ;;
+      *)
+        if [ -s "$response_file" ] || [ -n "$captured" ]; then
+          # Legacy test doubles ignore -o/-w and print the body on stdout.
+          status=200
+          output="$captured"
+          [ -s "$response_file" ] && output="$(cat "$response_file")"
+        else
+          status=000
+          output=""
+        fi
+        ;;
+    esac
+    if [ "$status" = 429 ] && [ "$attempt" -lt "$max_attempts" ]; then
+      delay="$(python3 - "$headers_file" <<'PY'
+import sys
+
+delay = ""
+with open(sys.argv[1], encoding="utf-8", errors="replace") as stream:
+    for line in stream:
+        name, _, value = line.partition(":")
+        if name.strip().lower() == "retry-after":
+            delay = value.strip()
+print(delay)
+PY
+)"
+      case "$delay" in ''|*[!0-9]*) delay="${PLANE_429_RETRY_DELAY:-1}" ;; esac
+      max_delay="${PLANE_429_MAX_DELAY:-30}"
+      [ "$delay" -le "$max_delay" ] 2>/dev/null || delay="$max_delay"
+      rm -f "$response_file" "$headers_file"
+      sleep "$delay"
+      continue
+    fi
+    case "$status" in
+      2*)
+        printf '%s' "$output"
+        rm -f "$response_file" "$headers_file"
+        return 0
+        ;;
+    esac
+    detail="$(printf '%s' "$output" | head -c 300 | tr '\n' ' ')"
+    rm -f "$response_file" "$headers_file"
+    die "$method $path failed (HTTP $status)${detail:+: $detail}"
+  done
 }
 
-# Map a normalized state -> a concrete Plane state id in this project.
+# api_all PATH — GET every page of a Plane list endpoint and print one merged
+# JSON array. Plane v1 paginates with a next_cursor query token and a
+# next_page_results flag; bare-list and single-page responses pass through.
+api_all() {
+  path="$1"
+  pages_file="$(mktemp "${TMPDIR:-/tmp}/plane-pages.XXXXXX")" || die "could not create pagination scratch file"
+  cursor=""
+  while :; do
+    case "$path" in *\?*) sep="&" ;; *) sep="?" ;; esac
+    if [ -n "$cursor" ]; then page_path="$path${sep}cursor=$cursor"; else page_path="$path"; fi
+    page="$(api GET "$page_path")" || { rm -f "$pages_file"; return 1; }
+    printf '%s\0' "$page" >> "$pages_file"
+    next="$(printf '%s' "$page" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+if isinstance(d,dict) and d.get("next_page_results"):
+    print(str(d.get("next_cursor") or ""))')"
+    [ -n "$next" ] || break
+    if [ "$next" = "$cursor" ]; then
+      rm -f "$pages_file"
+      die "plane: pagination cursor for $path did not advance"
+    fi
+    cursor="$next"
+  done
+  python3 - "$pages_file" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = []
+for chunk in pathlib.Path(sys.argv[1]).read_bytes().split(b"\0"):
+    if not chunk:
+        continue
+    d = json.loads(chunk)
+    if isinstance(d, list):
+        rows.extend(d)
+    elif isinstance(d, dict):
+        rows.extend(d.get("results") or [])
+print(json.dumps(rows))
+PY
+  rm -f "$pages_file"
+}
+
+# Select the one date-current cycle. An empty result is explicit and must never
+# fall back to the first historical cycle returned by Plane.
+current_cycle() {
+  CALENDAR_TZ="$CALENDAR_TZ" TICKET_PROVIDER_NOW="${TICKET_PROVIDER_NOW:-}" python3 -c 'import sys,json,datetime,os
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
+tz_name=os.environ.get("CALENDAR_TZ", "").strip()
+try:
+    calendar_tz=ZoneInfo(tz_name) if tz_name else (datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc)
+except (ZoneInfoNotFoundError, ValueError):
+    raise SystemExit(f"plane: invalid project timezone {tz_name!r}")
+clock=os.environ.get("TICKET_PROVIDER_NOW", "").strip()
+if clock:
+    try: now=datetime.datetime.fromisoformat(clock.replace("Z", "+00:00"))
+    except ValueError: raise SystemExit(f"plane: invalid TICKET_PROVIDER_NOW {clock!r}")
+    if now.tzinfo is None: raise SystemExit("plane: TICKET_PROVIDER_NOW must include a UTC offset")
+else:
+    now=datetime.datetime.now(datetime.timezone.utc)
+today=now.astimezone(calendar_tz).date()
+def boundary(value):
+    try: return datetime.date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError): return None
+def current(c):
+    start,end=boundary(c.get("start_date")),boundary(c.get("end_date"))
+    return bool(start and end and start <= today <= end)
+active=sorted((c for c in rows if current(c)), key=lambda c:(str(c.get("start_date") or ""),str(c.get("id") or "")), reverse=True)
+m=active[0] if active else {}
+print(json.dumps({"id":m.get("id", ""),"name":m.get("name", ""),"state":"active" if m else "inactive"}))'
+}
+
+# Map a normalized state -> exactly one concrete Plane state id. A configured
+# name must exist in the expected group; it never falls back to another state in
+# the same group. An unnamed group is safe only when the group has one member.
 resolve_state_id() {
   want="$1"
   [ -n "$PROJ" ] || die "ticket_provider.project not set"
@@ -146,18 +292,28 @@ resolve_state_id() {
     completed) grp=completed; nm="$SM_DONE" ;;
     cancelled) grp=cancelled; nm="$SM_CANCELLED" ;;
     in_review) grp=started;   nm="$SM_IN_REVIEW" ;;
-    started)   grp=started;   nm="" ;;
-    unstarted) grp=unstarted; nm="" ;;
-    backlog)   grp=backlog;   nm="" ;;
+    started)   grp=started;   nm="$SM_STARTED" ;;
+    unstarted) grp=unstarted; nm="$SM_UNSTARTED" ;;
+    backlog)   grp=backlog;   nm="$SM_BACKLOG" ;;
     *) die "invalid normalized state: $want" ;;
   esac
-  api GET "projects/$PROJ/states/" | GRP="$grp" NM="$nm" python3 -c 'import sys,json,os
+  api_all "projects/$PROJ/states/" | GRP="$grp" NM="$nm" WANT="$want" python3 -c 'import sys,json,os
 d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
-grp=os.environ["GRP"]; nm=os.environ.get("NM","")
-named=[s for s in rows if nm and (s.get("name","").lower()==nm.lower())]
+grp=os.environ["GRP"]; nm=os.environ.get("NM","").strip(); want=os.environ["WANT"]
 grouped=[s for s in rows if s.get("group")==grp]
-pick=(named or grouped or [{}])[0]
-print(pick.get("id",""))'
+if nm:
+    candidates=[s for s in grouped if str(s.get("name","")).strip().casefold()==nm.casefold()]
+    if len(candidates) != 1:
+        raise SystemExit(f"plane: exact Plane state {nm!r} for normalized {want!r} was not resolved uniquely in group {grp!r}")
+else:
+    candidates=grouped
+    if len(candidates) != 1:
+        names=", ".join(str(s.get("name") or "") for s in candidates) or "none"
+        raise SystemExit(f"plane: normalized state {want!r} is ambiguous in group {grp!r} ({names}); configure ticket_provider.{want}")
+state_id=str(candidates[0].get("id") or "")
+if not state_id:
+    raise SystemExit(f"plane: resolved Plane state for normalized {want!r} has no id")
+print(state_id)'
 }
 
 # All Plane ops except the explicit-workspace read below require the bound
@@ -179,27 +335,29 @@ except Exception: print("")')"
 
   active_milestone)
     [ -n "$PROJ" ] || die "project not set"
-    api GET "projects/$PROJ/cycles/" | python3 -c 'import sys,json,datetime
-d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
-now=datetime.datetime.now(datetime.timezone.utc)
-def cur(c):
-    s,e=c.get("start_date"),c.get("end_date")
-    return bool(s and e and s<=now.date().isoformat()<=e)
-active=[c for c in rows if cur(c)] or rows
-m=active[0] if active else {}
-print(json.dumps({"id":m.get("id",""),"name":m.get("name",""),"state":"active" if active else ""}))'
+    api_all "projects/$PROJ/cycles/" | current_cycle
     ;;
 
   list_issues)
     [ -n "$PROJ" ] || die "project not set"
     # Plane v1 returns issue.state as a bare UUID, so join against the states map.
-    STATES="$(api GET "projects/$PROJ/states/")"
-    ISSUES="$(api GET "projects/$PROJ/issues/")"
-    printf '%s\n%s\n' "$STATES" "$ISSUES" | BASE="$BASE" WS="$WS" PROJ="$PROJ" python3 -c 'import sys,json,os
-parts=sys.stdin.read().split("\n",1)
+    STATES="$(api_all "projects/$PROJ/states/")"
+    ISSUES="$(api_all "projects/$PROJ/issues/")"
+    MILESTONE="$(api_all "projects/$PROJ/cycles/" | current_cycle)"
+    MILESTONE_ID="$(printf '%s' "$MILESTONE" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("id", ""))')"
+    MILESTONE_ISSUES='[]'
+    if [ -n "$MILESTONE_ID" ]; then
+      MILESTONE_ISSUES="$(api_all "projects/$PROJ/cycles/$MILESTONE_ID/cycle-issues/")"
+    fi
+    printf '%s\0%s\0%s\0%s' "$STATES" "$ISSUES" "$MILESTONE" "$MILESTONE_ISSUES" \
+      | BASE="$BASE" WS="$WS" PROJ="$PROJ" python3 -c 'import sys,json,os
+parts=sys.stdin.buffer.read().split(b"\0",3)
 srows=json.loads(parts[0] or "{}"); srows=srows if isinstance(srows,list) else srows.get("results", []) if isinstance(srows,dict) else []
 smap={s.get("id"):(s.get("name",""),s.get("group","")) for s in srows}
 d=json.loads(parts[1] or "{}"); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
+milestone=json.loads(parts[2] or "{}"); milestone_id=str(milestone.get("id") or ""); milestone_name=str(milestone.get("name") or "")
+md=json.loads(parts[3] or "{}"); mrows=md if isinstance(md,list) else md.get("results", []) if isinstance(md,dict) else []
+member_ids={str(issue.get("id") or "") for issue in mrows}
 base,ws,proj=os.environ["BASE"],os.environ["WS"],os.environ["PROJ"]
 out=[]
 for n in rows:
@@ -208,16 +366,19 @@ for n in rows:
     out.append({"id":iid,"key":n.get("sequence_id",iid),
                 "title":n.get("name",""),"state":name,"state_type":group,
                 "updated_at":n.get("updated_at",""),"assignee":"",
+                "active_milestone_id":milestone_id,
+                "active_milestone_name":milestone_name,
+                "in_active_milestone":bool(milestone_id and str(iid) in member_ids),
                 "url":base+"/"+ws+"/projects/"+proj+"/issues/"+str(iid)})
 print(json.dumps(out))'
     ;;
 
   get_issue)
     ID="${1:?usage: get_issue <id>}"
-    STATES="$(api GET "projects/$PROJ/states/")"
+    STATES="$(api_all "projects/$PROJ/states/")"
     ISSUE="$(api GET "projects/$PROJ/issues/$ID/")"
-    COMM="$(api GET "projects/$PROJ/issues/$ID/comments/" 2>/dev/null || echo '[]')"
-    ATTACH="$(api GET "projects/$PROJ/issues/$ID/issue-attachments/" 2>/dev/null || echo '[]')"
+    COMM="$(api_all "projects/$PROJ/issues/$ID/comments/" 2>/dev/null || echo '[]')"
+    ATTACH="$(api_all "projects/$PROJ/issues/$ID/issue-attachments/" 2>/dev/null || echo '[]')"
     printf '%s\n%s\n%s\n%s\n' "$STATES" "$ISSUE" "$COMM" "$ATTACH" | python3 -c 'import sys,json,re
 parts=sys.stdin.read().split("\n",3)
 srows=json.loads(parts[0] or "{}"); srows=srows if isinstance(srows,list) else srows.get("results", []) if isinstance(srows,dict) else []
@@ -253,9 +414,30 @@ print(json.dumps({"id":i.get("id",""),"key":i.get("sequence_id",""),"title":i.ge
   transition)
     ID="${1:?usage: transition <id> <normalized-state>}"; TARGET="${2:?}"
     SID="$(resolve_state_id "$TARGET")"
-    [ -n "$SID" ] || die "no Plane state for normalized '$TARGET'"
-    api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" \
-      | python3 -c 'import sys,json; d=json.load(sys.stdin); print("ok "+str(d.get("sequence_id","")) )'
+    # A PATCH is never repeated blindly: every attempt is followed by a live
+    # read-back, and a PATCH that failed at the transport layer but landed on
+    # the server is confirmed by that read-back instead of being re-sent. Only
+    # an exact read-back of the intended state id produces `ok`; anything else
+    # fails explicitly after a bounded number of attempts.
+    MAX_ATTEMPTS="${PLANE_MUTATION_MAX_ATTEMPTS:-3}"
+    RETRY_DELAY="${PLANE_MUTATION_RETRY_DELAY:-2}"
+    attempt=0
+    SEQUENCE=""
+    while :; do
+      [ "$attempt" -eq 0 ] || sleep "$RETRY_DELAY"
+      attempt=$((attempt + 1))
+      # Subshell: a transport-level die inside api must not kill the retry loop.
+      ( api PATCH "projects/$PROJ/issues/$ID/" "$(printf '{"state":"%s"}' "$SID")" ) >/dev/null || true
+      SEQUENCE="$(api GET "projects/$PROJ/issues/$ID/" | EXPECTED_SID="$SID" python3 -c 'import sys,json,os
+d=json.load(sys.stdin); state=d.get("state", "")
+actual=str(state.get("id") or "") if isinstance(state,dict) else str(state or "")
+if actual != os.environ["EXPECTED_SID"]:
+    raise SystemExit(1)
+print(str(d.get("sequence_id") or ""))')" && break
+      [ "$attempt" -lt "$MAX_ATTEMPTS" ] \
+        || die "plane: transition read-back state never matched intended state id $SID after $attempt PATCH attempt(s); refusing to claim the transition completed"
+    done
+    printf 'ok %s\n' "$SEQUENCE"
     ;;
 
   describe_board)
@@ -291,7 +473,7 @@ print(json.dumps({
   create_board)
     NAME="${1:?usage: create_board <name> <ident> <desc>}"; IDENT="${2:-}"; DESC="${3:-}"
     [ -n "$WS" ] || die "workspace not set"
-    EXIST="$(api GET "projects/?per_page=200" | NAME="$NAME" IDENT="$IDENT" python3 -c 'import sys,json,os
+    EXIST="$(api_all "projects/?per_page=200" | NAME="$NAME" IDENT="$IDENT" python3 -c 'import sys,json,os
 d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
 name=os.environ["NAME"].strip().lower(); ident=os.environ["IDENT"].upper()
 # Repo NAME is the primary key — links an existing repo board even if its
@@ -332,7 +514,7 @@ except Exception: print("")')"
     [ -n "$PROJ" ] || die "project not set (.project.json ticket_provider.board_id; run 42-ticket-provider.sh)"
     IID=""; SEQ=""; CREATED=true
     if [ "$IF_ABSENT" = 1 ]; then
-      HIT="$(api GET "projects/$PROJ/issues/?per_page=200" | TITLE="$TITLE" python3 -c 'import sys,json,os
+      HIT="$(api_all "projects/$PROJ/issues/?per_page=200" | TITLE="$TITLE" python3 -c 'import sys,json,os
 d=json.load(sys.stdin); rows=d if isinstance(d,list) else d.get("results", []) if isinstance(d,dict) else []
 want=os.environ["TITLE"].strip().lower()
 m=next((i for i in rows if (i.get("name") or "").strip().lower()==want), None)

@@ -90,8 +90,10 @@ concrete states, groups, or lists of its back end.
 
 The mapping is configurable per project in `role.yaml` under
 `ticket_provider`, so non-standard boards still work. For example, you can set
-`in_review: "In Review"`, `completed: "Done"`, and `cancelled: "Cancelled"`
-to match your board's column names.
+`started: "In Progress"`, `in_review: "Ready for QA"`, `completed: "Done"`,
+and `cancelled: "Cancelled"` to match your board's column names. A configured
+name must resolve exactly in the expected provider group; the adapter never
+silently substitutes another lane from that group.
 
 ## Autonomous adversarial review (act, do not wait)
 

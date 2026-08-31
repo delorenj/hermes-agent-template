@@ -11,11 +11,14 @@
 #
 # Implements the contract in lib/ticket-provider.sh. All Linear access goes
 # through GraphQL so the same envelope works in unattended runs.
+# GraphQL variable references are intentionally single-quoted shell literals.
+# shellcheck disable=SC2016
 set -eu
 
 OP="${1:-}"; shift 2>/dev/null || true
 ROLE_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 ROLE_YAML="$ROLE_DIR/role.yaml"
+GRAPHQL_URL="${LINEAR_GRAPHQL_URL:-https://api.linear.app/graphql}"
 
 die() { echo "linear: $*" >&2; exit 1; }
 need_key() { [ -n "${LINEAR_API_KEY:-}" ] || die "LINEAR_API_KEY is not set"; }
@@ -55,11 +58,11 @@ PY
 gql() {
   need_key
   _vars="${2:-}"; [ -n "$_vars" ] || _vars='{}'
-  python3 - "$1" "$_vars" <<'PY'
+  python3 - "$1" "$_vars" "$GRAPHQL_URL" <<'PY'
 import json, os, sys, urllib.request, urllib.error
 q, variables = sys.argv[1], json.loads(sys.argv[2])
 req = urllib.request.Request(
-    "https://api.linear.app/graphql",
+    sys.argv[3],
     data=json.dumps({"query": q, "variables": variables}).encode(),
     headers={"Authorization": os.environ["LINEAR_API_KEY"],
              "Content-Type": "application/json"},
@@ -107,17 +110,39 @@ print(json.dumps({"id":m.get("id",""),"name":m.get("name",""),"state":p.get("sta
 
   list_issues)
     [ -n "$TEAM" ] || die "ticket_provider.team not set"
-    gql 'query($k:String!){ issues(first:100, filter:{team:{key:{eq:$k}}}){nodes{ id identifier title updatedAt url state{name type} assignee{name} }} }' \
-        "$(printf '{"k":"%s"}' "$TEAM")" \
-      | python3 -c 'import sys,json
-d=json.load(sys.stdin); out=[]
-for n in d.get("issues",{}).get("nodes") or []:
+    ISSUE_PAGE_ROWS="$(mktemp "${TMPDIR:-/tmp}/linear-issues.XXXXXX")" || die "could not create pagination scratch file"
+    cleanup_issue_pages() { rm -f "$ISSUE_PAGE_ROWS"; }
+    trap cleanup_issue_pages EXIT HUP INT TERM
+    AFTER=""
+    while :; do
+      VARS="$(python3 -c 'import json,sys; print(json.dumps({"k":sys.argv[1],"after":sys.argv[2] or None}))' "$TEAM" "$AFTER")"
+      PAGE="$(gql 'query($k:String!,$after:String){ issues(first:100, after:$after, filter:{team:{key:{eq:$k}}}){nodes{ id identifier title updatedAt url state{name type} assignee{name} } pageInfo{hasNextPage endCursor}} }' "$VARS")"
+      printf '%s' "$PAGE" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+for n in (d.get("issues") or {}).get("nodes") or []:
     st=n.get("state") or {}
-    out.append({"id":n["id"],"key":n.get("identifier",""),"title":n.get("title",""),
-                "state":st.get("name",""),"state_type":st.get("type",""),
-                "updated_at":n.get("updatedAt",""),
-                "assignee":(n.get("assignee") or {}).get("name",""),"url":n.get("url","")})
-print(json.dumps(out))'
+    print(json.dumps({"id":n["id"],"key":n.get("identifier",""),"title":n.get("title",""),
+                      "state":st.get("name",""),"state_type":st.get("type",""),
+                      "updated_at":n.get("updatedAt",""),
+                      "assignee":(n.get("assignee") or {}).get("name",""),"url":n.get("url","")}))' \
+        >> "$ISSUE_PAGE_ROWS"
+      HAS_NEXT="$(printf '%s' "$PAGE" | python3 -c 'import sys,json; print("true" if ((json.load(sys.stdin).get("issues") or {}).get("pageInfo") or {}).get("hasNextPage") else "false")')"
+      [ "$HAS_NEXT" = "true" ] || break
+      NEXT="$(printf '%s' "$PAGE" | python3 -c 'import sys,json; print(str(((json.load(sys.stdin).get("issues") or {}).get("pageInfo") or {}).get("endCursor") or ""))')"
+      [ -n "$NEXT" ] || die "Linear pagination reported another page without an end cursor"
+      [ "$NEXT" != "$AFTER" ] || die "Linear pagination cursor did not advance"
+      AFTER="$NEXT"
+    done
+    python3 - "$ISSUE_PAGE_ROWS" <<'PY'
+import json
+import pathlib
+import sys
+
+rows = [json.loads(line) for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line]
+print(json.dumps(rows))
+PY
+    cleanup_issue_pages
+    trap - EXIT HUP INT TERM
     ;;
 
   get_issue)

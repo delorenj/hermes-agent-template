@@ -55,7 +55,11 @@ ticket_provider:
 {%- elif ticket_provider == 'trello' %}
   board: ""       # Trello board id (set by 42-ticket-provider.sh)
 {%- endif %}
+  timezone: ""    # IANA project calendar; empty = TICKET_PROVIDER_TIMEZONE, TZ, then host-local
   # Optional normalized-state name overrides for non-standard boards.
+  backlog: ""     # e.g. "Backlog"
+  unstarted: ""   # e.g. "Todo"
+  started: ""     # e.g. "In Progress"
   in_review: ""   # e.g. "In Review"
   completed: ""   # e.g. "Done"
   cancelled: ""   # e.g. "Cancelled"
