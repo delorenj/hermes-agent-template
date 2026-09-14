@@ -96,18 +96,18 @@ if [[ "$ROLE" == "reporter" ]]; then
   # config: it may carry dashboard credentials, write-capable MCPs, or broad tools.
   MODEL_PROVIDER="$(yaml_get model.provider)"
   MODEL_NAME="$(yaml_get model.name)"
-  CANONICAL_SKILLS_DIR="${CANONICAL_SKILLS_DIR:-$(config_get fleet.canonical_skills_dir "$HOME/.agents/skills")}"
   if [[ ! -e "$RUNTIME_LOCAL/config.yaml" ]]; then
     python3 - "$RUNTIME_LOCAL/config.yaml" "$PROJECT_PATH" "${HERMES_TIMEZONE:-America/New_York}" \
-      "$MODEL_PROVIDER" "$MODEL_NAME" "$CANONICAL_SKILLS_DIR" "$ROLE" <<'PYEOF'
+      "$MODEL_PROVIDER" "$MODEL_NAME" "$ROLE" <<'PYEOF'
 import json, pathlib, re, sys
-path, cwd, timezone, provider, model, skills, role = sys.argv[1:8]
+path, cwd, timezone, provider, model, role = sys.argv[1:7]
 if not re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z_]+)*", timezone):
     raise SystemExit("unsafe timezone")
 config = {
     "timezone": timezone,
     "terminal": {"cwd": cwd},
-    "skills": {"external_dirs": [skills]},
+    # The named profile owns its real skills overlay, reconciled in step 10.
+    "skills": {"external_dirs": []},
 }
 if provider or model:
     config["model"] = {}

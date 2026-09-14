@@ -72,7 +72,6 @@ you to review it. Keys:
 | `fleet` | `fleet_env`, `registry_file` | Fleet source-of-truth + registry locations |
 | `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
-| `fleet` | `canonical_skills_dir`, `symlinked_runtime_skills` | Skills mirrored into each profile |
 | `plane` | `base`, `workspace` | Plane URL + workspace slug |
 
 The example configuration retains an inert `[github].runtime_repo_owner` value
@@ -83,6 +82,39 @@ Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.e
 → `config.toml` → built-in fallback**. So you can still override any single value
 per-run with an env var or `--data`, and existing setups keep working even without
 the config file present.
+
+## Profile skills
+
+Provisioning requires mise, Node.js 24+, a configured canonical Skillex registry,
+and the owning project's `.agents/skills.json`. Step 10 explicitly runs the
+pinned `npm:@delorenj/skillex@0.1.1` CLI:
+
+```bash
+mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project
+```
+
+The script supplies the selected profile, Hermes root, and owning project path.
+It never infers the project from the invocation directory. It reconciles the
+union of global and project selections: a project exclusion affects the project
+contribution, while an independently selected global skill remains available.
+Select the required PM skills in those manifests instead of configuring the
+retired `canonical_skills_dir` or `symlinked_runtime_skills` template settings.
+
+The profile and its `skills/` directory stay real. Profile-local skills, files,
+and foreign links win; Skillex only updates/prunes children recorded in its XDG
+profile receipt. It does not replace the root or copy a nested PM fallback.
+Legacy whole-directory skills links require explicit `skillex migrate` first.
+Runtime/channel/config provisioning remains owned by the other existing steps.
+
+The template repository's own `mise run skills:sync` task uses the same pinned
+release with `--scope project --project '{{config_root}}'`. No skills enter hook,
+manifest watcher, or copied Python skill engine remains.
+
+Acceptance tests install the npm release under canonical `/tmp` paths. Run
+`PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_skillex_profile.py`.
+Before publication, supply `SKILLEX_TEST_TARBALL=/absolute/path/delorenj-skillex-0.1.1.tgz`
+to verify a prebuilt release candidate without a source dependency or rebuild.
+The fixture executes the real CLI with Python and uv absent from PATH.
 
 ## What gets created where
 

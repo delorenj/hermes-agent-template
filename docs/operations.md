@@ -64,7 +64,6 @@ hermes_git_ref = "main"
 hermes_git_sha = "0408fec7a153e6c32c064acd2b8053917f1525f1"
 oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
-canonical_skills_dir = "/path/to/.agents/skills"
 vox_plugin_name = "vox"
 vox_plugin_dir = "~/code/voxxy/plugins/tts/vox"
 vox_voice = "carlin"
@@ -80,6 +79,24 @@ workspace = "your-workspace"
 `role.yaml` stores compatibility metadata for older generated roles, but the
 current local-runtime provisioner does not use it for storage. Plane workspace
 defaults are still filled from `config.toml`.
+
+## Reconcile profile skills
+
+Declare selections in the global and owning project's `.agents/skills.json`,
+then explicitly run the pinned Node CLI (Node.js 24+):
+
+```bash
+mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project --dry-run
+mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project
+```
+
+An explicit project is required. The profile receives the global/project union;
+profile-local content wins and only receipt-owned children may be pruned. Preview
+writes nothing. Receipt state is under `$XDG_STATE_HOME/skillex/profiles/v2`
+(default `~/.local/state/skillex/profiles/v2`), outside project Git state. A legacy
+whole `skills/` symlink is refused with migration guidance; do not delete it to
+make provisioning pass. The old template `canonical_skills_dir` and
+`symlinked_runtime_skills` settings no longer drive skill writes.
 
 ## Fleet source-of-truth
 
