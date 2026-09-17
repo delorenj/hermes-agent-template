@@ -121,9 +121,9 @@ repo_root() {
 }
 REPO_ROOT="$(repo_root)"
 cd "$REPO_ROOT"
-EXECUTION_MODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("execution",{}).get("mode","legacy"))' "$REPO_ROOT/.project.json" 2>/dev/null || printf 'legacy')"
+EXECUTION_MODE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("execution",{}).get("mode","legacy"))' "$REPO_ROOT/.project.json")"
 if [[ "$EXECUTION_MODE" == managed || "$EXECUTION_MODE" == shadow ]]; then
-  exec python3 "$ROLE_DIR/.scripts/managed-execution.py" "$REPO_ROOT"
+  KREBS_PLANNER_ENABLED="$(reconcile_enabled)" exec python3 "$ROLE_DIR/.scripts/managed-execution.py" "$REPO_ROOT"
 fi
 
 mkdir -p "$RUNTIME/logs"
