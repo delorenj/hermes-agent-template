@@ -609,7 +609,7 @@ def test_close_gate_fails_when_installed_role_repo_disagrees_with_manifest(
     assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
 
 
-def test_close_gate_manifest_never_falls_back_when_slug_is_invalid(
+def test_close_gate_manifest_never_falls_back_when_project_identity_is_missing(
     tmp_path: Path,
 ) -> None:
     _, _, _ = stage_role(tmp_path)
@@ -638,7 +638,7 @@ def test_close_gate_manifest_never_falls_back_when_slug_is_invalid(
     )
 
     assert result.returncode == 1
-    assert "has no non-blank project_slug" in result.stderr
+    assert "has no non-blank project_id" in result.stderr
     assert "CLOSE GATE: PASS" not in result.stdout + result.stderr
 
 
