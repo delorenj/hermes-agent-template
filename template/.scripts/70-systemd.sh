@@ -31,7 +31,7 @@ HB_TIMER="hermes-${AGENT_ID}-heartbeat.timer"
 # unit state; cleanup remains fail-closed whenever systemd management is active.
 if [[ "${SKIP_SYSTEMD:-0}" == "1" ]]; then
   if already_done 70-systemd \
-     && [[ -f "$SYS_DIR/$GW_UNIT" && -f "$SYS_DIR/$HB_SVC" && -f "$SYS_DIR/$HB_TIMER" ]]; then
+     && [[ -f "$SYS_DIR/$GW_UNIT" ]]; then
     log "[70] systemd — SKIPPED; existing complete unit set preserved"
   else
     clear_done 70-systemd
@@ -186,7 +186,9 @@ if [[ $legacy_consumer_present -eq 1 ]]; then
 fi
 
 if already_done 70-systemd; then
-  if [[ -f "$SYS_DIR/$GW_UNIT" && -f "$SYS_DIR/$HB_SVC" && -f "$SYS_DIR/$HB_TIMER" ]]; then
+  # The heartbeat units are deliberately absent (retired); the gateway is the
+  # only unit whose presence still proves a complete install.
+  if [[ -f "$SYS_DIR/$GW_UNIT" ]]; then
     log "[70] systemd already installed — reconciling unit definitions"
   else
     clear_done 70-systemd
@@ -239,76 +241,38 @@ StandardError=$GW_LOG_OUTPUT
 WantedBy=default.target
 UNIT
 
-# Fused heartbeat: board-reconciliation sentinel pass + gated runtime checkpoint.
-# Frequent ticks (1 min); heartbeat.sh's own cooldown/lock logic rate-limits the
-# full Hermes pass, and the checkpoint is gated to ~hourly inside the runner.
-# The per-agent EnvironmentFiles load ticket-provider creds for the sentinel pass.
-cat > "$SYS_DIR/$HB_SVC" <<UNIT
-[Unit]
-Description=$HB_DESCRIPTION
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-WorkingDirectory=$WORKING_DIRECTORY
-$ENV_HERMES_HOME
-$ENV_HERMES_BIN
-$ENV_CODEX_HOME
-$ENV_TERMINAL_CWD
-EnvironmentFile=-%h/.config/hermes-agent/env
-EnvironmentFile=-%h/.hermes/env
-EnvironmentFile=-%h/.hermes/hermes-agent.env
-EnvironmentFile=-%h/.hermes/${AGENT_ID}.env
-EnvironmentFile=$RUNTIME_ENV_FILE
-$HB_CREDENTIAL_LINES
-ExecStart=$HB_EXEC_START heartbeat
-TimeoutStartSec=45min
-StandardOutput=$HB_LOG_OUTPUT
-StandardError=$HB_LOG_OUTPUT
-UNIT
-cat > "$SYS_DIR/$HB_TIMER" <<UNIT
-[Unit]
-Description=$TIMER_DESCRIPTION
-
-[Timer]
-OnBootSec=1min
-OnUnitInactiveSec=1min
-Unit=$HB_SVC
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-UNIT
+# Heartbeat: RETIRED.
+#
+# Every agent used to get a 1-minute oneshot timer here. It was retired on
+# 2026-09-17 because it did nothing. The board-reconciliation pass behind it is
+# gated on role.yaml's `reconcile.enabled`, which was true in exactly one repo
+# fleet-wide (and that timer was disabled), so every tick fell through to
+# `maybe_checkpoint` — and checkpoint.sh returns immediately unless the agent's
+# runtime is a nested Git repo, which none are. The result was ~20,000 no-op
+# invocations a day writing one identical log line; 33god-pm's heartbeat.log
+# reached 3.8 MB of it.
+#
+# The three jobs a heartbeat appeared to do are owned elsewhere now:
+#   liveness    -> the gateway unit below (Restart=on-failure)
+#   scheduling  -> Bloodbank; krebs pull-subscribes
+#                  bloodbank.cmd.lifecycle.task.invoke
+#   persistence -> krebs attempts/leases, which park a stalled ticket in
+#                  "Needs Attention" instead of ticking forever
+#
+# Provisioning now REMOVES any heartbeat units it finds, so re-running this
+# script on an older install cleans up rather than resurrecting them.
+if systemd_user_available; then
+  if [[ -f "$SYS_DIR/$HB_TIMER" || -f "$SYS_DIR/$HB_SVC" ]]; then
+    systemctl --user disable --now "$HB_TIMER" >/dev/null 2>&1 || true
+    systemctl --user stop "$HB_SVC" >/dev/null 2>&1 || true
+    rm -f "$SYS_DIR/$HB_TIMER" "$SYS_DIR/$HB_SVC"
+    log "    heartbeat retired: removed $HB_TIMER and $HB_SVC"
+  fi
+  systemctl --user daemon-reload
+fi
+yaml_upsert_block_value service_state heartbeat retired
 
 if systemd_user_available; then
-  systemctl --user daemon-reload
-  if systemctl --user enable --now "$HB_TIMER" >/dev/null 2>&1; then
-    # The timer's first scheduled tick can be a minute away. Run the oneshot
-    # once now so deployment proves the heartbeat command itself completed;
-    # timer activity alone is not an operational postcondition.
-    if ! systemctl --user start "$HB_SVC" >/dev/null 2>&1; then
-      systemctl --user disable --now "$HB_TIMER" >/dev/null 2>&1 || true
-      yaml_upsert_block_value service_state heartbeat error
-      clear_done 70-systemd
-      die "required heartbeat oneshot failed its deployment probe: $HB_SVC"
-    fi
-    if hb_health="$(systemd_wait_for_stable_health \
-        systemd_timer_health_snapshot "$HB_TIMER" "$HB_SVC")"; then
-      yaml_upsert_block_value service_state heartbeat active
-      log "    heartbeat enabled + active with healthy latest result: $HB_TIMER"
-    else
-      systemctl --user disable --now "$HB_TIMER" >/dev/null 2>&1 || true
-      yaml_upsert_block_value service_state heartbeat error
-      clear_done 70-systemd
-      die "heartbeat did not stabilize healthy: $hb_health"
-    fi
-  else
-    yaml_upsert_block_value service_state heartbeat error
-    clear_done 70-systemd
-    die "failed to enable/start required heartbeat timer: $HB_TIMER"
-  fi
-
   if [[ $gateway_ready -eq 1 ]]; then
     if systemctl --user enable --now "$GW_UNIT" >/dev/null 2>&1; then
       if gw_health="$(systemd_wait_for_stable_health \
