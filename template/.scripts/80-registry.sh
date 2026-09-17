@@ -38,7 +38,7 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$(yaml_get bloodbank.enabled)" "$(yaml_get bloodbank.gateway_scope)" \
   "$(yaml_get bloodbank.target_agent_id)" \
   "$PLANE_WORKSPACE" "$PLANE_PROJECT_ID" "$(yaml_get plane.identifier)" \
-  "$RUNTIME_REPO" "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
+  "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
   "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" \
   "$(yaml_get service_state.gateway)" "$(yaml_get service_state.heartbeat)" <<'PYEOF'
@@ -57,9 +57,9 @@ except ImportError:
  telegram_status, bot, telegram_bot_id,
  slack_status, slack_team_id, slack_team_name, slack_user_id, slack_bot_id,
  slack_username, bloodbank_enabled, bloodbank_scope, bloodbank_target, plane_ws, plane_id,
- plane_ident, runtime_repo, hermes_bin, hermes_repo, hermes_git_url,
+ plane_ident, hermes_bin, hermes_repo, hermes_git_url,
  hermes_git_ref, hermes_git_sha, fleet_env, gw, heartbeat,
- gateway_state, heartbeat_state) = sys.argv[1:35]
+ gateway_state, heartbeat_state) = sys.argv[1:34]
 p = pathlib.Path(path)
 if p.is_symlink():
     raise SystemExit(f"refusing to update registry symlink: {p}")
@@ -106,7 +106,9 @@ managed = {
     "target_agent_id": bloodbank_target,
   },
   "plane": {"workspace": plane_ws, "project_id": plane_id, "identifier": plane_ident},
-  "runtime_repo": runtime_repo,
+  # No `runtime_repo`. An agent runtime is host-local and may hold secrets and
+  # mutable state (PJAN-41); it is never a Git repository, never a submodule, and
+  # never pushed anywhere. Durability belongs to Hindsight.
   "hermes": {
     "bin": hermes_bin,
     "repo": hermes_repo,

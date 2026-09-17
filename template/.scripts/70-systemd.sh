@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Install systemd --user units: profile gateway and fused heartbeat timer
-# (board-reconciliation sentinel pass + gated runtime checkpoint, one tick).
+# (board-reconciliation sentinel pass).
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
@@ -43,7 +43,7 @@ fi
 # Legacy manifests defaulted reconciliation off and had no way to distinguish
 # that default from an operator decision. The new explicit_opt_out sentinel is
 # authoritative: migrate unmarked roles to the operational PM default, while a
-# rendered/operator-recorded opt-out remains checkpoint-only on every rerun.
+# rendered/operator-recorded opt-out stays opted out on every rerun.
 if [[ "$(yaml_get reconcile.explicit_opt_out)" == "true" ]]; then
   yaml_upsert_block_value reconcile enabled false bool
   log "    PM reconciliation explicit opt-out preserved"
@@ -75,8 +75,8 @@ systemd_exec_value() {
     || die "systemd ExecStart value validation failed"
 }
 GW_DESCRIPTION="$(systemd_scalar "Hermes Gateway — $DISPLAY_NAME")"
-HB_DESCRIPTION="$(systemd_scalar "Hermes Heartbeat (reconcile + checkpoint) — $DISPLAY_NAME")"
-TIMER_DESCRIPTION="$(systemd_scalar "Heartbeat (reconcile + checkpoint) for $AGENT_ID")"
+HB_DESCRIPTION="$(systemd_scalar "Hermes Heartbeat (reconcile) — $DISPLAY_NAME")"
+TIMER_DESCRIPTION="$(systemd_scalar "Heartbeat (reconcile) for $AGENT_ID")"
 ENV_HERMES_HOME="$(systemd_environment HERMES_HOME "$PROFILE_HOME")"
 ENV_HERMES_BIN="$(systemd_environment HERMES_BIN "$HERMES_BIN")"
 ENV_CODEX_HOME="$(systemd_environment CODEX_HOME "$CODEX_HOME")"
@@ -196,12 +196,10 @@ if already_done 70-systemd; then
   fi
 fi
 
-# The heartbeat runner (board-reconciliation sentinel pass + gated checkpoint)
-# and the checkpoint helper both render into the role dir; just ensure they are
-# executable. heartbeat.sh calls checkpoint.sh internally.
+# The heartbeat runner renders into the role dir; just ensure it is executable.
 HEARTBEAT_BIN="$ROLE_DIR/.scripts/heartbeat.sh"
 CREDENTIAL_LAUNCHER="$ROLE_DIR/.scripts/credential-launch.sh"
-chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" "$ROLE_DIR/.scripts/checkpoint.sh" 2>/dev/null || true
+chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" 2>/dev/null || true
 
 [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
   || die "named profile is not a real directory; run: pj migrate hermes.runtime-singleton '$REPO_ROOT'"
@@ -247,7 +245,7 @@ UNIT
 # 2026-09-17 because it did nothing. The board-reconciliation pass behind it is
 # gated on role.yaml's `reconcile.enabled`, which was true in exactly one repo
 # fleet-wide (and that timer was disabled), so every tick fell through to
-# `maybe_checkpoint` — and checkpoint.sh returns immediately unless the agent's
+# `maybe_checkpoint` — a no-op helper that has since been deleted along with
 # runtime is a nested Git repo, which none are. The result was ~20,000 no-op
 # invocations a day writing one identical log line; 33god-pm's heartbeat.log
 # reached 3.8 MB of it.
