@@ -84,7 +84,10 @@ provisioned_at = existing.get("provisioned_at")
 if not isinstance(provisioned_at, str) or not provisioned_at:
     provisioned_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 managed = {
-  "repo": repo, "role": role, "display_name": display,
+  # The RUNTIME this row describes. Emitted on every provision so a re-provision
+  # can never drop the field back to an assumption: the registry states the
+  # runtime, it is not inferred from the fact that this template wrote the row.
+  "repo": repo, "role": role, "type": "hermes", "display_name": display,
   "project_path": project, "role_dir": role_dir,
   "profile_name": profile,
   "telegram": {
