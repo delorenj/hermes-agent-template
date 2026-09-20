@@ -83,6 +83,23 @@ Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.e
 per-run with an env var or `--data`, and existing setups keep working even without
 the config file present.
 
+## Ticket-provider adapters are vendored, not owned
+
+`template/.scripts/providers/{plane,linear,trello}.sh` are a **mirror**. The
+canonical copies live in Krebs at `krebs/adapters/tp/`, which
+`33god-platform/components/krebs.yaml` declares as its source of truth.
+
+They are mirrored here because a deployed employee needs its adapter rendered
+into its own role directory and cannot reach into another repo at runtime. They
+are *owned* by Krebs because creating a ticket board is a ticket concern: before
+this split, pjangler created a project's board by staging a fake Hermes role tree
+in a temp directory and running this template's adapter inside it, so a project
+could not get a board without the agent template on disk.
+
+Edit the Krebs copy, then `mise run tp:vendor`.
+`tests/test_tp_adapter_vendoring.py` fails on drift wherever Krebs is checked
+out beside this template.
+
 ## Profile skills
 
 Provisioning requires mise, Node.js 24+, a configured canonical Skillex registry,

@@ -48,3 +48,21 @@ run = "'{{config_root}}/.mise/scripts/link-agentfiles.sh' '{{config_root}}'"
 description = "Apply this project's declared skills with Skillex"
 tools = { "npm:@delorenj/skillex" = "0.1.1" }
 run = "skillex sync --scope project --project '{{config_root}}'"
+
+[tasks."tp:vendor"]
+description = "Re-sync the vendored ticket-provider adapters from Krebs (the canonical copies)"
+run = """
+set -euo pipefail
+krebs="${KREBS_TP_ADAPTERS:-}"
+if [ -z "$krebs" ]; then
+  d='{{config_root}}'
+  while [ "$d" != "/" ]; do
+    if [ -d "$d/krebs/adapters/tp" ]; then krebs="$d/krebs/adapters/tp"; break; fi
+    d="$(dirname "$d")"
+  done
+fi
+[ -n "$krebs" ] || { echo "krebs/adapters/tp not found; set KREBS_TP_ADAPTERS" >&2; exit 1; }
+cp "$krebs"/plane.sh "$krebs"/linear.sh "$krebs"/trello.sh '{{config_root}}/template/.scripts/providers/'
+chmod +x '{{config_root}}/template/.scripts/providers/'*.sh
+echo "vendored ticket-provider adapters from $krebs"
+"""
