@@ -124,7 +124,7 @@ runtime:
 
     assert result.returncode != 0
     assert "legacy named profile symlink" in result.stderr
-    assert "pj migrate hermes.runtime-singleton" in result.stderr
+    assert "flume remediate hermes.runtime-singleton" in result.stderr
     assert profile.is_symlink()
     assert marker.is_file()
     after = {

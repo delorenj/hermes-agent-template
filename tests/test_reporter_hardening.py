@@ -187,7 +187,7 @@ headers = {
         for literal in ('"ddr:', "delonet", "ntfy.delo.sh"):
             self.assertNotIn(literal, body, f"{literal!r} must not be hardcoded below the config block")
 
-    def test_runtime_profile_wiring_is_delegated_to_pjangler(self) -> None:
+    def test_runtime_profile_wiring_is_delegated_to_flume(self) -> None:
         text = (ROOT / "template" / ".scripts" / "20-runtime-repo.sh").read_text()
         self.assertIn("migrate hermes.runtime-singleton", text)
         self.assertIn("--dry-run --json", text)

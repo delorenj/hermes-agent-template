@@ -202,7 +202,7 @@ CREDENTIAL_LAUNCHER="$ROLE_DIR/.scripts/credential-launch.sh"
 chmod +x "$HEARTBEAT_BIN" "$CREDENTIAL_LAUNCHER" 2>/dev/null || true
 
 [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
-  || die "named profile is not a real directory; run: pj migrate hermes.runtime-singleton '$REPO_ROOT'"
+  || die "named profile is not a real directory; run: flume remediate hermes.runtime-singleton '$REPO_ROOT'"
 
 # Gateway unit
 #

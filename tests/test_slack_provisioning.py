@@ -352,7 +352,7 @@ def test_slack_rejects_symlinked_profile_root_without_touching_target(
 
     assert result.returncode != 0
     assert "refusing symlinked profile root" in result.stderr
-    assert "runtime-singleton migration" in result.stderr
+    assert "'flume remediate hermes.runtime-singleton'" in result.stderr
     assert {path.name: path.read_bytes() for path in target.iterdir()} == before
 
 

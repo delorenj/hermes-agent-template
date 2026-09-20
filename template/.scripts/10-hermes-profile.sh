@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Create or reconcile the initial named Hermes profile without cloning secrets.
 # The directory remains REAL. Step 20 delegates final shared-vs-owned link
-# topology to `pj migrate hermes.runtime-singleton`; no template step may
+# topology to `flume remediate hermes.runtime-singleton`; no template step may
 # replace the profile itself with a symlink.
 
 if [[ "${SKIP_HOST_STATE:-0}" == "1" ]]; then
@@ -20,7 +20,7 @@ PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 # from the link target before the singleton-runtime migration can preserve
 # them.  Refuse the legacy topology before any profile mutation.
 if [[ -L "$PROFILE_HOME" ]]; then
-  die "legacy named profile symlink detected at $PROFILE_HOME; refusing mutation. Run: pj migrate hermes.runtime-singleton '$(project_repo_path 2>/dev/null || printf '%s' "$ROLE_DIR")'"
+  die "legacy named profile symlink detected at $PROFILE_HOME; refusing mutation. Run: flume remediate hermes.runtime-singleton '$(project_repo_path 2>/dev/null || printf '%s' "$ROLE_DIR")'"
 fi
 PROFILE_DELTA_SEEDER="$ROLE_DIR/.scripts/lib/profile-config-seed.py"
 [[ -f "$PROFILE_DELTA_SEEDER" && ! -L "$PROFILE_DELTA_SEEDER" ]] \

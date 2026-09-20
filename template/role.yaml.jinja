@@ -19,7 +19,7 @@ model:
   key_env: {{ model_key_env | tojson }}
 
 # Hermes profile name. ~/.hermes/profiles/<name> is a REAL directory managed by
-# `pj migrate hermes.runtime-singleton`: shared config/auth/skills link to the
+# `flume remediate hermes.runtime-singleton`: shared config/auth/skills link to the
 # fleet root while role-owned state links into ./runtime. Never replace the
 # named profile with a symlink to runtime.
 profile: {{ agent_id | tojson }}

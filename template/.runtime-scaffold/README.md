@@ -2,7 +2,7 @@
 
 This is the ignored, role-owned state for the **{{display_name}}** agent. The
 actual HERMES_HOME is a real named directory under `~/.hermes/profiles/`, with
-PJangler-managed links into this runtime. Back it up separately; it is not
+Flume-managed links into this runtime. Back it up separately; it is not
 published by project Git.
 
 ## What's in here
