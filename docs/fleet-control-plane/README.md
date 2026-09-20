@@ -10,6 +10,12 @@ source: adapted-bmad
 This folder captures the implementation plan for tightening the Fleet without
 collapsing its repos into one codebase.
 
+All four artifacts are the 2026-06-27 planning snapshot, kept as written. They
+describe what was decided that day, not what runs now. The control plane they
+propose was built in Flume, whose live contract is `flume/contracts/handbook.yaml`;
+the n8n orchestration plane was never built, and heartbeat v2 was retired rather
+than promoted. Read them for the reasoning, not for a command surface.
+
 The Fleet remains a set of independently useful parts:
 
 - `CommonProject` owns the base project scaffold.

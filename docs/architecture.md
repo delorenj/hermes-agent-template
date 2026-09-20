@@ -37,8 +37,9 @@ them means:
 
 - The template repo is small, stable, easy to update fleet-wide
 - Project commits cannot accidentally publish runtime credentials or sessions
-- Each agent uses a real named HERMES_HOME under `~/.hermes/profiles/`; PJangler
-  links shared config/auth/skills to the fleet root and owned state to runtime
+- Each agent uses a real named HERMES_HOME under `~/.hermes/profiles/`; Flume
+  links the profile's owned state back to runtime and renders its config from
+  the fleet base plus a per-profile delta
 - Provisioning can refresh tracked launchers and scaffolds without overwriting
   existing local state
 
@@ -47,13 +48,15 @@ It is the single source-of-truth pointer for the shared Hermes executable/repo
 that every generated launcher uses.
 
 The template never rewrites the named profile. `.scripts/20-runtime-repo.sh`
-delegates that topology to `pj migrate hermes.runtime-singleton` (dry-run audit,
-then idempotent apply). This prevents a stale local bootstrap from replacing a
-real named profile with the legacy profile-to-runtime symlink.
+delegates that topology to `flume remediate hermes.runtime-singleton` (dry-run
+audit, then idempotent apply). This prevents a stale local bootstrap from
+replacing a real named profile with the legacy profile-to-runtime symlink.
 
-Because the named profile's `config.yaml` is deliberately linked to fleet
-truth, provisioning never writes a project-specific `terminal.cwd` into it.
-The manual wrapper, gateway, and heartbeat launcher instead export
+The named profile's `config.yaml` is generated —
+`deep_merge(~/.hermes/config.yaml, <profile>/config.delta.yaml)` — so every line
+in it is either fleet truth or an override someone had to justify in the delta.
+A project-specific `terminal.cwd` is neither, so provisioning never writes one.
+The manual wrapper, the gateway unit, and the credential launcher instead export
 `TERMINAL_CWD` as a process-local value resolved from the role's Git root.
 
 ## Per-agent gateway route and secret references
@@ -80,15 +83,28 @@ Hindsight retains only memories/events explicitly written to its bank, while a
 secret manager retains only credentials explicitly stored there; neither is a
 complete runtime backup. See [Operations](operations.md#back-up-and-restore-an-agent).
 
-## Heartbeat cadence
+## Board-reconciliation cadence
 
-A systemd `--user` timer runs `.scripts/heartbeat.sh` frequently (about once a
-minute). For a pure-local runtime, each tick performs one job:
+There is no per-agent heartbeat timer. One used to run `.scripts/heartbeat.sh`
+about once a minute on every agent; it was retired on 2026-09-17 because the
+reconciliation pass behind it is gated on `role.yaml`'s `reconcile.enabled`,
+true in exactly one repo fleet-wide, so ~20,000 ticks a day fell through to a
+no-op. `70-systemd.sh` now removes any heartbeat unit it finds, and the gateway
+is the only per-agent unit. The three jobs the timer appeared to do are owned
+elsewhere:
 
-1. **Board-reconciliation sentinel pass** — the PM's continuous ticket sentinel.
-   The runner's own cooldown/lock logic decides whether a full, LLM-backed
-   reconciliation pass is worth running (it rate-limits the expensive Hermes
-   call); see [the sentinel docs](sentinel/README.md).
+- **liveness** — the gateway unit's `Restart=on-failure`
+- **scheduling** — Bloodbank; krebs pull-subscribes
+  `bloodbank.cmd.lifecycle.task.invoke`
+- **persistence** — krebs attempts/leases, which park a stalled ticket in
+  "Needs Attention" instead of ticking forever
+
+`.scripts/heartbeat.sh` still renders into every role and is still the
+board-reconciliation sentinel's entrypoint — invoked on demand rather than on a
+timer. Its own cooldown/lock logic still decides whether a full, LLM-backed
+reconciliation pass is worth running; see [the sentinel
+docs](sentinel/README.md).
+
 Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters project Git.
 It lives only in ignored local storage unless the operator separately places a
 credential in the secret manager or includes the runtime in an encrypted
@@ -139,9 +155,9 @@ bloodbank:
 ```
 
 The shared gateway subscribes once, resolves `data.target_agent_id` through the
-fleet registry, and routes the turn into that Hermes profile. Per-profile
-messaging gateways and heartbeat timers remain independent; there is no
-per-profile NATS process, systemd consumer unit, or filesystem inbox bridge.
+fleet registry, and routes the turn into that Hermes profile. Each profile's own
+messaging gateway remains independent; there is no per-profile NATS process,
+systemd consumer unit, or filesystem inbox bridge.
 
 Discovery is not execution authority. New roles and registry entries start
 with strict boolean `bloodbank.enabled: false`; only an explicit activation

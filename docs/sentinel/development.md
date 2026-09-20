@@ -127,19 +127,17 @@ The script:
 5. binds the PM to the existing board (it never creates one — it scrubs the
    provider key from Copier's environment so `42-ticket-provider.sh` skips board
    creation),
-6. installs the PM's board-reconciliation heartbeat timer as a `launchd` agent
-   on macOS or a `systemd` timer on
-   Linux,
-7. smoke-tests the board connection through the adapter.
+6. smoke-tests the board connection through the adapter.
 
 Useful environment overrides (skip the prompts): `HAT_REPO`, `HAT_PROVIDER`,
 `HAT_ROLES`, `HAT_PLANE_WORKSPACE`, `HAT_PLANE_PROJECT`, `HAT_LINEAR_TEAM`,
 `HAT_TRELLO_BOARD`, and `HAT_DRY_RUN=1` to preview without changing anything.
 
 This local path does not wire Telegram or email. Those are convenience layers in
-the `pjangler` provisioner, not requirements for a working agent — talk to the
-agent with `agents/hermes/pm/hermes chat "..."` and let the sentinel run on its
-heartbeat timer.
+the `flume hire` provisioner, not requirements for a working agent — talk to the
+agent with `agents/hermes/pm/hermes chat "..."` and invoke the sentinel yourself
+when you want a pass. Nothing schedules it; see [Scheduling a reconciliation
+pass](#scheduling-a-reconciliation-pass).
 
 ## Provisioning the PM (manual)
 
@@ -161,7 +159,7 @@ order. Several of them reach outside the repository.
 > [!CAUTION]
 > Full provisioning is outward-facing and partly interactive.
 > `20-runtime-repo.sh` populates the ignored local runtime and delegates named-profile
-> wiring to `pj migrate hermes.runtime-singleton`;
+> wiring to `flume remediate hermes.runtime-singleton`;
 > it creates no GitHub storage,
 > `30-telegram.sh` prompts for a BotFather token and blocks waiting for input,
 > and `42-ticket-provider.sh` can create a Plane project. Don't run full
@@ -176,7 +174,7 @@ script checks its flag and skips cleanly.
 | `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile migration. No remote storage is created. |
 | `SKIP_PLANE` | Creating a Plane project. |
 | `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
-| `SKIP_SYSTEMD` | Installing `systemd` units (profile gateway and heartbeat timer). |
+| `SKIP_SYSTEMD` | Installing the `systemd` profile gateway unit. |
 
 For example, a local install that creates no cloud resources:
 
@@ -188,19 +186,44 @@ SKIP_TELEGRAM=1 SKIP_RUNTIME_REPO=1 SKIP_PLANE=1 SKIP_BLOODBANK=1 \
 
 After provisioning, set the board binding in
 `agents/hermes/pm/role.yaml`. For Linear, set `ticket_provider.team`
-to the team key. Make the provider key available to the heartbeat's environment:
-on Linux through a `systemd` `EnvironmentFile` (for example
-`~/.hermes/<agent_id>.env`); on macOS the `launchd` agent sources that same
-per-agent env file, so write the key there.
+to the team key. Make the provider key available to the runner's environment:
+export it in the invoking shell, or write it into `~/.hermes/fleet.env`, which
+each adapter reads directly as its last resort.
 
-`SKIP_SYSTEMD` gates the profile gateway and `heartbeat` timer in
-`70-systemd.sh`. A local install that wants the sentinel running must leave
-`SKIP_SYSTEMD` unset (or install the timer afterward).
+`SKIP_SYSTEMD` gates the profile gateway unit in `70-systemd.sh`. The gateway is
+what a chat platform talks to; the sentinel does not need it.
 
-Both units keep `HERMES_HOME` on the real named profile established by
-`pj migrate hermes.runtime-singleton`; heartbeat must not reset it to the raw
-runtime path. When encrypted model credentials are present, the units use the
-same secret-free credential launcher as the gateway.
+The gateway keeps `HERMES_HOME` on the real named profile established by
+`flume remediate hermes.runtime-singleton`; nothing may reset it to the raw
+runtime path. When encrypted model credentials are present, it starts through
+the secret-free credential launcher.
+
+## Scheduling a reconciliation pass
+
+Nothing schedules one. Every agent used to carry a `hermes-<agent>-heartbeat`
+timer that ran `heartbeat.sh` about once a minute; it was retired on 2026-09-17
+and `70-systemd.sh` now deletes any that an older install left behind. The pass
+it guarded is gated on `role.yaml`'s `reconcile.enabled`, which was true in one
+repo fleet-wide, so the other ~20,000 ticks a day did nothing at all.
+
+The runner is unchanged and still the entrypoint — it is invoked rather than
+timed. Give it the named profile; left to itself it falls back to the raw
+runtime directory, which is the topology the singleton contract exists to
+prevent:
+
+```bash
+# <profile> is the `profile:` field in agents/hermes/pm/role.yaml.
+HERMES_HOME="$HOME/.hermes/profiles/<profile>" agents/hermes/pm/.scripts/heartbeat.sh
+```
+
+`.scripts/credential-launch.sh heartbeat` does the same thing plus the encrypted
+model credential, and needs `HERMES_BIN` exported; that is the path the units
+used. Either way the runner's own cooldown and lock logic still apply, so an
+extra invocation is cheap.
+
+In the fleet, scheduling is Bloodbank's: krebs pull-subscribes
+`bloodbank.cmd.lifecycle.task.invoke`, and a stalled ticket parks in "Needs
+Attention" on a krebs lease instead of being re-ticked forever.
 
 ## Propagating changes
 
@@ -219,15 +242,14 @@ copier update ./agents/hermes/pm
 > `copier update` re-runs the `_tasks` chain. Pass the same `SKIP_*` flags you
 > used at provision time so the update doesn't try to recreate cloud resources.
 
-## History: consolidation into the PM heartbeat
+## History: consolidation into the PM
 
 The sentinel began as a bespoke loop on the `pm` role, was briefly extracted into
 a standalone `scrum-master` role with its own `continuous-ticket-sentinel` timer,
-and has now been folded back into the unified PM. Today there is exactly one
-role (`pm`), one engine (under `.scripts/sentinel/`), and one timer
-(`hermes-<agent>-heartbeat.timer`) for board reconciliation. The earlier
-standalone-role design is recoverable from Git history if you ever need to
-compare.
+and was folded back into the unified PM. Today there is exactly one role (`pm`),
+one engine (under `.scripts/sentinel/`), and one runner (`.scripts/heartbeat.sh`)
+for board reconciliation. The earlier standalone-role design is recoverable from
+Git history if you ever need to compare.
 
 ## Known gotchas
 
@@ -265,12 +287,11 @@ The following work is open for the incoming agent, roughly in priority order.
    adapter](providers.md#verifying-an-adapter-against-a-live-board) with Trello
    credentials, and fix any endpoint or field mismatches.
 2. **Confirm `install-local.sh` on a real macOS machine.** The Linux path is
-   verified end to end and the Plane adapter is verified live, but the macOS
-   `launchd` agent, the `mkdir` lock, and the assumption that the older Copier
-   steps (`10-hermes-profile.sh`, `80-registry.sh`) are Darwin-clean get their
-   first real run on a Mac.
+   verified end to end and the Plane adapter is verified live, but the `mkdir`
+   lock and the assumption that the older Copier steps (`10-hermes-profile.sh`,
+   `80-registry.sh`) are Darwin-clean get their first real run on a Mac.
 3. **Confirm the first full Hermes reconciliation pass on a fresh PM.** The
-   heartbeat, adapter, and enforcement layers are verified, but the first live
+   runner, adapter, and enforcement layers are verified, but the first live
    `run:full` pass with the rendered prompt on a newly provisioned PM is the
    last thing to watch.
 

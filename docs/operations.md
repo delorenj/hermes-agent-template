@@ -5,6 +5,10 @@ debugging.
 
 ## Provision a new agent
 
+`flume hire <title>` is the normal path — it drives the Copier invocation below
+after resolving the host config, the template, and the target repo. Drive Copier
+directly when you want one step, one role, and no wrapper:
+
 ```bash
 cd /path/to/the/project-repo            # MUST be inside a git repo
 copier copy gh:delorenj/hermes-agent-template ./agents/hermes/<role> \
@@ -26,22 +30,22 @@ invocations).
 | 00 banner | Print identity | n/a |
 | 01 config | Seed `~/.config/hermes-agent-template/config.toml` from the shipped example if absent (see [Configuration](#configuration)) | n/a |
 | 05 fleet env | Ensure `~/.hermes/fleet.env` exists (shared Hermes binary/repo/registry source-of-truth), populated from `config.toml` | n/a |
-| 10 hermes profile | Create a clean named profile without cloning credentials; hard-validate and symlink canonical runtime skills (`delonet-conventions`, `delonet-dotenv`, `hermes-pm-template-maintenance`, `hindsight`, `subagent-driven-development`) from `~/.agents/skills`; reject legacy raw channel credentials for approval-gated migration | n/a |
-| 20 local runtime | Populate missing files from role-local `.runtime-scaffold/` into ignored `./runtime/`, then audit/apply `pj migrate hermes.runtime-singleton`; the named profile remains a real directory | `SKIP_RUNTIME_REPO=1` |
+| 10 hermes profile | Create a clean named profile without cloning credentials; seed an empty `config.delta.yaml`; project the owning project's declared skills through Skillex `profile sync` (requires its `.agents/skills.json`); reject legacy raw channel credentials for approval-gated migration | n/a |
+| 20 local runtime | Populate missing files from role-local `.runtime-scaffold/` into ignored `./runtime/`, then audit/apply `flume remediate hermes.runtime-singleton`; the named profile remains a real directory | `SKIP_RUNTIME_REPO=1` |
 | 30 telegram | Verify an invocation-supplied, profile-dedicated BotFather token; reject fleet reuse; store it in 1Password and map only an `op://` reference | `SKIP_TELEGRAM=1` |
 | 31 slack | Deferred by default; verify a dedicated app+bot pair with `auth.test`, store both in 1Password, and map references only | `SKIP_SLACK=1` |
 | 40 plane | Create Plane project in 33god workspace (1:1 with agent), patch identifier into role.yaml | `SKIP_PLANE=1` |
 | 60 bloodbank | Compatibility checkpoint for fleet-shared routing; installs no files, dependencies, or services | `SKIP_BLOODBANK=1` remains a no-op |
-| 70 systemd | Install user units: profile gateway and board-reconciliation heartbeat timer | `SKIP_SYSTEMD=1` |
+| 70 systemd | Install the profile gateway user unit, and remove the retired heartbeat unit if an older install left one | `SKIP_SYSTEMD=1` |
 | 80 registry | Append entry to ~/.hermes/agents-registry.yaml | n/a |
 | 99 summary | Print summary | n/a |
 
 Every step is idempotent — re-running the entire provisioning is safe. Each
 step writes a `.done-NN-*` marker; delete that marker to force a re-run.
-PM reconciliation defaults on. A deliberate checkpoint-only deployment sets
-both `reconcile.enabled: false` and `reconcile.explicit_opt_out: true`; this
-sentinel preserves the choice while legacy default-off manifests migrate to
-the operational default.
+PM reconciliation defaults on. A deliberate opt-out sets both
+`reconcile.enabled: false` and `reconcile.explicit_opt_out: true`; step 70
+preserves that choice on every rerun while legacy default-off manifests migrate
+to the operational default.
 
 ## Configuration
 
@@ -155,11 +159,13 @@ replacements also sync the containing directory where the platform supports it.
 Unexpected directory-sync errors are reported as failures without marking the
 step complete, so rerunning the idempotent provisioning step is safe.
 
-## Start the daemons for an agent
+## Start the daemon for an agent
+
+The gateway is the only per-agent unit. There is no heartbeat timer: scheduling
+moved to Bloodbank, and liveness is the gateway's own `Restart=on-failure`.
 
 ```bash
 AGENT=bloodbank-pm
-systemctl --user start hermes-${AGENT}-heartbeat.timer
 
 # Gateway will fail to start until at least one messaging platform is wired.
 # After running .scripts/30-telegram.sh or .scripts/31-slack.sh:
@@ -185,9 +191,8 @@ for k, v in agents.items():
     print(f"{k:25s}  @{v['telegram']['bot_username']:30s}  plane={v['plane']['identifier']}  runtime=gh:{v['runtime_repo']}")
 EOF
 
-# Service status
+# Service status (gateways only — the fleet installs no hermes timers)
 systemctl --user list-units --state=active 'hermes-*'
-systemctl --user list-timers 'hermes-*'
 
 # Bloodbank routing identity consumed by the fleet-shared gateway
 python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpath('.hermes/agents-registry.yaml').read_text())['agents']['<agent-id>']['bloodbank'])"
@@ -291,7 +296,7 @@ Recovery sources are intentionally distinct:
 
 Restore the project and provision the role first. With its services stopped,
 extract the verified archive at the project root, run
-`pj migrate hermes.runtime-singleton /absolute/path/to/project`, and confirm
+`flume remediate hermes.runtime-singleton /absolute/path/to/project`, and confirm
 the named profile is a real directory before enabling the services.
 
 ### Inject an encrypted model credential from 1Password
@@ -328,16 +333,21 @@ AGENT=bloodbank-pm
 RUNTIME="$PROJECT/agents/hermes/$ROLE/runtime"
 PROFILE="$HOME/.hermes/profiles/$AGENT"
 
+# The gateway is the agent's only unit.
 systemctl --user disable --now "hermes-${AGENT}-gateway.service"
-systemctl --user disable --now "hermes-${AGENT}-heartbeat.timer"
 
 # The profile is a real directory. Do not unlink or recursively delete it;
-# archive/retire through a dedicated PJangler migration when available.
+# no reviewed archive/retire tool for it exists yet.
 test -d "$PROFILE"
 test ! -L "$PROFILE"
 
 # Archive the Plane project and retire Telegram/Slack identities through their
-# administrative UIs, then remove the fleet registry entry under its lock.
+# administrative UIs, then remove the org-chart row. `flume offboard` is
+# deliberately narrow: it removes that one record, reports the role directory,
+# profile and units it did not touch, and is a dry run until --apply.
+flume offboard "$AGENT"
+flume offboard "$AGENT" --apply
+
 # The runtime directory remains in place.
 test -d "$RUNTIME"
 ```
@@ -360,7 +370,9 @@ part of profile or service retirement.
 ## Troubleshooting
 
 ### Gateway service fails immediately
-- Check `~/.hermes/profiles/<agent>/.env` has `TELEGRAM_BOT_TOKEN` set
+- Check the profile's `config.delta.yaml` maps a `TELEGRAM_BOT_TOKEN` `op://`
+  reference under `secrets.onepassword.env`, and that `op` can read it. No
+  dotenv file carries the token.
 - `journalctl --user -u hermes-<agent>-gateway.service`
 - If "all configured messaging platforms failed to connect" — Telegram step wasn't run yet. Run `.scripts/30-telegram.sh` first.
 
@@ -373,8 +385,8 @@ part of profile or service retirement.
 
 ### Runtime changes are not appearing in Hindsight or backups
 
-Pure-local runtime changes are not synchronized by the heartbeat.
-- Look at the most recent heartbeat log: `tail <role>/runtime/logs/heartbeat.log`
+Nothing synchronizes a pure-local runtime, and the retired heartbeat timer
+never did either.
 - Verify the configured filesystem backup includes the exact runtime path and
   successfully restore-test its latest snapshot.
 - Query Hindsight separately for the agent bank; only events already written
