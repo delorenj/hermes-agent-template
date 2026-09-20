@@ -8,6 +8,16 @@ agent_id: {{ agent_id | tojson }}
 display_name: {{ display_name | tojson }}
 purpose: {{ agent_purpose | tojson }}
 
+# Personality tone -- a key in the flume repo's `roles/_tones.yaml`.
+#
+# PERSISTED, and that is the point. Tone used to be a hire-time-only copier
+# variable that was written into SOUL.md prose and then forgotten, so
+# re-composing a deployed agent had no way to reproduce the operator's choice
+# and would silently normalise the whole fleet to `direct`. Roles provisioned
+# before this field existed are recovered by recognising the tone paragraph
+# already in their soul; every role provisioned from here carries its answer.
+soul_tone: {{ soul_tone | tojson }}
+
 # Process-local gateway inference target (empty = inherit from shared
 # ~/.hermes/config.yaml). key_env is a variable NAME only; its secret value is
 # injected at runtime and must never be written here.
