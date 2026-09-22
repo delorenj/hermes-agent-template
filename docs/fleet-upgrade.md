@@ -125,12 +125,29 @@ The account cap is **1000 read_write/day**.
   the cap, i.e. total fleet silence until reset. This has happened: 2026-09-20,
   Dumply went mute at 1000/1000.
 - Units carry `StartLimitIntervalSec=300` / `StartLimitBurst=5` to cap it.
-- `secrets.onepassword.cache_ttl_seconds` is currently **0**, which also
-  disables the *disk* cache (`op_cache.json`, `onepassword.py:358/386`) — no
-  such file exists on the box, confirming it is dormant. Turning it on is the
-  single highest-leverage change available, at the cost of resolved secret
-  values sitting on disk for the TTL. **That trade is Jarad's call, not the
-  upgrader's.**
+- `secrets.onepassword.cache_ttl_seconds` is **900** as of 2026-09-22 (was 0,
+  which disabled the *disk* cache as well as the in-process one —
+  `_cache.py:65` and `:136` both bail on `ttl_seconds <= 0`). 900 is chosen
+  against the `StartLimitIntervalSec=300` window so an entire 5-start burst
+  resolves from cache after the first start.
+
+  Measured on Dumply, restarting twice inside the window:
+
+  | | account reads consumed |
+  |---|---|
+  | restart #1 (cold, writes the cache) | **3** |
+  | restart #2 (within TTL) | **0** |
+
+  Both starts logged `1Password: applied 20 secrets` and came up with Telegram
+  connected — the second resolved every one of them from disk. Note the real
+  cold cost is ~3 account operations, not the ~19 the ref count suggests: `op`
+  batches refs per request.
+
+  The cost is that resolved secret values sit in
+  `<profile>/cache/op_cache.json` for the TTL. They are written atomically as
+  mode **0600** inside a **0700** directory (`_cache.py:180-199`), the same
+  posture as the `.env` files already in those profiles. A rotated secret can
+  linger up to 15 minutes; `rm` the file to force a re-fetch.
 
 Do not attempt a fan-out on a day you have already spent reads.
 
