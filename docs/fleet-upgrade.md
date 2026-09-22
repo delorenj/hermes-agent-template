@@ -62,6 +62,35 @@ checkout, so "0.20.1" is frozen dist-info, not what runs. Consequences:
   `git -C <release> status` is clean before any upgrade** — a `git stash` there
   breaks cron admission at call time.
 
+## 3a. Release checkouts are partial clones and CANNOT push
+
+`git remote -v` in a release dir shows `[blob:none]` — these are blobless
+partial clones. Committing works; **pushing does not**. `pack-objects` stalls
+trying to lazily backfill blobs it does not have, producing no output at all and
+never reaching the network. Verified 2026-09-22 across SSH, HTTPS, `--no-thin`
+and `pack.window=0`: every one hung silently until timeout while a fresh clone
+of the same repo took seconds.
+
+To land work that is sitting in a release checkout:
+
+```bash
+git -C <release> format-patch -1 <sha> --stdout > /tmp/x.patch
+git clone git@github.com:delorenj/hermes-agent.git /tmp/hfork   # FULL, not --depth 1
+git -C /tmp/hfork am /tmp/x.patch && git -C /tmp/hfork push origin main
+git -C <release> fetch origin main
+git -C <release> diff --stat HEAD origin/main    # MUST be empty before the next line
+git -C <release> reset --hard origin/main
+```
+
+Do **not** use `--depth 1`: the pre-push guard refuses a shallow clone because it
+cannot build ancestry to scan ("outgoing commits do not build from a clone").
+That refusal is correct — unshallow rather than reaching for `GIT_GUARD_OFF=1`.
+
+The final `diff --stat` is the safety check: `git am` produces a different sha for
+identical content, and the reset is only safe because the content matches. The
+release dir is the running code — confirm a checksum on a touched file is
+unchanged across the reset.
+
 ## 4. The order that actually matters
 
 1. **Preflight, all read-only.** `git -C <release> status` clean;
