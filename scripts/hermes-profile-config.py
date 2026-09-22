@@ -539,9 +539,18 @@ def cmd_memory_pin(args) -> int:
 
     Six profiles hit this today. Rather than depend on that resolver, pin
     ``bank_id`` per profile so identity is deterministic and a future rename or
-    re-symlink cannot silently merge two agents' private memory.
+    re-symlink cannot silently merge two agents' private memory. A travelling
+    named agent may pass ``--bank-id agent-<identity>``; that declaration is
+    deliberately exact and is not derived from the current post/profile name.
     """
     import json
+
+    if args.bank_id and not args.profile:
+        sys.exit("FATAL: --bank-id requires --profile; one declared personal bank cannot be applied to every profile")
+    if args.bank_id and args.only_broken:
+        sys.exit("FATAL: --bank-id cannot be combined with --only-broken")
+    if args.bank_id and __import__("re").fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", args.bank_id) is None:
+        sys.exit("FATAL: --bank-id must be a lower-case bank identifier")
 
     broken = args.only_broken
     pinned = skipped = 0
@@ -563,10 +572,11 @@ def cmd_memory_pin(args) -> int:
                 payload = json.loads(target.read_text(encoding="utf-8"))
             except Exception:
                 payload = {}
-        payload["bank_id"] = f"agent-{name}"
+        bank_id = args.bank_id or f"agent-{name}"
+        payload["bank_id"] = bank_id
         payload.pop("bank_id_template", None)  # explicit pin wins; no ambiguity
-        why = "resolver-ok" if ok else "resolver would yield 'custom'"
-        print(f"pin {name:34s} -> agent-{name:32s} ({why})")
+        why = "declared bank" if args.bank_id else ("resolver-ok" if ok else "resolver would yield 'custom'")
+        print(f"pin {name:34s} -> {bank_id:32s} ({why})")
         if args.dry_run:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -652,6 +662,10 @@ def main() -> int:
             action="store_true",
             help="memory-pin: pin only the profiles whose identity would "
             "silently resolve to 'custom' and collide",
+        )
+        p.add_argument(
+            "--bank-id",
+            help="memory-pin: pin one profile to this explicit named-agent bank; requires --profile",
         )
         p.set_defaults(func=fn)
     args = ap.parse_args()

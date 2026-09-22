@@ -471,3 +471,76 @@ def test_initial_delta_seed_uses_shared_lock_and_recovers_after_crash(
     )
     assert "profile-config-seed.py" in profile_step
     assert 'cat > "$PROFILE_DELTA"' not in profile_step
+
+
+def test_memory_pin_keeps_named_agent_bank_across_profile_change(tmp_path: Path) -> None:
+    fleet = tmp_path / "home" / ".hermes"
+    first = fleet / "profiles" / "infra-director"
+    first.mkdir(parents=True)
+    (fleet / "config.yaml").write_text("operator: {}\n", encoding="utf-8")
+
+    env = os.environ.copy()
+    env["HERMES_FLEET_HOME"] = str(fleet)
+    pinned = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(PROFILE_RENDERER),
+            "memory-pin",
+            "--profile",
+            "infra-director",
+            "--bank-id",
+            "agent-grolf",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert pinned.returncode == 0, pinned.stdout + pinned.stderr
+    assert yaml.safe_load(
+        (first / "hindsight" / "config.json").read_text(encoding="utf-8")
+    )["bank_id"] == "agent-grolf"
+
+    moved = fleet / "profiles" / "cto"
+    first.rename(moved)
+    repinned = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(PROFILE_RENDERER),
+            "memory-pin",
+            "--profile",
+            "cto",
+            "--bank-id",
+            "agent-grolf",
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert repinned.returncode == 0, repinned.stdout + repinned.stderr
+    assert yaml.safe_load(
+        (moved / "hindsight" / "config.json").read_text(encoding="utf-8")
+    )["bank_id"] == "agent-grolf"
+
+
+def test_memory_pin_keeps_profile_template_as_legacy_default(tmp_path: Path) -> None:
+    fleet = tmp_path / "home" / ".hermes"
+    profile = fleet / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
+    (fleet / "config.yaml").write_text("operator: {}\n", encoding="utf-8")
+    env = os.environ.copy()
+    env["HERMES_FLEET_HOME"] = str(fleet)
+    result = subprocess.run(
+        [sys.executable, "-I", str(PROFILE_RENDERER), "memory-pin", "--profile", "demo-pm"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert yaml.safe_load(
+        (profile / "hindsight" / "config.json").read_text(encoding="utf-8")
+    )["bank_id"] == "agent-demo-pm"
