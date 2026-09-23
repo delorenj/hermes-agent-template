@@ -166,3 +166,21 @@ def test_launcher_scrubs_channel_env_but_preserves_model_env_fallback(tmp_path: 
     observed = json.loads(Path(env["CAPTURE_PATH"]).read_text(encoding="utf-8"))
     assert observed["telegram"] is None
     assert observed["model_key"] == "runtime-env-model"
+
+
+def test_unit_entrypoints_ship_executable() -> None:
+    # 70-systemd.sh writes `ExecStart=<role>/.scripts/credential-launch.sh`,
+    # and systemd execs it directly: a 0644 copy fails with status=203/EXEC.
+    # `flume remediate` copies a template file's executable bit, so the bit
+    # has to be on the template file itself -- chmod at provisioning time does
+    # not survive the next scaffold refresh.
+    for name in ("credential-launch.sh", "heartbeat.sh"):
+        path = SCRIPTS / name
+        assert os.access(path, os.X_OK), f"{name} must be executable"
+        mode = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-s", f"template/.scripts/{name}"],
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.split()[0]
+        assert mode == "100755", f"{name} is tracked as {mode}"
