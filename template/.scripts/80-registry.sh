@@ -50,7 +50,6 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
   "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" \
-  "$(yaml_get service_state.gateway)" "$(yaml_get service_state.heartbeat)" \
   "$ROLE_IDENTITY_JSON" <<'PYEOF'
 import datetime
 import copy
@@ -71,7 +70,7 @@ except ImportError:
  slack_username, role_yaml, plane_ws, plane_id,
  plane_ident, hermes_bin, hermes_repo, hermes_git_url,
  hermes_git_ref, hermes_git_sha, fleet_env, gw, heartbeat,
- gateway_state, heartbeat_state, identity_json) = sys.argv[1:33]
+ identity_json) = sys.argv[1:31]
 p = pathlib.Path(path)
 if p.is_symlink():
     raise SystemExit(f"refusing to update registry symlink: {p}")
@@ -166,6 +165,10 @@ existing = agents.get(agent_id, {})
 if not isinstance(existing, dict):
     raise SystemExit(f"fleet registry entry for {agent_id} must be a mapping")
 provisioned_at = existing.get("provisioned_at")
+if isinstance(provisioned_at, (datetime.datetime, datetime.date)):
+    # PyYAML reads an unquoted timestamp (how most rows are written) as a
+    # datetime; keep the original provisioning time instead of resetting it.
+    provisioned_at = provisioned_at.isoformat()
 if not isinstance(provisioned_at, str) or not provisioned_at:
     provisioned_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
 managed = {
@@ -205,11 +208,14 @@ managed = {
     "git_sha": hermes_git_sha,
     "fleet_env": fleet_env,
   },
+  # Only the unit NAMES the handbook's systemd_lifecycle seam declares
+  # writable. The gateway/heartbeat STATE lives in role.yaml `service_state`
+  # (70-systemd.sh writes it, 99-summary.sh reads it); flume review derives the
+  # desired gateway state from the messaging declaration and reports any other
+  # systemd key on a row as `registry-retired-key`.
   "systemd": {
     "gateway_unit": gw,
     "heartbeat_timer": heartbeat,
-    "gateway_state": gateway_state,
-    "heartbeat_state": heartbeat_state,
   },
   "provisioned_at": provisioned_at,
 }
@@ -248,11 +254,15 @@ if not identity and isinstance(entry.get("identity"), str):
     hindsight = entry.get("hindsight")
     if isinstance(hindsight, dict) and hindsight.get("write_bank") == f"agent-{prior}":
         entry.pop("hindsight", None)
-# This is retired managed schema, not extension metadata.  Keeping it would
-# falsely advertise a second per-agent Bloodbank execution path.
+# Retired managed schema, not extension metadata. consumer_unit would falsely
+# advertise a second per-agent Bloodbank execution path; gateway_state and
+# heartbeat_state (projected 2026-08-27 to 2026-09-23) duplicate role.yaml
+# service_state under keys the handbook does not declare.
+RETIRED_SYSTEMD_KEYS = ("consumer_unit", "gateway_state", "heartbeat_state")
 systemd = entry.get("systemd")
 if isinstance(systemd, dict):
-    systemd.pop("consumer_unit", None)
+    for retired_key in RETIRED_SYSTEMD_KEYS:
+        systemd.pop(retired_key, None)
 agents[agent_id] = entry
 rendered = yaml.safe_dump(data, sort_keys=False)
 p.parent.mkdir(parents=True, exist_ok=True)

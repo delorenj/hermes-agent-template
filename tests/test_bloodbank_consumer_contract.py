@@ -797,10 +797,54 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
     assert entry["systemd"] == {
         "gateway_unit": "hermes-demo-pm-gateway.service",
         "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
-        "gateway_state": "pending",
-        "heartbeat_state": "pending",
     }
     assert "consumer_unit" not in entry["systemd"]
+
+
+def test_registry_drops_retired_service_state_keys_and_keeps_role_state(
+    tmp_path: Path,
+) -> None:
+    """gateway_state/heartbeat_state are not handbook-declared systemd keys.
+
+    80-registry.sh projected role.yaml service_state into them from 2026-08-27;
+    flume review reports both as registry-retired-key. A re-provision must drop
+    them from an existing row (tonnybox-pm, dumply carried them) while leaving
+    operator extension keys and role.yaml's own service_state alone.
+    """
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    role_before = (role / "role.yaml").read_bytes()
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "agents": {
+                    "demo-pm": {
+                        "systemd": {
+                            "gateway_unit": "hermes-demo-pm-gateway.service",
+                            "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
+                            "gateway_state": "deferred",
+                            "heartbeat_state": "retired",
+                            "operator_policy": "manual-window",
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    systemd = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["systemd"]
+    assert systemd == {
+        "gateway_unit": "hermes-demo-pm-gateway.service",
+        "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
+        "operator_policy": "manual-window",
+    }
+    assert (role / "role.yaml").read_bytes() == role_before
 
 
 def test_registry_merge_preserves_extensions_timestamp_and_is_byte_convergent(
