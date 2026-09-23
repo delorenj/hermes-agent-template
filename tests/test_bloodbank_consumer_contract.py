@@ -918,6 +918,113 @@ def test_registry_rejects_malformed_bloodbank_gate_without_mutation(tmp_path: Pa
     assert registry.read_bytes() == before
 
 
+def _drop_bloodbank_enabled(role_yaml: Path) -> None:
+    text = role_yaml.read_text(encoding="utf-8").replace("  enabled: false\n", "", 1)
+    assert "enabled:" not in text.split("bloodbank:", 1)[1].split("service_state:", 1)[0]
+    role_yaml.write_text(text, encoding="utf-8")
+
+
+def test_absent_bloodbank_enabled_is_never_read_from_a_later_block(tmp_path: Path) -> None:
+    """Regression: an absent bloodbank.enabled once read `reconcile.enabled: false`.
+
+    The shell `yaml_get` found `^bloodbank:` and then scanned the REST OF THE
+    FILE for `enabled:`, so a later block's flag decided the gate and
+    80-registry.sh wrote the agent quarantined -- the silent-quarantine path
+    that "no key means enabled" was meant to close.
+    """
+    role, registry = _make_role(tmp_path)
+    role_yaml = role / "role.yaml"
+    _drop_bloodbank_enabled(role_yaml)
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8")
+        + "reconcile:\n  enabled: false\n  explicit_opt_out: true\n",
+        encoding="utf-8",
+    )
+    env = _environment(tmp_path, registry)
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["bloodbank"]["enabled"] is True
+    assert entry["bloodbank"]["gateway_scope"] == "fleet"
+    assert entry["bloodbank"]["target_agent_id"] == "demo-pm"
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    (
+        ("  enabled: false  # quarantined by the operator\n", False),
+        ("  enabled: true   # re-activated\n", True),
+    ),
+)
+def test_bloodbank_gate_ignores_trailing_comments(
+    tmp_path: Path, line: str, expected: bool
+) -> None:
+    role, registry = _make_role(tmp_path)
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace("  enabled: false\n", line, 1),
+        encoding="utf-8",
+    )
+    env = _environment(tmp_path, registry)
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["bloodbank"]["enabled"] is expected
+
+
+@pytest.mark.parametrize(
+    "line",
+    (
+        '  enabled: "false"\n',
+        "  enabled: True\n",
+        "  enabled: on\n",
+        "  enabled:\n",
+        '  enabled: ""\n',
+    ),
+)
+def test_present_non_boolean_bloodbank_gate_is_refused(tmp_path: Path, line: str) -> None:
+    """Present but not the strict boolean `true`/`false`: refuse, never guess."""
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    seeded = _run(role, "80-registry.sh", env)
+    assert seeded.returncode == 0, seeded.stderr
+    before = registry.read_bytes()
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace("  enabled: false\n", line, 1),
+        encoding="utf-8",
+    )
+
+    refused = _run(role, "80-registry.sh", env)
+
+    assert refused.returncode != 0
+    assert "strict YAML boolean" in refused.stderr
+    assert registry.read_bytes() == before
+
+
+def test_duplicate_bloodbank_block_cannot_discard_a_quarantine(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    seeded = _run(role, "80-registry.sh", env)
+    assert seeded.returncode == 0, seeded.stderr
+    before = registry.read_bytes()
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8") + "bloodbank:\n  gateway_scope: fleet\n",
+        encoding="utf-8",
+    )
+
+    refused = _run(role, "80-registry.sh", env)
+
+    assert refused.returncode != 0
+    assert "duplicate key" in refused.stderr
+    assert registry.read_bytes() == before
+
+
 def test_concurrent_registry_upserts_are_atomic_and_lossless(tmp_path: Path) -> None:
     role_a, _ = _make_role(tmp_path / "a")
     role_b, _ = _make_role(tmp_path / "b")
