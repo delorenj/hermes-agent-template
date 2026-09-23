@@ -123,3 +123,36 @@ def test_yaml_get_refuses_to_descend_into_a_scalar(tmp_path: Path) -> None:
     result = _yaml_get(tmp_path, "repo.enabled")
     assert result.returncode != 0
     assert "not a block mapping" in result.stderr
+
+
+def test_yaml_upsert_block_value_inserts_into_its_own_block(tmp_path: Path) -> None:
+    """A key the block lacks lands in THAT block, not after the file's last line."""
+    role = tmp_path / "role"
+    (role / ".scripts").mkdir(parents=True)
+    shutil.copy2(LIB, role / ".scripts" / "_lib.sh")
+    shutil.copytree(LIB.parent / "lib", role / ".scripts" / "lib")
+    (role / "role.yaml").write_text(
+        "reconcile:\n  enabled: false  # legacy\n  grace_hours: 0\n\n"
+        "plane:\n  identifier: X\n\n# Provenance\nprovisioned_by: hermes-agent-template\n",
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    env = dict(os.environ)
+    env.update({"HOME": str(home), "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env")})
+    script = (
+        'source "$1"; yaml_upsert_block_value reconcile enabled true bool; '
+        "yaml_upsert_block_value reconcile explicit_opt_out false bool; "
+        "yaml_upsert_block_value service_state gateway active"
+    )
+    result = subprocess.run(
+        ["bash", "-c", script, "upsert", str(role / ".scripts" / "_lib.sh")],
+        env=env, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    import yaml
+
+    data = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
+    assert data["reconcile"] == {"enabled": True, "grace_hours": 0, "explicit_opt_out": False}
+    assert data["provisioned_by"] == "hermes-agent-template"
+    assert data["service_state"] == {"gateway": "active"}
