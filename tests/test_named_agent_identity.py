@@ -228,3 +228,17 @@ def test_telegram_refuses_a_token_and_a_reference_together(tmp_path: Path) -> No
     assert "not both" in result.stderr
     assert BOT_TOKEN not in result.stdout + result.stderr
     assert yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["telegram"]["provisioning_status"] == "deferred"
+
+
+def test_registry_keeps_an_unquoted_provisioning_timestamp(tmp_path: Path) -> None:
+    role, _, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    registry.write_text(
+        "schema_version: 1\nagents:\n  demo-pm:\n    provisioned_at: 2026-08-26 19:47:13.188942+00:00\n",
+        encoding="utf-8",
+    )
+    result = _run_registry(role, registry, home)
+    assert result.returncode == 0, result.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["provisioned_at"] == "2026-08-26T19:47:13.188942+00:00"

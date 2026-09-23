@@ -169,7 +169,8 @@ if already_done 30-telegram; then
   log "[30] existing completion marker preserved while Telegram is reconciled"
 fi
 
-cat >&2 <<EOF
+# An adopted vault reference already names a bot; BotFather steps are noise.
+[[ -n "$TELEGRAM_ADOPTED_REFERENCE" ]] || cat >&2 <<EOF
 
 ╭─ BotFather steps for @$BOT_HANDLE ─────────────────────────────────────╮
 │ 1. Open Telegram, message @BotFather                                   │
