@@ -198,10 +198,15 @@ systemctl --user list-units --state=active 'hermes-*'
 python3 -c "import yaml,pathlib; print(yaml.safe_load(pathlib.Path.home().joinpath('.hermes/agents-registry.yaml').read_text())['agents']['<agent-id>']['bloodbank'])"
 ```
 
-A resolvable target remains quarantined while `bloodbank.enabled` is `false`.
-After the profile and ingress policy have passed their activation checks, edit
-that strict boolean to `true` in the role's `role.yaml`, then rerun
-`.scripts/80-registry.sh`. No provisioning or parity command auto-enables it.
+No key means enabled: a resolvable target is routable unless
+`bloodbank.enabled` is explicitly `false`. An absent key in `role.yaml` is
+projected into the registry as `true` by `.scripts/80-registry.sh`, and the
+fleet gateway treats an absent registry key as enabled too. To quarantine an
+agent, set the strict boolean `enabled: false` under `bloodbank:` in the role's
+`role.yaml` and rerun `.scripts/80-registry.sh`; set it back to `true` (or
+delete the line) to re-enable. A non-boolean value (`yes`, `"true"`) is refused
+by `80-registry.sh` and treated as disabled by the gateway, which logs an
+ERROR naming `agents.<id>.bloodbank.enabled`.
 
 ## Deferred manual steps (one-time per agent)
 

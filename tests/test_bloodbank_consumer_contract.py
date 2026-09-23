@@ -833,9 +833,10 @@ def test_registry_merge_preserves_extensions_timestamp_and_is_byte_convergent(
     ("role_name", "agent_id"),
     (("pm", "demo-pm"), ("director", "demo-director")),
 )
-def test_bloodbank_stays_quarantined_until_explicit_activation(
+def test_bloodbank_absent_key_enables_and_explicit_false_quarantines(
     tmp_path: Path, role_name: str, agent_id: str
 ) -> None:
+    """No key means enabled; only an explicit `false` quarantines."""
     role, registry = _make_role(tmp_path)
     role_yaml = role / "role.yaml"
     if role_name == "director":
@@ -867,6 +868,30 @@ def test_bloodbank_stays_quarantined_until_explicit_activation(
     )
     activated = _run(role, "80-registry.sh", env)
     assert activated.returncode == 0, activated.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
+    assert entry["bloodbank"]["enabled"] is True
+    assert isinstance(entry["bloodbank"]["enabled"], bool)
+
+    # Quarantine again, then DROP the key: an absent bloodbank.enabled must
+    # re-enable the agent rather than silently leave it disabled.
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            "  enabled: true", "  enabled: false"
+        ),
+        encoding="utf-8",
+    )
+    requarantined = _run(role, "80-registry.sh", env)
+    assert requarantined.returncode == 0, requarantined.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
+    assert entry["bloodbank"]["enabled"] is False
+
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace("  enabled: false\n", "", 1),
+        encoding="utf-8",
+    )
+    assert "enabled:" not in role_yaml.read_text(encoding="utf-8").split("bloodbank:", 1)[1].split("service_state:", 1)[0]
+    absent = _run(role, "80-registry.sh", env)
+    assert absent.returncode == 0, absent.stderr
     entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"][agent_id]
     assert entry["bloodbank"]["enabled"] is True
     assert isinstance(entry["bloodbank"]["enabled"], bool)
@@ -979,7 +1004,8 @@ def test_template_declares_fleet_scope_and_retains_compatibility_step() -> None:
     step = (SCRIPTS / "60-bloodbank.sh").read_text(encoding="utf-8")
 
     assert "gateway_scope: fleet" in role
-    assert "enabled: false" in role
+    # Activation defaults on; an operator quarantines with an explicit false.
+    assert re.search(r"(?m)^bloodbank:\n(?:\s*#.*\n)*\s+enabled: true$", role)
     assert "target_agent_id: {{ agent_id | tojson }}" in role
     assert './.scripts/60-bloodbank.sh' in copier
     assert "SKIP_BLOODBANK accepted as a compatibility no-op" in step

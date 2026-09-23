@@ -149,7 +149,7 @@ not by a consumer in every runtime. Each registry entry advertises:
 
 ```yaml
 bloodbank:
-  enabled: false
+  enabled: true        # default on; absent also means enabled; false quarantines
   gateway_scope: fleet
   target_agent_id: <agent-id>
 ```
@@ -159,10 +159,16 @@ fleet registry, and routes the turn into that Hermes profile. Each profile's own
 messaging gateway remains independent; there is no per-profile NATS process,
 systemd consumer unit, or filesystem inbox bridge.
 
-Discovery is not execution authority. New roles and registry entries start
-with strict boolean `bloodbank.enabled: false`; only an explicit activation
-edit may set it to `true`. Provisioning preserves that explicit manifest value
-and never infers activation from a resolvable target or installed service.
+No key means enabled. New roles render `bloodbank.enabled: true`, and an
+ABSENT `bloodbank.enabled` in `role.yaml` or in the registry row also means
+enabled: `80-registry.sh` projects it as `true`, flume's parity rules read it as
+`true`, and the fleet gateway routes it. Only an explicit YAML `false`
+quarantines an agent; provisioning preserves that explicit value. A present
+value that is not a strict YAML boolean (`yes`, `"true"`, `1`) is invalid:
+`80-registry.sh` refuses it without touching the registry and the gateway
+treats the row as disabled and logs an ERROR. (Until 2026-09-22 an absent key
+read as `false`; an accidental re-provision that dropped the key silently
+disabled 33god-pm's grooming, which is why the default flipped.)
 
 Each agent emits CloudEvents 1.0 envelopes with `actor.agent_id`,
 `producer = hermes-agent:<id>`, `source = hermes://agent/<id>`. The naming
