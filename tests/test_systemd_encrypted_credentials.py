@@ -22,6 +22,9 @@ def _role(tmp_path: Path) -> tuple[Path, dict[str, str]]:
     subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
     for name in ("_lib.sh", "credential-launch.sh"):
         shutil.copy2(SCRIPTS / name, scripts / name)
+    # credential-launch.sh reads role.yaml through the shared block-scoped
+    # walker in lib/role-yaml.py.
+    shutil.copytree(SCRIPTS / "lib", scripts / "lib")
     (role / "role.yaml").write_text(
         """repo: demo
 role: director
@@ -103,7 +106,11 @@ def test_launcher_reads_volatile_credentials_and_forwards_only_key_name(
     assert observed["model_key"] == "model-runtime-secret"
     assert observed["home"].endswith("/.hermes/profiles/demo-director")
     assert observed["terminal_cwd"] == str(role.parents[2])
+    # A named profile rides on argv: `hermes profile list` identifies a gateway
+    # by its command line, and HERMES_HOME alone reports it "stopped".
     assert observed["argv"] == [
+        "-p",
+        "demo-director",
         "gateway",
         "run",
         "--replace",

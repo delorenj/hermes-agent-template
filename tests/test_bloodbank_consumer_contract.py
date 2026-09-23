@@ -213,7 +213,9 @@ def test_step_60_is_a_harmless_compatibility_noop(tmp_path: Path, skip: str) -> 
     assert "NATS" not in result.stdout + result.stderr
 
 
-def test_systemd_installs_only_profile_gateway_and_heartbeat(tmp_path: Path) -> None:
+def test_systemd_installs_only_the_profile_gateway(tmp_path: Path) -> None:
+    # The per-agent heartbeat timer/service is retired (2026-09-17): the gateway
+    # is the only unit an agent has, and service_state records heartbeat retired.
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
     subprocess.run(["git", "init", "--quiet"], cwd=tmp_path, check=True)
@@ -239,8 +241,8 @@ exit 1
     assert result.returncode == 0, result.stderr
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
     assert (unit_dir / "hermes-demo-pm-gateway.service").is_file()
-    assert (unit_dir / "hermes-demo-pm-heartbeat.service").is_file()
-    assert (unit_dir / "hermes-demo-pm-heartbeat.timer").is_file()
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.service").exists()
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.timer").exists()
     assert not (unit_dir / "hermes-demo-pm-consumer.service").exists()
     rendered = "\n".join(path.read_text(encoding="utf-8") for path in unit_dir.iterdir())
     assert "bloodbank-consumer.py" not in rendered
@@ -248,21 +250,18 @@ exit 1
     assert f'Environment="HERMES_HOME={Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"}"' in rendered
     assert f'Environment="TERMINAL_CWD={tmp_path}"' in rendered
     assert 'ExecStart="' + str(role / ".scripts" / "credential-launch.sh") + '" gateway' in rendered
-    assert f"WorkingDirectory={tmp_path}" in rendered
     assert f"EnvironmentFile=-{role / 'runtime' / '.env'}" in rendered
     assert f"StandardOutput=append:{role / 'runtime' / 'logs' / 'gateway.systemd.log'}" in rendered
     assert 'Description="Hermes' not in rendered
     assert "HERMES_OAUTH_FILE" not in rendered
     states = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["service_state"]
-    assert states == {"gateway": "deferred", "heartbeat": "installed"}
+    assert states == {"gateway": "deferred", "heartbeat": "retired"}
 
     verification = subprocess.run(
         [
             "systemd-analyze",
             "verify",
             str(unit_dir / "hermes-demo-pm-gateway.service"),
-            str(unit_dir / "hermes-demo-pm-heartbeat.service"),
-            str(unit_dir / "hermes-demo-pm-heartbeat.timer"),
         ],
         text=True,
         capture_output=True,
@@ -301,10 +300,9 @@ def test_systemd_serializes_spaces_quotes_backslashes_percent_and_dollar(
     assert result.returncode == 0, result.stderr
     units = Path(env["HOME"]) / ".config" / "systemd" / "user"
     gateway = (units / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
-    heartbeat = (units / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
     expected = 'Environment="CODEX_HOME=/code x/\\"quoted\\"/back\\\\slash/%%token/$dollar"'
     assert expected in gateway
-    assert expected in heartbeat
+    assert not (units / "hermes-demo-pm-heartbeat.service").exists()
 
 
 def test_systemd_execstart_suppresses_variable_and_specifier_expansion(
@@ -373,8 +371,8 @@ exit 1
     assert (role / ".scripts" / ".done-70-systemd").is_file()
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
     assert (unit_dir / "hermes-demo-pm-gateway.service").is_file()
-    assert (unit_dir / "hermes-demo-pm-heartbeat.service").is_file()
-    assert (unit_dir / "hermes-demo-pm-heartbeat.timer").is_file()
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.service").exists()
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.timer").exists()
 
 
 def test_systemd_loads_optional_encrypted_credentials_without_plaintext(
@@ -418,15 +416,16 @@ exit 1
     assert result.returncode == 0, result.stderr
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
     gateway = (unit_dir / "hermes-demo-pm-gateway.service").read_text(encoding="utf-8")
-    heartbeat = (unit_dir / "hermes-demo-pm-heartbeat.service").read_text(encoding="utf-8")
     assert f'LoadCredentialEncrypted="telegram_bot_token:{telegram_cred}"' not in gateway
     assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in gateway
-    assert f'LoadCredentialEncrypted="model_api_key:{model_cred}"' in heartbeat
-    assert "DIRECTOR_LITELLM_KEY" not in gateway + heartbeat
-    assert "encrypted-placeholder" not in gateway + heartbeat
+    assert "DIRECTOR_LITELLM_KEY" not in gateway
+    assert "encrypted-placeholder" not in gateway
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.service").exists()
 
 
-def test_no_credential_gateway_is_deferred_while_heartbeat_runs_on_rerun(tmp_path: Path) -> None:
+def test_no_credential_gateway_is_deferred_and_legacy_heartbeat_removed_on_rerun(
+    tmp_path: Path,
+) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
     unit_dir = Path(env["HOME"]) / ".config" / "systemd" / "user"
@@ -456,16 +455,8 @@ case "$*" in
     if [[ -f "$SYSTEMCTL_RETIRED" ]]; then echo disabled; exit 1; else echo enabled; exit 0; fi ;;
   *"is-system-running"*) echo running; exit 0 ;;
   *"daemon-reload"*) exit 0 ;;
-  *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
-  *"start hermes-demo-pm-heartbeat.service"*) exit 0 ;;
-  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
-  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.timer"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.service"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
-      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
+  *"disable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
+  *"stop hermes-demo-pm-heartbeat.service"*) exit 0 ;;
   *"disable --now hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"reset-failed hermes-demo-pm-gateway.service"*) exit 0 ;;
   *"is-active hermes-demo-pm-gateway.service"*) echo inactive; exit 3 ;;
@@ -494,15 +485,26 @@ exit 1
     calls = log.read_text(encoding="utf-8")
     assert "enable --now hermes-demo-pm-gateway.service" not in calls
     assert "disable --now hermes-demo-pm-gateway.service" in calls
+    # Re-provisioning a legacy host converges it: the retired heartbeat units are
+    # disabled and deleted, never re-enabled.
+    assert "disable --now hermes-demo-pm-heartbeat.timer" in calls
+    assert "enable --now hermes-demo-pm-heartbeat.timer" not in calls
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.service").exists()
+    assert not (unit_dir / "hermes-demo-pm-heartbeat.timer").exists()
+    assert "heartbeat retired" in result.stderr
     role_data = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
     states = role_data["service_state"]
-    assert states == {"gateway": "deferred", "heartbeat": "active"}
+    assert states == {"gateway": "deferred", "heartbeat": "retired"}
     assert role_data["reconcile"] == {"enabled": True, "explicit_opt_out": False}
 
 
-def test_heartbeat_delayed_exit_78_is_observed_across_full_stabilization_window(
+def test_gateway_delayed_exit_78_is_observed_across_full_stabilization_window(
     tmp_path: Path,
 ) -> None:
+    # The stabilization window used to be proven on the heartbeat timer, which
+    # is retired. The gateway is the one unit left, so the window is proven on
+    # it: a gateway that looks healthy for three samples and then exits 78 must
+    # still be caught, because every sample in the window is read.
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
     env.update(
@@ -512,12 +514,38 @@ def test_heartbeat_delayed_exit_78_is_observed_across_full_stabilization_window(
             "SYSTEMD_STABILIZATION_INTERVAL_SECONDS": "0",
         }
     )
-    marker = role / ".scripts" / ".done-70-systemd"
+    scripts = role / ".scripts"
+    marker = scripts / ".done-70-systemd"
     marker.touch()
-    shutil.copy2(SCRIPTS / "99-summary.sh", role / ".scripts" / "99-summary.sh")
+    shutil.copy2(SCRIPTS / "store-onepassword-secret.py", scripts)
+    shutil.copy2(SCRIPTS / "99-summary.sh", scripts)
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(
+        role_yaml.read_text(encoding="utf-8").replace(
+            'provisioning_status: "deferred"',
+            'provisioning_status: "verified"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    (profile / "config.delta.yaml").write_text(
+        "secrets:\n"
+        "  onepassword:\n"
+        "    enabled: true\n"
+        "    env:\n"
+        "      TELEGRAM_BOT_TOKEN: op://DeLoSecrets/demo/password\n",
+        encoding="utf-8",
+    )
     fake_bin = tmp_path / "delayed-failure-bin"
     fake_bin.mkdir()
-    samples = tmp_path / "heartbeat-samples"
+    samples = tmp_path / "gateway-samples"
+    op = fake_bin / "op"
+    op.write_text(
+        "#!/usr/bin/env bash\n[[ \"$1\" == read ]] && { printf '%s\\n' resolved; exit 0; }; exit 1\n",
+        encoding="utf-8",
+    )
+    op.chmod(0o755)
     systemctl = fake_bin / "systemctl"
     systemctl.write_text(
         """#!/usr/bin/env bash
@@ -525,27 +553,20 @@ case "$*" in
   *"is-active hermes-demo-pm-consumer.service"*) echo inactive; exit 4 ;;
   *"is-enabled hermes-demo-pm-consumer.service"*) echo not-found; exit 4 ;;
   *"is-system-running"*) echo running; exit 0 ;;
-  *"daemon-reload"*) exit 0 ;;
-  *"enable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
-  *"start hermes-demo-pm-heartbeat.service"*) exit 0 ;;
-  *"disable --now hermes-demo-pm-heartbeat.timer"*) exit 0 ;;
-  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
-  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.timer"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.service"*)
+  *"daemon-reload"*|*"enable --now"*|*"disable --now"*|*"reset-failed"*) exit 0 ;;
+  *"is-active hermes-demo-pm-gateway.service"*) echo active; exit 0 ;;
+  *"is-enabled hermes-demo-pm-gateway.service"*) echo enabled; exit 0 ;;
+  *"show hermes-demo-pm-gateway.service"*)
     count=0
-    [[ ! -f "$HEARTBEAT_SAMPLES" ]] || count="$(cat "$HEARTBEAT_SAMPLES")"
+    [[ ! -f "$GATEWAY_SAMPLES" ]] || count="$(cat "$GATEWAY_SAMPLES")"
     count=$((count + 1))
-    printf '%s\n' "$count" > "$HEARTBEAT_SAMPLES"
+    printf '%s\n' "$count" > "$GATEWAY_SAMPLES"
     if (( count <= 3 )); then
-      printf '%s\n' 'LoadState=loaded' 'ActiveState=activating' 'SubState=start' \
-        'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
-        'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=0'
+      printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=running' \
+        'Result=success' 'ExecMainStatus=0' 'NRestarts=0'
     else
       printf '%s\n' 'LoadState=loaded' 'ActiveState=failed' 'SubState=failed' \
-        'Result=exit-code' 'ExecMainStatus=78' 'NRestarts=1' \
-        'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=400'
+        'Result=exit-code' 'ExecMainStatus=78' 'NRestarts=1'
     fi
     exit 0 ;;
 esac
@@ -557,19 +578,19 @@ exit 1
     env.update(
         {
             "PATH": f"{fake_bin}:{env['PATH']}",
-            "HEARTBEAT_SAMPLES": str(samples),
+            "GATEWAY_SAMPLES": str(samples),
         }
     )
 
     result = _run(role, "70-systemd.sh", env)
 
     assert result.returncode != 0
-    assert "heartbeat did not stabilize healthy" in result.stderr
+    assert "did not stabilize healthy" in result.stderr
     assert "status=78" in result.stderr
     assert samples.read_text(encoding="utf-8").strip() == "6"
-    role_data = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))
-    assert role_data["service_state"]["heartbeat"] == "error"
-    assert role_data["service_state"]["gateway"] != "active"
+    role_data = yaml.safe_load(role_yaml.read_text(encoding="utf-8"))
+    assert role_data["service_state"]["gateway"] == "error"
+    assert role_data["service_state"]["heartbeat"] == "retired"
     assert not marker.exists()
 
     summary = _run(role, "99-summary.sh", env)
@@ -651,7 +672,7 @@ exit 1
     assert "status=78" in deployed.stderr
     role_data = yaml.safe_load(role_yaml.read_text(encoding="utf-8"))
     assert role_data["service_state"]["gateway"] == "error"
-    assert role_data["service_state"]["heartbeat"] == "active"
+    assert role_data["service_state"]["heartbeat"] == "retired"
     assert not (scripts / ".done-70-systemd").exists()
     calls = log.read_text(encoding="utf-8")
     assert "disable --now hermes-demo-pm-gateway.service" in calls

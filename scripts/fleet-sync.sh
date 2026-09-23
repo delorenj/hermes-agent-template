@@ -331,7 +331,9 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     continue
   fi
   fleet_assets_eligible=1
-  for fleet_asset in fleet-env.sh parse-fleet-env.py profile-config-lock.py profile-config-seed.py voice-config.py; do
+  # role-yaml.py is heartbeat.sh's role.yaml reader, so it lands before the
+  # heartbeat refresh below.
+  for fleet_asset in fleet-env.sh parse-fleet-env.py profile-config-lock.py profile-config-seed.py voice-config.py role-yaml.py; do
     source_asset="$SCRIPT_DIR/../template/.scripts/lib/$fleet_asset"
     target_asset="$role_lib_dir/$fleet_asset"
     if [[ -L "$target_asset" ]]; then
@@ -376,6 +378,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
       "$PROFILE_CONFIG_LOCK_SOURCE|$role_lib_dir/profile-config-lock.py" \
       "$PROFILE_CONFIG_SEED_SOURCE|$role_lib_dir/profile-config-seed.py" \
       "$VOICE_CONFIG_TOOL|$role_lib_dir/voice-config.py" \
+      "$SCRIPT_DIR/../template/.scripts/lib/role-yaml.py|$role_lib_dir/role-yaml.py" \
       "$HEARTBEAT_TEMPLATE|$heartbeat_target"
     do
       source_asset="${attestation%%|*}"

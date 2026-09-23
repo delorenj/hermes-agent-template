@@ -46,15 +46,54 @@ def snapshot(root):
     return result
 
 
+MIN_NODE_MAJOR = 24
+
+
+def _node_major(node: Path) -> int:
+    result = subprocess.run([str(node), "--version"], text=True, capture_output=True)
+    try:
+        return int(result.stdout.strip().lstrip("v").split(".")[0])
+    except ValueError:
+        return 0
+
+
+def _node_with_npm() -> Path:
+    """The Node this suite installs Skillex with.
+
+    SKILLEX_TEST_NODE_BIN wins. Otherwise the first candidate that is new
+    enough for Skillex AND ships npm beside it: the ambient `node`, then the one
+    mise resolves. The ambient one is often not it: a shell without mise
+    activation finds the distro's /usr/bin/node (Node 20), and a mise install
+    that was pruned or half-installed can leave a node with no npm.
+    """
+    override = os.environ.get("SKILLEX_TEST_NODE_BIN")
+    if override:
+        return Path(override).resolve()
+    candidates = []
+    ambient = shutil.which("node")
+    if ambient:
+        candidates.append(Path(ambient).resolve())
+    mise = shutil.which("mise")
+    if mise:
+        resolved = subprocess.run([mise, "which", "node"], text=True, capture_output=True)
+        if resolved.returncode == 0 and resolved.stdout.strip():
+            candidates.append(Path(resolved.stdout.strip()).resolve())
+    for node in candidates:
+        if (node.parent / "npm").exists() and _node_major(node) >= MIN_NODE_MAJOR:
+            return node
+    pytest.fail(
+        f"no Node >= {MIN_NODE_MAJOR} with npm beside it among {[str(c) for c in candidates]}; "
+        "set SKILLEX_TEST_NODE_BIN"
+    )
+
+
 @pytest.fixture(scope="module")
 def installed():
     with tempfile.TemporaryDirectory(
         prefix="hermes-template-skillex-", dir="/tmp"
     ) as tmp:
         root = Path(tmp).resolve()
-        node = Path(
-            os.environ.get("SKILLEX_TEST_NODE_BIN") or shutil.which("node")
-        ).resolve()
+        node = _node_with_npm()
         mise = Path(shutil.which("mise")).resolve()
         prefix = root / "package"
         env = {

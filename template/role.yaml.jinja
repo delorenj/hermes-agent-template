@@ -73,6 +73,15 @@ ticket_provider:
   in_review: ""   # e.g. "In Review"
   completed: ""   # e.g. "Done"
   cancelled: ""   # e.g. "Cancelled"
+  # Optional extended transition targets. A role enables one by naming its
+  # lane here; left out, `tp transition <id> <state>` refuses it with
+  # "ticket_provider.<state> is required" (Plane defaults awaiting_decision to
+  # "Needs Attention"). Aliases: needs_attention/waiting_reply ->
+  # awaiting_decision, ready_for_e2e -> e2e_testing.
+  # awaiting_decision: ""        # started group, e.g. "Awaiting Decision"
+  # e2e_testing: ""              # started group, e.g. "E2E Testing & QA"
+  # ready_for_documentation: ""  # started group, e.g. "Ready for Documentation"
+  # needs_re_evaluation: ""      # unstarted group, e.g. "Needs Re-evaluation"
 
 # Board-reconciliation knobs for the heartbeat sentinel pass.
 reconcile:
