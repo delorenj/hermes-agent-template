@@ -120,6 +120,19 @@ reconcile_enabled:
   help: "Run autonomous PM ticket-board reconciliation from the heartbeat timer"
   default: true
 
+agent_identity:
+  type: str
+  help: >-
+    Optional NAME for a named agent (lower-case, e.g. grolf). Empty = an unnamed
+    post. A named agent keeps its name, personal Hindsight bank (agent-<name>)
+    and chat identity if it changes posts; agent_id/profile stay the post id.
+  default: ""
+  validator: >-
+    {% set ok = 'abcdefghijklmnopqrstuvwxyz0123456789_-' -%}
+    {% if agent_identity and (agent_identity|length > 58 or agent_identity[0] in '_-' or agent_identity|reject('in', ok)|list|length or agent_identity == target_repo ~ '-' ~ role) -%}
+    Name must be a lower-case id ([a-z0-9][a-z0-9_-]*, at most 58 chars) and never the post id
+    {%- endif %}
+
 # ─── Derived (never asked) ───────────────────────────────────────────────
 
 agent_id:
@@ -129,8 +142,9 @@ agent_id:
 
 display_name:
   type: str
-  # Short roles (pm, dev, ops, qa, ci) get uppercased; longer ones get title-cased.
-  default: "{{ target_repo|title }} {% if role|length <= 3 %}{{ role|upper }}{% else %}{{ role|title }}{% endif %}"
+  # A named agent is addressed by its name. Otherwise short roles (pm, dev,
+  # ops, qa, ci) get uppercased; longer ones get title-cased.
+  default: "{% if agent_identity %}{{ agent_identity|title }}{% else %}{{ target_repo|title }} {% if role|length <= 3 %}{{ role|upper }}{% else %}{{ role|title }}{% endif %}{% endif %}"
   when: false
 
 bot_handle:

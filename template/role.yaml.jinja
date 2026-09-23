@@ -17,6 +17,22 @@ purpose: {{ agent_purpose | tojson }}
 # before this field existed are recovered by recognising the tone paragraph
 # already in their soul; every role provisioned from here carries its answer.
 soul_tone: {{ soul_tone | tojson }}
+{%- if agent_identity %}
+
+# Named agent. `name` is WHO this agent is; agent_id/profile below are only the
+# POST it currently holds. The name, the personal Hindsight bank and the chat
+# identity travel with the agent if it changes posts; the repo, board and
+# project memory stay with the post. 10-hermes-profile.sh pins the profile's
+# identity memory to write_bank and 80-registry.sh projects this block into
+# agents.<agent_id>.identity / hindsight.* (validated by .scripts/lib/role-identity.py).
+# Posts are unnamed and carry no identity block at all.
+identity:
+  name: {{ agent_identity | tojson }}
+  write_bank: {{ ("agent-" ~ agent_identity) | tojson }}
+  # Read-only history the agent may recall explicitly (write_bank is implied).
+  recall_banks:
+    - {{ ("agent-" ~ agent_identity) | tojson }}
+{%- endif %}
 
 # Process-local gateway inference target (empty = inherit from shared
 # ~/.hermes/config.yaml). key_env is a variable NAME only; its secret value is

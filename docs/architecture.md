@@ -121,6 +121,55 @@ credential in 1Password, maps only its `op://` reference into the named profile,
 and records safe identity metadata in `role.yaml` and the registry. Hermes'
 scoped runtime lock remains a second line of defense against duplicate pollers.
 
+A token the operator already stored in 1Password is adopted by reference
+instead of pasted: run `.scripts/30-telegram.sh` with
+`TELEGRAM_BOT_TOKEN_REF=op://DeLoSecrets/<item-uuid>/<field>` (and the usual
+`TELEGRAM_ALLOWED_USERS`). The token is read through
+`store-onepassword-secret.py --read-reference` into an unexported variable,
+verified with `getMe` and the same fleet ownership scan, and the profile maps
+the operator's own reference -- no second vault item is staged. Passing both
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_BOT_TOKEN_REF` is refused.
+
+## Named agents (posts vs. people)
+
+A role directory describes a **post**: `agent_id` and `profile` (`33god-pm`)
+are the routing key for units, the registry row, Bloodbank `target_agent_id`
+and the named profile directory. Most posts are held by an unnamed agent whose
+identity memory lives in the post-derived compatibility bank `agent-<profile>`.
+
+A **named agent** is a person-like identity that holds a post. It declares
+itself in `role.yaml`:
+
+```yaml
+display_name: "Grolf"
+identity:
+  name: grolf               # who the agent is; never a post id
+  write_bank: agent-grolf   # always agent-<name>
+  recall_banks:             # read-only history it may recall explicitly
+    - agent-grolf
+    - agent-33god-pm
+```
+
+- `lib/role-identity.py` validates the block: a lower-case name that is not the
+  post id (a name equal to the post would pin the agent to `agent-<post>`, the
+  bank the next unnamed holder of that post inherits), `write_bank` exactly
+  `agent-<name>`, and recall banks that are valid ids and never the shared
+  fallback `custom`/`hermes`.
+- `10-hermes-profile.sh` pins `<profile>/hindsight/config.json` to
+  `write_bank`. It reads role.yaml first (it runs before step 80) and only
+  falls back to a registry declaration for rows named before role.yaml carried
+  the block.
+- `80-registry.sh` projects the block into `agents.<agent_id>.identity` and
+  `agents.<agent_id>.hindsight.{write_bank,recall_banks}`; a role that drops
+  the block drops the projection too.
+- Flume's composer addresses the agent by `display_name`, names the personal
+  bank in the SOUL's memory table and lists the recall banks.
+
+The post id never changes when an agent is named, so gateway units, Bloodbank
+routing, gitlinks and the profile directory are untouched. A named agent that
+moves to another post takes its `identity:` block (and chat bot) to the new
+role.yaml; its personal bank does not move.
+
 ## One app and bot per Slack-enabled agent
 
 Slack is opt-in and remains deferred for newly provisioned agents unless the
