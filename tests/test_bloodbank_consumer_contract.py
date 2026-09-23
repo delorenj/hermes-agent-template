@@ -1006,6 +1006,63 @@ def test_present_non_boolean_bloodbank_gate_is_refused(tmp_path: Path, line: str
     assert registry.read_bytes() == before
 
 
+def test_role_without_a_bloodbank_block_projects_the_routable_fleet_contract(
+    tmp_path: Path,
+) -> None:
+    """No block at all means the canonical fleet block, never empty strings.
+
+    80-registry.sh used to copy `bloodbank.gateway_scope` and
+    `bloodbank.target_agent_id` straight from role.yaml, so a role provisioned
+    before the block existed re-registered with `""` for both. The fleet
+    gateway's eligibility is default-deny, so that agent silently stopped
+    receiving commands while its row still said `enabled: true`.
+    """
+    role, registry = _make_role(tmp_path)
+    role_yaml = role / "role.yaml"
+    text = role_yaml.read_text(encoding="utf-8")
+    block = text[text.index("bloodbank:\n") : text.index("service_state:\n")]
+    role_yaml.write_text(text.replace(block, ""), encoding="utf-8")
+    assert "bloodbank" not in role_yaml.read_text(encoding="utf-8")
+    env = _environment(tmp_path, registry)
+
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert entry["bloodbank"] == {
+        "enabled": True,
+        "gateway_scope": "fleet",
+        "target_agent_id": "demo-pm",
+    }
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "message"),
+    (
+        ("  gateway_scope: fleet\n", "  gateway_scope: host\n", "gateway_scope must be fleet"),
+        ("  gateway_scope: fleet\n", '  gateway_scope: ""\n', "gateway_scope must be fleet"),
+        ('  target_agent_id: "demo-pm"\n', '  target_agent_id: "someone-else"\n', "target_agent_id must be this agent"),
+        ('  target_agent_id: "demo-pm"\n', "  target_agent_id:\n", "target_agent_id must be this agent"),
+    ),
+)
+def test_non_canonical_bloodbank_routing_is_refused(
+    tmp_path: Path, old: str, new: str, message: str
+) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    seeded = _run(role, "80-registry.sh", env)
+    assert seeded.returncode == 0, seeded.stderr
+    before = registry.read_bytes()
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(role_yaml.read_text(encoding="utf-8").replace(old, new, 1), encoding="utf-8")
+
+    refused = _run(role, "80-registry.sh", env)
+
+    assert refused.returncode != 0
+    assert message in refused.stderr
+    assert registry.read_bytes() == before
+
+
 def test_duplicate_bloodbank_block_cannot_discard_a_quarantine(tmp_path: Path) -> None:
     role, registry = _make_role(tmp_path)
     env = _environment(tmp_path, registry)
