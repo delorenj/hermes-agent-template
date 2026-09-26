@@ -588,6 +588,102 @@ def cmd_memory_pin(args) -> int:
     return 0
 
 
+def _template_config_path() -> Path:
+    """The host's hermes-agent-template config.toml, resolved like _lib.sh does."""
+    explicit = os.environ.get("HERMES_TEMPLATE_CONFIG")
+    if explicit:
+        return Path(explicit)
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "hermes-agent-template" / "config.toml"
+
+
+def _configured_agent_bank_template() -> str:
+    """``[hindsight] agent_bank_template`` from config.toml, expanded, or ""."""
+    path = _template_config_path()
+    if not path.is_file():
+        return ""
+    try:
+        import tomllib
+    except ImportError:  # Python < 3.11: no stdlib TOML reader
+        return ""
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        sys.exit(f"FATAL: cannot parse {path}: {exc}")
+    value = (data.get("hindsight") or {}).get("agent_bank_template") or ""
+    if not isinstance(value, str):
+        sys.exit(f"FATAL: {path}: [hindsight] agent_bank_template must be a string")
+    return os.path.expandvars(os.path.expanduser(value.strip())) if value.strip() else ""
+
+
+def cmd_memory_template(args) -> int:
+    """Record the bank template an agent's identity bank should start from.
+
+    Writes ``bank_template`` into ``<profile>/hindsight/config.json`` and
+    touches nothing else there (``bank_id`` stays whatever memory-pin set).
+    The Hermes Hindsight provider imports that manifest once, the first time
+    it initializes against a bank that has no mission of its own, and never
+    over a mission already on the bank. So this is safe to run on a desk
+    whose bank is already steered: it records intent, the bank is unchanged.
+
+    The template comes from ``--bank-template``, else from config.toml
+    ``[hindsight] agent_bank_template``. ``--bank-template ''`` removes it.
+    """
+    import json
+
+    explicit = args.bank_template is not None
+    template = args.bank_template if explicit else _configured_agent_bank_template()
+    template = os.path.expandvars(os.path.expanduser(template.strip())) if template else ""
+    if not template and not explicit:
+        print("no [hindsight] agent_bank_template configured in "
+              f"{_template_config_path()}; nothing to record")
+        return 0
+    if template:
+        tpl = Path(template)
+        if not tpl.is_file():
+            sys.exit(f"FATAL: bank template not found: {template}")
+        try:
+            manifest = json.loads(tpl.read_text(encoding="utf-8"))
+        except Exception as exc:
+            sys.exit(f"FATAL: bank template is not JSON: {template}: {exc}")
+        bank = manifest.get("bank") if isinstance(manifest, dict) else None
+        if not isinstance(bank, dict) or not any(
+            bank.get(key) for key in ("retain_mission", "reflect_mission", "observations_mission")
+        ):
+            sys.exit(f"FATAL: {template} sets no mission in its 'bank' block; the provider "
+                     "could not tell an imported bank from an unsteered one")
+        template = str(tpl.resolve())
+
+    changed = 0
+    for pdir in _select(args):
+        target = pdir / "hindsight" / "config.json"
+        if not target.is_file() or target.is_symlink():
+            print(f"skip {pdir.name:34s} (no pinned hindsight/config.json; run memory-pin first)")
+            continue
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except Exception as exc:
+            sys.exit(f"FATAL: {target} is not valid JSON: {exc}")
+        if not isinstance(payload, dict):
+            sys.exit(f"FATAL: {target} is not a JSON object")
+        before = payload.get("bank_template")
+        if template:
+            payload["bank_template"] = template
+        else:
+            payload.pop("bank_template", None)
+        if payload.get("bank_template") == before:
+            print(f"ok   {pdir.name:34s} bank_template={before or '(none)'}")
+            continue
+        print(f"set  {pdir.name:34s} bank_template={template or '(removed)'}")
+        if args.dry_run:
+            continue
+        target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(target, 0o600)
+        changed += 1
+    print(f"\nchanged {changed}")
+    return 0
+
+
 def _ensure_runtime_ignored(path: Path) -> None:
     """Keep a pinned config out of any repo that happens to contain it.
 
@@ -646,6 +742,8 @@ def main() -> int:
         ("absorb", cmd_absorb, "fold out-of-band config.yaml edits into the delta"),
         ("status", cmd_status, "show delta size and drift state per profile"),
         ("memory-pin", cmd_memory_pin, "pin each agent's identity-memory bank explicitly"),
+        ("memory-template", cmd_memory_template,
+         "record the bank template the Hindsight provider imports into an unsteered identity bank"),
     ]:
         p = sub.add_parser(name, help=helptext)
         p.add_argument("--profile", help="operate on one profile (default: all)")
@@ -666,6 +764,11 @@ def main() -> int:
         p.add_argument(
             "--bank-id",
             help="memory-pin: pin one profile to this explicit named-agent bank; requires --profile",
+        )
+        p.add_argument(
+            "--bank-template",
+            help="memory-template: manifest path (default: config.toml [hindsight] "
+            "agent_bank_template); '' removes it",
         )
         p.set_defaults(func=fn)
     args = ap.parse_args()

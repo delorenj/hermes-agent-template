@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -544,3 +545,129 @@ def test_memory_pin_keeps_profile_template_as_legacy_default(tmp_path: Path) -> 
     assert yaml.safe_load(
         (profile / "hindsight" / "config.json").read_text(encoding="utf-8")
     )["bank_id"] == "agent-demo-pm"
+
+
+def _memory_template_env(tmp_path: Path, template: str | None) -> tuple[Path, dict]:
+    fleet = tmp_path / "home" / ".hermes"
+    (fleet / "profiles").mkdir(parents=True)
+    (fleet / "config.yaml").write_text("operator: {}\n", encoding="utf-8")
+    config_toml = tmp_path / "template-config.toml"
+    if template is not None:
+        config_toml.write_text(
+            f'[hindsight]\nagent_bank_template = "{template}"\n', encoding="utf-8"
+        )
+    env = os.environ.copy()
+    env["HERMES_FLEET_HOME"] = str(fleet)
+    env["HERMES_TEMPLATE_CONFIG"] = str(config_toml)
+    return fleet, env
+
+
+def _pinned_profile(fleet: Path, name: str, bank_id: str) -> Path:
+    profile = fleet / "profiles" / name
+    (profile / "hindsight").mkdir(parents=True)
+    pin = profile / "hindsight" / "config.json"
+    pin.write_text(json.dumps({"bank_id": bank_id}) + "\n", encoding="utf-8")
+    return pin
+
+
+def _manifest(tmp_path: Path, bank: dict) -> Path:
+    path = tmp_path / "identity.json"
+    path.write_text(json.dumps({"version": "1", "bank": bank}), encoding="utf-8")
+    return path
+
+
+def _memory_template(env: dict, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-I", str(PROFILE_RENDERER), "memory-template", *extra],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+
+def test_memory_template_records_configured_template_and_keeps_the_pin(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, {"retain_mission": "Remember who this agent is."})
+    fleet, env = _memory_template_env(tmp_path, str(manifest))
+    pin = _pinned_profile(fleet, "33god-pm", "agent-grolf")
+
+    first = _memory_template(env, "--profile", "33god-pm")
+    assert first.returncode == 0, first.stdout + first.stderr
+    payload = json.loads(pin.read_text(encoding="utf-8"))
+    assert payload == {"bank_id": "agent-grolf", "bank_template": str(manifest.resolve())}
+    assert pin.stat().st_mode & 0o777 == 0o600
+
+    before = pin.read_bytes()
+    again = _memory_template(env, "--profile", "33god-pm")
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "changed 0" in again.stdout
+    assert pin.read_bytes() == before
+
+
+def test_memory_template_expands_home_in_config(tmp_path: Path) -> None:
+    home = tmp_path / "userhome"
+    manifest_dir = home / "templates"
+    manifest_dir.mkdir(parents=True)
+    manifest = manifest_dir / "identity.json"
+    manifest.write_text(json.dumps({"bank": {"reflect_mission": "x"}}), encoding="utf-8")
+    fleet, env = _memory_template_env(tmp_path, "~/templates/identity.json")
+    env["HOME"] = str(home)
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    result = _memory_template(env, "--profile", "demo-pm")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(pin.read_text(encoding="utf-8"))["bank_template"] == str(manifest.resolve())
+
+
+def test_memory_template_unconfigured_is_a_noop(tmp_path: Path) -> None:
+    fleet, env = _memory_template_env(tmp_path, None)
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    before = pin.read_bytes()
+    result = _memory_template(env, "--profile", "demo-pm")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "nothing to record" in result.stdout
+    assert pin.read_bytes() == before
+
+
+def test_memory_template_refuses_a_manifest_without_a_mission(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, {"disposition_empathy": 2})
+    fleet, env = _memory_template_env(tmp_path, str(manifest))
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    before = pin.read_bytes()
+    result = _memory_template(env, "--profile", "demo-pm")
+    assert result.returncode != 0
+    assert "sets no mission" in result.stderr
+    assert pin.read_bytes() == before
+
+
+def test_memory_template_refuses_a_missing_manifest(tmp_path: Path) -> None:
+    fleet, env = _memory_template_env(tmp_path, str(tmp_path / "nope.json"))
+    _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    result = _memory_template(env, "--profile", "demo-pm")
+    assert result.returncode != 0
+    assert "not found" in result.stderr
+
+
+def test_memory_template_explicit_empty_removes_it(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, {"retain_mission": "x"})
+    fleet, env = _memory_template_env(tmp_path, str(manifest))
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    assert _memory_template(env, "--profile", "demo-pm").returncode == 0
+    removed = _memory_template(env, "--profile", "demo-pm", "--bank-template", "")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert json.loads(pin.read_text(encoding="utf-8")) == {"bank_id": "agent-demo-pm"}
+
+
+def test_memory_template_skips_a_desk_without_a_pin(tmp_path: Path) -> None:
+    manifest = _manifest(tmp_path, {"retain_mission": "x"})
+    fleet, env = _memory_template_env(tmp_path, str(manifest))
+    (fleet / "profiles" / "fresh-pm").mkdir()
+    result = _memory_template(env, "--profile", "fresh-pm")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "run memory-pin first" in result.stdout
+    assert not (fleet / "profiles" / "fresh-pm" / "hindsight" / "config.json").exists()
+
+
+def test_hire_step_records_the_identity_bank_template() -> None:
+    profile_step = (ROOT / "template" / ".scripts" / "10-hermes-profile.sh").read_text(
+        encoding="utf-8"
+    )
+    assert 'memory-template --profile "$PROFILE_NAME"' in profile_step
+    example = (ROOT / "template" / ".scripts" / "config.example.toml").read_text(encoding="utf-8")
+    assert "[hindsight]" in example and "agent_bank_template" in example
