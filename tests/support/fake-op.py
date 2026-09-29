@@ -37,6 +37,13 @@ if args[:2] == ["item", "list"]:
     print(json.dumps([{"id": row["id"], "title": row["title"]} for row in documents()]))
 elif args[:2] == ["item", "create"]:
     document = json.load(sys.stdin)
+    # The real CLI rejects PASSWORD items without their primary password.
+    # Custom concealed fields alone are valid for API_CREDENTIAL items.
+    if document.get("category") == "PASSWORD" and not any(
+        field.get("purpose") == "PASSWORD" and field.get("value")
+        for field in document.get("fields", [])
+    ):
+        raise SystemExit("Password item requires password value")
     reject_field = home / ".fake-onepassword-reject-field"
     if reject_field.exists():
         rejected = reject_field.read_text(encoding="utf-8").strip()
