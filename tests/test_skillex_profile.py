@@ -398,6 +398,29 @@ def test_null_skills_block_in_delta_is_treated_as_empty(fixture):
     assert strict_markers(fixture["profile"])
 
 
+def test_default_catalog_is_the_canonical_checkout_not_a_stale_registry_cache(fixture):
+    fixture["profile"].rmdir()
+    canonical = fixture["home"] / "code/skillex"
+    canonical.parent.mkdir(parents=True)
+    shutil.copytree(fixture["registry"], canonical)
+    stale = fixture["home"] / ".agents/.cache/registries/https___example_invalid_skillex_git"
+    shutil.copytree(fixture["registry"], stale)
+    data = json.loads(fixture["manifest"].read_text())
+    data["registry"] = "https://example.invalid/skillex.git"
+    fixture["manifest"].write_text(json.dumps(data))
+    env = {k: v for k, v in fixture["env"].items() if k != "PJ_SKILLS_REGISTRY_ROOT"}
+    succeeded(
+        run(
+            ["/bin/bash", str(fixture["scripts"] / "10-hermes-profile.sh")],
+            cwd=fixture["cwd"],
+            env=env,
+        )
+    )
+    skills = fixture["profile"] / "skills"
+    for name in ("alpha", "beta", "gamma"):
+        assert (skills / name).resolve() == canonical / "all-skills" / name
+
+
 def test_node_only_preview_then_owned_prune_preserves_foreign_and_released_entries(
     fixture,
 ):
