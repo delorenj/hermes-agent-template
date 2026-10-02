@@ -86,21 +86,39 @@ defaults are still filled from `config.toml`.
 
 ## Reconcile profile skills
 
-Declare selections in the global and owning project's `.agents/skills.json`,
-then explicitly run the pinned Node CLI (Node.js 24+):
+PM desks are Skillex-only. Declare selections in the global and owning
+project's `.agents/skills.json`, then preview and apply (Skillex 0.1.3+,
+Node.js 24+):
 
 ```bash
-mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project --dry-run
-mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project
+skillex profile sync example-pm --project /path/to/project --skillex-only --dry-run
+skillex profile sync example-pm --project /path/to/project --skillex-only
 ```
 
-An explicit project is required. The profile receives the global/project union;
-profile-local content wins and only receipt-owned children may be pruned. Preview
-writes nothing. Receipt state is under `$XDG_STATE_HOME/skillex/profiles/v2`
-(default `~/.local/state/skillex/profiles/v2`), outside project Git state. A legacy
-whole `skills/` symlink is refused with migration guidance; do not delete it to
-make provisioning pass. The old template `canonical_skills_dir` and
-`symlinked_runtime_skills` settings no longer drive skill writes.
+An explicit project is required. The profile receives the global/project union.
+A strict desk carries `.skillex-only` and `.no-bundled-skills` in its profile
+root and `skills.external_dirs: []` in its `config.delta.yaml`; strict sync
+refuses (exit 3, `E_PROFILE_SKILLEX_ONLY`) any `skills/` entry Skillex does not
+own other than Hermes bookkeeping (`.usage.json`, `.curator_state`,
+`.curator_suppressed`, `.sync_state`, `.curator_backups/`), and any non-empty
+external discovery root. Preview writes nothing. Receipt state is under
+`$XDG_STATE_HOME/skillex/profiles/v2` (default `~/.local/state/skillex/profiles/v2`),
+outside project Git state.
+
+A desk with local skills or a whole `skills/` symlink is converted only by the
+preservation-first cutover, which quarantines displaced content under
+`~/.hermes/.skill-quarantine/<profile>/<stamp>/` with a journal:
+
+```bash
+python3 ~/code/skillex/scripts/hermes-skillex-cutover.py --profile example-pm \
+  --project /path/to/project --registry-root ~/code/skillex \
+  --renderer ~/code/33GOD/hermes-agent-template/scripts/hermes-profile-config.py
+# review the preview, then rerun with --apply
+```
+
+Do not delete content to make provisioning pass. The old template
+`canonical_skills_dir` and `symlinked_runtime_skills` settings no longer drive
+skill writes.
 
 ## Fleet source-of-truth
 

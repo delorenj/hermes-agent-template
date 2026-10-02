@@ -207,9 +207,17 @@ def set_external_dirs(cfg: Path, dirs: list[str], apply: bool) -> str:
     return action
 
 
+def skillex_only(rt: Path) -> bool:
+    """A Skillex-only PM desk owns its skills through Skillex alone (ADR-0001,
+    Hermes PM amendment): no external dirs, no local dedup. Never touch one."""
+    return (rt / ".skillex-only").exists() or (rt / ".skillex-only").is_symlink()
+
+
 def provision(root: Path, dirs: list[str], apply: bool) -> None:
     for rt in runtimes(root):
         print(f"-- {rt}")
+        if skillex_only(rt):
+            print("   SKIPPED: Skillex-only desk; skills.external_dirs stays []"); continue
         print("   " + set_external_dirs(rt / "config.yaml", dirs, apply))
 
 
@@ -229,6 +237,8 @@ def dedup(root: Path, slug: str, pack: Path, apply: bool) -> None:
     for rt in runtimes(root):
         sk = rt / "skills"
         print(f"-- {rt}")
+        if skillex_only(rt):
+            print("   SKIPPED: Skillex-only desk; Skillex owns skills/"); continue
         if not sk.is_dir():
             print("   no skills/ — nothing to do"); continue
         ok, already = config_wireable(rt / "config.yaml", pack)

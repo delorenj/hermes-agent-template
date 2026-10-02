@@ -15,7 +15,7 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.1"
+VERSION = "0.1.3"
 
 
 def run(command, *, cwd, env):
@@ -178,6 +178,7 @@ def fixture(installed):
             )
         profile = home / ".hermes/profiles/fixture-pm"
         profile.mkdir(parents=True)
+        (home / ".hermes/config.yaml").write_text("skills:\n  external_dirs: [legacy]\n")
         # This is deliberately not the selected project or a descendant of it.
         cwd = root / "ambient project"
         (cwd / ".agents").mkdir(parents=True)
@@ -215,7 +216,8 @@ def fixture(installed):
             "HERMES_FLEET_ENV": str(home / ".hermes/fleet.env"),
             "HERMES_BIN": str(hermes),
             "HERMES_LOG": str(root / "hermes.log"),
-            "PROFILE_RENDERER": str(root / "no-renderer"),
+            "PROFILE_RENDERER": str(ROOT / "scripts/hermes-profile-config.py"),
+            "SKILLEX_BIN": str(prefix / "bin/skillex"),
             "PJANGLER_PROJECT_ROOT": str(project),
             "PJ_SKILLS_REGISTRY_ROOT": str(registry),
             "PYTHONDONTWRITEBYTECODE": "1",
@@ -276,43 +278,17 @@ def cli(fixture, *args):
     )
 
 
-def test_step_uses_explicit_union_and_preserves_profile_local_overrides(fixture):
+def test_step_refuses_foreign_skills_without_resetting_existing_profile(fixture):
     skills = fixture["profile"] / "skills"
     local = skills / "alpha"
     local.mkdir(parents=True)
-    (local / "SKILL.md").write_text("Profile-owned alpha wins.\n")
-    (local / "helper.sh").write_text("#!/bin/sh\nexit 0\n")
-    (local / "helper.sh").chmod(0o755)
-    gamma = skills / "gamma"
-    gamma.symlink_to(fixture["registry"] / "all-skills/gamma")
-    (skills / "runtime-notes.txt").write_text("Hermes-owned file.\n")
-    local_before = snapshot(local)
-    profile_inode, skills_inode = fixture["profile"].stat().st_ino, skills.stat().st_ino
-    source_before = snapshot(fixture["registry"])
-    manifest_bytes = (
-        fixture["manifest"].read_bytes(),
-        fixture["global_manifest"].read_bytes(),
-    )
-    succeeded(provision(fixture))
-    assert (skills / "beta").resolve() == fixture["registry"] / "all-skills/beta"
-    assert snapshot(local) == local_before
-    assert (skills / "gamma").is_symlink()
-    assert fixture["profile"].stat().st_ino == profile_inode
-    assert skills.stat().st_ino == skills_inode
-    assert snapshot(fixture["registry"]) == source_before
-    assert (
-        fixture["manifest"].read_bytes(),
-        fixture["global_manifest"].read_bytes(),
-    ) == manifest_bytes
-    assert not (fixture["project"] / ".agents/skills").exists()
-    assert not (fixture["home"] / ".agents/skills").exists()
-    assert not (skills / "software-development").exists(), "no copied PM fallback"
-    assert (
-        fixture["profile"] / "SOUL.md"
-    ).read_text() == "Profile-specific identity.\n"
-    before = snapshot(skills), snapshot(fixture["root"] / "state")
-    succeeded(provision(fixture))
-    assert (snapshot(skills), snapshot(fixture["root"] / "state")) == before
+    (local / "SKILL.md").write_text("Preserve foreign alpha.\n")
+    (fixture["profile"] / "state.db").write_bytes(b"runtime-owned")
+    before = snapshot(fixture["profile"])
+    result = provision(fixture)
+    assert result.returncode != 0
+    assert "legacy/invalid skills" in result.stdout + result.stderr
+    assert snapshot(fixture["profile"]) == before
 
 
 def test_new_profile_receives_declared_global_and_project_skills(fixture):
@@ -322,11 +298,104 @@ def test_new_profile_receives_declared_global_and_project_skills(fixture):
     assert skills.is_dir() and not skills.is_symlink()
     assert {path.name for path in skills.iterdir()} == {"alpha", "beta", "gamma"}
     assert (fixture["root"] / "hermes.log").read_text().splitlines() == [
-        "profile create fixture-pm --no-alias"
+        "profile create fixture-pm --no-alias --no-skills"
     ]
     # A project exclusion does not erase the independently selected global alpha.
     assert (skills / "alpha").resolve() == fixture["registry"] / "all-skills/alpha"
     assert not (fixture["cwd"] / ".agents/skills").exists()
+
+
+def strict_markers(profile):
+    return all(
+        (profile / name).is_file() and not (profile / name).is_symlink()
+        for name in (".skillex-only", ".no-bundled-skills")
+    )
+
+
+def delta_of(fixture):
+    import yaml
+
+    return yaml.safe_load((fixture["profile"] / "config.delta.yaml").read_text())
+
+
+def test_new_profile_is_strict_with_isolated_discovery_and_commented_delta(fixture):
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    assert strict_markers(fixture["profile"])
+    text = (fixture["profile"] / "config.delta.yaml").read_text()
+    assert text.startswith("# Override-only delta"), text
+    assert delta_of(fixture) == {"skills": {"external_dirs": []}}
+    import yaml
+
+    rendered = yaml.safe_load((fixture["profile"] / "config.yaml").read_text())
+    assert rendered["skills"]["external_dirs"] == []
+
+
+def test_rerun_on_strict_profile_is_byte_and_inode_noop(fixture):
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    (fixture["profile"] / "state.db").write_bytes(b"runtime-owned")
+    (fixture["profile"] / "gateway.pid").write_text("4242\n")
+    before = snapshot(fixture["profile"])
+    succeeded(provision(fixture))
+    assert snapshot(fixture["profile"]) == before
+
+
+def test_strict_rerun_keeps_curator_state_and_applies_a_pending_selection(fixture):
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    skills = fixture["profile"] / "skills"
+    (skills / ".curator_state").write_text('{"last_run_at": null}\n')
+    (skills / ".curator_backups" / "2026-10-01T18-00-00Z").mkdir(parents=True)
+    fixture["manifest"].write_text(
+        json.dumps({"inherit_global": False, "exclude": ["alpha"], "skills": [{"name": "beta"}, {"name": "delta"}]})
+    )
+    config_before = snapshot(fixture["profile"] / "config.yaml")
+    succeeded(provision(fixture))
+    assert (skills / "delta").resolve() == fixture["registry"] / "all-skills/delta"
+    assert (skills / ".curator_state").read_text() == '{"last_run_at": null}\n'
+    assert snapshot(fixture["profile"] / "config.yaml") == config_before
+
+
+def test_strict_rerun_refuses_a_local_skill_without_changes(fixture):
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    local = fixture["profile"] / "skills" / "agent-made"
+    local.mkdir()
+    (local / "SKILL.md").write_text("---\nname: agent-made\ndescription: x\n---\n")
+    before = snapshot(fixture["profile"])
+    refused = provision(fixture)
+    assert refused.returncode != 0
+    assert "E_PROFILE_SKILLEX_ONLY" in refused.stdout + refused.stderr
+    assert snapshot(fixture["profile"]) == before
+
+
+def test_interrupted_first_run_resumes_to_a_strict_profile(fixture):
+    fixture["profile"].rmdir()
+    broken = dict(fixture["env"], PROFILE_RENDERER=str(fixture["root"] / "missing.py"))
+    first = run(
+        ["/bin/bash", str(fixture["scripts"] / "10-hermes-profile.sh")],
+        cwd=fixture["cwd"],
+        env=broken,
+    )
+    assert first.returncode != 0
+    assert fixture["profile"].is_dir() and not strict_markers(fixture["profile"])
+    succeeded(provision(fixture))
+    assert strict_markers(fixture["profile"])
+    assert delta_of(fixture) == {"skills": {"external_dirs": []}}
+    assert {p.name for p in (fixture["profile"] / "skills").iterdir()} == {"alpha", "beta", "gamma"}
+
+
+def test_null_skills_block_in_delta_is_treated_as_empty(fixture):
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    for name in (".skillex-only", ".no-bundled-skills"):
+        (fixture["profile"] / name).unlink()
+    (fixture["profile"] / "config.delta.yaml").write_text("# keep me\nskills:\nvoice: true\n")
+    succeeded(provision(fixture))
+    assert delta_of(fixture) == {"skills": {"external_dirs": []}, "voice": True}
+    assert (fixture["profile"] / "config.delta.yaml").read_text().startswith("# keep me\n")
+    assert strict_markers(fixture["profile"])
 
 
 def test_node_only_preview_then_owned_prune_preserves_foreign_and_released_entries(
@@ -385,7 +454,7 @@ def test_whole_skills_link_is_refused_without_following_it(fixture):
     before = snapshot(fixture["profile"]), snapshot(target)
     refused = provision(fixture)
     assert refused.returncode != 0
-    assert "E_PROFILE_SKILLS_ROOT" in refused.stdout + refused.stderr
+    assert "legacy/invalid skills" in refused.stdout + refused.stderr
     assert (snapshot(fixture["profile"]), snapshot(target)) == before
 
 
@@ -393,7 +462,9 @@ def test_root_task_has_no_automatic_skill_writer():
     config = tomllib.loads((ROOT / "mise.toml").read_text())
     tasks = config["tasks"]
     assert [name for name in tasks if name.startswith("skills:")] == ["skills:sync"]
-    assert tasks["skills:sync"]["tools"] == {"npm:@delorenj/skillex": VERSION}
+    assert tasks["skills:sync"]["tools"] == {
+        "npm:@delorenj/skillex": {"version": VERSION, "allow_low_downloads": True}
+    }
     assert (
         tasks["skills:sync"]["run"]
         == "skillex sync --scope project --project '{{config_root}}'"

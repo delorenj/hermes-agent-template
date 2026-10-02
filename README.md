@@ -102,26 +102,44 @@ out beside this template.
 
 ## Profile skills
 
-Provisioning requires mise, Node.js 24+, a configured canonical Skillex registry,
-and the owning project's `.agents/skills.json`. Step 10 explicitly runs the
-pinned `npm:@delorenj/skillex@0.1.1` CLI:
+PM desks are **Skillex-only**: the profile's `skills/` directory holds nothing
+but links Skillex owns, plus Hermes bookkeeping (`.usage.json`, curator state).
+No bundled skills, no hub installs, no local skills, and no external discovery
+roots. This is the canonical standard (skillex ADR-0001, Hermes PM amendment).
+
+Provisioning requires a Skillex release whose `profile sync` supports
+`--skillex-only` (0.1.3 or later; step 10 checks `--help` and refuses an older
+build), Node.js 24+, a configured canonical Skillex registry, and the owning
+project's `.agents/skills.json`.
+
+- **New profile:** `hermes profile create NAME --no-alias --no-skills`, then the
+  usual config, memory and SOUL steps, then `lib/skills-policy.py` writes
+  `skills.external_dirs: []` into `config.delta.yaml` under the renderer lock,
+  then a strict preview and a strict sync publish `.no-bundled-skills` and
+  `.skillex-only` in the profile root.
+- **Existing strict desk (has `.skillex-only`):** a read-only `profile show`
+  (exit 0, or 6 for a pending selection or catalog change), the idempotent
+  skills policy, then strict preview and sync. Config, SOUL, memory pin and
+  runtime state are left byte-for-byte alone. Nothing is ever deleted.
+- **Existing desk that is not strict yet:** if its `skills/` holds nothing but
+  Hermes bookkeeping (an interrupted first run), provisioning resumes the full
+  path. If it holds local skills or is a whole-root link, step 10 refuses and
+  names the preservation-first cutover
+  (`~/code/skillex/scripts/hermes-skillex-cutover.py`, preview, then `--apply`).
+
+To apply a selection change by hand:
 
 ```bash
-mise exec npm:@delorenj/skillex@0.1.1 -- skillex profile sync example-pm --project /path/to/project
+skillex profile sync example-pm --project /path/to/project --skillex-only --dry-run
+skillex profile sync example-pm --project /path/to/project --skillex-only
 ```
 
-The script supplies the selected profile, Hermes root, and owning project path.
-It never infers the project from the invocation directory. It reconciles the
-union of global and project selections: a project exclusion affects the project
+The script supplies the selected profile and owning project path. It never
+infers the project from the invocation directory. It reconciles the union of
+global and project selections: a project exclusion affects the project
 contribution, while an independently selected global skill remains available.
 Select the required PM skills in those manifests instead of configuring the
 retired `canonical_skills_dir` or `symlinked_runtime_skills` template settings.
-
-The profile and its `skills/` directory stay real. Profile-local skills, files,
-and foreign links win; Skillex only updates/prunes children recorded in its XDG
-profile receipt. It does not replace the root or copy a nested PM fallback.
-Legacy whole-directory skills links require explicit `skillex migrate` first.
-Runtime/channel/config provisioning remains owned by the other existing steps.
 
 The template repository's own `mise run skills:sync` task uses the same pinned
 release with `--scope project --project '{{config_root}}'`. No skills enter hook,
@@ -129,7 +147,7 @@ manifest watcher, or copied Python skill engine remains.
 
 Acceptance tests install the npm release under canonical `/tmp` paths. Run
 `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_skillex_profile.py`.
-Before publication, supply `SKILLEX_TEST_TARBALL=/absolute/path/delorenj-skillex-0.1.1.tgz`
+Before publication, supply `SKILLEX_TEST_TARBALL=/absolute/path/delorenj-skillex-<version>.tgz`
 to verify a prebuilt release candidate without a source dependency or rebuild.
 The fixture executes the real CLI with Python and uv absent from PATH.
 

@@ -46,7 +46,7 @@ run = "'{{config_root}}/.mise/scripts/link-agentfiles.sh' '{{config_root}}'"
 
 [tasks."skills:sync"]
 description = "Apply this project's declared skills with Skillex"
-tools = { "npm:@delorenj/skillex" = "0.1.1" }
+tools = { "npm:@delorenj/skillex" = { version = "0.1.3", allow_low_downloads = true } }
 run = "skillex sync --scope project --project '{{config_root}}'"
 
 [tasks."tp:vendor"]
