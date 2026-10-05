@@ -98,6 +98,27 @@ def test_raw_inherited_credential_refused_before_profile_creation(tmp_path):
     assert not profile.exists()
 
 
+def test_dashboard_auth_secret_is_not_inherited_or_written(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    base = yaml.safe_load((fleet / "config.yaml").read_text())
+    base["dashboard"] = {"basic_auth": {"enabled": True, "secret": "fixture-dashboard-value"}, "theme": "keep"}
+    (fleet / "config.yaml").write_text(yaml.safe_dump(base))
+    before = (fleet / "config.yaml").read_bytes()
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert not profile.exists()
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["dashboard"]["enabled"] is False
+    assert config["dashboard"]["basic_auth"] == {"enabled": False, "secret": ""}
+    assert config["dashboard"]["theme"] == "keep"
+    for path in profile.rglob("*"):
+        if path.is_file():
+            assert "fixture-dashboard-value" not in path.read_text()
+    assert (fleet / "config.yaml").read_bytes() == before
+
+
 def test_profile_lock_precedes_snapshot_and_preserves_concurrent_settings(tmp_path):
     _, profile, request, env = fixture(tmp_path)
     assert run(request, env).returncode == 0
