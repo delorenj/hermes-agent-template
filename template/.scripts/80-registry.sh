@@ -49,7 +49,7 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$PLANE_WORKSPACE" "$PLANE_PROJECT_ID" "$(yaml_get plane.identifier)" \
   "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
-  "hermes-${AGENT_ID}-gateway.service" "hermes-${AGENT_ID}-heartbeat.timer" \
+  "hermes-${AGENT_ID}-gateway.service" \
   "$ROLE_IDENTITY_JSON" <<'PYEOF'
 import datetime
 import copy
@@ -69,8 +69,8 @@ except ImportError:
  slack_status, slack_team_id, slack_team_name, slack_user_id, slack_bot_id,
  slack_username, role_yaml, plane_ws, plane_id,
  plane_ident, hermes_bin, hermes_repo, hermes_git_url,
- hermes_git_ref, hermes_git_sha, fleet_env, gw, heartbeat,
- identity_json) = sys.argv[1:31]
+ hermes_git_ref, hermes_git_sha, fleet_env, gw,
+ identity_json) = sys.argv[1:30]
 p = pathlib.Path(path)
 if p.is_symlink():
     raise SystemExit(f"refusing to update registry symlink: {p}")
@@ -209,13 +209,12 @@ managed = {
     "fleet_env": fleet_env,
   },
   # Only the unit NAMES the handbook's systemd_lifecycle seam declares
-  # writable. The gateway/heartbeat STATE lives in role.yaml `service_state`
+  # writable. Gateway state and heartbeat retirement live in role.yaml `service_state`
   # (70-systemd.sh writes it, 99-summary.sh reads it); flume review derives the
   # desired gateway state from the messaging declaration and reports any other
   # systemd key on a row as `registry-retired-key`.
   "systemd": {
     "gateway_unit": gw,
-    "heartbeat_timer": heartbeat,
   },
   "provisioned_at": provisioned_at,
 }
@@ -257,8 +256,9 @@ if not identity and isinstance(entry.get("identity"), str):
 # Retired managed schema, not extension metadata. consumer_unit would falsely
 # advertise a second per-agent Bloodbank execution path; gateway_state and
 # heartbeat_state (projected 2026-08-27 to 2026-09-23) duplicate role.yaml
-# service_state under keys the handbook does not declare.
-RETIRED_SYSTEMD_KEYS = ("consumer_unit", "gateway_state", "heartbeat_state")
+# service_state under keys the handbook does not declare. heartbeat_timer names
+# a retired unit; reprovisioning removes that old managed projection as well.
+RETIRED_SYSTEMD_KEYS = ("consumer_unit", "gateway_state", "heartbeat_state", "heartbeat_timer")
 systemd = entry.get("systemd")
 if isinstance(systemd, dict):
     for retired_key in RETIRED_SYSTEMD_KEYS:

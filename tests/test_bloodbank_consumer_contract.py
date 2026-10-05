@@ -796,7 +796,6 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
     }
     assert entry["systemd"] == {
         "gateway_unit": "hermes-demo-pm-gateway.service",
-        "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
     }
     assert "consumer_unit" not in entry["systemd"]
 
@@ -804,7 +803,7 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
 def test_registry_drops_retired_service_state_keys_and_keeps_role_state(
     tmp_path: Path,
 ) -> None:
-    """gateway_state/heartbeat_state are not handbook-declared systemd keys.
+    """State projections and the heartbeat timer are retired systemd keys.
 
     80-registry.sh projected role.yaml service_state into them from 2026-08-27;
     flume review reports both as registry-retired-key. A re-provision must drop
@@ -841,7 +840,6 @@ def test_registry_drops_retired_service_state_keys_and_keeps_role_state(
     systemd = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["systemd"]
     assert systemd == {
         "gateway_unit": "hermes-demo-pm-gateway.service",
-        "heartbeat_timer": "hermes-demo-pm-heartbeat.timer",
         "operator_policy": "manual-window",
     }
     assert (role / "role.yaml").read_bytes() == role_before
