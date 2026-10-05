@@ -17,7 +17,7 @@ RENDERER = ROOT / "scripts/hermes-profile-config.py"
 def fixture(tmp_path):
     fleet = tmp_path / "fleet"
     (fleet / "profiles").mkdir(parents=True)
-    (fleet / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "automaticai/personal/sol"}, "operator": {"base": "keep"}, "skills": {"external_dirs": ["/foreign"]}}))
+    (fleet / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "automaticai/personal/sol"}, "operator": {"base": "keep"}, "skills": {"external_dirs": ["/foreign"], "inherit_global": True}}))
     request = {"id": "specialist", "display_name": "Specialist", "definition": str(tmp_path / "desk/agent.yaml"), "charter": {"purpose": "Portable charter"}, "memory": {"write_bank": "agent-specialist", "recall_banks": ["infra"]}}
     env = {**os.environ, "HERMES_FLEET_HOME": str(fleet), "PYTHONDONTWRITEBYTECODE": "1"}
     profile = fleet / "profiles/specialist"
@@ -46,9 +46,13 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     config = yaml.safe_load((profile / "config.yaml").read_text())
     assert config["skills"]["external_dirs"] == []
     assert config["skills"]["project_discovery"] is False
+    assert config["skills"]["inherit_global"] is False
+    assert yaml.safe_load((profile / "config.delta.yaml").read_text())["skills"]["inherit_global"] is False
+    assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is False
     assert config["model"]["provider"] == "automaticai"
     assert config["providers"]["automaticai"]["api"] == "https://api.automaticai.io/v1"
     assert json.loads((profile / "hindsight/config.json").read_text())["bank_id"] == "agent-specialist"
+    assert json.loads((profile / "hindsight/config.json").read_text())["recall_types"] == ["world", "experience", "observation"]
     (profile / "handwritten.md").write_text("keep")
     metadata = yaml.safe_load((profile / "profile.yaml").read_text())
     metadata["config"]["operator_note"] = "keep"
@@ -117,6 +121,44 @@ def test_dashboard_auth_secret_is_not_inherited_or_written(tmp_path):
         if path.is_file():
             assert "fixture-dashboard-value" not in path.read_text()
     assert (fleet / "config.yaml").read_bytes() == before
+
+
+def test_global_inheritance_policy_refuses_handwritten_override(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    base = (fleet / "config.yaml").read_bytes()
+    assert run(request, env).returncode == 0
+    path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(path.read_text())
+    delta["skills"]["inherit_global"] = True
+    path.write_text(yaml.safe_dump(delta))
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode != 0
+    assert "ownership conflict: config skills.inherit_global" in result.stderr
+    assert snapshot(profile) == before
+    assert (fleet / "config.yaml").read_bytes() == base
+
+
+@pytest.mark.parametrize("recall_types", [["observation"], []])
+def test_memory_recall_type_override_survives_refresh_and_noop(tmp_path, recall_types):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / "hindsight/config.json"
+    memory = json.loads(path.read_text())
+    memory["recall_types"] = recall_types
+    memory["operator_note"] = "preserve"
+    path.write_text(json.dumps(memory))
+    request["charter"]["purpose"] = "Updated charter"
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    memory = json.loads(path.read_text())
+    assert memory["recall_types"] == recall_types
+    assert memory["operator_note"] == "preserve"
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["changed"] == []
+    assert snapshot(profile) == before
 
 
 def test_profile_lock_precedes_snapshot_and_preserves_concurrent_settings(tmp_path):

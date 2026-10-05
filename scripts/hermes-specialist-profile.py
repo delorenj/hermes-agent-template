@@ -127,6 +127,7 @@ def project(request, check):
             "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY": f"op://DeLoSecrets/hermes-{employee}/credential",
             "skills.external_dirs": [],
             "skills.project_discovery": False,
+            "skills.inherit_global": False,
             "memory.provider": "hindsight", "memory.memory_enabled": True,
             "memory.user_profile_enabled": False,
             "fallback_providers": [],
@@ -167,6 +168,7 @@ def project(request, check):
         if "bank_id" in memory and memory["bank_id"] != f"agent-{employee}":
             raise ValueError("ownership conflict: memory bank")
         memory.update({"bank_id": f"agent-{employee}", "api_url": "https://api.hs.delo.sh", "bank_id_template": ""})
+        memory.setdefault("recall_types", ["world", "experience", "observation"])
         base = mapping(r.BASE)
         merged = r.deep_merge(base, delta)
         refuse_credentials(merged)
