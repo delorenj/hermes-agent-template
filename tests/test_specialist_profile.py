@@ -17,7 +17,7 @@ RENDERER = ROOT / "scripts/hermes-profile-config.py"
 def fixture(tmp_path):
     fleet = tmp_path / "fleet"
     (fleet / "profiles").mkdir(parents=True)
-    (fleet / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "automaticai/personal/sol"}, "operator": {"base": "keep"}, "skills": {"external_dirs": ["/foreign"], "inherit_global": True}}))
+    (fleet / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "automaticai/personal/sol"}, "operator": {"base": "keep"}, "skills": {"external_dirs": ["/foreign"], "inherit_global": True}, "providers": {"automaticai": {"enabled": False}}}))
     request = {"id": "specialist", "display_name": "Specialist", "definition": str(tmp_path / "desk/agent.yaml"), "charter": {"purpose": "Portable charter"}, "memory": {"write_bank": "agent-specialist", "recall_banks": ["infra"]}}
     env = {**os.environ, "HERMES_FLEET_HOME": str(fleet), "PYTHONDONTWRITEBYTECODE": "1"}
     profile = fleet / "profiles/specialist"
@@ -40,7 +40,8 @@ def wait_for(path):
 
 
 def test_project_refresh_noop_and_preservation(tmp_path):
-    _, profile, request, env = fixture(tmp_path)
+    fleet, profile, request, env = fixture(tmp_path)
+    base = (fleet / "config.yaml").read_bytes()
     result = run(request, env)
     assert result.returncode == 0, result.stderr
     config = yaml.safe_load((profile / "config.yaml").read_text())
@@ -51,6 +52,10 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is False
     assert config["model"]["provider"] == "automaticai"
     assert config["providers"]["automaticai"]["api"] == "https://api.automaticai.io/v1"
+    assert config["providers"]["automaticai"]["enabled"] is True
+    assert config["providers"]["automaticai"]["key_env"] == "AUTOMATICAI_GATEWAY_KEY"
+    assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == "op://DeLoSecrets/hermes-specialist/credential"
+    assert (fleet / "config.yaml").read_bytes() == base
     assert json.loads((profile / "hindsight/config.json").read_text())["bank_id"] == "agent-specialist"
     assert json.loads((profile / "hindsight/config.json").read_text())["recall_types"] == ["world", "experience", "observation"]
     (profile / "handwritten.md").write_text("keep")
@@ -159,6 +164,89 @@ def test_memory_recall_type_override_survives_refresh_and_noop(tmp_path, recall_
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["changed"] == []
     assert snapshot(profile) == before
+
+
+@pytest.mark.parametrize("name", ["config.delta.yaml", "profile.yaml", "hindsight/config.json"])
+def test_raw_projected_config_credentials_refuse_without_writes(tmp_path, name):
+    fleet, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / name
+    data = json.loads(path.read_text()) if name.endswith("json") else yaml.safe_load(path.read_text())
+    data["api_key"] = "fixture-unvaulted-value"
+    path.write_text(json.dumps(data) if name.endswith("json") else yaml.safe_dump(data))
+    before, base = snapshot(profile), (fleet / "config.yaml").read_bytes()
+    for args in [("--check",), ()]:
+        result = run(request, env, *args)
+        assert result.returncode != 0
+        assert "raw credential cannot be projected" in result.stderr
+        assert snapshot(profile) == before
+        assert (fleet / "config.yaml").read_bytes() == base
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+@pytest.mark.parametrize("after", ["SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml", "hindsight/config.json", ".skillex-only", "specialist-projection.json"])
+def test_interrupted_publication_recovers_with_readonly_preview(tmp_path, refresh, after):
+    fleet, profile, request, env = fixture(tmp_path)
+    if refresh:
+        assert run(request, env).returncode == 0
+        request["charter"]["purpose"] = "New charter"
+        request["display_name"] = "Updated Specialist"
+        request["memory"]["recall_banks"] = ["docker"]
+        delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
+        delta["operator"] = {"revision": "preserve"}
+        (profile / "config.delta.yaml").write_text(yaml.safe_dump(delta))
+        memory = json.loads((profile / "hindsight/config.json").read_text())
+        memory["operator_note"] = "preserve"
+        (profile / "hindsight/config.json").write_text(json.dumps(memory))
+    base = (fleet / "config.yaml").read_bytes()
+    interrupted = run(request, {**env, "FLUME_TEST_SPECIALIST_INTERRUPT_AFTER": after})
+    assert interrupted.returncode == 91, interrupted.stderr
+    assert (profile / ".specialist-pending.json").is_file()
+    before = snapshot(profile)
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert ".specialist-pending.json" in json.loads(preview.stdout)["changed"]
+    assert snapshot(profile) == before
+    recovered = run(request, env)
+    assert recovered.returncode == 0, recovered.stderr
+    assert not (profile / ".specialist-pending.json").exists()
+    assert request["charter"]["purpose"] in (profile / "SOUL.md").read_text()
+    if refresh:
+        assert yaml.safe_load((profile / "config.yaml").read_text())["operator"]["revision"] == "preserve"
+        assert json.loads((profile / "hindsight/config.json").read_text())["operator_note"] == "preserve"
+    complete = snapshot(profile)
+    again = run(request, env)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["changed"] == []
+    assert snapshot(profile) == complete
+    assert (fleet / "config.yaml").read_bytes() == base
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_interrupted_publication_does_not_adopt_handwritten_conflicts(tmp_path, refresh):
+    _, profile, request, env = fixture(tmp_path)
+    if refresh:
+        assert run(request, env).returncode == 0
+        request["charter"]["purpose"] = "Changed charter"
+    assert run(request, {**env, "FLUME_TEST_SPECIALIST_INTERRUPT_AFTER": "SOUL.md"}).returncode == 91
+    (profile / "SOUL.md").write_text("Handwritten conflicting charter")
+    before = snapshot(profile)
+    for args in [("--check",), ()]:
+        refused = run(request, env, *args)
+        assert refused.returncode != 0
+        assert "ownership conflict: interrupted publication SOUL.md" in refused.stderr
+        assert snapshot(profile) == before
+
+
+def test_reserved_default_refuses_without_fleet_effects(tmp_path):
+    fleet, _, request, env = fixture(tmp_path)
+    request["id"] = "default"
+    request["memory"]["write_bank"] = "agent-default"
+    before = snapshot(fleet)
+    result = run(request, env)
+    assert result.returncode != 0
+    assert "reserved Hermes profile identity" in result.stderr
+    assert snapshot(fleet) == before
 
 
 def test_profile_lock_precedes_snapshot_and_preserves_concurrent_settings(tmp_path):

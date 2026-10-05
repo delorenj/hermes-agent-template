@@ -18,6 +18,11 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import yaml
+
+PENDING = ".specialist-pending.json"
+MANAGED_FILES = {"SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml",
+                 "hindsight/config.json", ".skillex-only", "specialist-projection.json"}
 
 
 spec = importlib.util.spec_from_file_location("specialist_renderer", Path(__file__).with_name("hermes-profile-config.py"))
@@ -78,6 +83,8 @@ def project(request, check):
     employee = request["id"]
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,57}", employee):
         raise ValueError("unsafe specialist identity")
+    if employee == "default":
+        raise ValueError("reserved Hermes profile identity: default")
     if request["memory"]["write_bank"] != f"agent-{employee}":
         raise ValueError("specialist write bank must belong to its identity")
     profile = r.PROFILES / employee
@@ -91,18 +98,50 @@ def project(request, check):
         safe(profile, True)
         state_path = profile / "specialist-projection.json"
         safe(state_path)
-        old = json.loads(state_path.read_text()) if state_path.exists() else {}
+        pending_path = profile / PENDING
+        safe(pending_path)
+        pending = json.loads(pending_path.read_text()) if pending_path.exists() else None
+        if pending is not None:
+            if (not isinstance(pending, dict) or pending.get("id") != employee
+                    or pending.get("definition") != request["definition"]
+                    or set(pending.get("files", {})) != MANAGED_FILES
+                    or set(pending.get("before", {})) != MANAGED_FILES):
+                raise ValueError("pending profile ownership conflict")
+            # Only the recorded pre-write bytes or transaction output are ours.
+            for name, text in pending["files"].items():
+                path = profile / name
+                safe(path)
+                if not isinstance(text, str):
+                    raise ValueError("invalid pending profile publication")
+                actual = digest(path.read_text()) if path.exists() else None
+                if actual not in (pending["before"][name], digest(text)):
+                    raise ValueError(f"ownership conflict: interrupted publication {name}")
+
+        def owned_text(name):
+            if pending is not None:
+                return pending["files"][name]
+            path = profile / name
+            safe(path)
+            return path.read_text() if path.exists() else None
+
+        def owned_mapping(name):
+            data = yaml.safe_load(owned_text(name) or "{}")
+            if not isinstance(data, dict):
+                raise ValueError(f"expected mapping: {profile / name}")
+            return data
+
+        old = json.loads(owned_text("specialist-projection.json") or "{}")
         if old and (old.get("id") != employee or old.get("definition") != request["definition"]):
             raise ValueError("profile ownership conflict")
         if profile.exists() and not old and list(profile.iterdir()):
             raise ValueError("occupied profile has no specialist ownership receipt")
         # Read config ONLY after locking. A concurrent config writer cannot be lost.
         delta_path = profile / "config.delta.yaml"
-        delta = mapping(delta_path)
-        metadata = mapping(profile / "profile.yaml")
+        delta = owned_mapping("config.delta.yaml")
+        metadata = owned_mapping("profile.yaml")
         memory_path = profile / "hindsight/config.json"
         safe(memory_path)
-        memory = json.loads(memory_path.read_text()) if memory_path.exists() else {}
+        memory = json.loads(owned_text("hindsight/config.json") or "{}")
         if not isinstance(memory, dict):
             raise ValueError("hindsight config must be a mapping")
         r.PROFILE_LOCK.test_snapshot_barrier("specialist")
@@ -116,6 +155,7 @@ def project(request, check):
         # Inference is pinned independently of the fleet's credentials and channels.
         desired = {
             "model.provider": "automaticai",
+            "providers.automaticai.enabled": True,
             "providers.automaticai.api": "https://api.automaticai.io/v1",
             "providers.automaticai.base_url": "https://api.automaticai.io/v1",
             "providers.automaticai.api_key": "",
@@ -171,10 +211,11 @@ def project(request, check):
         memory.setdefault("recall_types", ["world", "experience", "observation"])
         base = mapping(r.BASE)
         merged = r.deep_merge(base, delta)
-        refuse_credentials(merged)
+        for name, value in (("config.delta", delta), ("config", merged), ("profile", metadata), ("hindsight", memory)):
+            refuse_credentials(value, name)
         current_config = profile / "config.yaml"
         safe(current_config)
-        if current_config.exists() and digest(current_config.read_text()) != old.get("files", {}).get("config.yaml") and mapping(current_config) != merged:
+        if pending is None and current_config.exists() and digest(current_config.read_text()) != old.get("files", {}).get("config.yaml") and mapping(current_config) != merged:
             raise ValueError("ownership conflict: handwritten config.yaml; retain changes in config.delta.yaml")
         # Inherited list patches cannot re-enable external discovery.
         if merged.get("skills", {}).get("external_dirs") != []:
@@ -192,18 +233,27 @@ def project(request, check):
         for name in files:
             path = profile / name
             safe(path)
-            if name == "SOUL.md" and path.exists() and digest(path.read_text()) != old.get("files", {}).get(name):
+            if pending is None and name == "SOUL.md" and path.exists() and digest(path.read_text()) != old.get("files", {}).get(name):
                 raise ValueError(f"ownership conflict: {name}")
         safe(profile / ".agents", True)
         if (profile / ".agents").exists():
             raise ValueError("strict specialist refuses profile .agents discovery root")
         receipt = {"id": employee, "definition": request["definition"], "config": managed,
                    "metadata": owned_meta, "files": {k: digest(v) for k, v in files.items()}}
+        refuse_credentials(receipt, "receipt")
         files["specialist-projection.json"] = json.dumps(receipt, sort_keys=True, indent=2) + "\n"
         changes = [name for name, text in files.items() if not (profile / name).exists() or (profile / name).read_text() != text]
-        if not check:
+        if pending is not None:
+            changes.append(PENDING)
+        if not check and changes:
+            journal = {"id": employee, "definition": request["definition"], "files": files,
+                       "before": {name: digest((profile / name).read_text()) if (profile / name).exists() else None for name in files}}
+            atomic(pending_path, json.dumps(journal, sort_keys=True, indent=2) + "\n")
             for name, text in files.items():
                 atomic(profile / name, text)
+                if os.environ.get("FLUME_TEST_SPECIALIST_INTERRUPT_AFTER") == name:
+                    os._exit(91)
+            pending_path.unlink()
         return {"profile": str(profile), "changed": changes, "write_bank": f"agent-{employee}", "recall_banks": recall}
 
 
