@@ -50,6 +50,7 @@ FLEET_REFERENCE_ALLOWLIST = {
     "template/.scripts/heartbeat.sh",
     "template/.scripts/lib/fleet-env.sh",
     "template/.scripts/lib/parse-fleet-env.py",
+    "template/.scripts/lib/project-skills.py",  # two path pins, canonical data-only parser
     "template/.scripts/providers/plane.sh",
     "template/hermes.jinja",
 }

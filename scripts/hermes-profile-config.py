@@ -39,6 +39,8 @@ Commands:
     absorb   fold an out-of-band edit to a generated config.yaml back into the
              delta, so in-agent writes (``/model``, onboarding) survive.
     status   show each profile's delta size and drift state.
+    skills-policy  enforce a named desk's strict loadout under the shared lock.
+    project-skills bind proven PM projects through the pinned runtime adapter.
 
 Backups are written to ~/.hermes/.profile-config-backups/<timestamp>/<profile>/
 -- deliberately NOT beside the file, because several profile dirs are symlinks
@@ -51,8 +53,10 @@ import copy
 import datetime
 import importlib.util
 import os
+import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
@@ -328,12 +332,17 @@ def backup(paths: list[Path], tag: str) -> Path | None:
 
 def write_generated(path: Path, merged: dict) -> None:
     """Write the rendered config, replacing a symlink with a real file."""
-    if path.is_symlink():
-        path.unlink()
-    tmp = path.parent / f".{path.name}.tmp"
-    tmp.write_text(GENERATED_HEADER + dump_yaml(merged), encoding="utf-8")
-    os.replace(tmp, path)
-    os.chmod(path, 0o600)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.render-", dir=path.parent)
+    tmp = Path(name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(GENERATED_HEADER + dump_yaml(merged))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -725,11 +734,40 @@ def _ensure_runtime_ignored(path: Path) -> None:
 
 def _select(args) -> list[Path]:
     if getattr(args, "profile", None):
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.profile) is None:
+            sys.exit("FATAL: invalid profile name")
         pdir = PROFILES / args.profile
         if not pdir.is_dir():
             sys.exit(f"FATAL: no such profile: {args.profile}")
         return [pdir]
     return profile_dirs()
+
+
+def load_policy_helper(name):
+    source = Path(__file__).resolve().parent.parent / "template/.scripts/lib" / name
+    if source.is_symlink() or not source.is_file():
+        raise RuntimeError(f"trusted policy helper unavailable: {source}")
+    spec = importlib.util.spec_from_file_location(name.replace("-", "_").removesuffix(".py"), source)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load trusted policy helper")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cmd_skills_policy(args) -> int:
+    if not args.profile:
+        raise RuntimeError("skills-policy requires --profile; select a single desk explicitly")
+    helper = load_policy_helper("skills-policy.py")
+    for profile in _select(args):
+        outcome = helper.set_policy(profile, renderer=sys.modules[__name__], dry_run=args.dry_run)
+        print(f"skills-policy {profile.name}: {outcome}")
+    return 0
+
+
+def cmd_project_skills(args) -> int:
+    helper = load_policy_helper("project-skills.py")
+    return helper.command(args, sys.modules[__name__], load_policy_helper("skills-policy.py"))
 
 
 def main() -> int:
@@ -741,6 +779,7 @@ def main() -> int:
         ("check", cmd_check, "drift gate (non-zero exit on drift)"),
         ("absorb", cmd_absorb, "fold out-of-band config.yaml edits into the delta"),
         ("status", cmd_status, "show delta size and drift state per profile"),
+        ("skills-policy", cmd_skills_policy, "enforce strict loadout through a locked base+delta transaction"),
         ("memory-pin", cmd_memory_pin, "pin each agent's identity-memory bank explicitly"),
         ("memory-template", cmd_memory_template,
          "record the bank template the Hindsight provider imports into an unsteered identity bank"),
@@ -771,12 +810,24 @@ def main() -> int:
             "agent_bank_template); '' removes it",
         )
         p.set_defaults(func=fn)
+    project = sub.add_parser("project-skills", help="configure exact trust for evidenced PM bindings and report native discovery")
+    scope = project.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--profile")
+    scope.add_argument("--registered-pms", action="store_true")
+    project.add_argument("--project-root", help="explicit canonical project, never inferred from Git")
+    project.add_argument("--role-dir", help="role corroborating the explicit canonical project")
+    project.add_argument("--registry", default=str(HERMES_HOME / "agents-registry.yaml"))
+    project.add_argument("--dry-run", action="store_true")
+    project.add_argument("--json", action="store_true")
+    project.set_defaults(func=cmd_project_skills)
     args = ap.parse_args()
     if not BASE.exists():
         sys.exit(f"FATAL: fleet base not found: {BASE}")
     try:
         return args.func(args)
     except PROFILE_LOCK.ProfileConfigLockError as exc:
+        sys.exit(f"FATAL: {exc}")
+    except (RuntimeError, ValueError, OSError) as exc:
         sys.exit(f"FATAL: {exc}")
 
 

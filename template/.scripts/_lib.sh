@@ -1127,7 +1127,8 @@ systemd_wait_for_stable_health() {
 }
 
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
-# Walk up from $ROLE_DIR until we find a git root that isn't us.
+# Prefer the manifest-defined owning project, including non-Git projects.
+# A role's own nested Git repository is not the canonical project binding.
 project_repo_path() {
   # Structured provisioners know the project root even before a fresh target
   # receives its own .git directory. Accept only a root that contains this
@@ -1141,6 +1142,27 @@ project_repo_path() {
       "$explicit"/agents/hermes/*) printf '%s\n' "$explicit"; return 0 ;;
       *) return 1 ;;
     esac
+  fi
+  local canonical
+  canonical="$(cd "$ROLE_DIR/../../.." 2>/dev/null && pwd -P)" || return 1
+  if [[ -e "$canonical/.project.json" || -L "$canonical/.project.json" ]]; then
+    python3 -I - "$canonical" <<'PYEOF'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+manifest = root / ".project.json"
+if manifest.is_symlink() or not manifest.is_file():
+    raise SystemExit("canonical project manifest must be a regular file")
+data = json.loads(manifest.read_text(encoding="utf-8"))
+declared = data.get("repo_path") if isinstance(data, dict) else None
+if not isinstance(declared, str) or pathlib.Path(declared).expanduser().resolve() != root:
+    raise SystemExit("canonical project manifest repo_path disagrees with the role directory")
+print(root)
+PYEOF
+    return $?
+  fi
+  if [[ "$ROLE_DIR" == "$canonical/agents/hermes/pm" && -f "$ROLE_DIR/role.yaml" ]]; then
+    printf '%s\n' "$canonical"
+    return 0
   fi
   local d="$ROLE_DIR"
   [[ -d "$d/.git" || -f "$d/.git" ]] && { echo "$d"; return 0; }

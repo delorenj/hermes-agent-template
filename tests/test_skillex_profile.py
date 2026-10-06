@@ -500,3 +500,129 @@ def test_root_task_has_no_automatic_skill_writer():
     assert all(watch["task"] != "skills:sync" for watch in config["watch_files"])
     for name in ("sync-skills.py", "provision-packs.py"):
         assert not (ROOT / ".mise/scripts" / name).exists()
+
+
+def project_binding_fixture(fixture):
+    """A manifest-defined project and a runtime with only profile discovery."""
+    (fixture["project"] / ".project.json").write_text(json.dumps({
+        "repo_path": str(fixture["project"]),
+        "agents": {"fixture-pm": {"role": "pm", "role_dir": "agents/hermes/pm"}},
+    }))
+    runtime = fixture["root"] / "release"
+    for directory in ("tools", "agent", "hermes_cli", ".venv/bin"):
+        (runtime / directory).mkdir(parents=True)
+    (runtime / "tools/skills_tool.py").write_text("def _find_all_skills():\n    return []\n")
+    (runtime / "agent/skill_utils.py").write_text("def get_all_skills_dirs():\n    return []\n")
+    (runtime / "hermes_cli/config_defaults.py").write_text("DEFAULT_CONFIG = {'skills': {'external_dirs': []}}\n")
+    binary = runtime / ".venv/bin/hermes"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    fixture["env"]["HERMES_FLEET_REPO"] = str(runtime)
+    fixture["env"]["HERMES_FLEET_BIN"] = str(binary)
+
+
+def test_future_provisioning_reports_unsupported_project_binding_and_keeps_strict_loadout(fixture):
+    project_binding_fixture(fixture)
+    fixture["profile"].rmdir()
+    result = succeeded(provision(fixture))
+    assert "project skills BLOCKED" in result.stdout + result.stderr
+    assert str(fixture["project"]) in result.stdout + result.stderr
+    assert delta_of(fixture) == {"skills": {"external_dirs": []}}
+    assert strict_markers(fixture["profile"])
+    assert not (fixture["project"] / ".agents/skills").exists()
+    before = snapshot(fixture["profile"])
+    repeated = succeeded(provision(fixture))
+    assert "project skills BLOCKED" in repeated.stdout + repeated.stderr
+    assert snapshot(fixture["profile"]) == before
+
+
+def test_strict_role_selection_rerun_does_not_rebind_receipt_to_repo(fixture):
+    project_binding_fixture(fixture)
+    fixture["profile"].rmdir()
+    succeeded(provision(fixture))
+    selection = fixture["profile"] / ".skillex-selection"
+    (selection / ".agents").mkdir(parents=True)
+    (selection / ".agents/skills.json").write_text('{"skills":[{"name":"delta"}]}\n')
+    succeeded(run([
+        fixture["env"]["SKILLEX_BIN"], "profile", "sync", "fixture-pm",
+        "--project", str(selection), "--skillex-only",
+    ], cwd=fixture["cwd"], env=fixture["env"]))
+    before = snapshot(fixture["profile"])
+    succeeded(provision(fixture))
+    assert snapshot(fixture["profile"]) == before
+    assert {p.name for p in (fixture["profile"] / "skills").iterdir()} == {"alpha", "gamma", "delta"}
+
+
+def test_manifest_root_precedes_nested_role_git_root(fixture):
+    project_binding_fixture(fixture)
+    succeeded(run(["git", "init", "--quiet", str(fixture["role"])], cwd=fixture["cwd"], env=fixture["env"]))
+    env = {k: v for k, v in fixture["env"].items() if k != "PJANGLER_PROJECT_ROOT"}
+    result = succeeded(run([
+        "/bin/bash", "-c", 'source "$1"; project_repo_path', "fixture",
+        str(fixture["scripts"] / "_lib.sh"),
+    ], cwd=fixture["cwd"], env=env))
+    assert result.stdout.strip() == str(fixture["project"])
+
+
+def test_supported_onboarding_and_role_resync_keep_canonical_project_trust(fixture):
+    from project_skills_runtime_fixture import install_supported_runtime
+    import yaml
+
+    project_binding_fixture(fixture)
+    install_supported_runtime(fixture["root"] / "release")
+    (fixture["project"] / ".git").mkdir()
+    fixture["profile"].rmdir()
+    result = succeeded(provision(fixture))
+    assert "project skills BLOCKED" not in result.stdout + result.stderr
+    config_path = fixture["profile"] / "config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    assert config["skills"]["project_discovery"] is True
+    assert config["skills"]["trusted_project_dirs"] == [str(fixture["project"])]
+    selection = fixture["profile"] / ".skillex-selection"
+    (selection / ".agents").mkdir(parents=True)
+    (selection / ".agents/skills.json").write_text('{"skills":[{"name":"delta"}]}\n')
+    succeeded(run([
+        fixture["env"]["SKILLEX_BIN"], "profile", "sync", "fixture-pm",
+        "--project", str(selection), "--skillex-only",
+    ], cwd=fixture["cwd"], env=fixture["env"]))
+    before = snapshot(fixture["profile"])
+    succeeded(provision(fixture))
+    assert snapshot(fixture["profile"]) == before
+    assert yaml.safe_load(config_path.read_text())["skills"]["trusted_project_dirs"] == [str(fixture["project"])]
+    assert {p.name for p in (fixture["profile"] / "skills").iterdir()} == {"alpha", "gamma", "delta"}
+
+
+def test_supported_step10_missing_manifest_uses_registered_canonical_root(fixture):
+    from project_skills_runtime_fixture import install_supported_runtime
+    import yaml
+
+    project_binding_fixture(fixture)
+    install_supported_runtime(fixture["root"] / "release")
+    (fixture["project"] / ".project.json").unlink()
+    source = fixture["root"] / "current-template"
+    source.mkdir()
+    shutil.copy2(ROOT / "copier.yml", source / "copier.yml")
+    shutil.copytree(ROOT / "template", source / "template", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    succeeded(run([
+        shutil.which("copier"), "copy", "--skip-tasks", "--defaults", "--trust", "--overwrite",
+        "--data", "target_repo=fixture", str(source), str(fixture["role"]),
+    ], cwd=fixture["cwd"], env=fixture["env"]))
+    assert (fixture["scripts"] / "lib/project-skills.py").read_bytes() == (ROOT / "template/.scripts/lib/project-skills.py").read_bytes()
+    fleet = fixture["profile"].parent.parent
+    (fleet / "agents-registry.yaml").write_text(yaml.safe_dump({"agents": {"fixture-pm": {
+        "role": "pm", "profile_name": "fixture-pm", "project_path": str(fixture["project"]),
+        "role_dir": str(fixture["role"]),
+    }}}))
+    fixture["profile"].rmdir()
+    fixture["env"].pop("PJANGLER_PROJECT_ROOT", None)
+    result = succeeded(provision(fixture))
+    assert "project skills BLOCKED" not in result.stdout + result.stderr
+    config = yaml.safe_load((fixture["profile"] / "config.yaml").read_text())
+    assert config["skills"]["trusted_project_dirs"] == [str(fixture["project"])]
+    assert config["skills"]["project_discovery"] is True
+    assert config["skills"]["external_dirs"] == []
+    before = snapshot(fixture["profile"])
+    succeeded(provision(fixture))
+    assert snapshot(fixture["profile"]) == before
+    assert not (fixture["project"] / ".project.json").exists()
+    assert not (fixture["project"] / ".git").exists()
