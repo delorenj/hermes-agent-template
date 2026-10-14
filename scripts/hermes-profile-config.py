@@ -348,6 +348,35 @@ def write_generated(path: Path, merged: dict) -> None:
 # --------------------------------------------------------------------------
 # per-profile state
 # --------------------------------------------------------------------------
+def pin_codegraph_root(config: dict) -> dict:
+    """Never render a ``codegraph serve --mcp`` entry that can index the wrong tree.
+
+    A Hermes gateway runs with cwd ``~/.hermes`` (not a git repo; ``installs/`` alone is ~200k
+    vendored files). Hermes's MCP client does not send a project rootUri, so a ``codegraph serve
+    --mcp`` with no ``--path`` indexed ``~/.hermes`` itself on 2026-10-11: 49.7 GiB of
+    ``.codegraph/codegraph.db`` plus an unflushed WAL in 37 minutes. The desk's repo is the first
+    ``skills.trusted_project_dirs`` entry the project binding wrote (a git checkout); pin it with
+    ``--path``. A profile with no resolvable repo gets no codegraph server at all rather than one
+    that indexes its cwd. ``codegraph install`` writes the unpinned form into ``~/.hermes/config.yaml``,
+    so the pin has to be applied at render, not hoped for in the base.
+    """
+    servers = config.get("mcp_servers")
+    entry = servers.get("codegraph") if isinstance(servers, dict) else None
+    if not isinstance(entry, dict):
+        return config
+    args = [str(a) for a in (entry.get("args") or [])]
+    if any(a in ("--path", "-p") or a.startswith("--path=") for a in args):
+        return config
+    trusted = ((config.get("skills") or {}).get("trusted_project_dirs") or [])
+    repo = next((Path(str(d)).expanduser() for d in trusted if (Path(str(d)).expanduser() / ".git").exists()), None)
+    if repo is None:
+        print("note: dropped mcp_servers.codegraph (no git repo to --path it to)", file=sys.stderr)
+        del servers["codegraph"]
+        return config
+    entry["args"] = [*args, "--path", str(repo)]
+    return config
+
+
 def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     """Return (delta, current_cfg, expected_render, is_symlink)."""
     cfg_path = pdir / "config.yaml"
@@ -355,7 +384,7 @@ def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     is_link = cfg_path.is_symlink()
     delta = load_yaml(delta_path)
     current = load_yaml(cfg_path)
-    expected = deep_merge(base, delta)
+    expected = pin_codegraph_root(deep_merge(base, delta))
     return delta, current, expected, is_link
 
 
