@@ -284,3 +284,45 @@ with r.PROFILE_LOCK.ProfileConfigLock(p):
         for process in [child, holder]:
             if process and process.poll() is None:
                 process.kill(); process.wait()
+
+
+def test_flume39_gateway_key_accepted_in_delta(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    flume39_ref = "op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/hermes-specialist"
+    delta_path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(delta_path.read_text())
+    delta.setdefault("secrets", {}).setdefault("onepassword", {}).setdefault("env", {})["AUTOMATICAI_GATEWAY_KEY"] = flume39_ref
+    delta_path.write_text(yaml.safe_dump(delta))
+
+    # check mode detects difference in specialist-projection.json
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert "specialist-projection.json" in json.loads(preview.stdout)["changed"]
+
+    # refresh mode applies and converges
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == flume39_ref
+    receipt = json.loads((profile / "specialist-projection.json").read_text())
+    assert receipt["config"]["secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY"] == flume39_ref
+
+    # subsequent check is a clean no-op
+    clean = run(request, env, "--check")
+    assert clean.returncode == 0, clean.stderr
+    assert json.loads(clean.stdout)["changed"] == []
+
+
+def test_foreign_gateway_key_refused_as_ownership_conflict(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    delta_path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(delta_path.read_text())
+    delta.setdefault("secrets", {}).setdefault("onepassword", {}).setdefault("env", {})["AUTOMATICAI_GATEWAY_KEY"] = "op://DeLoSecrets/foreign-item/foreign-key"
+    delta_path.write_text(yaml.safe_dump(delta))
+
+    refused = run(request, env)
+    assert refused.returncode != 0
+    assert "ownership conflict: config secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY" in refused.stderr
+

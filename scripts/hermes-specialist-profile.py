@@ -184,7 +184,22 @@ def project(request, check):
                     raise ValueError(f"ownership conflict: config {key}")
                 node = node[part]
             leaf = parts[-1]
-            if leaf in node and node[leaf] != old.get("config", {}).get(key, wanted):
+            if key == "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY":
+                flume39_ref = f"op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/hermes-{employee}"
+                valid_refs = {wanted, flume39_ref}
+                if "config" in old and key in old["config"]:
+                    valid_refs.add(old["config"][key])
+                if leaf in node:
+                    current_val = node[leaf]
+                    if isinstance(current_val, str) and re.match(r"^op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/[A-Za-z0-9][A-Za-z0-9_-]*$", current_val):
+                        valid_refs.add(current_val)
+                    if current_val in valid_refs:
+                        wanted = current_val
+                    else:
+                        raise ValueError(f"ownership conflict: config {key}")
+                elif "config" in old and old["config"].get(key):
+                    wanted = old["config"][key]
+            elif leaf in node and node[leaf] != old.get("config", {}).get(key, wanted):
                 raise ValueError(f"ownership conflict: config {key}")
             node[leaf] = wanted
             managed[key] = wanted
