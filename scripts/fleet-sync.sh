@@ -333,7 +333,8 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   fleet_assets_eligible=1
   # role-yaml.py is heartbeat.sh's role.yaml reader, so it lands before the
   # heartbeat refresh below.
-  for fleet_asset in fleet-env.sh parse-fleet-env.py profile-config-lock.py profile-config-seed.py voice-config.py role-yaml.py; do
+  # profile-renderer.py locates THE canonical renderer for voice-config.py's expected config.
+  for fleet_asset in fleet-env.sh parse-fleet-env.py profile-config-lock.py profile-config-seed.py profile-renderer.py voice-config.py role-yaml.py; do
     source_asset="$SCRIPT_DIR/../template/.scripts/lib/$fleet_asset"
     target_asset="$role_lib_dir/$fleet_asset"
     if [[ -L "$target_asset" ]]; then
@@ -377,6 +378,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
       "$FLEET_ENV_PARSER_SOURCE|$role_lib_dir/parse-fleet-env.py" \
       "$PROFILE_CONFIG_LOCK_SOURCE|$role_lib_dir/profile-config-lock.py" \
       "$PROFILE_CONFIG_SEED_SOURCE|$role_lib_dir/profile-config-seed.py" \
+      "$SCRIPT_DIR/../template/.scripts/lib/profile-renderer.py|$role_lib_dir/profile-renderer.py" \
       "$VOICE_CONFIG_TOOL|$role_lib_dir/voice-config.py" \
       "$SCRIPT_DIR/../template/.scripts/lib/role-yaml.py|$role_lib_dir/role-yaml.py" \
       "$HEARTBEAT_TEMPLATE|$heartbeat_target"
@@ -581,7 +583,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
           note "$agent_id" FIXED "config.yaml rendered from fleet base + delta"
           changed=1; FIXED=$((FIXED + 1))
         else
-          note "$agent_id" DRIFT "config.yaml != deep_merge(fleet base, config.delta.yaml)"
+          note "$agent_id" DRIFT "config.yaml != expected_config(fleet base, config.delta.yaml) (merge + renderer pins)"
           DRIFT=$((DRIFT + 1))
         fi
       fi

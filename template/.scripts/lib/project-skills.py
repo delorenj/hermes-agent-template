@@ -65,8 +65,12 @@ def runtime_pins(renderer):
     repo, binary = (Path(pins[key]).expanduser() for key in ("HERMES_FLEET_REPO", "HERMES_FLEET_BIN"))
     if not repo.is_absolute() or repo.is_symlink() or not repo.is_dir():
         raise RuntimeError("pinned runtime repository must be a real absolute directory")
-    if binary != repo / ".venv/bin/hermes" or binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK):
-        raise RuntimeError("pinned HERMES_FLEET_BIN must be the executable in HERMES_FLEET_REPO/.venv/bin/hermes")
+    # The ONE install (2026-10-17) execs the managed launcher <repo>/.hermes/bin/hermes; the venv
+    # entry point is the pre-unification spelling. Either is the same install's own executable.
+    if (binary not in (repo / ".venv/bin/hermes", repo / ".hermes/bin/hermes")
+            or binary.is_symlink() or not binary.is_file() or not os.access(binary, os.X_OK)):
+        raise RuntimeError("pinned HERMES_FLEET_BIN must be the executable in HERMES_FLEET_REPO/.hermes/bin/hermes "
+                           "(or HERMES_FLEET_REPO/.venv/bin/hermes)")
     return repo, binary
 
 
@@ -80,14 +84,23 @@ from hermes_cli.config_defaults import DEFAULT_CONFIG
 features = {key: key in (DEFAULT_CONFIG.get("skills") or {})
             for key in ("project_discovery", "trusted_project_dirs")}
 api = {name: callable(getattr(skill_utils, name, None)) for name in
-       ("find_project_root", "get_project_skills_dirs", "get_scan_ordered_skills_dirs", "is_project_root_trusted")}
+       ("find_project_root", "get_project_skills_dirs", "is_project_root_trusted")}
+# The ONE precedence ordering: upstream folded get_scan_ordered_skills_dirs (removed as dead code,
+# Hermes be5c6a2fd8) into get_skill_search_roots -> [(tier, dir), ...], project tier first.
+search_roots = getattr(skill_utils, "get_skill_search_roots", None)
+legacy_order = getattr(skill_utils, "get_scan_ordered_skills_dirs", None)
+api["scan_ordered_skills_dirs"] = callable(search_roots) or callable(legacy_order)
+def ordered_dirs():
+    if callable(search_roots):
+        return [str(d) for _tier, d in search_roots()]
+    return [str(p) for p in legacy_order()]
 result = {"cwd": os.getcwd(), "features": features, "api": api}
 if all(api.values()):
     root = skill_utils.find_project_root()
     result.update(root=str(root) if root is not None else None,
                   trusted=skill_utils.is_project_root_trusted(Path(request["project_root"])),
                   project_dirs=[str(p) for p in skill_utils.get_project_skills_dirs()],
-                  ordered_dirs=[str(p) for p in skill_utils.get_scan_ordered_skills_dirs()])
+                  ordered_dirs=ordered_dirs())
     if request.get("skill"):
         from tools.skills_tool import skill_view
         # The normal support-file branch returns the lexical source path before
@@ -321,7 +334,10 @@ def command(args, renderer, policy):
                 # The same lock protects snapshot/validation as the real writer.
                 snapshot = policy.policy_snapshot(profile, renderer)
                 _, delta, base, current = snapshot
-                if current is None or current not in (renderer.deep_merge(base, delta), renderer.deep_merge(base, policy.strict_delta(delta))):
+                # THE expected config (base + delta + renderer pins), never a local deep_merge: a
+                # pinned desk is a pure render, and a pin-only difference is a stale render.
+                if not any(renderer.is_render_of(current, base, candidate, name)
+                           for candidate in (delta, policy.strict_delta(delta))):
                     result["blockers"].append({"code": "profile_config_drift", "reason": "check/absorb the generated config before project enablement"})
                 try:
                     root = canonical(row.get("project_path"))

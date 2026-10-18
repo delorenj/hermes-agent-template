@@ -171,11 +171,14 @@ def set_policy_locked(profile, renderer, *, dry_run=False, project_root=None, sn
     path = profile / "config.delta.yaml"
     config = profile / "config.yaml"
     delta = strict_delta(old_delta) if project_root is None else project_delta(old_delta, base, project_root, renderer)
-    expected = renderer.deep_merge(base, delta)
+    # THE expected config (base + delta + every renderer pin). A bare deep_merge here refused every
+    # pinned desk as drift and, on write, stripped its pin.
+    expected = renderer.expected_config(base, delta, profile.name)
     if project_root is not None and (expected.get("skills") or {}).get("external_dirs") != []:
         raise RuntimeError("skills.external_dirs list patch conflicts with the strict profile loadout")
-    if current is not None and current not in (
-        renderer.deep_merge(base, old_delta), renderer.deep_merge(base, strict_delta(old_delta)), expected
+    if current is not None and not any(
+        renderer.is_render_of(current, base, candidate, profile.name)
+        for candidate in (old_delta, strict_delta(old_delta), delta)
     ):
         raise RuntimeError(
             "config.yaml has out-of-band drift; inspect with hermes-profile-config.py "

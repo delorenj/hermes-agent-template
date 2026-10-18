@@ -225,12 +225,13 @@ def project(request, check):
         memory.update({"bank_id": f"agent-{employee}", "api_url": "https://api.hs.delo.sh", "bank_id_template": ""})
         memory.setdefault("recall_types", ["world", "experience", "observation"])
         base = mapping(r.BASE)
-        merged = r.deep_merge(base, delta)
+        # THE expected config (base + delta + renderer pins), the same value `check` compares against.
+        merged = r.expected_config(base, delta, employee)
         for name, value in (("config.delta", delta), ("config", merged), ("profile", metadata), ("hindsight", memory)):
             refuse_credentials(value, name)
         current_config = profile / "config.yaml"
         safe(current_config)
-        if pending is None and current_config.exists() and digest(current_config.read_text()) != old.get("files", {}).get("config.yaml") and mapping(current_config) != merged:
+        if pending is None and current_config.exists() and digest(current_config.read_text()) != old.get("files", {}).get("config.yaml") and not r.is_render_of(mapping(current_config), base, delta, employee):
             raise ValueError("ownership conflict: handwritten config.yaml; retain changes in config.delta.yaml")
         # Inherited list patches cannot re-enable external discovery.
         if merged.get("skills", {}).get("external_dirs") != []:

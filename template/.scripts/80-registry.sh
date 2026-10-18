@@ -306,4 +306,23 @@ PYEOF
 fleet_lock_release
 trap - EXIT
 
+# The row just written is the org chart's project_path: the input of the renderer's terminal.cwd pin.
+# Step 10 rendered this profile BEFORE the row existed (a fresh hire) or while it named an older
+# path, so the generated config.yaml is a faithful render with a stale pin. Re-render it through the
+# canonical renderer -- the registry stays the one ordering truth, and nothing here re-derives the
+# pin. `repin` rewrites a pin-only difference and refuses real out-of-band drift (absorb first).
+PROFILE_RENDERER="${PROFILE_RENDERER:-$HOME/code/33GOD/hermes-agent-template/scripts/hermes-profile-config.py}"
+PIN_PROFILE_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}/profiles/$PROFILE_NAME"
+if [[ -f "$PIN_PROFILE_HOME/config.delta.yaml" && ! -L "$PIN_PROFILE_HOME/config.delta.yaml" ]]; then
+  [[ -f "$PROFILE_RENDERER" && ! -L "$PROFILE_RENDERER" ]] \
+    || die "canonical config renderer required to pin the registered project: $PROFILE_RENDERER"
+  if repin_output="$(HERMES_AGENTS_REGISTRY="$REGISTRY_FILE" \
+      python3 -I "$PROFILE_RENDERER" repin --profile "$PROFILE_NAME" 2>&1)"; then
+    log "    profile config pinned to the registry row: ${repin_output##*$'\n'}"
+  else
+    warn "    $PROFILE_NAME's config.yaml has out-of-band drift beyond renderer pins; its terminal.cwd is NOT pinned. Run: hermes-profile-config.py absorb --profile $PROFILE_NAME && hermes-profile-config.py repin --profile $PROFILE_NAME"
+    printf '%s\n' "$repin_output" >&2
+  fi
+fi
+
 mark_done 80-registry

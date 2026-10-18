@@ -17,6 +17,7 @@ import yaml
 ROOT = Path(__file__).parents[1]
 TRANSACTION_SOURCE = ROOT / "template" / ".scripts" / "channel-transaction.py"
 LOCK_SOURCE = ROOT / "template" / ".scripts" / "lib" / "profile-config-lock.py"
+RENDERER_LOCATOR_SOURCE = ROOT / "template" / ".scripts" / "lib" / "profile-renderer.py"
 
 
 def _fixture(tmp_path: Path) -> dict[str, Path]:
@@ -31,6 +32,7 @@ def _fixture(tmp_path: Path) -> dict[str, Path]:
     (scripts / "lib").mkdir(parents=True)
     shutil.copy2(TRANSACTION_SOURCE, helper)
     shutil.copy2(LOCK_SOURCE, scripts / "lib" / LOCK_SOURCE.name)
+    shutil.copy2(RENDERER_LOCATOR_SOURCE, scripts / "lib" / RENDERER_LOCATOR_SOURCE.name)
     helper.chmod(0o755)
 
     base = {

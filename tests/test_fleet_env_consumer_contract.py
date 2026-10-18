@@ -38,6 +38,7 @@ FLEET_REFERENCE_ALLOWLIST = {
     "scripts/backfill-fleet-sot.py",
     "scripts/backfill-fleet-sot.sh",
     "scripts/fleet-sync.sh",
+    "scripts/hermes-single-install-check.py",  # reads two path pins (data-only), never executes fleet.env
     "scripts/migrate-unify.sh",
     "template/.scripts/01-config.sh",
     "template/.scripts/05-fleet-env.sh",

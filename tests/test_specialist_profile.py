@@ -261,7 +261,7 @@ with r.PROFILE_LOCK.ProfileConfigLock(p):
  pathlib.Path(os.environ['TEST_READY']).write_text('held')
  while not pathlib.Path(os.environ['TEST_RESUME']).exists():time.sleep(.02)
  delta=r.load_yaml(p/'config.delta.yaml');delta['operator']={'concurrent':'keep'}
- (p/'config.delta.yaml').write_text(r.dump_yaml(delta));r.write_generated(p/'config.yaml',r.deep_merge(r.load_yaml(r.BASE),delta))
+ (p/'config.delta.yaml').write_text(r.dump_yaml(delta));r.write_generated(p/'config.yaml',r.expected_config(r.load_yaml(r.BASE),delta,p))
 """
     holder_env = {**env, "TEST_RENDERER": str(RENDERER), "TEST_READY": str(ready), "TEST_RESUME": str(resume)}
     holder = subprocess.Popen([sys.executable, "-c", holder_code], env=holder_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

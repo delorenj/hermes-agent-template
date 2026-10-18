@@ -220,7 +220,9 @@ fi
 # The generated launchers pass TERMINAL_CWD process-locally instead.
 #
 # config.yaml is GENERATED, never hand-written and never a symlink to the fleet
-# base. It is deep_merge(~/.hermes/config.yaml, <profile>/config.delta.yaml).
+# base. It is the renderer's expected_config: the merge of ~/.hermes/config.yaml and
+# <profile>/config.delta.yaml plus the renderer pins (terminal.cwd from the registry row, which
+# 80-registry.sh writes and then re-pins for a fresh hire).
 # The old symlink-to-base topology was actively harmful: Hermes' atomic writes
 # use os.replace, which REPLACES a symlink with a regular file, so the first
 # in-agent write (/model, onboarding, a config migration) silently detached the

@@ -24,7 +24,13 @@ This tool makes the intended contract real:
 
     ~/.hermes/config.yaml                     canonical base (hand-edited)
     ~/.hermes/profiles/<p>/config.delta.yaml  SSOT override (hand-edited, tiny)
-    ~/.hermes/profiles/<p>/config.yaml        GENERATED = deep_merge(base, delta)
+    ~/.hermes/profiles/<p>/config.yaml        GENERATED = expected_config(base, delta, <p>)
+                                              = deep_merge(base, delta) + renderer pins
+                                                (terminal.cwd <- registry project_path,
+                                                 codegraph --path <- the desk's repo)
+
+``expected_config`` is the ONE definition of the generated config. Every consumer that compares or
+writes one imports this module (or runs ``expected``) instead of re-assembling the merge.
 
 A missing or empty delta means "identical to base", which is exactly the
 expected behavior. The merge replicates Hermes' own ``_deep_merge`` semantics
@@ -34,8 +40,11 @@ Commands:
     init     one-time migration: recover each profile's true delta from the
              config it has today, then render. Idempotent.
     render   regenerate config.yaml from base + delta.
-    check    verify every config.yaml matches its base+delta render (drift
-             gate; exits non-zero on drift).
+    check    verify every config.yaml matches expected_config (drift gate; exits
+             non-zero on drift; WARNs on a stale registry project_path).
+    repin    re-render only configs whose difference is renderer pins alone (a
+             registry row written or moved after the last render).
+    expected print THE expected config for one profile as JSON.
     absorb   fold an out-of-band edit to a generated config.yaml back into the
              delta, so in-agent writes (``/model``, onboarding) survive.
     status   show each profile's delta size and drift state.
@@ -381,27 +390,62 @@ def pin_codegraph_root(config: dict) -> dict:
 CWD_PLACEHOLDERS = frozenset({"", ".", "auto", "cwd"})
 
 
-def registry_project_path(profile: str, registry: Path | None = None) -> str | None:
-    """The absolute project directory the org chart gives *profile*, or None.
+_WARNED_STALE_PROJECT_PATHS: set = set()
 
-    The registry row whose ``profile_name`` (or key) is *profile* and whose ``project_path`` is an
-    absolute, existing directory. Anything else (portable specialist with no project, stale path,
-    unreadable registry) is None, which leaves the profile's cwd behaviour exactly as it was.
+
+def stale_registry_project_path(profile: str, registry: Path | None = None) -> str | None:
+    """The registry ``project_path`` of *profile* when it is set but unusable, else None.
+
+    A row that names a project the renderer cannot pin (relative, deleted, moved) is the one case
+    where ``terminal.cwd`` silently stays the placeholder ``.`` -- which the multiplexed gateway
+    resolves to ``$HOME``, so every turn of that desk runs in, and is attributed to, the home
+    directory. ``check`` reports it loudly instead of letting it pass as "in sync".
     """
+    row = _registry_row(profile, registry)
+    raw = str((row or {}).get("project_path") or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    return None if candidate.is_absolute() and candidate.is_dir() else raw
+
+
+def _registry_row(profile: str, registry: Path | None = None) -> dict | None:
     path = registry or REGISTRY
     try:
         agents = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("agents") or {}
     except (OSError, yaml.YAMLError, AttributeError):
         return None
-    for key, row in agents.items():
-        if not isinstance(row, dict) or (row.get("profile_name") or key) != profile:
-            continue
-        raw = str(row.get("project_path") or "").strip()
-        if raw and Path(raw).expanduser().is_absolute() and Path(raw).expanduser().is_dir():
-            return str(Path(raw).expanduser())
-        if raw:
-            print(f"note: {profile}: registry project_path {raw!r} is not an existing absolute dir", file=sys.stderr)
+    if not isinstance(agents, dict):
         return None
+    for key, row in agents.items():
+        if isinstance(row, dict) and (row.get("profile_name") or key) == profile:
+            return row
+    return None
+
+
+def registry_project_path(profile: str, registry: Path | None = None) -> str | None:
+    """The absolute project directory the org chart gives *profile*, or None.
+
+    The registry row whose ``profile_name`` (or key) is *profile* and whose ``project_path`` is an
+    absolute, existing directory. Anything else (portable specialist with no project, stale path,
+    unreadable registry) is None, which leaves the profile's cwd behaviour exactly as it was. A
+    stale path is warned about on stderr (once per profile per process) and by ``check``.
+    """
+    row = _registry_row(profile, registry)
+    raw = str((row or {}).get("project_path") or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute() and candidate.is_dir():
+        return str(candidate)
+    if profile not in _WARNED_STALE_PROJECT_PATHS:
+        _WARNED_STALE_PROJECT_PATHS.add(profile)
+        print(
+            f"WARN: {profile}: registry project_path {raw!r} is not an existing absolute directory; "
+            "terminal.cwd stays '.', which the multiplexed gateway resolves to $HOME. "
+            "Fix the agents-registry.yaml row (re-run 80-registry.sh), then repin.",
+            file=sys.stderr,
+        )
     return None
 
 
@@ -434,6 +478,70 @@ def pin_terminal_cwd(config: dict, profile: str, registry: Path | None = None) -
     return config
 
 
+# --------------------------------------------------------------------------
+# THE expected config: base + delta + every renderer pin
+# --------------------------------------------------------------------------
+# Dotted paths whose generated value the RENDERER owns (derived from the host or the org chart, never
+# from the delta). A consumer that compared config.yaml against a bare deep_merge(base, delta) called
+# every pinned desk "out-of-band drift" and, when it wrote, stripped the pin again (2026-10-18).
+RENDER_PIN_PATHS = ("terminal.cwd", "mcp_servers.codegraph")
+
+
+def apply_render_pins(config: dict, profile: str, *, registry: Path | None = None) -> dict:
+    """Every renderer pin, in render order. Add a new pin HERE and in ``RENDER_PIN_PATHS`` only."""
+    return pin_terminal_cwd(pin_codegraph_root(config), profile, registry)
+
+
+def expected_config(base: dict, delta: dict, profile, *, registry: Path | None = None) -> dict:
+    """THE generated ``config.yaml`` for *profile*: ``deep_merge(base, delta)`` plus every renderer pin.
+
+    The one definition of "expected config". ``render`` writes it, ``check`` compares against it, and
+    every other reader or writer of a generated profile config -- skills-policy, project-skills, the
+    Skillex cutover, flume's role projection and hire restriction, the specialist publisher -- must
+    call this (``import`` the renderer, or ``hermes-profile-config.py expected``) rather than
+    re-assembling ``deep_merge`` + pins itself. *profile* is the profile name or its directory.
+    """
+    name = profile.name if isinstance(profile, Path) else str(profile)
+    return apply_render_pins(deep_merge(base, delta), name, registry=registry)
+
+
+def without_render_pins(config: Any) -> Any:
+    """*config* with every renderer-owned path removed (an emptied parent mapping is dropped too)."""
+    if not isinstance(config, dict):
+        return copy.deepcopy(config)
+    out = copy.deepcopy(config)
+    for dotted in RENDER_PIN_PATHS:
+        parts = dotted.split(".")
+        chain = [out]
+        for part in parts[:-1]:
+            child = chain[-1].get(part)
+            if not isinstance(child, dict):
+                break
+            chain.append(child)
+        else:
+            chain[-1].pop(parts[-1], None)
+            for depth in range(len(chain) - 1, 0, -1):
+                if chain[depth]:
+                    break
+                chain[depth - 1].pop(parts[depth - 1], None)
+    return out
+
+
+def is_render_of(current: Any, base: dict, delta: dict, profile, *, registry: Path | None = None) -> bool:
+    """Whether *current* is a render of base + delta: exact, or stale only on renderer-owned pins.
+
+    A pin-only difference is not out-of-band drift: it is a config rendered before the org chart (or
+    the host) gave the renderer the pin's input -- a fresh hire's step 10 runs before 80-registry.sh
+    writes its row -- or rendered by a writer that predates the pin. Writers accept it and write
+    ``expected_config``; ``check`` still reports it, because the file on disk is not yet what the
+    runtime should read.
+    """
+    if not isinstance(current, dict):
+        return False
+    expected = expected_config(base, delta, profile, registry=registry)
+    return current == expected or without_render_pins(current) == without_render_pins(expected)
+
+
 def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     """Return (delta, current_cfg, expected_render, is_symlink)."""
     cfg_path = pdir / "config.yaml"
@@ -441,7 +549,7 @@ def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     is_link = cfg_path.is_symlink()
     delta = load_yaml(delta_path)
     current = load_yaml(cfg_path)
-    expected = pin_terminal_cwd(pin_codegraph_root(deep_merge(base, delta)), pdir.name)
+    expected = expected_config(base, delta, pdir.name)
     return delta, current, expected, is_link
 
 
@@ -486,7 +594,7 @@ def cmd_init(args) -> int:
                 if dropped > 0:
                     origin += f", {dropped} stale line(s) pruned"
 
-            merged = pin_terminal_cwd(deep_merge(base, delta), pdir.name)
+            merged = expected_config(base, delta, pdir.name)
             lines = len(dump_yaml(delta).splitlines()) if delta else 0
             gained = len(merged) - len(load_yaml(cfg_path)) if not is_link else 0
 
@@ -530,9 +638,14 @@ def cmd_render(args) -> int:
 def cmd_check(args) -> int:
     base = load_yaml(BASE)
     drifted = []
+    pin_only = []
+    stale = []
     for pdir in _select(args):
         with PROFILE_LOCK.ProfileConfigLock(pdir):
             delta, current, expected, is_link = profile_state(pdir, base)
+            raw = stale_registry_project_path(pdir.name)
+            if raw is not None:
+                stale.append((pdir.name, raw))
             if is_link:
                 drifted.append(
                     (pdir.name, "config.yaml is a SYMLINK (no override capability)")
@@ -546,13 +659,79 @@ def cmd_check(args) -> int:
                     if current.get(k) != expected.get(k)
                 )
                 drifted.append((pdir.name, f"drift in: {', '.join(keys[:6])}"))
+                if without_render_pins(current) == without_render_pins(expected):
+                    pin_only.append(pdir.name)
     if drifted:
         print("PROFILE CONFIG DRIFT:\n")
         for name, why in drifted:
             print(f"  {name:36s} {why}")
         print(f"\n{len(drifted)} profile(s) drifted. Fix: hermes-profile-config.py render --all")
-        return 1
-    print("OK: every profile config.yaml == deep_merge(base, delta)")
+        if pin_only:
+            print(
+                f"{len(pin_only)} of them differ ONLY on renderer pins ({', '.join(RENDER_PIN_PATHS)}): "
+                "hermes-profile-config.py repin --all re-renders exactly those."
+            )
+    else:
+        print("OK: every profile config.yaml == expected_config(base, delta) (deep_merge + renderer pins)")
+    if stale:
+        # Loud, but after the verdict line: flume's observer keys on the first line ("OK:" / "PROFILE
+        # CONFIG DRIFT:"). A stale path is not drift -- the render is faithful -- it is a desk whose
+        # every gateway turn runs in $HOME.
+        print(f"\nWARN: {len(stale)} profile(s) have a STALE registry project_path; terminal.cwd falls back to '.' ($HOME under the multiplexed gateway):")
+        for name, raw in stale:
+            print(f"WARN:   {name:34s} project_path={raw!r} is not an existing absolute directory")
+        for name, raw in stale:
+            print(f"WARN: {name}: stale registry project_path {raw!r}", file=sys.stderr)
+    return 1 if drifted else 0
+
+
+def cmd_repin(args) -> int:
+    """Re-render only profiles whose config differs from the expected render ONLY on renderer pins.
+
+    The pin inputs live outside the delta (the org chart's ``project_path``, the desk's repo), so a
+    change there -- 80-registry.sh writing a fresh hire's row, a project moving -- leaves a faithful
+    render stale. This rewrites exactly those configs and refuses (exit 1) any profile with real
+    out-of-band drift, which ``absorb`` must fold into the delta first. Profiles that are a symlink or
+    have no delta are skipped: they are not under inheritance.
+    """
+    base = load_yaml(BASE)
+    refused = 0
+    for pdir in _select(args):
+        with PROFILE_LOCK.ProfileConfigLock(pdir):
+            cfg_path = pdir / "config.yaml"
+            if cfg_path.is_symlink() or not (pdir / "config.delta.yaml").is_file():
+                print(f"skip   {pdir.name:36s} (not under inheritance)")
+                continue
+            delta, current, expected, _link = profile_state(pdir, base)
+            if current == expected:
+                print(f"ok     {pdir.name}")
+            elif without_render_pins(current) == without_render_pins(expected):
+                print(f"repin  {pdir.name}")
+                if not args.dry_run:
+                    write_generated(cfg_path, expected)
+            else:
+                refused += 1
+                print(f"DRIFT  {pdir.name:36s} out-of-band edits beyond renderer pins; absorb first")
+    return 1 if refused else 0
+
+
+def cmd_expected(args) -> int:
+    """Print THE expected config for one profile as JSON, for consumers that are not Python.
+
+    ``--delta-file`` evaluates a proposed delta instead of the profile's own (``-`` reads stdin).
+    """
+    import json
+
+    if not args.profile:
+        sys.exit("FATAL: expected requires --profile")
+    pdir = _select(args)[0]
+    if args.delta_file == "-":
+        delta = yaml.safe_load(sys.stdin.read()) or {}
+    elif args.delta_file:
+        delta = load_yaml(Path(args.delta_file))
+    else:
+        delta = load_yaml(pdir / "config.delta.yaml")
+    print(json.dumps(expected_config(load_yaml(BASE), delta, pdir.name), indent=2, sort_keys=False, default=str))
     return 0
 
 
@@ -572,11 +751,8 @@ def cmd_absorb(args) -> int:
             old_delta = load_yaml(pdir / "config.delta.yaml")
             current = load_yaml(cfg_path)
             directive = copy.deepcopy(old_delta.get(LIST_PATCH_KEY))
-            effective_base = pin_terminal_cwd(
-                deep_merge(
-                    base, {LIST_PATCH_KEY: directive} if directive is not None else {}
-                ),
-                pdir.name,
+            effective_base = expected_config(
+                base, {LIST_PATCH_KEY: directive} if directive is not None else {}, pdir.name
             )
             new_delta = minimal_delta(current, effective_base)
             if directive is not None:
@@ -866,6 +1042,8 @@ def main() -> int:
         ("init", cmd_init, "recover deltas from current configs and render"),
         ("render", cmd_render, "regenerate config.yaml from base + delta"),
         ("check", cmd_check, "drift gate (non-zero exit on drift)"),
+        ("repin", cmd_repin, "re-render configs that differ from the expected render ONLY on renderer pins"),
+        ("expected", cmd_expected, "print THE expected config (base + delta + renderer pins) for one profile as JSON"),
         ("absorb", cmd_absorb, "fold out-of-band config.yaml edits into the delta"),
         ("status", cmd_status, "show delta size and drift state per profile"),
         ("skills-policy", cmd_skills_policy, "enforce strict loadout through a locked base+delta transaction"),
@@ -897,6 +1075,10 @@ def main() -> int:
             "--bank-template",
             help="memory-template: manifest path (default: config.toml [hindsight] "
             "agent_bank_template); '' removes it",
+        )
+        p.add_argument(
+            "--delta-file",
+            help="expected: evaluate this delta instead of the profile's own ('-' reads stdin)",
         )
         p.set_defaults(func=fn)
     project = sub.add_parser("project-skills", help="configure exact trust for evidenced PM bindings and report native discovery")

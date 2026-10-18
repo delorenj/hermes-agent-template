@@ -259,7 +259,7 @@ profile_config_delta_update() {
       --voice "$4"
     return
   fi
-  python3 - "$profile_lock_tool" "$@" <<'PYEOF'
+  PJANGLER_REGISTRY_FILE="${REGISTRY_FILE:-}" python3 - "$profile_lock_tool" "$@" <<'PYEOF'
 import atexit, copy, importlib.util, os, pathlib, re, sys, tempfile
 try:
     import yaml
@@ -305,56 +305,25 @@ def load(path):
         raise SystemExit(f"config source must be a mapping: {path}")
     return data
 
-LIST_PATCH_KEY = "x-pjangler-merge"
-
-def plain_merge(base, override):
-    result = copy.deepcopy(base)
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = plain_merge(result[key], value)
-        elif key in result and isinstance(result[key], dict) and value is None:
-            continue
-        else:
-            result[key] = copy.deepcopy(value)
-    return result
-
-def apply_list_patches(result, directive):
-    if directive is None:
-        return
-    if not isinstance(directive, dict) or not isinstance(directive.get("list_patches", {}), dict):
-        raise SystemExit(f"{LIST_PATCH_KEY}.list_patches must be a mapping")
-    for dotted, rule in directive.get("list_patches", {}).items():
-        if not isinstance(dotted, str) or not dotted or not isinstance(rule, dict):
-            raise SystemExit("invalid list patch")
-        additions = rule.get("add", []) or []
-        removals = rule.get("remove", []) or []
-        if not isinstance(additions, list) or not isinstance(removals, list) or not all(
-            isinstance(item, str) for item in [*additions, *removals]
-        ):
-            raise SystemExit(f"list patch for {dotted} must contain string lists")
-        cursor = result
-        parts = dotted.split(".")
-        for part in parts[:-1]:
-            child = cursor.setdefault(part, {})
-            if not isinstance(child, dict):
-                raise SystemExit(f"list patch parent for {dotted} is not a mapping")
-            cursor = child
-        current = cursor.get(parts[-1], []) or []
-        if not isinstance(current, list):
-            raise SystemExit(f"list patch target {dotted} is not a list")
-        removed = set(removals)
-        merged = [item for item in current if item not in removed]
-        for item in additions:
-            if item not in merged:
-                merged.append(item)
-        cursor[parts[-1]] = merged
-
-def merge(base, override):
-    directive = override.get(LIST_PATCH_KEY)
-    ordinary = {key: value for key, value in override.items() if key != LIST_PATCH_KEY}
-    result = plain_merge(base, ordinary)
-    apply_list_patches(result, directive)
-    return result
+def merge(base, delta):
+    # THE expected config -- the Hermes merge plus every renderer pin -- comes from the canonical
+    # renderer, never from a private merge here (that once rewrote config.yaml without the pin).
+    locator_source = lock_source.with_name("profile-renderer.py")
+    if not locator_source.is_file() or locator_source.is_symlink():
+        raise SystemExit(f"trusted profile renderer locator is unavailable: {locator_source}")
+    locator_spec = importlib.util.spec_from_file_location("pjangler_profile_renderer_locator", locator_source)
+    if locator_spec is None or locator_spec.loader is None:
+        raise SystemExit(f"cannot load profile renderer locator: {locator_source}")
+    locator = importlib.util.module_from_spec(locator_spec)
+    locator_spec.loader.exec_module(locator)
+    try:
+        renderer = locator.load(profile.parent.parent)
+        registry = os.environ.get("PJANGLER_REGISTRY_FILE") or None
+        return renderer.expected_config(
+            base, delta, profile.name, registry=pathlib.Path(registry) if registry else None
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
 
 def atomic_write(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)

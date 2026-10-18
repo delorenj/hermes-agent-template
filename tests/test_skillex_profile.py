@@ -626,3 +626,52 @@ def test_supported_step10_missing_manifest_uses_registered_canonical_root(fixtur
     assert snapshot(fixture["profile"]) == before
     assert not (fixture["project"] / ".project.json").exists()
     assert not (fixture["project"] / ".git").exists()
+
+
+def test_fresh_hire_gets_the_registry_terminal_cwd_pin_and_check_is_green(fixture):
+    """A brand-new desk: step 10 renders BEFORE 80-registry.sh writes the org chart row.
+
+    80-registry.sh re-pins through the renderer, so the hire ends with terminal.cwd = the registered
+    project and `check` green -- and the strict re-onboard after it keeps the pin (skills-policy and
+    project-skills compare against the renderer's expected config, not a bare deep_merge).
+    """
+    import yaml
+
+    shutil.copy2(ROOT / "template/.scripts/80-registry.sh", fixture["scripts"])
+    fleet = fixture["home"] / ".hermes"
+    (fleet / "config.yaml").write_text(
+        "skills:\n  external_dirs: [legacy]\nterminal:\n  backend: local\n  cwd: .\n"
+    )
+    registry = fleet / "agents-registry.yaml"
+    assert not registry.exists()
+    fixture["profile"].rmdir()  # a FRESH hire: Hermes creates the profile in step 10
+    renderer = [sys.executable, "-I", str(ROOT / "scripts/hermes-profile-config.py")]
+    renderer_env = dict(fixture["env"], HERMES_FLEET_HOME=str(fleet))
+
+    succeeded(provision(fixture))
+    config = yaml.safe_load((fixture["profile"] / "config.yaml").read_text())
+    assert config["terminal"]["cwd"] == "."  # no row yet: nothing to pin to
+    assert run([*renderer, "check"], cwd=fixture["cwd"], env=renderer_env).returncode == 0
+
+    registered = succeeded(run(["/bin/bash", str(fixture["scripts"] / "80-registry.sh")],
+                               cwd=fixture["cwd"], env=fixture["env"]))
+    assert "profile config pinned to the registry row: repin" in registered.stdout + registered.stderr
+    row = yaml.safe_load(registry.read_text())["agents"]["fixture-pm"]
+    assert row["project_path"] == str(fixture["project"])
+    config = yaml.safe_load((fixture["profile"] / "config.yaml").read_text())
+    assert config["terminal"] == {"backend": "local", "cwd": str(fixture["project"])}
+    delta = yaml.safe_load((fixture["profile"] / "config.delta.yaml").read_text())
+    assert "terminal" not in delta  # the pin is rendered, never frozen into the SSOT
+    check = run([*renderer, "check"], cwd=fixture["cwd"], env=renderer_env)
+    assert check.returncode == 0, check.stdout + check.stderr
+    assert check.stdout.startswith("OK:")
+
+    before = snapshot(fixture["profile"])
+    succeeded(run(["/bin/bash", str(fixture["scripts"] / "80-registry.sh")],
+                  cwd=fixture["cwd"], env=fixture["env"]))
+    assert snapshot(fixture["profile"]) == before
+
+    # Re-onboard of the now-strict desk (step 10 again): pinned config is expected, not drift.
+    succeeded(provision(fixture))
+    assert yaml.safe_load((fixture["profile"] / "config.yaml").read_text())["terminal"]["cwd"] == str(fixture["project"])
+    assert run([*renderer, "check"], cwd=fixture["cwd"], env=renderer_env).returncode == 0
