@@ -800,8 +800,8 @@ fi
 unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
 # Tools we expect on the host
-HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}}"
-HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}}"
+HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.hermes/hermes-agent/.hermes/bin/hermes")}}"
+HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.hermes/hermes-agent")}}"
 # Named-profile topology is owned by Flume (was PJangler).
 #
 # BOTH keys are read, newest first, and that is deliberate. A copy of
@@ -814,7 +814,9 @@ FLUME_BIN="${FLUME_BIN:-${PJANGLER_BIN:-$(config_get fleet.flume_bin "$(config_g
 PJANGLER_BIN="$FLUME_BIN"
 HERMES_RUNTIME_GIT_URL="${HERMES_RUNTIME_GIT_URL:-$(config_get fleet.hermes_git_url 'https://github.com/delorenj/hermes-agent.git')}"
 HERMES_RUNTIME_GIT_REF="${HERMES_RUNTIME_GIT_REF:-$(config_get fleet.hermes_git_ref 'main')}"
-HERMES_RUNTIME_GIT_SHA="${HERMES_RUNTIME_GIT_SHA:-$(config_get fleet.hermes_git_sha '0408fec7a153e6c32c064acd2b8053917f1525f1')}"
+# The sha a registry row records is the LIVE HEAD of the one install (never a static pin that goes stale
+# the moment the install is fast-forwarded); the host config is only the fallback when git cannot answer.
+HERMES_RUNTIME_GIT_SHA="${HERMES_RUNTIME_GIT_SHA:-$(git -C "$HERMES_AGENT_REPO" rev-parse HEAD 2>/dev/null || config_get fleet.hermes_git_sha '')}"
 HERMES_OAUTH_FILE="${HERMES_OAUTH_FILE:-${HERMES_FLEET_OAUTH_FILE:-$(config_get fleet.oauth_file "$HOME/.hermes/auth.json")}}"
 CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_home "$HOME/.codex")}}"
 # Prefer a scaffold vendored into this agent directory; fall back to the configured template path.

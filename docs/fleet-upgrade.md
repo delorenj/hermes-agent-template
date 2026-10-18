@@ -1,121 +1,73 @@
-# Upgrading hermes across the fleet
+# Hermes on big-chungus: ONE install, ONE code path
 
-Status: **the fleet is deliberately pinned.** Read rule 1 before doing anything.
+Status: **single install (2026-10-17).** Hermes runs from `~/.hermes/hermes-agent`, a checkout of
+`delorenj/hermes-agent` `main`, and from nowhere else.
 
-## 1. Never run `hermes update` on big-chungus while gateways are live
+| consumer | resolves to |
+|---|---|
+| `hermes-gateway.service` (the one host gateway, every profile, Telegram + the Bloodbank fleet lane) | `~/.hermes/hermes-agent/.hermes/bin/hermes` |
+| `~/.local/bin/hermes`, `hermes-acp`, `hermes-agent` | same launcher |
+| `~/.hermes/fleet.env` `HERMES_FLEET_BIN` / `HERMES_FLEET_REPO` | same launcher / same checkout |
+| `~/.config/hermes-agent-template/config.toml` `[fleet]` | same |
+| every `agents/hermes/*/hermes` wrapper | same (env, then config, then the embedded fallback) |
+| `agents-registry.yaml` `hermes.bin` / `repo` / `git_sha` | same launcher / checkout / an ancestor of its HEAD |
 
-It is not merely useless here — it will take the fleet down.
+## Why this is one line and not two
 
-`hermes update`'s systemd discovery glob is `hermes-gateway*`
-(`hermes_cli/update_cmd_fleet.py:38`, and `_is_hermes_gateway_unit` at `:638`
-requires a unit to be `hermes-gateway.service` or start with `hermes-gateway-`).
-Every unit on this host is named `hermes-<profile>-gateway.service`. Verified:
+For two months Hermes ran from **two** code lines. The CLI wrappers and the registry pinned an "immutable"
+release directory (`~/.local/share/hermes-agent/releases/<sha>`, added 2026-08-15 by DNET-4); `hermes` on
+PATH and, from 2026-10-10, `hermes-gateway.service` ran the dev checkout (Hermes' own installer derives
+`ExecStart` from whichever `hermes` is first on PATH). Neither line was a superset: the gateway lacked 32 of
+the fork's commits (route-limit 403 fallback, op:// credential refusal, cron economics), the CLI lacked the
+upstream gateway, the hook `final_response` the Bloodbank artifact sidecar needs, and four thousand upstream
+commits. The same prompt behaved differently through Telegram and through `agents/hermes/pm/hermes`.
 
-```
-$ systemctl --user list-units 'hermes-gateway*'  --plain --no-legend | wc -l
-0
-$ systemctl --user list-units 'hermes-*gateway*' --plain --no-legend | wc -l
-16
-```
+The "immutable release" reason did not survive contact: the release dir was fast-forwarded in place, carried
+uncommitted edits, and was not what production ran. There is nothing to protect by keeping a second copy.
 
-That empty set flows into `_get_service_pids(all_profiles=True)`
-(`hermes_cli/gateway.py:120`), so `service_pids` is empty. `find_gateway_pids`
-then scans `/proc`, and every live gateway matches
-`looks_like_gateway_command_line` — their real cmdline is
-`.../hermes -p <profile> gateway run --replace`, and `gateway run` is exactly
-what the matcher wants. **All of them are classified as *manual* processes**,
-signalled, and handed detached respawn watchers that race systemd's
-`Restart=on-failure`.
+The fork's still-relevant commits were ported onto the upstream tree and published as `delorenj/hermes-agent`
+`main` (the previous main is `backup/main-a-line-20261017`). The upstream base is NOT bumped as a side effect
+of anything here: scope is unification, not upgrade.
 
-It also rewrites **every** profile's `config.yaml` non-interactively
-(`update_cmd_config.py::_migrate_sibling_profile_configs`), colliding with the
-generated base+delta output of `hermes-profile-config.py`.
-
-There is nothing on the box that stops you typing it. That is the risk.
-
-## 2. This is a fork re-sync, not a version bump
-
-| surface | checkout | remote | version |
-|---|---|---|---|
-| `hermes` on PATH | `~/.hermes/hermes-agent` | `NousResearch/hermes-agent` (upstream) | 0.21.3 |
-| every gateway | `~/.local/share/hermes-agent/releases/<sha>` | `delorenj/hermes-agent` (fork) | 0.20.1 |
-
-`git rev-list --left-right --count delorenj/main...origin/main` → **19 / 15895**
-across merge-base `45af7a71`. The upstream tree carries none of the fork-only
-paths or the fork's gateway commits. Pinning the fleet at the upstream tree
-deletes them silently.
-
-Two one-way doors are **already open**: every config says
-`_config_version: 45` while the running code knows 37, and six profiles'
-`state.db` are at `SCHEMA_VERSION 30` against code that knows 26. Schema
-migrations are forward-only — there is no clean rollback from those six.
-
-## 3. The runtime is an editable install, so the release dir *is* the code
-
-`site-packages/__editable__.hermes_agent-0.20.1.pth` points at the release
-checkout, so "0.20.1" is frozen dist-info, not what runs. Consequences:
-
-- Editing files in the release dir changes the running fleet on next start.
-- The dir named `0408fec7a153…` was at HEAD `dbf5e7a0ce` with uncommitted work,
-  including an untracked `cron/economics.py` that `cron/scheduler.py` imports at
-  `:5117` and `:5521`. Landed 2026-09-22 as `5ca0851f`. **Check
-  `git -C <release> status` is clean before any upgrade** — a `git stash` there
-  breaks cron admission at call time.
-
-## 3a. Release checkouts are partial clones and CANNOT push
-
-`git remote -v` in a release dir shows `[blob:none]` — these are blobless
-partial clones. Committing works; **pushing does not**. `pack-objects` stalls
-trying to lazily backfill blobs it does not have, producing no output at all and
-never reaching the network. Verified 2026-09-22 across SSH, HTTPS, `--no-thin`
-and `pack.window=0`: every one hung silently until timeout while a fresh clone
-of the same repo took seconds.
-
-To land work that is sitting in a release checkout:
+## Deploying a change (the only procedure)
 
 ```bash
-git -C <release> format-patch -1 <sha> --stdout > /tmp/x.patch
-git clone git@github.com:delorenj/hermes-agent.git /tmp/hfork   # FULL, not --depth 1
-git -C /tmp/hfork am /tmp/x.patch && git -C /tmp/hfork push origin main
-git -C <release> fetch origin main
-git -C <release> diff --stat HEAD origin/main    # MUST be empty before the next line
-git -C <release> reset --hard origin/main
+cd ~/.hermes/hermes-agent
+git status --short            # must be clean (untracked agents/ is the one known exception)
+git pull --ff-only            # tracks delorenj/main; never merge or reset here
+# restart only when idle: gateway_state.json active_agents == 0, no turn lease held
+systemctl --user restart hermes-gateway.service
+python3 ~/code/33GOD/hermes-agent-template/scripts/hermes-single-install-check.py
 ```
 
-Do **not** use `--depth 1`: the pre-push guard refuses a shallow clone because it
-cannot build ancestry to scan ("outgoing commits do not build from a clone").
-That refusal is correct — unshallow rather than reaching for `GIT_GUARD_OFF=1`.
+Work on Hermes happens in a **clone** (`~/code/hermes-unify` style), is pushed to `delorenj/hermes-agent`
+`main`, and lands in the install by the fast-forward above. Do not edit files in the install itself: the
+running gateway imports from it, and a half-written edit is live on the next import.
 
-The final `diff --stat` is the safety check: `git am` produces a different sha for
-identical content, and the reset is only safe because the content matches. The
-release dir is the running code — confirm a checksum on a touched file is
-unchanged across the reset.
+Never run `hermes update` here: it pulls Nous `origin/main` (thousands of commits) over the fork's work and
+rewrites every profile's `config.yaml`. The `main` branch of the install tracks `delorenj/main` on purpose.
 
-## 4. The order that actually matters
+## The drift guard
 
-1. **Preflight, all read-only.** `git -C <release> status` clean;
-   `hermes-runtime-dropin.py check` green; `hermes-profile-config.py check`
-   green; no unit flapping (`NRestarts`); **1Password budget** —
-   `op service-account ratelimit`, account `read_write` must have room.
-2. **Land and sync the fork.** Size it first with `git merge-tree` against the
-   merge-base; do not start a merge you have not measured.
-3. **Build a release from a pushed fork sha.** Never point a drop-in at a dirty
-   or unpushed tree.
-4. **Canary one agent** whose `state.db` is already at the newer schema — that
-   agent has already walked through the one-way door, so the canary adds no new
-   irreversible step. Watch a full minute, not a sample.
-5. **Re-pin the drop-ins:** `hermes-runtime-dropin.py apply --release <sha>`.
-   It writes all in-scope units in one pass and restarts nothing, by design.
-   Once drop-ins disagree on a release, every later call **must** pass
-   `--release` explicitly or the generator refuses to infer one.
-6. **The five wrapper-launched units are invisible to that generator**
-   (deckard, infra, ssbnk, TonnyBox, voxxy). Their release path lives in each
-   repo's `agents/hermes/pm/.scripts/credential-launch.sh`. Update them
-   separately or they stay on the old runtime.
-7. **Restart in batches, Dumply last** — it is the one with a non-technical
-   user on the other end, and she cannot tell a dead bot from a slow one.
+`scripts/hermes-single-install-check.py` reduces every consumer in the table to the install root it execs and
+fails when two differ, when a binary is missing, when a registry `git_sha` is not in the install's history,
+when the install does not track a `delorenj/*` branch, or when it is a blobless partial clone. It warns on a
+wrapper's embedded fallback that names another path (shadowed by env/config today), a registry sha behind
+HEAD, and a gateway that booted from an older sha than HEAD. Run it by hand, or let the timer do it:
+`hermes-single-install-guard.timer` runs it every 15 minutes and `infra-doctor` watches its `ok` stamp
+(`~/.cache/hermes-single-install/ok`, probe `hermes-single-install`).
 
-## 5. The 1Password budget is a first-class constraint
+## Rules that stay
+
+1. **Never run `hermes update` on big-chungus** (above).
+2. **Restart the gateway only when idle.** There is one gateway now; a restart interrupts every profile.
+   Check `~/.hermes/gateway_state.json` (`active_agents: 0`) and the session turn leases first.
+3. **State migrations are one-way.** Every profile `config.yaml` is at `_config_version 50` and `state.db` at
+   schema 31 (written by the upstream tree). Never run an older tree against them.
+4. **Release dirs are retired.** `~/.local/share/hermes-agent/retired-20261017/` holds the old ones; nothing
+   references them. Do not recreate `releases/<sha>`: `hermes-runtime-dropin.py` and `install-local.sh` refuse.
+
+## The 1Password budget is a first-class constraint
 
 hermes resolves ~19 `op://` refs per gateway start with no cross-restart cache.
 The account cap is **1000 read_write/day**.
@@ -151,24 +103,3 @@ The account cap is **1000 read_write/day**.
 
 Do not attempt a fan-out on a day you have already spent reads.
 
-## 6. Abort conditions
-
-Stop, do not continue, if any of these is true:
-
-- the release checkout is dirty or has unpushed commits
-- `hermes-runtime-dropin.py check` or `hermes-profile-config.py check` is red
-- any gateway is flapping (`NRestarts` climbing)
-- 1Password `read_write` remaining is under ~400
-- a drop-in is missing from a unit — its **base** `ExecStart` points at
-  `~/.hermes/hermes-agent/.venv/bin/hermes`, which is the *other* version, so a
-  unit that loses its drop-in silently jumps a major version alone on next start
-
-## 7. Open question: unit naming
-
-Renaming units to hermes' own convention (`hermes-gateway-<profile>.service`)
-would make `hermes update --plan`, its fleet-restart phase, and
-`hermes -p <p> gateway restart` all work natively, deleting more custom code
-than it costs. But it is a migration — 25 base units, 20 drop-in dirs, plus
-every script and registry field that names a unit — and it must land *together*
-with an explicit rule about when `hermes update` may run, because renaming is
-precisely what arms the mass-restart described in rule 1.

@@ -21,7 +21,7 @@ The Fleet remains a set of independently useful parts:
 - `CommonProject` owns the base project scaffold.
 - `hermes-agent-template` owns agent-role provisioning.
 - `~/.hermes` owns live runtime state.
-- `~/.local/share/hermes-agent/releases/<commit>` owns each immutable Hermes engine checkout and binary.
+- `~/.hermes/hermes-agent` owns the ONE Hermes engine checkout and binary (gateway, PATH and every wrapper exec it).
 - `pjangler` becomes the explicit Fleet control plane.
 - n8n becomes the visual orchestration layer, backed by local systemd fallback.
 

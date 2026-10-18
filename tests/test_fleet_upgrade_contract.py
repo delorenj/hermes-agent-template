@@ -577,25 +577,25 @@ def test_fleet_audit_and_apply_fail_closed_on_state_query_errors(tmp_path: Path)
             assert not Path(env["SYSTEMCTL_RETIRED"]).exists()
 
 
-def test_pinned_fork_publication_replaces_upstream_clean_install_path() -> None:
+def test_one_install_replaces_the_pinned_release_split() -> None:
+    """Hermes is ONE code path: the gateway, every CLI wrapper and ~/.local/bin/hermes exec the same checkout."""
     installer = (ROOT / "install-local.sh").read_text(encoding="utf-8")
-    config = (ROOT / "template" / ".scripts" / "config.example.toml").read_text(
-        encoding="utf-8"
-    )
-    expected_sha = "0408fec7a153e6c32c064acd2b8053917f1525f1"
-    expected_release = f".local/share/hermes-agent/releases/{expected_sha}"
+    config = (ROOT / "template" / ".scripts" / "config.example.toml").read_text(encoding="utf-8")
+    wrapper = (ROOT / "template" / "hermes.jinja").read_text(encoding="utf-8")
+    lib = (ROOT / "template" / ".scripts" / "_lib.sh").read_text(encoding="utf-8")
 
     assert "raw.githubusercontent.com/NousResearch/hermes-agent" not in installer
     assert 'HERMES_RUNTIME_GIT_URL="https://github.com/delorenj/hermes-agent.git"' in installer
-    assert 'HERMES_RUNTIME_GIT_REF="main"' in installer
-    assert f'HERMES_RUNTIME_GIT_SHA="{expected_sha}"' in installer
-    assert '$HOME/.local/share/hermes-agent/releases/$HERMES_RUNTIME_GIT_SHA' in installer
-    assert 'HERMES_BIN="$HERMES_INSTALL_DIR/.venv/bin/hermes"' in installer
+    assert 'HERMES_INSTALL_DIR="${HERMES_INSTALL_DIR:-$HOME/.hermes/hermes-agent}"' in installer
+    assert 'HERMES_BIN="$HERMES_INSTALL_DIR/.hermes/bin/hermes"' in installer
     assert 'HERMES_BIN="$(command -v hermes)"' not in installer
-    assert "merge-base --is-ancestor" in installer
-    assert f'hermes_git_sha = "{expected_sha}"' in config
-    assert f'hermes_repo = "~/{expected_release}"' in config
-    assert f'hermes_bin = "~/{expected_release}/.venv/bin/hermes"' in config
+    assert 'hermes_bin = "~/.hermes/hermes-agent/.hermes/bin/hermes"' in config
+    assert 'hermes_repo = "~/.hermes/hermes-agent"' in config
+    for text in (installer, config, wrapper, lib):
+        assert "hermes-agent/releases" not in text, "a second 'release' checkout would re-open the split"
+    assert "$HOME/.hermes/hermes-agent/.hermes/bin/hermes" in wrapper
+    # The registry records the install's live HEAD, never a static pin.
+    assert 'git -C "$HERMES_AGENT_REPO" rev-parse HEAD' in lib
 
 
 def test_runtime_templatizer_pins_canonical_bmad_next31_pack() -> None:

@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Generate the ``10-versioned-runtime.conf`` systemd drop-in for each gateway.
+"""Generate the ``10-versioned-runtime.conf`` systemd drop-in for each per-agent gateway unit.
+
+ONE INSTALL (2026-10-17): the drop-in no longer pins a ``releases/<sha>`` directory. Hermes is ONE code
+path -- ``~/.hermes/hermes-agent`` (tracking ``delorenj/hermes-agent`` main), the same launcher
+``hermes-gateway.service`` and every CLI wrapper exec. ``--release`` is therefore only a sanity check that
+the sha you name is the install's HEAD (or an ancestor of it); a second checkout can no longer be pinned
+here, because that is exactly how the gateway and the CLI ended up on different code. The host's own
+``hermes-gateway.service`` is owned by Hermes' installer and is never touched by this script.
+
 
 Why this exists
 ---------------
@@ -72,7 +80,8 @@ from pathlib import Path
 
 UNIT_DIR = Path.home() / ".config/systemd/user"
 PROFILES_DIR = Path.home() / ".hermes/profiles"
-RELEASES_DIR = Path.home() / ".local/share/hermes-agent/releases"
+INSTALL_DIR = Path.home() / ".hermes/hermes-agent"
+INSTALL_BIN_DIR = INSTALL_DIR / ".hermes/bin"
 DROPIN_NAME = "10-versioned-runtime.conf"
 REGISTRY = Path.home() / ".hermes/agents-registry.yaml"
 
@@ -141,30 +150,23 @@ def is_direct_hermes_exec(exec_start: str | None) -> bool:
     return Path(first).name == "hermes"
 
 
-def detect_release(units: list[Path]) -> str:
-    """The release every existing drop-in agrees on; ambiguity is an error, not a guess."""
-    seen: set[str] = set()
-    for unit in units:
-        dropin = UNIT_DIR / f"{unit.name}.d" / DROPIN_NAME
-        if not dropin.is_file():
-            continue
-        value = unit_env(dropin.read_text(encoding="utf-8", errors="replace"), "HERMES_RUNTIME_RELEASE")
-        if value:
-            seen.add(value)
-    if len(seen) == 1:
-        return seen.pop()
-    if not seen:
-        raise SystemExit(
-            "no existing drop-in to infer the release from — pass --release <sha>"
-        )
-    raise SystemExit(
-        "existing drop-ins disagree on HERMES_RUNTIME_RELEASE "
-        f"({', '.join(sorted(seen))}) — pass --release <sha> to settle it"
+def install_head() -> str:
+    """HEAD of THE install. There is exactly one; there is nothing to infer or choose between."""
+    out = subprocess.run(
+        ["git", "-C", str(INSTALL_DIR), "rev-parse", "HEAD"], capture_output=True, text=True, check=False
     )
+    if out.returncode:
+        raise SystemExit(f"{INSTALL_DIR} is not a git checkout — there is no Hermes install to pin")
+    return out.stdout.strip()
+
+
+def detect_release(units: list[Path]) -> str:
+    """Kept for callers of the old API: the release IS the install's HEAD."""
+    return install_head()
 
 
 def render(*, release: str, profile: str | None, cwd: str | None, need_workdir: bool) -> str:
-    venv = f"{RELEASES_DIR}/{release}/.venv/bin"
+    venv = str(INSTALL_BIN_DIR)
     flag = f" -p {profile}" if profile else ""
     lines = [
         "[Service]",
@@ -228,7 +230,7 @@ def plan(release: str) -> tuple[list[tuple[Path, str, str]], list[tuple[str, str
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("mode", nargs="?", default="check", choices=["check", "apply"])
-    p.add_argument("--release", help="runtime release sha to pin (default: infer from existing drop-ins)")
+    p.add_argument("--release", help="sanity check only: must be the install HEAD or an ancestor of it")
     p.add_argument("--verbose", action="store_true", help="list skipped units too")
     args = p.parse_args(argv)
 
@@ -236,9 +238,19 @@ def main(argv: list[str]) -> int:
         print(f"no systemd user unit dir at {UNIT_DIR}", file=sys.stderr)
         return 1
 
-    release = args.release or detect_release(sorted(UNIT_DIR.glob("hermes-*-gateway.service")))
-    if not (RELEASES_DIR / release / ".venv/bin/hermes").is_file():
-        print(f"release {release} has no hermes binary under {RELEASES_DIR}", file=sys.stderr)
+    release = install_head()
+    if args.release and not release.startswith(args.release) and subprocess.run(
+        ["git", "-C", str(INSTALL_DIR), "merge-base", "--is-ancestor", args.release, release],
+        capture_output=True, check=False,
+    ).returncode:
+        print(
+            f"--release {args.release} is not the install's HEAD ({release[:12]}) or an ancestor of it. "
+            "There is ONE Hermes install; deploy by fast-forwarding it, not by naming another checkout.",
+            file=sys.stderr,
+        )
+        return 1
+    if not (INSTALL_BIN_DIR / "hermes").is_file():
+        print(f"the shared install has no launcher at {INSTALL_BIN_DIR / 'hermes'}", file=sys.stderr)
         return 1
 
     writes, skips = plan(release)

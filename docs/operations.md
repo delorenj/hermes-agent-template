@@ -61,11 +61,11 @@ different machine/user, edit this one file:
 
 ```toml
 [fleet]
-hermes_bin = "/path/to/hermes-agent/.venv/bin/hermes"
+hermes_bin = "/path/to/hermes-agent/.hermes/bin/hermes"
 hermes_repo = "/path/to/hermes-agent"
 hermes_git_url = "https://github.com/delorenj/hermes-agent.git"
 hermes_git_ref = "main"
-hermes_git_sha = "0408fec7a153e6c32c064acd2b8053917f1525f1"
+hermes_git_sha = ""   # recorded from the install HEAD by fleet-sync
 oauth_file = "~/.hermes/auth.json"
 codex_home = "~/.codex"
 vox_plugin_name = "vox"
@@ -139,12 +139,11 @@ For Codex auth, run `hermes auth add openai-codex` through any generated agent
 launcher once; all agents using the same fleet env read the same Hermes OAuth
 store afterward.
 
-The reviewed runtime source is the `delorenj/hermes-agent` fork, publication
-ref `main`, pinned at
-`0408fec7a153e6c32c064acd2b8053917f1525f1`. `install-local.sh` performs a
-single-branch clone, verifies the pin is on that ref, passes both `--branch` and
-`--commit` to the checked-out installer, and refuses an existing checkout with
-a different origin. It never fetches or writes upstream `main`.
+The runtime source is the `delorenj/hermes-agent` fork, publication ref `main`, installed ONCE at
+`~/.hermes/hermes-agent` and shared by the gateway, `~/.local/bin/hermes` and every wrapper.
+`install-local.sh` clones it there when missing, runs the checked-out installer, and refuses an existing
+checkout with no `delorenj/hermes-agent` remote. It never writes upstream `main`. Drift guard:
+`scripts/hermes-single-install-check.py`.
 
 To retrofit older provisioned agents onto this model, run:
 
@@ -423,4 +422,4 @@ never did either.
   confirmed redundant entries to a quarantine directory for review.
 
 ### `hermes` launcher complains about HERMES_BIN
-- Check the launcher script: `./agents/hermes/<role>/hermes` falls back to the pinned full-SHA release under `$HOME/.local/share/hermes-agent/releases/` (after `$HERMES_BIN`, `fleet.env`, and config.toml). Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.
+- Check the launcher script: `./agents/hermes/<role>/hermes` falls back to the shared install at `$HOME/.hermes/hermes-agent/.hermes/bin/hermes` (after `$HERMES_BIN`, `fleet.env`, and config.toml). Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.

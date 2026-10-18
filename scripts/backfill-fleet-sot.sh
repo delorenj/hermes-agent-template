@@ -72,8 +72,8 @@ FLEET_ENV="${HERMES_FLEET_ENV:-$(cfg fleet.fleet_env "$HOME/.hermes/fleet.env")}
 load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER_SOURCE"
 
 REGISTRY_FILE="${HERMES_FLEET_REGISTRY_FILE:-$(cfg fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}"
-HERMES_FLEET_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1/.venv/bin/hermes")}"
-HERMES_FLEET_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1")}"
+HERMES_FLEET_BIN="${HERMES_FLEET_BIN:-$(cfg fleet.hermes_bin "$HOME/.hermes/hermes-agent/.hermes/bin/hermes")}"
+HERMES_FLEET_REPO="${HERMES_FLEET_REPO:-$(cfg fleet.hermes_repo "$HOME/.hermes/hermes-agent")}"
 HERMES_FLEET_OAUTH_FILE="${HERMES_FLEET_OAUTH_FILE:-$(cfg fleet.oauth_file "$HOME/.hermes/auth.json")}"
 HERMES_FLEET_CODEX_HOME="${HERMES_FLEET_CODEX_HOME:-$(cfg fleet.codex_home "$HOME/.codex")}"
 SCAFFOLD_SRC="$(cd "$(dirname "$0")/../runtime-scaffold" && pwd)"

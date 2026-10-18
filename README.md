@@ -68,7 +68,7 @@ you to review it. Keys:
 | Section | Key | What it sets |
 | --- | --- | --- |
 | `fleet` | `hermes_bin`, `hermes_repo` | Shared Hermes executable + repo checkout |
-| `fleet` | `hermes_git_url`, `hermes_git_ref`, `hermes_git_sha` | Reviewed Hermes fork publication used by clean installs and fleet audit metadata |
+| `fleet` | `hermes_git_url`, `hermes_git_ref`, `hermes_git_sha` | The fork the one Hermes install tracks; the sha is the last HEAD fleet-sync recorded (the drift guard requires the live HEAD to descend from it) |
 | `fleet` | `fleet_env`, `registry_file` | Fleet source-of-truth + registry locations |
 | `fleet` | `oauth_file`, `codex_home` | Shared Hermes OAuth store + Codex CLI/app-server auth home |
 | `fleet` | `runtime_scaffold_dir` | Fallback scaffold (if agent-local one is missing) |
@@ -207,24 +207,20 @@ writes use an atomic replace, sync the containing directory where supported, and
 keep both registry and lock at mode `0600`. Profile delta replacements use an
 atomic write and remain safe to retry when a durability sync reports an error.
 
-## Reviewed Hermes runtime publication
+## The Hermes runtime: one install
 
-Clean installs use only the reviewed fleet fork publication below. The local
-installer verifies the commit belongs to the named ref and refuses an existing
-checkout whose `origin` points elsewhere:
+Hermes is ONE code path. `~/.hermes/hermes-agent` is a checkout of the fork `delorenj/hermes-agent` `main`;
+`hermes-gateway.service`, `~/.local/bin/hermes` and every `agents/hermes/*/hermes` wrapper exec its launcher
+`~/.hermes/hermes-agent/.hermes/bin/hermes`. There is no second "release" checkout to drift from it.
 
 ```bash
-git clone --branch main --single-branch \
-  https://github.com/delorenj/hermes-agent.git \
-  ~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1
-git -C ~/.local/share/hermes-agent/releases/0408fec7a153e6c32c064acd2b8053917f1525f1 rev-parse HEAD
-# 0408fec7a153e6c32c064acd2b8053917f1525f1
+git clone --branch main --single-branch https://github.com/delorenj/hermes-agent.git ~/.hermes/hermes-agent
+git -C ~/.hermes/hermes-agent rev-parse HEAD    # the sha every registry row records
 ```
 
-Do not install this fleet path from `NousResearch/hermes-agent` or mutate a
-shared working checkout. Promotion happens on the reviewed fork `main` and is
-installed into an immutable, full-SHA release directory pinned by
-`config.example.toml` and each registry entry.
+Do not install this fleet path from `NousResearch/hermes-agent`. Promotion is a push to the fork `main`
+followed by `git pull --ff-only` in the install; `scripts/hermes-single-install-check.py` fails when any
+consumer resolves elsewhere. See `docs/fleet-upgrade.md`.
 
 ## Fleet single source-of-truth
 
