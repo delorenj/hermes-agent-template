@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import importlib.util
 import json
@@ -46,8 +47,37 @@ def mapping(path: Path):
     return data
 
 
+def same_projection(path: Path, text: str) -> bool:
+    """Bytes, or for structured files the parsed value: Hermes re-dumps YAML in its own style."""
+    if not path.exists():
+        return False
+    current = path.read_text()
+    if current == text:
+        return True
+    try:
+        if path.suffix == ".yaml":
+            return yaml.safe_load(current) == yaml.safe_load(text)
+        if path.suffix == ".json":
+            return json.loads(current) == json.loads(text)
+    except (yaml.YAMLError, ValueError):
+        return False
+    return False
+
+
 def digest(text: str):
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def receipt_digest(name: str, text: str):
+    """Receipt fingerprint: the parsed value for structured files, so key order and quoting don't count."""
+    try:
+        if name.endswith(".yaml"):
+            return digest(json.dumps(yaml.safe_load(text), sort_keys=True, default=str))
+        if name.endswith(".json"):
+            return digest(json.dumps(json.loads(text), sort_keys=True))
+    except (yaml.YAMLError, ValueError):
+        pass
+    return digest(text)
 
 
 def refuse_credentials(value, path="config"):
@@ -138,6 +168,8 @@ def project(request, check):
         # Read config ONLY after locking. A concurrent config writer cannot be lost.
         delta_path = profile / "config.delta.yaml"
         delta = owned_mapping("config.delta.yaml")
+        # The generated config.yaml was rendered from the delta as found, before this run's pins.
+        found_delta = copy.deepcopy(delta)
         metadata = owned_mapping("profile.yaml")
         memory_path = profile / "hindsight/config.json"
         safe(memory_path)
@@ -168,6 +200,10 @@ def project(request, check):
             "skills.external_dirs": [],
             "skills.project_discovery": False,
             "skills.inherit_global": False,
+            # skills/ belongs to Skillex alone; what the employee learns (skill_manage) lands beside it,
+            # and the curator, which archives into skills/.archive, stays off for a strict desk.
+            "skills.create_dir": "learned-skills",
+            "curator.enabled": False,
             "memory.provider": "hindsight", "memory.memory_enabled": True,
             "memory.user_profile_enabled": False,
             "fallback_providers": [],
@@ -231,7 +267,7 @@ def project(request, check):
             refuse_credentials(value, name)
         current_config = profile / "config.yaml"
         safe(current_config)
-        if pending is None and current_config.exists() and digest(current_config.read_text()) != old.get("files", {}).get("config.yaml") and not r.is_render_of(mapping(current_config), base, delta, employee):
+        if pending is None and current_config.exists() and old.get("files", {}).get("config.yaml") not in (digest(current_config.read_text()), receipt_digest("config.yaml", current_config.read_text())) and not any(r.is_render_of(mapping(current_config), base, d, employee) for d in (found_delta, delta)):
             raise ValueError("ownership conflict: handwritten config.yaml; retain changes in config.delta.yaml")
         # Inherited list patches cannot re-enable external discovery.
         if merged.get("skills", {}).get("external_dirs") != []:
@@ -255,10 +291,10 @@ def project(request, check):
         if (profile / ".agents").exists():
             raise ValueError("strict specialist refuses profile .agents discovery root")
         receipt = {"id": employee, "definition": request["definition"], "config": managed,
-                   "metadata": owned_meta, "files": {k: digest(v) for k, v in files.items()}}
+                   "metadata": owned_meta, "files": {k: receipt_digest(k, v) for k, v in files.items()}}
         refuse_credentials(receipt, "receipt")
         files["specialist-projection.json"] = json.dumps(receipt, sort_keys=True, indent=2) + "\n"
-        changes = [name for name, text in files.items() if not (profile / name).exists() or (profile / name).read_text() != text]
+        changes = [name for name, text in files.items() if not same_projection(profile / name, text)]
         if pending is not None:
             changes.append(PENDING)
         if not check and changes:

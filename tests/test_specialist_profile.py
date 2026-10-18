@@ -48,6 +48,8 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     assert config["skills"]["external_dirs"] == []
     assert config["skills"]["project_discovery"] is False
     assert config["skills"]["inherit_global"] is False
+    assert config["skills"]["create_dir"] == "learned-skills"
+    assert config["curator"]["enabled"] is False
     assert yaml.safe_load((profile / "config.delta.yaml").read_text())["skills"]["inherit_global"] is False
     assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is False
     assert config["model"]["provider"] == "automaticai"
@@ -326,3 +328,37 @@ def test_foreign_gateway_key_refused_as_ownership_conflict(tmp_path):
     assert refused.returncode != 0
     assert "ownership conflict: config secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY" in refused.stderr
 
+
+
+def test_hermes_restyled_yaml_is_not_projection_drift(tmp_path):
+    """Hermes re-dumps config.yaml/config.delta.yaml in its own style after a run; same value, no drift."""
+    fleet, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    for name in ("config.yaml", "config.delta.yaml"):
+        data = yaml.safe_load((profile / name).read_text())
+        (profile / name).write_text(yaml.safe_dump(data, sort_keys=True, indent=4, width=10_000, default_style=None))
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert json.loads(preview.stdout)["changed"] == []
+    refresh = run(request, env)
+    assert refresh.returncode == 0, refresh.stderr
+    assert json.loads(refresh.stdout)["changed"] == []
+
+
+def test_desk_from_before_a_new_pin_refreshes_after_hermes_restyle(tmp_path):
+    """A desk projected before a pin existed, then re-dumped by Hermes, is not 'handwritten'."""
+    fleet, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    for name in ("config.delta.yaml", "config.yaml"):
+        data = yaml.safe_load((profile / name).read_text())
+        data["skills"].pop("create_dir")
+        data.pop("curator")
+        (profile / name).write_text(yaml.safe_dump(data, sort_keys=True, indent=4, width=10_000))
+    receipt = json.loads((profile / "specialist-projection.json").read_text())
+    receipt["files"]["config.yaml"] = "0" * 64
+    for key in ("skills.create_dir", "curator.enabled"):
+        receipt["config"].pop(key)
+    (profile / "specialist-projection.json").write_text(json.dumps(receipt))
+    refresh = run(request, env)
+    assert refresh.returncode == 0, refresh.stderr
+    assert yaml.safe_load((profile / "config.yaml").read_text())["skills"]["create_dir"] == "learned-skills"
