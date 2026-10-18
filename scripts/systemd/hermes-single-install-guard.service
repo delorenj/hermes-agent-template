@@ -1,0 +1,6 @@
+[Unit]
+Description=Hermes drift guard: every consumer resolves to ONE install and ONE history
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -B %h/code/33GOD/hermes-agent-template/scripts/hermes-single-install-check.py --quiet

@@ -100,7 +100,7 @@ def install_root(path: str | os.PathLike) -> str | None:
     if cur.is_file():
         # A tiny launcher script (~/.local/bin/hermes) resolves to whatever it execs.
         inner = exec_target_of_script(cur) if cur.stat().st_size < 65536 else None
-        if inner and inner != str(cur) and Path(inner).exists():
+        if inner and inner != str(cur) and Path(inner).name.startswith("hermes") and Path(inner).exists():
             return install_root(inner)
         cur = cur.parent
     for candidate in (cur, *cur.parents):
