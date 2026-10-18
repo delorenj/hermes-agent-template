@@ -92,6 +92,7 @@ HERMES_HOME = Path(os.environ.get("HERMES_FLEET_HOME", Path.home() / ".hermes"))
 BASE = HERMES_HOME / "config.yaml"
 PROFILES = HERMES_HOME / "profiles"
 BACKUP_ROOT = HERMES_HOME / ".profile-config-backups"
+REGISTRY = Path(os.environ.get("HERMES_AGENTS_REGISTRY", HERMES_HOME / "agents-registry.yaml"))
 
 GENERATED_HEADER = """\
 # ---------------------------------------------------------------------------
@@ -377,6 +378,62 @@ def pin_codegraph_root(config: dict) -> dict:
     return config
 
 
+CWD_PLACEHOLDERS = frozenset({"", ".", "auto", "cwd"})
+
+
+def registry_project_path(profile: str, registry: Path | None = None) -> str | None:
+    """The absolute project directory the org chart gives *profile*, or None.
+
+    The registry row whose ``profile_name`` (or key) is *profile* and whose ``project_path`` is an
+    absolute, existing directory. Anything else (portable specialist with no project, stale path,
+    unreadable registry) is None, which leaves the profile's cwd behaviour exactly as it was.
+    """
+    path = registry or REGISTRY
+    try:
+        agents = (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("agents") or {}
+    except (OSError, yaml.YAMLError, AttributeError):
+        return None
+    for key, row in agents.items():
+        if not isinstance(row, dict) or (row.get("profile_name") or key) != profile:
+            continue
+        raw = str(row.get("project_path") or "").strip()
+        if raw and Path(raw).expanduser().is_absolute() and Path(raw).expanduser().is_dir():
+            return str(Path(raw).expanduser())
+        if raw:
+            print(f"note: {profile}: registry project_path {raw!r} is not an existing absolute dir", file=sys.stderr)
+        return None
+    return None
+
+
+def pin_terminal_cwd(config: dict, profile: str, registry: Path | None = None) -> dict:
+    """Give a PM desk its project as ``terminal.cwd`` instead of the placeholder ``.``.
+
+    Under the ONE multiplexed gateway (``WorkingDirectory=~/.hermes``) Hermes resolves a
+    placeholder ``terminal.cwd`` ('.', 'auto', 'cwd' or unset) for a local backend to ``$HOME``
+    (``gateway/cwd_placeholder.py``; ``tools/terminal_scope.py`` per routed turn), so every
+    gateway turn ran in /home/delorenj: the terminal tool, context-file discovery, and the
+    ``working_directory`` the Bloodbank artifact sidecar attributes a reply by. Before the
+    2026-10-10 multiplex each PM had its own gateway unit whose cwd WAS its repo, which is why
+    ``.`` used to work. The org chart (``agents-registry.yaml`` ``project_path``) names the
+    project, so the renderer writes it. Hermes reads an absolute ``terminal.cwd`` in both the
+    per-profile terminal scope and the standalone bridge, so one value serves every surface.
+    An explicit non-placeholder ``terminal.cwd`` in a delta is an operator choice and wins; a
+    profile with no ``project_path`` keeps the placeholder.
+    """
+    terminal = config.get("terminal")
+    if terminal is None:
+        terminal = {}
+    if not isinstance(terminal, dict):
+        return config
+    current = terminal.get("cwd")
+    if str(current if current is not None else "").strip() not in CWD_PLACEHOLDERS:
+        return config
+    project = registry_project_path(profile, registry)
+    if project:
+        config["terminal"] = {**terminal, "cwd": project}
+    return config
+
+
 def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     """Return (delta, current_cfg, expected_render, is_symlink)."""
     cfg_path = pdir / "config.yaml"
@@ -384,7 +441,7 @@ def profile_state(pdir: Path, base: dict) -> Tuple[dict, dict, dict, bool]:
     is_link = cfg_path.is_symlink()
     delta = load_yaml(delta_path)
     current = load_yaml(cfg_path)
-    expected = pin_codegraph_root(deep_merge(base, delta))
+    expected = pin_terminal_cwd(pin_codegraph_root(deep_merge(base, delta)), pdir.name)
     return delta, current, expected, is_link
 
 
@@ -429,7 +486,7 @@ def cmd_init(args) -> int:
                 if dropped > 0:
                     origin += f", {dropped} stale line(s) pruned"
 
-            merged = deep_merge(base, delta)
+            merged = pin_terminal_cwd(deep_merge(base, delta), pdir.name)
             lines = len(dump_yaml(delta).splitlines()) if delta else 0
             gained = len(merged) - len(load_yaml(cfg_path)) if not is_link else 0
 
@@ -515,8 +572,11 @@ def cmd_absorb(args) -> int:
             old_delta = load_yaml(pdir / "config.delta.yaml")
             current = load_yaml(cfg_path)
             directive = copy.deepcopy(old_delta.get(LIST_PATCH_KEY))
-            effective_base = deep_merge(
-                base, {LIST_PATCH_KEY: directive} if directive is not None else {}
+            effective_base = pin_terminal_cwd(
+                deep_merge(
+                    base, {LIST_PATCH_KEY: directive} if directive is not None else {}
+                ),
+                pdir.name,
             )
             new_delta = minimal_delta(current, effective_base)
             if directive is not None:
