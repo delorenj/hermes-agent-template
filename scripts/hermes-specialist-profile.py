@@ -199,7 +199,14 @@ def project(request, check):
             "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY": f"op://DeLoSecrets/hermes-{employee}/credential",
             "skills.external_dirs": [],
             "skills.project_discovery": False,
-            "skills.inherit_global": False,
+            # Global skill selection is SHARED operating guidance (the canonical
+            # ~/.agents/skills.json root), and Skillex profile sync unions it with
+            # the role's own set/pack selection. Hermes itself never reads this
+            # key (agent/skill_utils.py discovers via external_dirs and
+            # project_discovery only), so enabling it widens no Hermes discovery
+            # root; strict Skillex ownership still comes from external_dirs: []
+            # plus the .skillex-only marker, which the check below enforces.
+            "skills.inherit_global": True,
             # skills/ belongs to Skillex alone; what the employee learns (skill_manage) lands beside it,
             # and the curator, which archives into skills/.archive, stays off for a strict desk.
             "skills.create_dir": "learned-skills",

@@ -47,11 +47,11 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     config = yaml.safe_load((profile / "config.yaml").read_text())
     assert config["skills"]["external_dirs"] == []
     assert config["skills"]["project_discovery"] is False
-    assert config["skills"]["inherit_global"] is False
+    assert config["skills"]["inherit_global"] is True
     assert config["skills"]["create_dir"] == "learned-skills"
     assert config["curator"]["enabled"] is False
-    assert yaml.safe_load((profile / "config.delta.yaml").read_text())["skills"]["inherit_global"] is False
-    assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is False
+    assert yaml.safe_load((profile / "config.delta.yaml").read_text())["skills"]["inherit_global"] is True
+    assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is True
     assert config["model"]["provider"] == "automaticai"
     assert config["providers"]["automaticai"]["api"] == "https://api.automaticai.io/v1"
     assert config["providers"]["automaticai"]["enabled"] is True
@@ -136,7 +136,7 @@ def test_global_inheritance_policy_refuses_handwritten_override(tmp_path):
     assert run(request, env).returncode == 0
     path = profile / "config.delta.yaml"
     delta = yaml.safe_load(path.read_text())
-    delta["skills"]["inherit_global"] = True
+    delta["skills"]["inherit_global"] = False
     path.write_text(yaml.safe_dump(delta))
     before = snapshot(profile)
     result = run(request, env)
@@ -144,6 +144,46 @@ def test_global_inheritance_policy_refuses_handwritten_override(tmp_path):
     assert "ownership conflict: config skills.inherit_global" in result.stderr
     assert snapshot(profile) == before
     assert (fleet / "config.yaml").read_bytes() == base
+
+
+def test_managed_false_inheritance_receipt_migrates_to_true(tmp_path):
+    """A desk managed under the old inherit_global:false policy refreshes to true.
+
+    The renderer's receipt ownership accepts the old managed value, then pins the
+    new one; unrelated operator config survives, and the follow-up run is a no-op.
+    """
+    fleet, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    delta_path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(delta_path.read_text())
+    delta["skills"]["inherit_global"] = False
+    delta["operator"] = {"revision": "preserve"}
+    delta_path.write_text(yaml.safe_dump(delta))
+    receipt_path = profile / "specialist-projection.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["config"]["skills.inherit_global"] = False
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True, indent=2) + "\n")
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert json.loads(preview.stdout)["changed"]
+    assert not (profile / ".specialist-pending.json").exists()
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert snapshot(profile) != before
+    delta = yaml.safe_load(delta_path.read_text())
+    assert delta["skills"]["inherit_global"] is True
+    assert delta["operator"] == {"revision": "preserve"}
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["skills"]["inherit_global"] is True
+    assert config["skills"]["external_dirs"] == []
+    assert config["operator"] == {"base": "keep", "revision": "preserve"}
+    assert json.loads(receipt_path.read_text())["config"]["skills.inherit_global"] is True
+    complete = snapshot(profile)
+    again = run(request, env)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["changed"] == []
+    assert snapshot(profile) == complete
 
 
 @pytest.mark.parametrize("recall_types", [["observation"], []])
