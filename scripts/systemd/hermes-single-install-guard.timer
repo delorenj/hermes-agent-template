@@ -3,6 +3,9 @@ Description=Hermes drift guard, every 15 minutes
 
 [Timer]
 OnBootSec=2min
+# OnActiveSec re-arms the timer after a reboot: with Persistent=true, an elapsed OnBootSec plus
+# OnUnitActiveSec and no prior run leaves NextElapse=infinity (timer 'active (elapsed)' forever).
+OnActiveSec=2min
 OnUnitActiveSec=15min
 AccuracySec=1min
 Persistent=true
