@@ -320,7 +320,7 @@ if [[ -f "$PIN_PROFILE_HOME/config.delta.yaml" && ! -L "$PIN_PROFILE_HOME/config
       python3 -I "$PROFILE_RENDERER" repin --profile "$PROFILE_NAME" 2>&1)"; then
     log "    profile config pinned to the registry row: ${repin_output##*$'\n'}"
   else
-    warn "    $PROFILE_NAME's config.yaml has out-of-band drift beyond renderer pins; its terminal.cwd is NOT pinned. Run: hermes-profile-config.py absorb --profile $PROFILE_NAME && hermes-profile-config.py repin --profile $PROFILE_NAME"
+    warn "    $PROFILE_NAME's config.yaml has out-of-band drift beyond renderer pins; its terminal.cwd is NOT pinned. Review first: hermes-profile-config.py absorb --profile $PROFILE_NAME --dry-run (this one profile only, never a sweep); if it keeps your secrets.* references, rerun it without --dry-run, then hermes-profile-config.py repin --profile $PROFILE_NAME"
     printf '%s\n' "$repin_output" >&2
   fi
 fi

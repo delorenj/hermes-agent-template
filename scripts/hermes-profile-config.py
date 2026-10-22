@@ -223,19 +223,93 @@ FLEET_OWNED_PATHS = {
 SECRET_KEY_RE = __import__("re").compile(
     r"(api_key|password|passwd|secret|token|credential|hash)", __import__("re").I
 )
+# A *reference* is not a secret: ``op://vault/item/field`` and ``${VAR}`` name where a credential
+# lives and carry none. SECRET_KEY_RE exists to stop plaintext literals being re-sprayed into
+# deltas; it must never eat references. 2026-10-21: ``absorb`` matched the top-level ``secrets``
+# key ("secret"), deleted every ``secrets.onepassword.env`` op:// reference from 25 PM deltas, and
+# the next gateway start came up with 12 Telegram bots and a Slack app dark.
+REFERENCE_RE = __import__("re").compile(r"^\s*(op://\S+|\$\{[A-Za-z_][A-Za-z0-9_]*\})\s*$")
+
+
+_MISSING = object()
+
+
+def is_reference(value: Any) -> bool:
+    """True for a string that is an ``op://`` or ``${VAR}`` pointer, not a credential literal."""
+    return isinstance(value, str) and REFERENCE_RE.match(value) is not None
+
+
+def scrub_literals(value: Any, *, strict: bool = False, key: str = "") -> Any:
+    """*value* without plaintext credential literals; ``_MISSING`` when nothing survives.
+
+    A string is a plaintext literal when it is not a reference and either its own *key* is
+    secret-shaped or it sits under a *strict* ancestor (a secret-shaped key other than the top-level
+    ``secrets`` block, which is 1Password wiring and holds ordinary config such as ``enabled``).
+    Non-string scalars (``enabled: true``, ``max_tokens: 4096``) are never credentials and stay.
+    A list is dropped whole when it holds any literal.
+    """
+    secretish = bool(SECRET_KEY_RE.search(key))
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            kept = scrub_literals(
+                v, strict=strict or (secretish and key != "secrets"), key=str(k)
+            )
+            if kept is not _MISSING:
+                out[k] = kept
+        return out if out or not value else _MISSING
+    if isinstance(value, list):
+        leaky = any(isinstance(i, str) and i and not is_reference(i) for i in value)
+        return _MISSING if leaky and (strict or secretish) else copy.deepcopy(value)
+    if isinstance(value, str) and value and not is_reference(value) and (strict or secretish):
+        return _MISSING
+    return copy.deepcopy(value)
+
+
+def reference_paths(tree: Any, path: tuple = ()) -> Dict[tuple, Any]:
+    """Every credential-free leaf of *tree* below a secret-shaped key, by path tuple.
+
+    That is each reference (``op://`` / ``${VAR}``) and each non-string scalar (``enabled: true``)
+    -- everything under ``secrets`` or a ``*_token`` key that is safe to carry and costly to lose.
+    """
+    found: Dict[tuple, Any] = {}
+    if isinstance(tree, dict):
+        for key, val in tree.items():
+            found.update(reference_paths(val, path + (str(key),)))
+    elif (is_reference(tree) or isinstance(tree, (bool, int, float))) and any(
+        SECRET_KEY_RE.search(part) for part in path
+    ):
+        found[path] = tree
+    return found
+
+
+def _lookup(tree: Any, path: tuple) -> Any:
+    for part in path:
+        if not isinstance(tree, dict) or part not in tree:
+            return _MISSING
+        tree = tree[part]
+    return tree
+
 
 
 def minimal_delta(
-    current: Any, base: Any, *, history: list[dict] | None = None, path: str = ""
+    current: Any,
+    base: Any,
+    *,
+    history: list[dict] | None = None,
+    path: str = "",
+    _strict: bool = False,
 ) -> Any:
     """Return the smallest subtree of *current* that re-creates it over *base*.
 
     Invariant: ``deep_merge(base, minimal_delta(current, base))`` yields a dict
-    whose every key present in *current* holds *current*'s value.
+    whose every key present in *current* holds *current*'s value (plaintext secret literals aside).
 
-    Three filters keep a recovered delta honest rather than merely correct:
+    Filters keep a recovered delta honest rather than merely correct:
 
-    * ``BASE_OWNED_KEYS`` and secret-shaped keys are dropped outright.
+    * ``BASE_OWNED_KEYS`` is dropped outright. Plaintext credential literals (a string under a
+      secret-shaped key) are dropped so they are never re-sprayed into a delta, but references
+      (``op://...`` / ``${VAR}``) and ordinary config under the ``secrets`` block survive.
     * When *history* (older base snapshots) is supplied, a leaf whose value
       matches some historical base value is treated as inherited staleness, not
       intent, and dropped -- a profile that froze a copy of the base months ago
@@ -251,7 +325,11 @@ def minimal_delta(
     out: Dict[str, Any] = {}
     for key, cur_val in current.items():
         dotted = f"{path}.{key}" if path else key
-        if key in BASE_OWNED_KEYS or SECRET_KEY_RE.search(key):
+        if key in BASE_OWNED_KEYS:
+            continue
+        # Plaintext credential literals are never carried; references and plain config are.
+        cur_val = scrub_literals(cur_val, strict=_strict, key=key)
+        if cur_val is _MISSING:
             continue
         if dotted in FLEET_OWNED_PATHS:
             continue
@@ -269,6 +347,7 @@ def minimal_delta(
                 base[key],
                 history=[h for h in hist_vals if isinstance(h, dict)],
                 path=dotted,
+                _strict=_strict or (bool(SECRET_KEY_RE.search(key)) and key != "secrets"),
             )
             if sub:
                 out[key] = sub
@@ -711,7 +790,7 @@ def cmd_repin(args) -> int:
                     write_generated(cfg_path, expected)
             else:
                 refused += 1
-                print(f"DRIFT  {pdir.name:36s} out-of-band edits beyond renderer pins; absorb first")
+                print(f"DRIFT  {pdir.name:36s} out-of-band edits beyond renderer pins; review with `absorb --profile {pdir.name} --dry-run` first (never sweep absorb across profiles)")
     return 1 if refused else 0
 
 
@@ -757,6 +836,25 @@ def cmd_absorb(args) -> int:
             new_delta = minimal_delta(current, effective_base)
             if directive is not None:
                 new_delta[LIST_PATCH_KEY] = directive
+            # Belt and braces: a secret reference (and its sibling switches) the old delta carried is never silently deleted.
+            # minimal_delta already keeps references; this catches any path it still cannot see
+            # (a stripped config.yaml, a future filter) and carries the reference over instead.
+            carried = []
+            for ref_path, ref_val in sorted(reference_paths(old_delta).items()):
+                if _lookup(new_delta, ref_path) is not _MISSING:
+                    continue
+                if _lookup(effective_base, ref_path) == ref_val:
+                    continue
+                node = new_delta
+                for part in ref_path[:-1]:
+                    node = node.setdefault(part, {})
+                node[ref_path[-1]] = ref_val
+                carried.append(".".join(ref_path))
+            if carried:
+                print(
+                    f"keep   {pdir.name:36s} carried {len(carried)} secret reference(s) "
+                    f"over: {', '.join(carried[:6])}"
+                )
             if new_delta == old_delta:
                 print(f"clean  {pdir.name}")
                 continue

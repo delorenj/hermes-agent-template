@@ -182,7 +182,7 @@ def set_policy_locked(profile, renderer, *, dry_run=False, project_root=None, sn
     ):
         raise RuntimeError(
             "config.yaml has out-of-band drift; inspect with hermes-profile-config.py "
-            "check and absorb it before enforcing the PM skills policy"
+            "check, review `absorb --profile <name> --dry-run`, then absorb it before enforcing the PM skills policy"
         )
     changed = old_delta != delta or current != expected
     if dry_run or not changed:
