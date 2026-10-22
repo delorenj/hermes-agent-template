@@ -224,11 +224,11 @@ SECRET_KEY_RE = __import__("re").compile(
     r"(api_key|password|passwd|secret|token|credential|hash)", __import__("re").I
 )
 # A *reference* is not a secret: ``op://vault/item/field`` and ``${VAR}`` name where a credential
-# lives and carry none. SECRET_KEY_RE exists to stop plaintext literals being re-sprayed into
+# lives and carry none (op:// item titles may contain spaces). SECRET_KEY_RE exists to stop plaintext literals being re-sprayed into
 # deltas; it must never eat references. 2026-10-21: ``absorb`` matched the top-level ``secrets``
 # key ("secret"), deleted every ``secrets.onepassword.env`` op:// reference from 25 PM deltas, and
 # the next gateway start came up with 12 Telegram bots and a Slack app dark.
-REFERENCE_RE = __import__("re").compile(r"^\s*(op://\S+|\$\{[A-Za-z_][A-Za-z0-9_]*\})\s*$")
+REFERENCE_RE = __import__("re").compile(r"^\s*(op://[^\r\n]+|\$\{[A-Za-z_][A-Za-z0-9_]*\})\s*$")
 
 
 _MISSING = object()

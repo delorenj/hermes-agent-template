@@ -81,6 +81,16 @@ def test_minimal_delta_still_drops_plaintext_under_secret_shaped_keys():
     assert "hunter2" not in yaml.safe_dump(out)
 
 
+def test_op_references_with_spaces_in_the_item_title_are_references():
+    mod = _load()
+    assert mod.is_reference("op://DeLoSecrets/Some Bot Item/credential")
+    assert mod.is_reference("${SOME_VAR}")
+    assert not mod.is_reference("sk-abc op://x")
+    assert not mod.is_reference("op://x\nsk-leak")
+    out = mod.minimal_delta({**BASE, "x_token": "op://DeLoSecrets/Some Bot Item/credential"}, BASE)
+    assert out["x_token"] == "op://DeLoSecrets/Some Bot Item/credential"
+
+
 def test_minimal_delta_skips_a_reference_the_base_already_carries():
     base = {**BASE, "secrets": {"onepassword": {"env": {"SHARED_TOKEN": "op://v/shared/f"}}}}
     current = {**base, "secrets": {"onepassword": {"env": {"SHARED_TOKEN": "op://v/shared/f", "X_TOKEN": "op://v/x/f"}}}}
