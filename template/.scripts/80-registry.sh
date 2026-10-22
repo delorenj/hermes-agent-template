@@ -218,6 +218,16 @@ managed = {
   },
   "provisioned_at": provisioned_at,
 }
+# A channel the operator PARKED with `flume channel offline` stays parked: a
+# re-provision from role.yaml never flips it back to verified. Only
+# `flume channel online` lifts the park.
+for _platform in ("telegram", "slack"):
+    _prior = existing.get(_platform)
+    if isinstance(_prior, dict) and _prior.get("provisioning_status") == "offline":
+        managed[_platform]["provisioning_status"] = "offline"
+        for _key in ("offline_since", "offline_reason"):
+            if _prior.get(_key):
+                managed[_platform][_key] = _prior[_key]
 
 # Named agent: the stable identity and its personal bank. A post (no
 # `identity:` in role.yaml) leaves both absent and keeps the compatibility
