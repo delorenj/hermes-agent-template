@@ -53,9 +53,10 @@ rewrites every profile's `config.yaml`. The `main` branch of the install tracks 
 fails when two differ, when a binary is missing, when a registry `git_sha` is not in the install's history,
 when the install does not track a `delorenj/*` branch, or when it is a blobless partial clone. It warns on a
 wrapper's embedded fallback that names another path (shadowed by env/config today), a registry sha behind
-HEAD, and a gateway that booted from an older sha than HEAD. Run it by hand, or let the timer do it:
-`hermes-single-install-guard.timer` runs it every 15 minutes and `infra-doctor` watches its `ok` stamp
-(`~/.cache/hermes-single-install/ok`, probe `hermes-single-install`).
+HEAD, and a gateway that booted from an older sha than HEAD. Run it by hand, or let candybar do it:
+since 2026-10-26 the `hermes-single-install-guard` candybar (33GOD/candybar migration ledger, story 7.8)
+starts `hermes-single-install-guard.service` every 15 minutes — the `.timer` is retired, never re-enable it —
+and `infra-doctor` watches its `ok` stamp (`~/.cache/hermes-single-install/ok`, probe `hermes-single-install`).
 
 ## Rules that stay
 
