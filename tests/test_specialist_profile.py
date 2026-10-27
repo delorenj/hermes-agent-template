@@ -19,7 +19,9 @@ def fixture(tmp_path):
     (fleet / "profiles").mkdir(parents=True)
     (fleet / "config.yaml").write_text(yaml.safe_dump({"model": {"default": "automaticai/personal/sol"}, "operator": {"base": "keep"}, "skills": {"external_dirs": ["/foreign"], "inherit_global": True}, "providers": {"automaticai": {"enabled": False}}}))
     request = {"id": "specialist", "display_name": "Specialist", "definition": str(tmp_path / "desk/agent.yaml"), "charter": {"purpose": "Portable charter"}, "memory": {"write_bank": "agent-specialist", "recall_banks": ["infra"]}}
-    env = {**os.environ, "HERMES_FLEET_HOME": str(fleet), "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {**os.environ, "HERMES_FLEET_HOME": str(fleet), "PYTHONDONTWRITEBYTECODE": "1",
+           "HERMES_TEMPLATE_CONFIG": str(tmp_path / "no-config"),
+           "VOX_PLUGIN_DIR": str(tmp_path / "no-plugin"), "VOX_PLUGIN_NAME": "", "VOX_VOICE": "", "VOX_URL": ""}
     profile = fleet / "profiles/specialist"
     return fleet, profile, request, env
 
@@ -402,3 +404,364 @@ def test_desk_from_before_a_new_pin_refreshes_after_hermes_restyle(tmp_path):
     refresh = run(request, env)
     assert refresh.returncode == 0, refresh.stderr
     assert yaml.safe_load((profile / "config.yaml").read_text())["skills"]["create_dir"] == "learned-skills"
+
+
+def voice_env(env, tmp_path, plugin_dir=True):
+    """Isolate voice resolution: a fixture template TOML and plugin dir."""
+    toml_dir = tmp_path / "xdg/hermes-agent-template"
+    toml_dir.mkdir(parents=True)
+    plugin = tmp_path / "voxxy/plugins/tts/vox"
+    if plugin_dir:
+        plugin.mkdir(parents=True)
+    (toml_dir / "config.toml").write_text(
+        f'[fleet]\nvox_plugin_name = "vox"\nvox_plugin_dir = "{plugin}"\nvox_voice = "carlin"\n')
+    return {**env, "HERMES_TEMPLATE_CONFIG": str(toml_dir / "config.toml"), "VOX_PLUGIN_DIR": ""}, plugin
+
+
+def test_voice_contract_and_plugin_link_land(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
+    assert delta["tts"] == {"provider": "vox", "voice": "carlin", "vox": {"voice": "carlin", "base_url": "https://vox.delo.sh"}}
+    patches = delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]
+    assert patches["add"] == ["tts/vox"]
+    assert patches["remove"] == ["tts/voxxy"]
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["tts"]["provider"] == "vox"
+    assert config["tts"]["voice"] == "carlin"
+    assert config["tts"]["vox"]["voice"] == "carlin"
+    link = profile / "plugins/tts/vox"
+    assert link.is_symlink() and link.resolve() == plugin
+    receipt = json.loads((profile / "specialist-projection.json").read_text())
+    assert receipt["voice"] == {"plugin": "vox", "voice": "carlin", "plugin_dir": str(plugin), "installed": True}
+    # idempotent re-run: no managed bytes or receipts change
+    before = snapshot(profile)
+    again = run(request, env)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["changed"] == []
+    assert snapshot(profile) == before
+
+
+def test_definition_voice_overrides_fleet_default(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    request["voice"] = "walken"
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
+    assert delta["tts"]["voice"] == "walken"
+    assert delta["tts"]["vox"]["voice"] == "walken"
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["tts"]["voice"] == "walken"
+    receipt = json.loads((profile / "specialist-projection.json").read_text())
+    assert receipt["voice"]["voice"] == "walken"
+
+
+def test_invalid_definition_voice_refuses_before_effects(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    request["voice"] = "bad voice!"
+    result = run(request, env)
+    assert result.returncode != 0
+    assert "voice contract refused" in result.stderr
+    assert not profile.exists()
+
+
+def test_missing_plugin_dir_defers_link_but_lands_contract(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path, plugin_dir=False)
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert "voice_deferred" in json.loads(result.stdout)
+    assert not (profile / "plugins/tts/vox").exists()
+    config = yaml.safe_load((profile / "config.yaml").read_text())
+    assert config["tts"]["provider"] == "vox"
+    receipt = json.loads((profile / "specialist-projection.json").read_text())
+    assert receipt["voice"]["installed"] is False
+
+
+def test_foreign_plugin_occupation_refuses(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    assert run(request, env).returncode == 0
+    link = profile / "plugins/tts/vox"
+    link.unlink()
+    link.mkdir()
+    (link / "foreign").write_text("keep")
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode != 0
+    assert "ownership conflict" in result.stderr
+    assert snapshot(profile) == before
+    assert (link / "foreign").read_text() == "keep"
+
+
+def test_check_reports_voice_drift(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    assert run(request, env).returncode == 0
+    request["voice"] = "walken"
+    before = snapshot(profile)
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    changed = json.loads(preview.stdout)["changed"]
+    assert "config.delta.yaml" in changed and "config.yaml" in changed, changed
+    assert snapshot(profile) == before
+    # broken link is drift too
+    link = profile / "plugins/tts/vox"
+    link.unlink()
+    drift = run(request, env, "--check")
+    assert drift.returncode == 0, drift.stderr
+    assert "plugins/tts/vox" in json.loads(drift.stdout)["changed"]
+    assert not link.exists()
+
+
+def test_sealed_legacy_plugins_snapshot_migrates(tmp_path):
+    """A delta carrying the sealed 52d9445 fleet snapshot migrates instead of freezing."""
+    fleet, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    sealed = ["bloodbank-platform", "copilot-provider", "fal", "gemini-provider", "google_meet",
+              "kimi-coding-provider", "ntfy-platform", "openai-codex", "openrouter", "self-hosted",
+              "slack-platform", "teams-platform", "teams_pipeline", "telegram-platform",
+              "tts/vox", "web-brave-free", "web-tavily"]
+    (fleet / "profiles/specialist").mkdir(parents=True, exist_ok=True)
+    (fleet / "profiles/specialist/config.delta.yaml").write_text(yaml.safe_dump({"plugins": {"enabled": sealed}}))
+    (fleet / "profiles/specialist/specialist-projection.json").write_text(json.dumps(
+        {"id": "specialist", "definition": request["definition"], "config": {}, "metadata": {}, "files": {}}))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
+    assert "enabled" not in delta.get("plugins", {})
+    migration = delta["x-pjangler-merge"]["migrations"]["plugins_enabled_52d9445"]
+    assert migration["mode"] == "inherited-snapshot"
+    assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]["add"] == ["tts/vox"]
+
+
+@pytest.mark.parametrize("absent_target", [False, True])
+@pytest.mark.parametrize("installed", [False, True])
+def test_wrong_target_link_refuses_without_unlink(tmp_path, absent_target, installed):
+    _, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path, plugin_dir=installed)
+    assert run(request, env).returncode == 0
+    link = profile / "plugins/tts/vox"
+    if link.is_symlink():
+        link.unlink()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    foreign = tmp_path / "foreign-plugin"
+    if not absent_target:
+        foreign.mkdir()
+    link.symlink_to(foreign)
+    before = snapshot(profile)
+    for args in [("--check",), ()]:
+        result = run(request, env, *args)
+        assert result.returncode != 0
+        assert "ownership conflict" in result.stderr
+        assert os.readlink(link) == str(foreign)
+        assert snapshot(profile) == before
+
+
+@pytest.mark.parametrize("ancestor", ["plugins", "plugins/tts"])
+@pytest.mark.parametrize("installed", [False, True])
+def test_plugin_ancestor_symlink_refuses_without_foreign_writes(tmp_path, ancestor, installed):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path, plugin_dir=installed)
+    assert run(request, env).returncode == 0
+    import shutil
+    root = profile / ancestor
+    if root.exists():
+        shutil.rmtree(root)
+    root.parent.mkdir(parents=True, exist_ok=True)
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "keep").write_text("unchanged")
+    root.symlink_to(foreign)
+    before = snapshot(profile)
+    for args in [("--check",), ()]:
+        result = run(request, env, *args)
+        assert result.returncode != 0
+        assert "unsafe symlink" in result.stderr
+        assert snapshot(profile) == before
+        assert list(foreign.iterdir()) == [foreign / "keep"]
+
+
+@pytest.mark.parametrize("after", [".specialist-pending.json", "plugins/tts/vox", "SOUL.md", "specialist-projection.json"])
+@pytest.mark.parametrize("refresh", [False, True])
+def test_plugin_publication_is_journaled_and_recoverable(tmp_path, after, refresh):
+    _, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    if refresh:
+        assert run(request, env).returncode == 0
+        (profile / "plugins/tts/vox").unlink()
+        request["charter"]["purpose"] = "Refreshed"
+    result = run(request, {**env, "FLUME_TEST_SPECIALIST_INTERRUPT_AFTER": after})
+    assert result.returncode == 91, result.stderr
+    pending = json.loads((profile / ".specialist-pending.json").read_text())
+    assert pending["links"] == {"plugins/tts/vox": str(plugin)}
+    assert pending["before_links"] == {"plugins/tts/vox": None}
+    link = profile / "plugins/tts/vox"
+    assert link.is_symlink() == (after != ".specialist-pending.json")
+    before = snapshot(profile)
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert snapshot(profile) == before
+    assert run(request, env).returncode == 0
+    assert os.readlink(link) == str(plugin)
+    assert not (profile / ".specialist-pending.json").exists()
+    assert json.loads(run(request, env).stdout)["changed"] == []
+
+
+def test_pending_link_conflict_refuses_recovery(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    assert run(request, {**env, "FLUME_TEST_SPECIALIST_INTERRUPT_AFTER": "plugins/tts/vox"}).returncode == 91
+    link = profile / "plugins/tts/vox"
+    link.unlink()
+    link.symlink_to(tmp_path / "foreign")
+    before = snapshot(profile)
+    for args in [("--check",), ()]:
+        result = run(request, env, *args)
+        assert result.returncode != 0 and "ownership conflict" in result.stderr
+        assert snapshot(profile) == before
+        assert os.readlink(link) == str(tmp_path / "foreign")
+
+
+@pytest.mark.parametrize("leaves", [("voice",), ("vox",), ("voice", "vox")])
+def test_profile_voice_override_survives_refresh(tmp_path, leaves):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(path.read_text())
+    for leaf in leaves:
+        if leaf == "vox":
+            delta["tts"]["vox"]["voice"] = "walken"
+        else:
+            delta["tts"]["voice"] = "walken"
+    path.write_text(yaml.safe_dump(delta))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    for name in ["config.delta.yaml", "config.yaml"]:
+        tts = yaml.safe_load((profile / name).read_text())["tts"]
+        assert tts["voice"] == tts["vox"]["voice"] == "walken"
+    assert json.loads((profile / "specialist-projection.json").read_text())["voice"]["voice"] == "walken"
+    assert json.loads(run(request, env).stdout)["changed"] == []
+
+
+def test_definition_voice_updates_managed_pin_but_refuses_foreign_override(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    request["voice"] = "carlin"
+    assert run(request, env).returncode == 0
+    request["voice"] = "walken"
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(path.read_text())
+    delta["tts"]["voice"] = delta["tts"]["vox"]["voice"] = "rick"
+    path.write_text(yaml.safe_dump(delta))
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode != 0 and "ownership conflict" in result.stderr
+    assert snapshot(profile) == before
+
+
+@pytest.mark.parametrize("kind", ["malformed", "symlink", "directory", "bad-fleet"])
+def test_invalid_template_config_fails_closed(tmp_path, kind):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    config = Path(env["HERMES_TEMPLATE_CONFIG"])
+    config.unlink()
+    if kind == "symlink":
+        target = tmp_path / "toml"
+        target.write_text('[fleet]\nvox_voice="walken"')
+        config.symlink_to(target)
+    elif kind == "directory":
+        config.mkdir()
+    else:
+        config.write_text("[fleet" if kind == "malformed" else "fleet = 17")
+    result = run(request, env)
+    assert result.returncode != 0
+    assert not profile.exists()
+
+
+def test_missing_template_config_uses_fleet_base_voice_and_endpoint(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    base_path = fleet / "config.yaml"
+    base = yaml.safe_load(base_path.read_text())
+    base["tts"] = {"provider": "vox", "voice": "walken", "vox": {"voice": "walken", "base_url": "https://vox-base.test"}}
+    base_path.write_text(yaml.safe_dump(base))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    tts = yaml.safe_load((profile / "config.yaml").read_text())["tts"]
+    assert tts["voice"] == "walken" and tts["vox"]["base_url"] == "https://vox-base.test"
+
+
+def test_explicit_environment_overrides_template_defaults(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, plugin = voice_env(env, tmp_path)
+    other = tmp_path / "override-plugin"
+    other.mkdir()
+    result = run(request, {**env, "VOX_PLUGIN_DIR": str(other), "VOX_VOICE": "walken", "VOX_URL": "https://vox-override.test"})
+    assert result.returncode == 0, result.stderr
+    tts = yaml.safe_load((profile / "config.yaml").read_text())["tts"]
+    assert tts["voice"] == "walken" and tts["vox"]["base_url"] == "https://vox-override.test"
+    assert os.readlink(profile / "plugins/tts/vox") == str(other)
+
+
+@pytest.mark.parametrize("voice", ["walken", ""])
+def test_pre_parity_receipt_preserves_voice_or_refuses_invalid_override(tmp_path, voice):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    assert run(request, env).returncode == 0
+    receipt_path = profile / "specialist-projection.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt.pop("voice")
+    receipt["config"] = {k: v for k, v in receipt["config"].items() if not k.startswith("tts.")}
+    receipt_path.write_text(json.dumps(receipt))
+    path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(path.read_text())
+    delta["tts"]["voice"] = delta["tts"]["vox"]["voice"] = voice
+    path.write_text(yaml.safe_dump(delta))
+    before = snapshot(profile)
+    result = run(request, env)
+    if voice:
+        assert result.returncode == 0, result.stderr
+        assert yaml.safe_load((profile / "config.yaml").read_text())["tts"]["voice"] == voice
+    else:
+        assert result.returncode != 0 and "invalid TTS voice" in result.stderr
+        assert snapshot(profile) == before
+
+
+def test_ambiguous_legacy_plugins_snapshot_refuses_without_effects(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / "config.delta.yaml"
+    delta = yaml.safe_load(path.read_text())
+    delta["plugins"] = {"enabled": ["bloodbank-platform", "tts/vox"]}
+    path.write_text(yaml.safe_dump(delta))
+    before = snapshot(profile)
+    result = run(request, env)
+    assert result.returncode != 0
+    assert "partially matches sealed 52d history" in result.stderr
+    assert snapshot(profile) == before
+
+
+def test_credential_url_refuses_before_link_or_journal(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    result = run(request, {**env, "VOX_URL": "https://user:fixture-secret@vox.test"})
+    assert result.returncode != 0 and "without credentials" in result.stderr
+    assert "fixture-secret" not in result.stderr
+    assert not profile.exists()
+
+
+def test_definition_voice_beats_environment_default(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    request["voice"] = "walken"
+    result = run(request, {**env, "VOX_VOICE": "carlin"})
+    assert result.returncode == 0, result.stderr
+    assert yaml.safe_load((profile / "config.yaml").read_text())["tts"]["voice"] == "walken"

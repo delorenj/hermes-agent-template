@@ -19,6 +19,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+from urllib.parse import urlsplit
 import yaml
 
 PENDING = ".specialist-pending.json"
@@ -29,6 +30,88 @@ MANAGED_FILES = {"SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml",
 spec = importlib.util.spec_from_file_location("specialist_renderer", Path(__file__).with_name("hermes-profile-config.py"))
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
+
+
+def load_voice_config_module():
+    """THE shared voice contract transform (template/.scripts/lib/voice-config.py).
+
+    The same reconcile_delta the PM path (20-runtime-repo.sh -> set_voice.sh /
+    voice-config CLI) uses; never a private copy. Trusted path only.
+    """
+    source = Path(__file__).parent.parent / "template/.scripts/lib/voice-config.py"
+    safe(source)
+    if not source.is_file():
+        raise ValueError(f"trusted voice config helper is unavailable: {source}")
+    spec = importlib.util.spec_from_file_location("specialist_voice_config", source)
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses resolve cls.__module__ through sys.modules on Python 3.14+
+    sys.modules[spec.name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(spec.name, None)
+        raise
+    return module
+
+
+def template_config():
+    """The template TOML (~/.config/hermes-agent-template/config.toml) PM scripts read
+    through config_get; the specialist adapter resolves the same fleet.vox_* keys."""
+    path = Path(os.environ.get(
+        "HERMES_TEMPLATE_CONFIG",
+        Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "hermes-agent-template/config.toml"))
+    safe(path)
+    if not path.exists():
+        return {}
+    try:
+        import tomllib
+        with open(path, "rb") as stream:
+            data = tomllib.load(stream)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"invalid template config: {path}: {exc}") from exc
+    fleet = data.get("fleet", {})
+    if not isinstance(fleet, dict):
+        raise ValueError(f"template config fleet must be a mapping: {path}")
+    return fleet
+
+
+def voice_override(delta, plugin, old):
+    """Keep a profile override, including either leaf edited by the voice writer."""
+    tts = delta.get("tts", {})
+    if not isinstance(tts, dict) or not isinstance(tts.get(plugin, {}), dict):
+        raise ValueError("voice contract refused: TTS delta must be a mapping")
+    provider_voice = tts.get(plugin, {}).get("voice")
+    generic_voice = tts.get("voice")
+    if provider_voice is not None and generic_voice is not None and provider_voice != generic_voice:
+        previous = old.get("voice", {}).get("voice")
+        if previous == provider_voice:
+            return generic_voice
+        if previous == generic_voice:
+            return provider_voice
+        raise ValueError("ownership conflict: conflicting profile voice overrides")
+    return provider_voice if provider_voice is not None else generic_voice
+
+
+def plugin_state(profile, name, target):
+    """The sole allowed leaf symlink; all ancestors must be real directories."""
+    safe(profile / "plugins", True)
+    safe(profile / "plugins/tts", True)
+    path = profile / name
+    if path.is_symlink():
+        if os.readlink(path) != target:
+            raise ValueError(f"ownership conflict: {path}")
+        return target
+    if path.exists():
+        raise ValueError(f"ownership conflict: {path}")
+    return None
+
+
+def sync_directory(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def safe(path: Path, directory=False):
@@ -103,6 +186,7 @@ def atomic(path: Path, text: str):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(name, path)
+        sync_directory(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -135,8 +219,19 @@ def project(request, check):
             if (not isinstance(pending, dict) or pending.get("id") != employee
                     or pending.get("definition") != request["definition"]
                     or set(pending.get("files", {})) != MANAGED_FILES
-                    or set(pending.get("before", {})) != MANAGED_FILES):
+                    or set(pending.get("before", {})) != MANAGED_FILES
+                    or not isinstance(pending.get("links", {}), dict)
+                    or set(pending.get("links", {})) != set(pending.get("before_links", {}))):
                 raise ValueError("pending profile ownership conflict")
+            # Old journals lack links; new ones cover link publication too.
+            for name, target in pending.get("links", {}).items():
+                if (not re.fullmatch(r"plugins/tts/[a-z0-9][a-z0-9_-]{0,63}", name)
+                        or not isinstance(target, str) or not Path(target).is_absolute()
+                        or pending["before_links"][name] not in (None, target)):
+                    raise ValueError("invalid pending plugin publication")
+                actual = plugin_state(profile, name, target)
+                if actual not in (pending["before_links"][name], target):
+                    raise ValueError(f"ownership conflict: interrupted publication {name}")
             # Only the recorded pre-write bytes or transaction output are ours.
             for name, text in pending["files"].items():
                 path = profile / name
@@ -267,7 +362,52 @@ def project(request, check):
             raise ValueError("ownership conflict: memory bank")
         memory.update({"bank_id": f"agent-{employee}", "api_url": "https://api.hs.delo.sh", "bank_id_template": ""})
         memory.setdefault("recall_types", ["world", "experience", "observation"])
+        # Plugin/voice parity with the PM path (20-runtime-repo.sh): the same
+        # fleet.vox_* defaults, the same delta transform (voice-config.py), the
+        # same plugins/tts/<plugin> symlink. Definition `voice:` wins over the
+        # fleet default; tts slugs are non-secret. A missing optional plugin dir
+        # defers the link but never the config contract.
+        voice_config = load_voice_config_module()
+        fleet_cfg = template_config()
+        plugin_name = os.environ.get("VOX_PLUGIN_NAME") or str(fleet_cfg.get("vox_plugin_name") or "vox")
+        plugin_dir = Path(os.path.expandvars(os.path.expanduser(
+            os.environ.get("VOX_PLUGIN_DIR") or str(fleet_cfg.get("vox_plugin_dir") or f"~/code/voxxy/plugins/tts/{plugin_name}"))))
+        if not plugin_dir.is_absolute():
+            raise ValueError("voice contract refused: plugin directory must be absolute")
         base = mapping(r.BASE)
+        current_voice = voice_override(delta, plugin_name, old)
+        if "voice" in request:
+            voice = request["voice"]
+            previous = old.get("voice", {}).get("voice", voice)
+            if current_voice is not None and current_voice not in (previous, voice):
+                raise ValueError("ownership conflict: definition voice conflicts with profile override")
+        else:
+            base_tts = base.get("tts") or {}
+            voice = (current_voice if current_voice is not None else
+                     os.environ.get("VOX_VOICE") or fleet_cfg.get("vox_voice") or
+                     (base_tts.get(plugin_name) or {}).get("voice") or base_tts.get("voice") or "carlin")
+        try:
+            if not isinstance(voice, str):
+                raise voice_config.ContractError("invalid TTS voice name")
+            voice_config.reconcile_delta(delta, plugin_name, voice)
+        except voice_config.ContractError as exc:
+            raise ValueError(f"voice contract refused: {exc}")
+        # Preserve a desk-specific endpoint; otherwise use the same service key
+        # as fleet-sync. The plugin reads tts.<plugin>.base_url, not vox_url.
+        endpoint = (delta["tts"][plugin_name].get("base_url") or os.environ.get("VOX_URL") or
+                    fleet_cfg.get("vox_url") or ((base.get("tts") or {}).get(plugin_name) or {}).get("base_url") or
+                    "https://vox.delo.sh")
+        if not isinstance(endpoint, str):
+            raise ValueError("voice contract refused: invalid Vox URL")
+        url = urlsplit(endpoint)
+        if (url.scheme not in ("http", "https") or not url.netloc or url.username is not None
+                or url.password is not None or url.query or url.fragment):
+            raise ValueError("voice contract refused: Vox URL must be an HTTP(S) endpoint without credentials")
+        delta["tts"][plugin_name]["base_url"] = endpoint
+        managed["tts.provider"] = plugin_name
+        managed["tts.voice"] = voice
+        managed[f"tts.{plugin_name}.voice"] = voice
+        managed[f"tts.{plugin_name}.base_url"] = endpoint
         # THE expected config (base + delta + renderer pins), the same value `check` compares against.
         merged = r.expected_config(base, delta, employee)
         for name, value in (("config.delta", delta), ("config", merged), ("profile", metadata), ("hindsight", memory)):
@@ -297,23 +437,58 @@ def project(request, check):
         safe(profile / ".agents", True)
         if (profile / ".agents").exists():
             raise ValueError("strict specialist refuses profile .agents discovery root")
+        # The tts plugin symlink mirrors the PM install in 20-runtime-repo.sh:
+        # plugins/tts/<plugin> -> the fleet plugin dir. It is a convergence link,
+        # never owned bytes; foreign occupation refuses, a missing optional
+        # plugin dir defers with an explicit note (the config contract stands).
+        voice_note = None
+        plugin_link = profile / "plugins/tts" / plugin_name
+        link_name = f"plugins/tts/{plugin_name}"
+        link_ok = plugin_state(profile, link_name, str(plugin_dir)) is not None
+        links = {link_name: str(plugin_dir)} if plugin_dir.is_dir() else {}
+        if pending is not None and any(links.get(name) != target for name, target in pending.get("links", {}).items()):
+            raise ValueError("pending plugin publication changed; restore the original plugin configuration")
+        if not plugin_dir.is_dir():
+            voice_note = f"optional {plugin_name} plugin not installed at {plugin_dir}; voice activation deferred"
         receipt = {"id": employee, "definition": request["definition"], "config": managed,
-                   "metadata": owned_meta, "files": {k: receipt_digest(k, v) for k, v in files.items()}}
+                   "metadata": owned_meta, "files": {k: receipt_digest(k, v) for k, v in files.items()},
+                   "voice": {"plugin": plugin_name, "voice": voice,
+                             "plugin_dir": str(plugin_dir), "installed": plugin_dir.is_dir()}}
         refuse_credentials(receipt, "receipt")
         files["specialist-projection.json"] = json.dumps(receipt, sort_keys=True, indent=2) + "\n"
         changes = [name for name, text in files.items() if not same_projection(profile / name, text)]
+        if links and not link_ok and link_name not in changes:
+            changes.append(link_name)
         if pending is not None:
             changes.append(PENDING)
         if not check and changes:
             journal = {"id": employee, "definition": request["definition"], "files": files,
-                       "before": {name: digest((profile / name).read_text()) if (profile / name).exists() else None for name in files}}
+                       "before": {name: digest((profile / name).read_text()) if (profile / name).exists() else None for name in files},
+                       "links": links, "before_links": {name: plugin_state(profile, name, target) for name, target in links.items()}}
             atomic(pending_path, json.dumps(journal, sort_keys=True, indent=2) + "\n")
+            sync_directory(profile.parent)
+            if os.environ.get("FLUME_TEST_SPECIALIST_INTERRUPT_AFTER") == PENDING:
+                os._exit(91)
+            for name, target in links.items():
+                if plugin_state(profile, name, target) is None:
+                    plugin_link.parent.mkdir(parents=True, exist_ok=True)
+                    # Exclusive creation: never unlink or replace a foreign leaf.
+                    plugin_link.symlink_to(target)
+                    sync_directory(plugin_link.parent)
+                    sync_directory(plugin_link.parent.parent)
+                    sync_directory(profile)
+                if os.environ.get("FLUME_TEST_SPECIALIST_INTERRUPT_AFTER") == name:
+                    os._exit(91)
             for name, text in files.items():
                 atomic(profile / name, text)
                 if os.environ.get("FLUME_TEST_SPECIALIST_INTERRUPT_AFTER") == name:
                     os._exit(91)
             pending_path.unlink()
-        return {"profile": str(profile), "changed": changes, "write_bank": f"agent-{employee}", "recall_banks": recall}
+            sync_directory(profile)
+        result = {"profile": str(profile), "changed": changes, "write_bank": f"agent-{employee}", "recall_banks": recall}
+        if voice_note:
+            result["voice_deferred"] = voice_note
+        return result
 
 
 if __name__ == "__main__":
