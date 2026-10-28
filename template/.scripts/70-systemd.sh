@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Install the one systemd --user unit an agent has: its profile gateway. Any
 # retired per-agent heartbeat timer/service found on the host is removed.
+# On macOS (Darwin) there is no per-agent unit: see the launchd branch below.
 # shellcheck source=_lib.sh
 source "$(dirname "$0")/_lib.sh"
 load_role_env
@@ -51,6 +52,57 @@ else
   yaml_upsert_block_value reconcile enabled true bool
   yaml_upsert_block_value reconcile explicit_opt_out false bool
   log "    PM reconciliation enabled (operational default)"
+fi
+
+# macOS: launchd, one multiplexed gateway, no per-agent units.
+#
+# The live fleet standard is a single gateway per host serving every profile
+# (gateway.multiplex_profiles), so there is nothing per-agent to install: no
+# plist, no unit, no heartbeat. This role only declares whether the gateway
+# should be live (service_state.gateway), and this step makes the host agree
+# with that declaration through the fork's own CLI. Anything else is recorded
+# as deferred. A gateway that cannot be shown healthy is never left running by
+# this step.
+if [[ "$(host_os)" == "Darwin" ]]; then
+  yaml_upsert_block_value service_state heartbeat retired
+  DESIRED_GATEWAY="$(yaml_get service_state.gateway)"
+  legacy_plist="$HOME/Library/LaunchAgents/ai.hermes.gateway-${PROFILE_NAME:-$AGENT_ID}.plist"
+  [[ ! -e "$legacy_plist" ]] \
+    || warn "    per-profile gateway plist present (superseded by the multiplexed gateway): $legacy_plist; retire it with: hermes gateway migrate"
+  if [[ "$DESIRED_GATEWAY" != "active" ]]; then
+    yaml_upsert_block_value service_state gateway deferred
+    log "[70] launchd — gateway deferred (service_state.gateway is '${DESIRED_GATEWAY:-unset}', not active); nothing installed"
+    mark_done 70-systemd
+    exit 0
+  fi
+  if [[ ! -x "$HERMES_BIN" ]]; then
+    yaml_upsert_block_value service_state gateway deferred
+    log "[70] launchd — gateway deferred: HERMES_BIN is not executable ($HERMES_BIN)"
+    clear_done 70-systemd
+    exit 0
+  fi
+  before="$(launchd_gateway_snapshot)"
+  if [[ "$before" != "ok|supervised" ]]; then
+    hermes_gateway_cli install --if-missing >/dev/null 2>&1 \
+      || { yaml_upsert_block_value service_state gateway error; clear_done 70-systemd; die "hermes gateway install failed on launchd"; }
+    # install --if-missing leaves an installed-but-unloaded job alone; start loads it.
+    hermes_gateway_cli start >/dev/null 2>&1 || true
+  fi
+  if gw_health="$(launchd_wait_for_supervised)"; then
+    yaml_upsert_block_value service_state gateway active
+    log "[70] launchd — multiplexed gateway ai.hermes.gateway supervised and active"
+    mark_done 70-systemd
+    exit 0
+  fi
+  # Unhealthy. Only undo what this run created: a gateway that already had a
+  # definition (loaded or not) may be serving other profiles, so it is reported,
+  # never stopped.
+  if [[ "$before" == "ok|not-installed" ]]; then
+    hermes_gateway_cli stop >/dev/null 2>&1 || true
+  fi
+  yaml_upsert_block_value service_state gateway error
+  clear_done 70-systemd
+  die "launchd gateway did not become healthy (${gw_health#*|}); not leaving a crash loop running"
 fi
 
 # Render every caller-controlled systemd scalar through the same data-only

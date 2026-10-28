@@ -53,6 +53,18 @@ onepassword_item_prefix = "hermes-agent"
 # every agent runtime starts from. ~ is expanded.
 # canonical_pm_config = "~/.hermes/config.yaml"
 
+[paths]
+# Where this host keeps its checkouts. Defaults reproduce the Linux fleet host
+# (~/code/..., with the template at ~/code/33GOD/hermes-agent-template). A host
+# with a different layout (macOS: ~/Code/<repo>, no 33GOD/ level) sets these.
+# Env overrides: HERMES_CODE_ROOT, HERMES_TEMPLATE_REPO. Skillex's catalog
+# checkout is [skillex] registry_root (env PJ_SKILLS_REGISTRY_ROOT).
+# code_root = "~/code"
+# template_repo = "~/code/33GOD/hermes-agent-template"
+
+[skillex]
+# registry_root = "~/code/skillex"
+
 [github]
 # LEGACY INERT COMPATIBILITY METADATA ONLY. Older role manifests may still
 # carry this owner field. Current provisioning does not create, attach,

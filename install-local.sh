@@ -1,4 +1,16 @@
 #!/usr/bin/env sh
+# DEPRECATED. Do not use this to adopt a host (macOS or Linux) into the 33GOD fleet.
+#
+#   - It writes literal provider credentials (LINEAR_API_KEY, PLANE_API_KEY,
+#     TRELLO_*) into files. The fleet rule is op:// references or process env only.
+#   - It describes and installs the RETIRED per-agent heartbeat timer. Liveness is
+#     the one multiplexed gateway, scheduling is Bloodbank, persistence is krebs.
+#   - It predates the single multiplexed gateway and the generated-profile model.
+#
+# For an existing Hermes host (for example a Mac Studio running a non-33GOD
+# Hermes) follow docs/adopt-existing-hermes-host.md instead. On Darwin this
+# script refuses to run unless HAT_ALLOW_DEPRECATED_INSTALL=1 is set.
+#
 # Least-friction local install of the Hermes PM role into a project.
 #
 # Local-only: no GitHub runtime repo, no Telegram, no NATS/BloodBank, no Plane
@@ -38,6 +50,11 @@ ask()  { # ask VAR "prompt" "default"
 }
 
 OS="$(uname -s)"
+warn "DEPRECATED: install-local.sh writes literal provider credentials and installs the retired heartbeat."
+warn "            To adopt an existing Hermes host, follow docs/adopt-existing-hermes-host.md."
+if [ "$OS" = "Darwin" ] && [ "${HAT_ALLOW_DEPRECATED_INSTALL:-0}" != "1" ]; then
+  die "refusing on macOS: use docs/adopt-existing-hermes-host.md (set HAT_ALLOW_DEPRECATED_INSTALL=1 to override)"
+fi
 PROJECT_DIR="$(pwd)"
 [ -d "$PROJECT_DIR/.git" ] || warn "Note: $PROJECT_DIR is not a git repo root; the role will install here anyway."
 

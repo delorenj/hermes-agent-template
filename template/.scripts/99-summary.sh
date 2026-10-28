@@ -17,7 +17,13 @@ BOARD_ID="$(yaml_get ticket_provider.board_id)"
 # Reconcile durable claims with live unit truth at presentation time.  A stale
 # role.yaml must never turn an exited launcher or failed heartbeat into an
 # operational summary.
-if [[ "$GW_STATE" =~ ^(active|deferred)$ ]]; then
+if [[ "$GW_STATE" =~ ^(active|deferred)$ && "$(host_os)" == "Darwin" ]]; then
+  # launchd: one multiplexed gateway for the host, not a per-agent unit.
+  GW_UNIT="ai.hermes.gateway (launchd, multiplexed)"
+  if [[ "$GW_STATE" == "active" ]]; then
+    [[ "$(launchd_gateway_snapshot)" == "ok|supervised" ]] || GW_STATE="error (stale active claim)"
+  fi
+elif [[ "$GW_STATE" =~ ^(active|deferred)$ ]]; then
   if systemd_user_available; then
     if [[ "$GW_STATE" == "active" ]]; then
       gw_live="$(systemd_service_health_snapshot "$GW_UNIT" running)"
@@ -74,7 +80,11 @@ if [[ "$GW_STATE" == "deferred" ]]; then
 │  Slack credential through the provisioner; do not start $GW_UNIT manually.
 EOF
 elif [[ "$GW_STATE" == "active" ]]; then
-  printf '│  Gateway log:    journalctl --user -fu %s\n' "$GW_UNIT" >&2
+  if [[ "$(host_os)" == "Darwin" ]]; then
+    printf '│  Gateway log:    tail -f %s/logs/gateway.log\n' "${HERMES_FLEET_HOME:-$HOME/.hermes}" >&2
+  else
+    printf '│  Gateway log:    journalctl --user -fu %s\n' "$GW_UNIT" >&2
+  fi
 fi
 
 cat >&2 <<'EOF'

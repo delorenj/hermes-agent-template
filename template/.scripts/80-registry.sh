@@ -321,7 +321,7 @@ trap - EXIT
 # path, so the generated config.yaml is a faithful render with a stale pin. Re-render it through the
 # canonical renderer -- the registry stays the one ordering truth, and nothing here re-derives the
 # pin. `repin` rewrites a pin-only difference and refuses real out-of-band drift (absorb first).
-PROFILE_RENDERER="${PROFILE_RENDERER:-$HOME/code/33GOD/hermes-agent-template/scripts/hermes-profile-config.py}"
+PROFILE_RENDERER="${PROFILE_RENDERER:-$HERMES_TEMPLATE_REPO/scripts/hermes-profile-config.py}"
 PIN_PROFILE_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}/profiles/$PROFILE_NAME"
 if [[ -f "$PIN_PROFILE_HOME/config.delta.yaml" && ! -L "$PIN_PROFILE_HOME/config.delta.yaml" ]]; then
   [[ -f "$PROFILE_RENDERER" && ! -L "$PROFILE_RENDERER" ]] \

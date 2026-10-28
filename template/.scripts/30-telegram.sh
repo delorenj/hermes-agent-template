@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 # Capture a BotFather token and wire it into the runtime profile.
 #
+# bash >= 4.4 before anything else: lib/bash-guard.sh re-execs this step under
+# a modern bash (macOS /bin/bash is 3.2) and must run BEFORE the invocation
+# credentials below are captured and unset, or the re-exec would lose them.
+# Builtins only: no child process may see the still-exported credentials.
+case "$0" in */*) HAT_GUARD="${0%/*}/lib/bash-guard.sh" ;; *) HAT_GUARD="lib/bash-guard.sh" ;; esac
+if [[ -f "$HAT_GUARD" && ! -L "$HAT_GUARD" ]]; then
+  # shellcheck source=lib/bash-guard.sh
+  builtin source "$HAT_GUARD"
+fi
+unset HAT_GUARD
+#
 # Telegram credentials are invocation-only inputs. Capture them before _lib.sh
 # sources fleet.env so a token parked in shared fleet state can never provision
 # or be silently reused by a profile. The non-secret allow-list may be shared.
@@ -273,9 +284,18 @@ if token.endswith("\n"):
     token = token[:-1]
 if not token:
     raise SystemExit("Telegram ownership scan received no credential")
-for metadata_path in (pathlib.Path("/proc/self/cmdline"), pathlib.Path("/proc/self/environ")):
-    if metadata_path.is_file() and token.encode() in metadata_path.read_bytes():
-        raise SystemExit("Telegram ownership scan detected credential exposure in process metadata")
+def process_metadata():
+    # Linux: the kernel's view of this process's argv and initial environment.
+    # Without /proc (macOS) the interpreter's own copies of the same two.
+    procfs = (pathlib.Path("/proc/self/cmdline"), pathlib.Path("/proc/self/environ"))
+    if any(path.is_file() for path in procfs):
+        return [path.read_bytes() for path in procfs if path.is_file()]
+    return [
+        b"\0".join(os.fsencode(arg) for arg in getattr(sys, "orig_argv", sys.argv)),
+        b"\0".join(key + b"=" + value for key, value in os.environb.items()),
+    ]
+if any(token.encode() in metadata for metadata in process_metadata()):
+    raise SystemExit("Telegram ownership scan detected credential exposure in process metadata")
 target = pathlib.Path(target_path).resolve(strict=False)
 
 def env_token(path):

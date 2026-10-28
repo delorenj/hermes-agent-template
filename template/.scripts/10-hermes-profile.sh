@@ -53,15 +53,15 @@ command -v "$SKILLEX_BIN" >/dev/null 2>&1 \
 # bytes, or the sync refuses with E_DIVERGENT_CANONICAL_NAME when the global
 # selection names the same skill. Receipts already record this checkout.
 if [[ -z "${PJ_SKILLS_REGISTRY_ROOT:-}" ]]; then
-  PJ_SKILLS_REGISTRY_ROOT="$(config_get skillex.registry_root "$HOME/code/skillex")"
-  PJ_SKILLS_REGISTRY_ROOT="${PJ_SKILLS_REGISTRY_ROOT/#\~/$HOME}"
+  # HERMES_SKILLEX_REPO resolves env > [skillex] registry_root > $HERMES_CODE_ROOT/skillex (_lib.sh).
+  PJ_SKILLS_REGISTRY_ROOT="${HERMES_SKILLEX_REPO/#\~/$HOME}"
 fi
 [[ -d "$PJ_SKILLS_REGISTRY_ROOT/all-skills" ]] \
   || die "canonical Skillex catalog not found at $PJ_SKILLS_REGISTRY_ROOT/all-skills; set PJ_SKILLS_REGISTRY_ROOT or [skillex] registry_root in $HERMES_TEMPLATE_CONFIG"
 export PJ_SKILLS_REGISTRY_ROOT
 
-PROFILE_RENDERER="${PROFILE_RENDERER:-$HOME/code/33GOD/hermes-agent-template/scripts/hermes-profile-config.py}"
-CUTOVER_HINT="python3 $PJ_SKILLS_REGISTRY_ROOT/scripts/hermes-skillex-cutover.py --profile $PROFILE_NAME --project '$PROJECT_PATH' --registry-root $PJ_SKILLS_REGISTRY_ROOT --renderer ~/code/33GOD/hermes-agent-template/scripts/hermes-profile-config.py (preview, then --apply)"
+PROFILE_RENDERER="${PROFILE_RENDERER:-$HERMES_TEMPLATE_REPO/scripts/hermes-profile-config.py}"
+CUTOVER_HINT="python3 $PJ_SKILLS_REGISTRY_ROOT/scripts/hermes-skillex-cutover.py --profile $PROFILE_NAME --project '$PROJECT_PATH' --registry-root $PJ_SKILLS_REGISTRY_ROOT --renderer $HERMES_TEMPLATE_REPO/scripts/hermes-profile-config.py (preview, then --apply)"
 
 # Read-only Skillex preflight of an existing profile. Exit 0 is converged and
 # exit 6 is a pending sync (a selection change or catalog bump), which is what

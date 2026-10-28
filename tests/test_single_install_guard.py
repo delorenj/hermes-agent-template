@@ -122,3 +122,74 @@ def test_wrapper_fallback_to_another_path_is_a_shadowed_warning(host):
     result = _run(host["home"])
     assert result.returncode == 0, result.stdout
     assert "embedded fallback" in result.stdout
+
+
+# --- macOS: LaunchAgent gateway consumers -------------------------------------------------------
+import json  # noqa: E402
+import plistlib  # noqa: E402
+import shlex  # noqa: E402
+
+
+def _plist(home: Path, name: str, arguments: list[str], **extra) -> Path:
+    agents = home / "Library/LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    path = agents / f"{name}.plist"
+    path.write_bytes(plistlib.dumps({"Label": name, "ProgramArguments": arguments, **extra}))
+    return path
+
+
+def _osascript_arguments(command: list[str]) -> list[str]:
+    """The shape hermes_cli/gateway_launchd.py:launchd_program_arguments writes."""
+    shell = f"exec {shlex.join(command)} >> /tmp/gateway.log 2>> /tmp/gateway.error.log"
+    js = f'ObjC.import("stdlib"); const status=$.system({json.dumps(shell)});'
+    return ["/usr/bin/osascript", "-l", "JavaScript", "-e", js]
+
+
+def test_launchd_gateway_on_the_shared_install_passes_and_is_counted(host):
+    _plist(host["home"], "ai.hermes.gateway", _osascript_arguments([str(host["launcher"]), "--error-log", "/x", "--", "gateway", "run"]))
+    result = _run(host["home"], "--json")
+    assert result.returncode == 0, result.stdout
+    detail = json.loads(result.stdout)["detail"]
+    assert any(c["kind"] == "gateway" and c["label"] == "launchd:ai.hermes.gateway" and c["root"] == str(host["install"]) for c in detail)
+
+
+def test_launchd_gateway_on_a_second_install_is_drift(host):
+    other = host["home"] / ".local/share/hermes-agent/releases/abc"
+    other.mkdir(parents=True)
+    _install(other, fork_tracking=False)
+    _plist(host["home"], "ai.hermes.gateway", _osascript_arguments([str(other / ".hermes/bin/hermes"), "gateway", "run"]))
+    result = _run(host["home"])
+    assert result.returncode == 1
+    assert "2 different Hermes installs" in result.stdout and "launchd:ai.hermes.gateway" in result.stdout
+
+
+def test_launchd_direct_launcher_and_python_bootstrap_shapes(host):
+    _plist(host["home"], "ai.hermes.gateway", [str(host["launcher"]), "gateway", "run"])
+    bootstrap = f"import os, sys, runpy; sys.path.insert(0, {str(host['install'])!r}); import hermes_bootstrap"
+    _plist(host["home"], "ai.hermes.gateway-demo", ["/usr/bin/python3", "-c", bootstrap])
+    result = _run(host["home"], "--json")
+    assert result.returncode == 0, result.stdout
+    labels = {c["label"] for c in json.loads(result.stdout)["detail"] if c["kind"] == "gateway"}
+    assert labels == {"launchd:ai.hermes.gateway", "launchd:ai.hermes.gateway-demo"}
+
+
+def test_disabled_and_unrelated_launchd_plists_are_ignored(host):
+    other = host["home"] / "elsewhere"
+    other.mkdir()
+    _install(other, fork_tracking=False)
+    _plist(host["home"], "ai.hermes.gateway", [str(other / ".hermes/bin/hermes"), "gateway", "run"], Disabled=True)
+    _plist(host["home"], "io.example.other", [str(other / ".hermes/bin/hermes")])
+    (host["home"] / "Library/LaunchAgents/ai.hermes.gateway-broken.plist").write_text("not a plist")
+    result = _run(host["home"])
+    assert result.returncode == 0, result.stdout
+    assert "launchd:" not in result.stdout
+
+
+def test_code_root_override_finds_wrappers_outside_home_code(host):
+    root = host["home"] / "Code"
+    wrapper = root / "proj/agents/hermes/pm/hermes"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text('HERMES_BIN="${HERMES_BIN:-$HOME/.local/share/hermes-agent/releases/old/.venv/bin/hermes}"\n')
+    env = {"PATH": os.environ["PATH"], "HOME": str(host["home"]), "HERMES_GUARD_NO_SYSTEMCTL": "1", "HERMES_CODE_ROOT": str(root)}
+    result = subprocess.run(["python3", str(GUARD), "--no-stamp"], env=env, capture_output=True, text=True)
+    assert "embedded fallback" in result.stdout

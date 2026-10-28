@@ -12,7 +12,8 @@ Search order:
   1. ``$PROFILE_RENDERER`` (what 10-hermes-profile.sh and the tests set);
   2. the checkout this file ships in (``template/.scripts/lib`` -> ``scripts/``), which is how the
      template repo itself and flume's vendored ``templates/hermes-agent`` resolve it;
-  3. the host's canonical checkout, ``~/code/33GOD/hermes-agent-template/scripts`` (a desk's
+  3. the host's canonical checkout: ``$HERMES_TEMPLATE_REPO``, ``[paths] template_repo`` in the host
+     config.toml, else ``<code root>/33GOD/hermes-agent-template/scripts`` (a desk's
      deployed ``agents/hermes/pm/.scripts/lib`` copy has no renderer beside it).
 """
 from __future__ import annotations
@@ -24,6 +25,23 @@ from pathlib import Path
 RENDERER_NAME = "hermes-profile-config.py"
 
 
+def _configured_path(key: str) -> str:
+    """[paths] <key> from the host config.toml, or "" (missing file/key, python < 3.11)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        return ""
+    config = Path(
+        os.environ.get("HERMES_TEMPLATE_CONFIG")
+        or Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "hermes-agent-template" / "config.toml"
+    )
+    try:
+        value = tomllib.loads(config.read_text(encoding="utf-8")).get("paths", {}).get(key, "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 def candidates() -> list[Path]:
     found = []
     explicit = os.environ.get("PROFILE_RENDERER")
@@ -32,6 +50,13 @@ def candidates() -> list[Path]:
     here = Path(__file__).resolve()
     if len(here.parents) > 3:
         found.append(here.parents[3] / "scripts" / RENDERER_NAME)
+    # The host's canonical checkout: HERMES_TEMPLATE_REPO, then config.toml
+    # [paths] template_repo, then <code_root>/33GOD/hermes-agent-template.
+    repo = os.environ.get("HERMES_TEMPLATE_REPO") or _configured_path("template_repo")
+    if repo:
+        found.append(Path(repo).expanduser() / "scripts" / RENDERER_NAME)
+    code_root = Path(os.environ.get("HERMES_CODE_ROOT") or _configured_path("code_root") or Path.home() / "code").expanduser()
+    found.append(code_root / "33GOD" / "hermes-agent-template" / "scripts" / RENDERER_NAME)
     found.append(Path.home() / "code" / "33GOD" / "hermes-agent-template" / "scripts" / RENDERER_NAME)
     return found
 

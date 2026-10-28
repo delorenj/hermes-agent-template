@@ -17,7 +17,8 @@ fi
 PROFILE_HOME="$HOME/.hermes/profiles/$PROFILE_NAME"
 RUNTIME_LOCAL="$ROLE_DIR/runtime"
 PROJECT_PATH="$(project_repo_path)" || die "no project git root"
-REL_ROLE_PATH="$(realpath --relative-to="$PROJECT_PATH" "$ROLE_DIR")"
+REL_ROLE_PATH="$(path_relative_to "$PROJECT_PATH" "$ROLE_DIR")" \
+  || die "cannot express $ROLE_DIR relative to $PROJECT_PATH"
 REL_RUNTIME_PATH="${REL_ROLE_PATH}/runtime"
 
 log "[20] local runtime: $RUNTIME_LOCAL"

@@ -1,6 +1,15 @@
 # shellcheck shell=bash
 # Common helpers sourced by every numbered provisioning step.
 
+# bash >= 4.4 first: under macOS /bin/bash 3.2 this re-execs the calling step
+# with its arguments under a modern bash, or stops with instructions, before
+# this library does anything (lib/bash-guard.sh).
+if [[ -f "$(dirname "${BASH_SOURCE[0]}")/lib/bash-guard.sh" \
+      && ! -L "$(dirname "${BASH_SOURCE[0]}")/lib/bash-guard.sh" ]]; then
+  # shellcheck source=lib/bash-guard.sh
+  builtin source "$(dirname "${BASH_SOURCE[0]}")/lib/bash-guard.sh"
+fi
+
 set -euo pipefail
 
 # These three are set by Copier into the rendered role.yaml; we re-derive them
@@ -16,6 +25,65 @@ log()  { local msg="[$(date +%H:%M:%S)] $*"; printf '\033[36m%s\033[0m\n' "$msg"
 warn() { local msg="[$(date +%H:%M:%S)] $*"; printf '\033[33m%s\033[0m\n' "$msg" >&2; printf '%s\n' "$msg" >> "$PROV_LOG"; }
 err()  { local msg="[$(date +%H:%M:%S)] $*"; printf '\033[31m%s\033[0m\n' "$msg" >&2; printf '%s\n' "$msg" >> "$PROV_LOG"; }
 die()  { err "$*"; exit 1; }
+
+# ─── Portable host primitives (Linux + macOS) ────────────────────────────────
+# macOS has no flock(1), no sha256sum and a BSD realpath without
+# --relative-to. Each helper keeps the Linux tool when it is present, so Linux
+# behaviour is unchanged, and falls back to an equivalent that ships with the
+# OS (shasum) or with python3.
+
+# fd_lock FD TIMEOUT_SECONDS   — `flock -w TIMEOUT FD`
+# fd_unlock FD                 — `flock -u FD`
+# Without flock(1), lib/fd-lock.py takes the same flock(2) lock on the same
+# inherited descriptor, so it interoperates with flock(1) on one lock file.
+# HERMES_FD_LOCK=python forces the helper (tests exercise it on Linux).
+fd_lock_helper() {
+  local helper="$ROLE_DIR/.scripts/lib/fd-lock.py"
+  [[ -f "$helper" && ! -L "$helper" ]] \
+    || die "flock(1) is unavailable and the trusted lock helper is missing: $helper"
+  printf '%s' "$helper"
+}
+fd_lock_uses_flock() {
+  [[ "${HERMES_FD_LOCK:-auto}" != "python" ]] && command -v flock >/dev/null 2>&1
+}
+fd_lock() {
+  if fd_lock_uses_flock; then
+    flock -w "$2" "$1"
+    return
+  fi
+  local helper; helper="$(fd_lock_helper)"
+  python3 -I "$helper" lock "$1" "$2"
+}
+fd_unlock() {
+  if fd_lock_uses_flock; then
+    flock -u "$1"
+    return
+  fi
+  local helper; helper="$(fd_lock_helper)"
+  python3 -I "$helper" unlock "$1"
+}
+
+# sha256_hex < DATA   — print the lowercase hex SHA-256 of stdin.
+sha256_hex() {
+  local digest
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum)"
+  elif command -v shasum >/dev/null 2>&1; then
+    digest="$(shasum -a 256)"
+  else
+    digest="$(python3 -I -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+  fi
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$digest"
+}
+
+# path_relative_to BASE TARGET — `realpath --relative-to=BASE TARGET`: both
+# sides canonicalized (symlinks resolved), then TARGET expressed relative to BASE.
+path_relative_to() {
+  python3 -I -c 'import os, sys; print(os.path.relpath(os.path.realpath(sys.argv[2]), os.path.realpath(sys.argv[1])))' \
+    "$1" "$2"
+}
 
 # Read a single scalar from role.yaml. Requires python3 (no yaml dep).
 #
@@ -768,6 +836,15 @@ fi
 # restore only those values afterward; all other provisioning steps stay clean.
 unset TELEGRAM_BOT_TOKEN SLACK_BOT_TOKEN SLACK_APP_TOKEN
 
+# Where this host keeps its checkouts. Precedence like every other value:
+# env var > config.toml [paths] > today's layout. A host whose clones do not sit
+# under ~/code/33GOD (macOS: ~/Code/<repo>, no 33GOD level) sets either
+# HERMES_CODE_ROOT, or the individual HERMES_TEMPLATE_REPO / [paths] keys.
+HERMES_CODE_ROOT="${HERMES_CODE_ROOT:-$(config_get paths.code_root "$HOME/code")}"
+HERMES_TEMPLATE_REPO="${HERMES_TEMPLATE_REPO:-$(config_get paths.template_repo "$HERMES_CODE_ROOT/33GOD/hermes-agent-template")}"
+HERMES_SKILLEX_REPO="${HERMES_SKILLEX_REPO:-$(config_get skillex.registry_root "$HERMES_CODE_ROOT/skillex")}"
+export HERMES_CODE_ROOT HERMES_TEMPLATE_REPO HERMES_SKILLEX_REPO
+
 # Tools we expect on the host
 HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-$(config_get fleet.hermes_bin "$HOME/.hermes/hermes-agent/.hermes/bin/hermes")}}"
 HERMES_AGENT_REPO="${HERMES_AGENT_REPO:-${HERMES_FLEET_REPO:-$(config_get fleet.hermes_repo "$HOME/.hermes/hermes-agent")}}"
@@ -791,16 +868,19 @@ CODEX_HOME="${CODEX_HOME:-${HERMES_FLEET_CODEX_HOME:-$(config_get fleet.codex_ho
 # Prefer a scaffold vendored into this agent directory; fall back to the configured template path.
 RUNTIME_SCAFFOLD_DIR="${RUNTIME_SCAFFOLD_DIR:-$ROLE_DIR/.runtime-scaffold}"
 if [[ ! -d "$RUNTIME_SCAFFOLD_DIR" ]]; then
-  RUNTIME_SCAFFOLD_DIR="${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-$(config_get fleet.runtime_scaffold_dir "$HOME/code/hermes-agent-template/runtime-scaffold")}"
+  RUNTIME_SCAFFOLD_DIR="${HERMES_TEMPLATE_RUNTIME_SCAFFOLD:-$(config_get fleet.runtime_scaffold_dir "$HERMES_CODE_ROOT/hermes-agent-template/runtime-scaffold")}"
 fi
 REGISTRY_FILE="${REGISTRY_FILE:-${HERMES_FLEET_REGISTRY_FILE:-$(config_get fleet.registry_file "$HOME/.hermes/agents-registry.yaml")}}"
 
 # Cross-process serialization for fleet identity claims and registry updates.
 # The lock file may remain on disk; flock ownership is kernel-scoped, so a
-# crashed provisioner cannot leave a permanently stale lock.
+# crashed provisioner cannot leave a permanently stale lock. fd_lock uses
+# flock(1) where it exists and the same flock(2) through lib/fd-lock.py where it
+# does not (macOS).
 FLEET_LOCK_FD=""
 fleet_lock_acquire() {
-  command -v flock >/dev/null 2>&1 || die "flock is required for safe fleet registry updates"
+  # Fail before opening anything when neither lock implementation is usable.
+  fd_lock_uses_flock || fd_lock_helper >/dev/null
   local lock_file="${REGISTRY_FILE}.lock"
   mkdir -p "$(dirname "$lock_file")"
   [[ ! -L "$lock_file" ]] || die "refusing fleet lock symlink: $lock_file"
@@ -834,13 +914,13 @@ fleet_lock_acquire() {
       || die "unsafe test fleet-lock attempt path: $attempt_file"
     printf '%s\n' "$lock_file" > "$attempt_file"
   fi
-  flock -w "${FLEET_LOCK_TIMEOUT_SECONDS:-30}" "$FLEET_LOCK_FD" \
+  fd_lock "$FLEET_LOCK_FD" "${FLEET_LOCK_TIMEOUT_SECONDS:-30}" \
     || die "timed out waiting for fleet registry lock: $lock_file"
 }
 
 fleet_lock_release() {
   if [[ "${FLEET_LOCK_FD:-}" =~ ^[0-9]+$ ]]; then
-    flock -u "$FLEET_LOCK_FD" 2>/dev/null || true
+    fd_unlock "$FLEET_LOCK_FD" 2>/dev/null || true
     exec {FLEET_LOCK_FD}>&-
   fi
   FLEET_LOCK_FD=""
@@ -849,7 +929,7 @@ fleet_lock_release() {
 # Bloodbank / NATS
 BLOODBANK_NATS_HOST="${BLOODBANK_NATS_HOST:-$(config_get bloodbank.nats_host '127.0.0.1')}"
 BLOODBANK_NATS_PORT="${BLOODBANK_NATS_PORT:-$(config_get bloodbank.nats_port '4222')}"
-BLOODBANK_COMPOSE_DIR="${BLOODBANK_COMPOSE_DIR:-$(config_get bloodbank.compose_dir "$HOME/code/33GOD/bloodbank")}"
+BLOODBANK_COMPOSE_DIR="${BLOODBANK_COMPOSE_DIR:-$(config_get bloodbank.compose_dir "$HERMES_CODE_ROOT/33GOD/bloodbank")}"
 
 # Plane
 PLANE_BASE="${PLANE_BASE:-$(config_get plane.base 'https://plane.delo.sh')}"
@@ -1094,6 +1174,51 @@ systemd_wait_for_stable_health() {
     return 0
   fi
   printf '%s' "${last_error:-${sample:-error|no health sample}}"
+  return 1
+}
+
+# ─── Host service manager: macOS launchd ─────────────────────────────────────
+# The fleet runs ONE multiplexed gateway per host (gateway.multiplex_profiles),
+# so a Darwin host has exactly one LaunchAgent, ai.hermes.gateway, owned by the
+# fork (`hermes gateway install|start|stop|status`, hermes_cli/gateway_launchd.py).
+# Provisioning never writes a per-agent plist and never hand-rolls launchctl.
+host_os() {
+  printf '%s' "${HERMES_TEMPLATE_PLATFORM:-$(uname -s)}"
+}
+
+# The gateway belongs to the FLEET root, never to a profile: the profile's own
+# HERMES_HOME would name a different launchd label (ai.hermes.gateway-<profile>).
+hermes_gateway_cli() {
+  env HERMES_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}" "$HERMES_BIN" gateway "$@"
+}
+
+# Read-only. `ok|supervised`, `ok|not-loaded`, `ok|not-installed`, or `error|<why>`; the fork's
+# status text is the contract (launchd_status in gateway_launchd.py).
+launchd_gateway_snapshot() {
+  local output rc=0
+  [[ -x "${HERMES_BIN:-}" ]] || { printf 'error|HERMES_BIN is not executable'; return 0; }
+  output="$(hermes_gateway_cli status 2>&1)" || rc=$?
+  if grep -q 'supervised by launchd' <<<"$output"; then
+    printf 'ok|supervised'
+  elif grep -q 'service is not loaded' <<<"$output"; then
+    printf 'ok|not-loaded'          # a definition exists, launchd has not loaded it
+  elif grep -qE 'Gateway is not running|not installed' <<<"$output"; then
+    printf 'ok|not-installed'
+  elif [[ $rc -ne 0 ]]; then
+    printf 'error|gateway status exit %s' "$rc"
+  else
+    printf 'error|gateway not supervised by launchd'
+  fi
+}
+
+launchd_wait_for_supervised() {
+  local attempts="${LAUNCHD_STABILIZATION_ATTEMPTS:-6}" interval="${LAUNCHD_STABILIZATION_INTERVAL_SECONDS:-2}" sample="" n
+  for ((n = 1; n <= attempts; n++)); do
+    sample="$(launchd_gateway_snapshot)"
+    [[ "$sample" == "ok|supervised" ]] && { printf '%s' "$sample"; return 0; }
+    (( n < attempts )) && sleep "$interval"
+  done
+  printf '%s' "$sample"
   return 1
 }
 

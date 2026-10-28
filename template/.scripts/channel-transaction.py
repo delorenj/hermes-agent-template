@@ -244,9 +244,16 @@ class RegistryLock:
         )
 
     def _inherited_matching_fd(self, opened: os.stat_result) -> int | None:
-        try:
-            names = os.listdir("/proc/self/fd")
-        except OSError:
+        # /proc/self/fd on Linux, /dev/fd on Darwin; else probe the low range
+        # (bash allocates named descriptors from 10 upward).
+        names: list[str] | None = None
+        for listing in ("/proc/self/fd", "/dev/fd"):
+            try:
+                names = os.listdir(listing)
+                break
+            except OSError:
+                continue
+        if names is None:
             names = [str(number) for number in range(3, 256)]
         for raw in names:
             if not raw.isdigit():
@@ -429,27 +436,45 @@ def state_same_inode_and_bytes(current: FileState, expected: FileState) -> bool:
 AT_FDCWD = -100
 RENAME_NOREPLACE = 1
 RENAME_EXCHANGE = 2
+# Darwin <sys/stdio.h>: renamex_np(from, to, flags) carries the same two
+# operations (APFS): RENAME_SWAP is RENAME_EXCHANGE, RENAME_EXCL RENAME_NOREPLACE.
+DARWIN_RENAME_SWAP = 0x00000002
+DARWIN_RENAME_EXCL = 0x00000004
+_DARWIN_FLAGS = {RENAME_EXCHANGE: DARWIN_RENAME_SWAP, RENAME_NOREPLACE: DARWIN_RENAME_EXCL}
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAMEAT2 = getattr(_LIBC, "renameat2", None)
 if _RENAMEAT2 is not None:
     _RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     _RENAMEAT2.restype = ctypes.c_int
+_RENAMEX_NP = getattr(_LIBC, "renamex_np", None) if sys.platform == "darwin" else None
+if _RENAMEX_NP is not None:
+    _RENAMEX_NP.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    _RENAMEX_NP.restype = ctypes.c_int
 
 
 def renameat2(source: pathlib.Path, target: pathlib.Path, flags: int) -> None:
-    """Linux atomic rename primitive used as the file-level CAS operation."""
+    """Atomic rename primitive used as the file-level CAS operation.
 
-    if _RENAMEAT2 is None:
+    Linux renameat2(2); on Darwin renamex_np(2) with the equivalent flag. A
+    platform with neither refuses the transaction before anything moves.
+    """
+
+    if _RENAMEX_NP is not None:
+        if flags not in _DARWIN_FLAGS:
+            raise TransactionRecoveryError(f"unsupported atomic rename flags: {flags}")
+        result = _RENAMEX_NP(os.fsencode(source), os.fsencode(target), _DARWIN_FLAGS[flags])
+    elif _RENAMEAT2 is None:
         raise TransactionRecoveryError(
-            "renameat2 is required for crash-safe channel compare-and-swap"
+            "renameat2 (Linux) or renamex_np (Darwin) is required for crash-safe channel compare-and-swap"
         )
-    result = _RENAMEAT2(
-        AT_FDCWD,
-        os.fsencode(source),
-        AT_FDCWD,
-        os.fsencode(target),
-        flags,
-    )
+    else:
+        result = _RENAMEAT2(
+            AT_FDCWD,
+            os.fsencode(source),
+            AT_FDCWD,
+            os.fsencode(target),
+            flags,
+        )
     if result != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), str(source), str(target))

@@ -32,6 +32,35 @@ set -euo pipefail
 # Usage: fleet-sync.sh [--apply] [--no-restart] [--agent <id>]...
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# bash >= 4.4 (macOS /bin/bash is 3.2): re-exec under a modern bash or stop.
+if [[ -f "$SCRIPT_DIR/../template/.scripts/lib/bash-guard.sh" ]]; then
+  # shellcheck source=../template/.scripts/lib/bash-guard.sh
+  builtin source "$SCRIPT_DIR/../template/.scripts/lib/bash-guard.sh"
+fi
+FD_LOCK_HELPER="$SCRIPT_DIR/../template/.scripts/lib/fd-lock.py"
+
+# Portable host primitives: flock(1), `readlink -f` and `sed -i` are GNU-only.
+fd_lock_uses_flock() { [[ "${HERMES_FD_LOCK:-auto}" != "python" ]] && command -v flock >/dev/null 2>&1; }
+fd_lock() {  # fd_lock FD TIMEOUT
+  if fd_lock_uses_flock; then flock -w "$2" "$1"; else python3 -I "$FD_LOCK_HELPER" lock "$1" "$2"; fi
+}
+fd_unlock() {  # fd_unlock FD
+  if fd_lock_uses_flock; then flock -u "$1"; else python3 -I "$FD_LOCK_HELPER" unlock "$1"; fi
+}
+canon_path() {  # canon_path PATH  — readlink -f
+  python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+sed_inplace() {  # sed_inplace SCRIPT FILE — sed -i without GNU/BSD suffix differences or a backup file
+  local script="$1" file="$2" scratch
+  scratch="$(mktemp "${TMPDIR:-/tmp}/fleet-sync-sed.XXXXXX")"
+  if sed -e "$script" "$file" >"$scratch"; then
+    cat "$scratch" >"$file"   # rewrite in place: keeps mode, owner and symlink-free inode
+    rm -f "$scratch"
+  else
+    rm -f "$scratch"
+    return 1
+  fi
+}
 WRAPPER_TEMPLATE="$SCRIPT_DIR/../template/hermes.jinja"
 HEARTBEAT_TEMPLATE="$SCRIPT_DIR/../template/.scripts/heartbeat.sh"
 FLEET_ENV_LIBRARY_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/fleet-env.sh"
@@ -211,13 +240,13 @@ systemctl_user_unit_state() {  # systemctl_user_unit_state <is-active|is-enabled
 
 retire_registry_consumer_metadata() {  # retire_registry_consumer_metadata <agent_id>
   local target_agent="$1" lock_file="${REGISTRY_FILE}.lock" registry_lock_fd=""
-  command -v flock >/dev/null 2>&1 \
-    || { echo "fleet-sync: flock is required for registry updates" >&2; return 1; }
+  { fd_lock_uses_flock || [[ -f "$FD_LOCK_HELPER" ]]; } \
+    || { echo "fleet-sync: neither flock(1) nor $FD_LOCK_HELPER is available for registry updates" >&2; return 1; }
   [[ ! -L "$lock_file" ]] \
     || { echo "fleet-sync: refusing registry lock symlink: $lock_file" >&2; return 1; }
   exec {registry_lock_fd}>"$lock_file"
   chmod 600 "$lock_file"
-  flock -w 30 "$registry_lock_fd" \
+  fd_lock "$registry_lock_fd" 30 \
     || { echo "fleet-sync: timed out waiting for registry lock" >&2; return 1; }
   python3 - "$REGISTRY_FILE" "$target_agent" <<'PYEOF'
 import errno
@@ -276,7 +305,7 @@ except BaseException:
         pass
     raise
 PYEOF
-  flock -u "$registry_lock_fd"
+  fd_unlock "$registry_lock_fd"
   exec {registry_lock_fd}>&-
 }
 
@@ -495,7 +524,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   ensure_profile_link() {
     local label="$1" path="$2" target="$3" mkdir_target="$4"
     if [[ -L "$path" ]]; then
-      [[ "$(readlink -f "$path")" == "$(readlink -f "$target")" ]] && return 0
+      [[ "$(canon_path "$path")" == "$(canon_path "$target")" ]] && return 0
       if [[ $APPLY -eq 1 ]]; then
         [[ "$mkdir_target" == "dir" ]] && mkdir -p "$target"
         ln -sfn "$target" "$path"
@@ -611,7 +640,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
       continue
     fi
     if [[ $APPLY -eq 1 ]]; then
-      sed -i "s|^Environment=HERMES_HOME=.*|Environment=HERMES_HOME=$profile_dir|" "$unit_path"
+      sed_inplace "s|^Environment=HERMES_HOME=.*|Environment=HERMES_HOME=$profile_dir|" "$unit_path"
       note "$agent_id" FIXED "$unit HERMES_HOME -> $profile_dir"
       changed=1; FIXED=$((FIXED + 1)); UNITS_TOUCHED=1
     else
@@ -624,7 +653,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
   role_yaml="$role_dir/role.yaml"
   if [[ -f "$role_yaml" ]] && ! grep -q "^profile: $profile_name$" "$role_yaml"; then
     if [[ $APPLY -eq 1 ]] && grep -q '^profile: ' "$role_yaml"; then
-      sed -i "s/^profile: .*/profile: $profile_name/" "$role_yaml"
+      sed_inplace "s/^profile: .*/profile: $profile_name/" "$role_yaml"
       note "$agent_id" FIXED "role.yaml profile -> $profile_name"
       changed=1; FIXED=$((FIXED + 1))
     else
@@ -641,7 +670,7 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     if [[ $VOX_AVAILABLE -eq 1 && -d "$profile_dir" && ! -L "$profile_dir" ]]; then
       plugin_link="$profile_dir/plugins/tts/$VOX_PLUGIN_NAME"
       if [[ -L "$plugin_link" ]]; then
-        if [[ "$(readlink -f "$plugin_link")" != "$(readlink -f "$VOX_PLUGIN_DIR")" ]]; then
+        if [[ "$(canon_path "$plugin_link")" != "$(canon_path "$VOX_PLUGIN_DIR")" ]]; then
           if [[ $APPLY -eq 1 ]]; then
             ln -sfn "$VOX_PLUGIN_DIR" "$plugin_link"
             note "$agent_id" FIXED "profile $VOX_PLUGIN_NAME plugin relinked"

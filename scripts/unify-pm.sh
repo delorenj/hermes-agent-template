@@ -25,6 +25,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TEMPLATE_DIR="$SCRIPT_DIR/../template"
+if [[ -f "$TEMPLATE_DIR/.scripts/lib/bash-guard.sh" ]]; then
+  # shellcheck source=../template/.scripts/lib/bash-guard.sh
+  builtin source "$TEMPLATE_DIR/.scripts/lib/bash-guard.sh"
+fi
+canon_path() {  # readlink -f (GNU-only) via python
+  python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
 CHECKPOINT_SRC="$TEMPLATE_DIR/.scripts/checkpoint.sh"
 WRAPPER_TEMPLATE="$TEMPLATE_DIR/hermes.jinja"
 
@@ -130,7 +137,7 @@ while IFS=$'\t' read -r aid role_dir profile_name; do
 
   # 3. ensure the profile symlink points at the runtime (load-bearing; never drop).
   link="$PROFILES_DIR/$profile_name"
-  if [[ -L "$link" && "$(readlink -f "$link")" == "$(readlink -f "$runtime")" ]]; then
+  if [[ -L "$link" && "$(canon_path "$link")" == "$(canon_path "$runtime")" ]]; then
     echo "    profile symlink ok -> runtime"
   elif [[ -e "$link" && ! -L "$link" ]]; then
     echo "    profile entry is a REAL dir (MANUAL merge): $link — left untouched"; SKIP=$((SKIP+1))

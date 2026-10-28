@@ -15,7 +15,8 @@ This compares them. Each consumer is reduced to the install root it execs (the
 nearest ancestor directory holding ``.git``, after ``realpath``) and the HEAD
 sha of that root:
 
-    gateway     systemd user units + drop-ins that exec a hermes binary
+    gateway     systemd user units + drop-ins that exec a hermes binary (Linux), or
+                ~/Library/LaunchAgents/ai.hermes.gateway*.plist ProgramArguments (macOS)
     PATH        ~/.local/bin/hermes{,-acp,-agent}
     fleet.env   HERMES_FLEET_BIN / HERMES_FLEET_REPO
     config      ~/.config/hermes-agent-template/config.toml [fleet]
@@ -47,6 +48,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import plistlib
 import re
 import shlex
 import subprocess
@@ -190,6 +192,61 @@ def systemd_execs(home: Path) -> list[tuple[str, str]]:
     return found
 
 
+LAUNCHD_EXEC_QUOTED = re.compile(r"exec\s+(?:'([^']+)'|(/[^\s'\"\\]+))")
+LAUNCHD_SYS_PATH = re.compile(r"sys\.path\.insert\(0,\s*['\"]([^'\"]+)['\"]\)")
+
+
+def launchd_program_binary(arguments: list[str]) -> str | None:
+    """The hermes binary a LaunchAgent's ProgramArguments run.
+
+    The fork writes one of three shapes (hermes_cli/gateway_launchd.py):
+      [<install>/.hermes/bin/hermes, ...]                    direct launcher
+      [/usr/bin/osascript, -l, JavaScript, -e, <js>]         <js> holds `exec <hermes> ... >> log`
+      [<python>, -c, <bootstrap>]                            bootstrap does sys.path.insert(0, <install>)
+    """
+    if not arguments:
+        return None
+    first = arguments[0]
+    if Path(first).name.startswith("hermes") and first.startswith("/"):
+        return first
+    for argument in arguments[1:]:
+        match = LAUNCHD_EXEC_QUOTED.search(argument)
+        if match:
+            found = match.group(1) or match.group(2)
+            if Path(found).name.startswith("hermes"):
+                return found
+        match = LAUNCHD_SYS_PATH.search(argument)
+        if match:
+            return str(Path(match.group(1)) / ".hermes/bin/hermes")
+    return None
+
+
+def launchd_execs(home: Path) -> list[tuple[str, str]]:
+    """(label, binary) for every hermes LaunchAgent: ~/Library/LaunchAgents/ai.hermes.gateway*.plist.
+
+    A plist that is not Disabled loads at login (RunAtLoad), so it counts as a gateway consumer
+    whether or not launchd has it loaded right now, the way an enabled-but-stopped systemd unit does.
+    """
+    agent_dir = home / "Library/LaunchAgents"
+    found: list[tuple[str, str]] = []
+    if not agent_dir.is_dir():
+        return found
+    for plist in sorted(agent_dir.glob("ai.hermes.gateway*.plist")):
+        try:
+            data = plistlib.loads(plist.read_bytes())
+        except (OSError, ValueError, plistlib.InvalidFileException):
+            continue
+        if not isinstance(data, dict) or data.get("Disabled") is True:
+            continue
+        arguments = [str(a) for a in data.get("ProgramArguments") or []]
+        if not arguments and data.get("Program"):
+            arguments = [str(data["Program"])]
+        binary = launchd_program_binary(arguments)
+        if binary:
+            found.append((f"launchd:{plist.stem}", binary))
+    return found
+
+
 def registry_rows(path: Path) -> dict[str, dict]:
     if not path.is_file():
         return {}
@@ -223,7 +280,7 @@ def wrapper_defaults(home: Path, registry: Path) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     paths: list[Path] = []
-    code = home / "code"
+    code = Path(os.environ["HERMES_CODE_ROOT"]).expanduser() if os.environ.get("HERMES_CODE_ROOT") else home / "code"
     if code.is_dir():
         for pattern in ("*/agents/hermes/*/hermes", "*/*/agents/hermes/*/hermes"):
             paths.extend(code.glob(pattern))
@@ -258,6 +315,8 @@ def check(home: Path, registry: Path, fleet_env: Path, config: Path, quiet: bool
     declared: list[tuple[str, str, str]] = []  # (kind, label, path)
 
     for label, binary in systemd_execs(home):
+        declared.append(("gateway", label, binary))
+    for label, binary in launchd_execs(home):
         declared.append(("gateway", label, binary))
     for name in BIN_NAMES:
         p = home / ".local/bin" / name

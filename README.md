@@ -83,6 +83,29 @@ Resolution precedence for every value: **explicit env var → `~/.hermes/fleet.e
 per-run with an env var or `--data`, and existing setups keep working even without
 the config file present.
 
+## Platform support: Linux and macOS
+
+Provisioning runs on Linux (systemd) and macOS (launchd). The portable paths:
+
+| Concern | Linux | macOS |
+| --- | --- | --- |
+| Shell | bash >= 4.4 | `/bin/bash` is 3.2: `.scripts/lib/bash-guard.sh` re-execs the step under the first bash >= 4.4 it finds (`$HERMES_TEMPLATE_BASH`, PATH, `/opt/homebrew/bin`, `/usr/local/bin`) or stops with `brew install bash` instructions |
+| Fleet / project locks | `flock(1)` | no `flock(1)`: `.scripts/lib/fd-lock.py` takes the same `flock(2)` lock on the same inherited descriptor, so it excludes `flock(1)` holders on one lock file |
+| Atomic file exchange (`fleet.env`, channel CAS) | `renameat2(RENAME_EXCHANGE)` | `renamex_np(RENAME_SWAP)`; a volume without swap support fails closed before anything moves |
+| Hashing, relative paths, in-place edits | `sha256sum`, `realpath --relative-to`, `sed -i` | `shasum -a 256` / python, `os.path.relpath`, a temp-file rewrite (never a `.bak`) |
+| Service manager | one `hermes-<agent>-gateway.service` per agent unit file (`70-systemd.sh`) | **no per-agent units**: the one multiplexed gateway, LaunchAgent `ai.hermes.gateway`, is ensured through the fork (`hermes gateway install --if-missing`, `status`) only when the role's `service_state.gateway` is `active`; otherwise it is recorded `deferred`. A gateway that does not become supervised is never left running by the step |
+| Drift guard | systemd `ExecStart=` | plus `~/Library/LaunchAgents/ai.hermes.gateway*.plist` `ProgramArguments` |
+
+Checkout locations are configuration, not constants: `HERMES_CODE_ROOT`,
+`HERMES_TEMPLATE_REPO`, and `PJ_SKILLS_REGISTRY_ROOT` (env), or `[paths]` /
+`[skillex]` in `~/.config/hermes-agent-template/config.toml`. The defaults are the
+Linux fleet host's `~/code/...` layout. `HERMES_TEMPLATE_PLATFORM=Darwin|Linux`
+overrides `uname -s` (tests).
+
+`install-local.sh` is **deprecated** (literal credentials, retired heartbeat) and
+refuses to run on macOS. Adopt an existing host with
+`docs/adopt-existing-hermes-host.md`.
+
 ## Ticket-provider adapters are vendored, not owned
 
 `template/.scripts/providers/{plane,linear,trello}.sh` are a **mirror**. The
