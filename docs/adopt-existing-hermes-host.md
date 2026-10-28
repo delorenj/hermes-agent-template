@@ -424,6 +424,12 @@ fork without pinning a versioned interpreter path.
   host's catalog checkout; a broken checkout (staged deletions, a `*.failed-*`
   update folder) makes it "unable to assess". That checkout is the owner's to
   repair; do not reset it to get a green audit.
+- Before stripping direct-provider credentials (`auth remove`, `adopt_external_logins:
+  false`), list every desk on the host, including ones other agents hired mid-migration,
+  and grep each `config.delta.yaml` and role.yaml for a `model.provider` pin. On Damian's
+  Mac a desk hired during the cutover pinned `openai-codex/gpt-5.5`. After the strip it
+  could not authenticate until its role.yaml and delta model fields were blanked to
+  inherit the gateway base.
 - A commit an agent makes in the owner's repo uses the agent identity
   (`-c user.name=... -c user.email=...` plus a Co-Authored-By trailer), not the
   host's default git identity.
