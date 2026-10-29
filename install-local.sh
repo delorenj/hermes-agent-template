@@ -4,7 +4,7 @@
 #   - It writes literal provider credentials (LINEAR_API_KEY, PLANE_API_KEY,
 #     TRELLO_*) into files. The fleet rule is op:// references or process env only.
 #   - It describes and installs the RETIRED per-agent heartbeat timer. Liveness is
-#     the one multiplexed gateway, scheduling is Bloodbank, persistence is krebs.
+#     the one multiplexed gateway, scheduling is Candybar, persistence is krebs.
 #   - It predates the single multiplexed gateway and the generated-profile model.
 #
 # For an existing Hermes host (for example a Mac Studio running a non-33GOD
@@ -15,8 +15,8 @@
 #
 # Local-only: no GitHub runtime repo, no Telegram, no NATS/BloodBank, no Plane
 # project creation. It binds the PM to a ticket board you already have. The PM
-# runs the continuous ticket sentinel out-of-band on its heartbeat timer
-# (board-reconciliation pass + gated runtime checkpoint, one tick).
+# runs the continuous ticket sentinel out-of-band (board-reconciliation pass);
+# the heartbeat timer it once installed is retired and Candybar owns the cadence.
 # Works on macOS (launchd) and Linux (systemd).
 #
 # One-liner (from anywhere inside the target project):

@@ -22,10 +22,12 @@ The template provisions a single Hermes role per invocation. The `pm` role
 handles project management and triage, and also runs the continuous ticket
 sentinel out-of-band: a provider-agnostic board-reconciliation pass (Linear,
 Plane, or Trello) with an autonomous adversarial review (act, do not wait). The
-sentinel runs as the PM's **heartbeat** systemd timer. Under the current
-pure-local runtime contract, that tick performs board reconciliation only.
-(There is no separate `scrum-master` role; its duties folded into the PM
-heartbeat.)
+sentinel is the PM's `heartbeat.sh` reconciliation runner. **No timer is
+installed for it**: Candybar owns when it runs (see
+[Running reconciliation on a cadence](#running-reconciliation-on-a-cadence)).
+Under the current pure-local runtime contract, a pass performs board
+reconciliation only. (There is no separate `scrum-master` role; its duties
+folded into the PM.)
 
 To work on or extend the heartbeat sentinel, start with the [sentinel handoff
 guide](docs/sentinel/README.md).
@@ -51,7 +53,7 @@ The template will:
 8. Defer Slack by default, or wire a dedicated app+bot pair through the same reference-only contract
 9. Create a Plane project in your configured workspace
 10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
-11. Install systemd `--user` units: profile gateway and board-reconciliation heartbeat timer
+11. Install the systemd `--user` profile gateway unit (no heartbeat timer; provisioning deletes any an older install left)
 12. Append the agent and its Bloodbank `target_agent_id` to `~/.hermes/agents-registry.yaml`
 
 ## Configuration
@@ -190,7 +192,7 @@ your-project/
 
 ~/.hermes/agents-registry.yaml              ← fleet roster
 ~/.hermes/fleet.env                          ← shared Hermes binary/repo pointer
-~/.config/systemd/user/                     ← per-profile gateway + heartbeat timer
+~/.config/systemd/user/                     ← per-profile gateway (no heartbeat timer)
 ```
 
 `fleet.env` is parsed as configuration data, never sourced as shell code. Each
@@ -276,6 +278,33 @@ cd /home/delorenj/code/hermes-agent-template
 ## Architecture
 
 See `docs/architecture.md`.
+
+## Running reconciliation on a cadence
+
+No timer is installed for the sentinel, and you must not add one (no `.timer`,
+crontab entry, `systemd-run --on-*`, launchd interval, Hermes recurring job or
+private sleep loop). Candybar owns when recurring work runs. To reconcile a
+board on a cadence, register a Candybar `exec` runner that invokes the runner
+with the named profile (use `candybar` skill; policy in flume's
+`docs/scheduling-policy.md`):
+
+```toml
+# candybar.toml, next to the job source
+[candybar]
+name = "<project>-pm-reconcile"
+schedule = "*/15 * * * *"      # sub-minute cadence is not schedulable
+enabled = false                # enable only after a proven terminal invocation
+
+[candybar.runner]
+kind = "exec"
+argv = ["/usr/bin/env", "HERMES_HOME=/home/<user>/.hermes/profiles/<profile>", "/abs/path/agents/hermes/pm/.scripts/heartbeat.sh"]
+timeout_s = 900
+```
+
+Then `uv run candybar register <dir>` from `~/code/33GOD/candybar`, read the
+schedule back with `candybar show`, and prove an invocation with
+`candybar history`. The runner's own cooldown and lock still apply, so an
+extra fire is cheap.
 
 ## Re-running individual steps
 

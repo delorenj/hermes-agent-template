@@ -200,7 +200,7 @@ the secret-free credential launcher.
 
 ## Scheduling a reconciliation pass
 
-Nothing schedules one. Every agent used to carry a `hermes-<agent>-heartbeat`
+No timer schedules one. Every agent used to carry a `hermes-<agent>-heartbeat`
 timer that ran `heartbeat.sh` about once a minute; it was retired on 2026-09-17
 and `70-systemd.sh` now deletes any that an older install left behind. The pass
 it guarded is gated on `role.yaml`'s `reconcile.enabled`, which was true in one
@@ -221,7 +221,9 @@ model credential, and needs `HERMES_BIN` exported; that is the path the units
 used. Either way the runner's own cooldown and lock logic still apply, so an
 extra invocation is cheap.
 
-In the fleet, scheduling is Bloodbank's: krebs pull-subscribes
+In the fleet, scheduling is Candybar's (it fires Bloodbank commands and Hermes
+invocations; to run this pass on a cadence register a Candybar `exec` runner, see
+the README): krebs pull-subscribes
 `bloodbank.cmd.lifecycle.task.invoke`, and a stalled ticket parks in "Needs
 Attention" on a krebs lease instead of being re-ticked forever.
 

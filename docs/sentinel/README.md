@@ -3,7 +3,7 @@
 This guide is the entry point for continuing development of the **PM's heartbeat
 sentinel**: a provider-agnostic, always-on ticket-reconciliation engine with an
 autonomous adversarial review (act, do not wait). It is owned by the unified
-`pm` role and runs out-of-band on the PM's heartbeat timer. Read this first,
+`pm` role and runs out-of-band, fired by Candybar (no timer is installed). Read this first,
 then follow the links to the deeper guides. It's written so a Hermes agent (or a
 human) can pick up the work without prior context.
 
@@ -20,9 +20,10 @@ and emits a decision event. A real finding is `held` and the ticket goes back to
 active.
 
 There is no longer a separate `scrum-master` role; the sentinel folded into the
-PM and now runs as the PM's **heartbeat** systemd-timer tick
-(`.scripts/heartbeat.sh`). Under the pure-local runtime contract this timer
-performs board reconciliation only. The engine itself lives under the PM at
+PM and now runs as the PM's `.scripts/heartbeat.sh` reconciliation pass. No
+systemd timer drives it (the heartbeat timer was retired 2026-09-17): Candybar
+owns when it runs. Under the pure-local runtime contract a pass performs board
+reconciliation only. The engine itself lives under the PM at
 `.scripts/sentinel/`.
 
 It talks to the ticket board through a pluggable adapter, so the same engine
@@ -45,8 +46,9 @@ The following is true as of June 1, 2026.
 - The **Trello** adapter is implemented against the same contract but is
   **not** yet verified against a live board.
 - The heartbeat runner uses `flock` on Linux and an atomic `mkdir` lock on macOS
-  so concurrent ticks never overlap. The systemd timer (Linux) is the primary
-  scheduler; a `launchd` agent covers macOS.
+  so concurrent ticks never overlap. Candybar is the only scheduler; to run it
+  on a cadence register an `exec` runner (see the main README, "Running
+  reconciliation on a cadence"), never a systemd timer or `launchd` agent.
 
 ## Quick local install
 
@@ -59,9 +61,9 @@ curl -fsSL https://raw.githubusercontent.com/delorenj/hermes-agent-template/main
 ```
 
 It installs `hermes` and `copier` if missing, writes a host-correct local
-config, provisions the `pm` role, binds the PM to an existing board, and
-installs the PM's heartbeat timer (`systemd` on Linux, `launchd` agent on
-macOS). See [Development guide: local install](development.md#local-install-one-command).
+config, provisions the `pm` role, binds the PM to an existing board. It is
+deprecated (see its header): it no longer belongs in a fleet install, and no
+timer or `launchd` agent is installed; register a Candybar runner for a cadence. See [Development guide: local install](development.md#local-install-one-command).
 
 <!-- prettier-ignore -->
 > [!IMPORTANT]

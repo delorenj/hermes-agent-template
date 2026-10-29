@@ -11,19 +11,20 @@ The sentinel is owned by the unified `pm` role. It's materialized into a project
 at `agents/hermes/pm/`, where the PM carries its `role.yaml`, runtime, the
 sentinel prompt, the enforcement tools under `.scripts/sentinel/`, and the
 heartbeat runner. There is no separate `scrum-master` role; its
-continuous-ticket-sentinel duties fold into the PM and run out-of-band on the
-PM's heartbeat timer.
+continuous-ticket-sentinel duties fold into the PM and run out-of-band, fired
+by Candybar (no heartbeat timer is installed).
 
 You provision it by provisioning the PM: run Copier with `--data role=pm` (the
-`70-systemd.sh` step installs the fused `heartbeat` timer that drives the
-sentinel). For the exact commands, see [Development guide:
+`70-systemd.sh` step installs only the profile gateway unit; no timer drives
+the sentinel). For the exact commands, see [Development guide:
 provisioning](development.md#provisioning-the-pm-manual).
 
 ## The heartbeat loop
 
-A scheduler (`systemd` timer on Linux, `launchd` agent on macOS) fires the
-runner, `template/.scripts/heartbeat.sh`, about once a minute. For a pure-local
-runtime, each tick performs a board-reconciliation **sentinel pass**. The cheap
+The runner, `template/.scripts/heartbeat.sh`, is invoked on demand or by a
+Candybar `exec` runner (no systemd timer or `launchd` agent; the old
+once-a-minute timer is retired and sub-minute cadence is not schedulable). For a
+pure-local runtime, each invocation performs a board-reconciliation **sentinel pass**. The cheap
 heartbeat decides whether a full, LLM-backed reconciliation pass is worth
 running. This keeps cost low while staying responsive; runtime backup remains
 an operator-managed filesystem concern outside the sentinel.
@@ -174,8 +175,7 @@ for the naming rules to follow if a future pass genuinely needs a family here.
 
 A full pass moves through these components in order:
 
-1. The scheduler (`systemd` timer or `launchd` agent) triggers the heartbeat
-   runner (`heartbeat.sh`).
+1. Candybar (or an operator) invokes the heartbeat runner (`heartbeat.sh`).
 2. The runner's sentinel logic decides `run:full` and calls `hermes chat` with
    the prompt.
 3. The agent reads the runtime protocol docs and reconciles state by calling

@@ -94,14 +94,15 @@ is the only per-agent unit. The three jobs the timer appeared to do are owned
 elsewhere:
 
 - **liveness** — the gateway unit's `Restart=on-failure`
-- **scheduling** — Bloodbank; krebs pull-subscribes
+- **scheduling** — Candybar, the single clock, which fires Bloodbank commands
+  and Hermes invocations; krebs pull-subscribes
   `bloodbank.cmd.lifecycle.task.invoke`
 - **persistence** — krebs attempts/leases, which park a stalled ticket in
   "Needs Attention" instead of ticking forever
 
 `.scripts/heartbeat.sh` still renders into every role and is still the
-board-reconciliation sentinel's entrypoint — invoked on demand rather than on a
-timer. Its own cooldown/lock logic still decides whether a full, LLM-backed
+board-reconciliation sentinel's entrypoint — invoked on demand (or by a
+Candybar `exec` runner, see the README) rather than on a timer. Its own cooldown/lock logic still decides whether a full, LLM-backed
 reconciliation pass is worth running; see [the sentinel
 docs](sentinel/README.md).
 

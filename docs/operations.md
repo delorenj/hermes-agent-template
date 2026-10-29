@@ -178,8 +178,12 @@ step complete, so rerunning the idempotent provisioning step is safe.
 
 ## Start the daemon for an agent
 
-The gateway is the only per-agent unit. There is no heartbeat timer: scheduling
-moved to Bloodbank, and liveness is the gateway's own `Restart=on-failure`.
+The gateway is the only per-agent unit. There is no heartbeat timer and no
+timer of any kind: Candybar owns recurring schedules (it fires Bloodbank
+commands and Hermes invocations), and liveness is the gateway's own
+`Restart=on-failure`. To run reconciliation on a cadence, register a Candybar
+`exec` runner (see the README's "Running reconciliation on a cadence"); never
+add a `.timer`.
 
 ```bash
 AGENT=bloodbank-pm
@@ -408,7 +412,8 @@ part of profile or service retirement.
 ### Runtime changes are not appearing in Hindsight or backups
 
 Nothing synchronizes a pure-local runtime, and the retired heartbeat timer
-never did either.
+never did either. Do not add a timer or cron job to do it; a recurring sync is
+a Candybar manifest.
 - Verify the configured filesystem backup includes the exact runtime path and
   successfully restore-test its latest snapshot.
 - Query Hindsight separately for the agent bank; only events already written

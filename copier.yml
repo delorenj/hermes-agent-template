@@ -16,7 +16,7 @@
 #   6. Verifies a BotFather token, stores it in 1Password, and maps an op:// reference
 #   7. Optionally does the same for a dedicated Slack app+bot pair
 #   8. Records fleet-shared Bloodbank routing identity (no profile consumer)
-#   9. Installs a profile gateway + heartbeat timer (reconcile + checkpoint)
+#   9. Installs the profile gateway unit (no heartbeat timer; Candybar owns schedules)
 #  10. Appends to ~/.hermes/agents-registry.yaml
 #
 # Environment-specific defaults (Hermes binary path, legacy archive owner, Plane
@@ -117,7 +117,7 @@ soul_tone:
 
 reconcile_enabled:
   type: bool
-  help: "Run autonomous PM ticket-board reconciliation from the heartbeat timer"
+  help: "Allow autonomous PM ticket-board reconciliation when the runner is invoked (Candybar fires it; no timer is installed)"
   default: true
 
 agent_identity:
