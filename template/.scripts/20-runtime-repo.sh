@@ -166,6 +166,26 @@ fi
   || die "singleton-runtime migration failed; inspect with: flume remediate hermes.runtime-singleton '$PROJECT_PATH' --dry-run"
 [[ -d "$PROFILE_HOME" && ! -L "$PROFILE_HOME" ]] \
   || die "Flume did not establish a real named profile at $PROFILE_HOME"
+# Check the links themselves, not Flume's report of them. A re-hire is a desk
+# whose links are already correct over a fresh runtime dir: a Flume that only
+# compared link text audited that "verified" and never created the targets, and
+# Hermes refuses to create the target of a link, so the profile failed to
+# initialize on every gateway start (pilot-pm, 2026-10-24 and 2026-10-28).
+# Current Flume materializes them; this keeps a stale FLUME_BIN /
+# fleet.flume_bin from passing the same desk. Only owned runtime links are
+# judged (`<entry> -> .../runtime/<entry>`). state.db and kanban.db are exempt:
+# sqlite creates them through the link on first open.
+UNUSABLE_LINKS=()
+for link in "$PROFILE_HOME"/* "$PROFILE_HOME"/.[!.]*; do
+  [[ -L "$link" ]] || continue
+  name="${link##*/}"
+  case "$name" in state.db|kanban.db) continue ;; esac
+  [[ "$(readlink "$link")" == */runtime/"$name" ]] || continue
+  [[ -e "$link" ]] || UNUSABLE_LINKS+=("$name")
+done
+if (( ${#UNUSABLE_LINKS[@]} )); then
+  die "profile links into the runtime have no target (${UNUSABLE_LINKS[*]}); Hermes will not create them. Upgrade Flume, then: flume remediate hermes.runtime-singleton '$PROJECT_PATH'"
+fi
 log "    singleton profile verified by flume remediate hermes.runtime-singleton: $PROFILE_HOME"
 
 # Never persist a project-specific terminal.cwd through the named profile.

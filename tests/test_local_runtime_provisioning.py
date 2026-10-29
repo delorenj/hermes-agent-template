@@ -75,6 +75,11 @@ case " $* " in
   *" --dry-run "*) exit 0 ;;
 esac
 mkdir -p "$HOME/.hermes/profiles/demo-pm"
+# A migration that "succeeds" while leaving correct links over absent targets
+# (the re-hire shape an older Flume produced): PJANGLER_LINKS names them.
+for entry in ${PJANGLER_LINKS:-}; do
+  ln -sfn "$PJANGLER_RUNTIME/$entry" "$HOME/.hermes/profiles/demo-pm/$entry"
+done
 exit 0
 """,
         encoding="utf-8",
@@ -128,6 +133,42 @@ def test_provisioner_creates_ignored_local_runtime_without_git(tmp_path: Path) -
         cwd=project,
         check=False,
     ).returncode == 0
+
+
+def test_provisioner_refuses_correct_links_over_a_fresh_runtime(tmp_path: Path) -> None:
+    # The re-hire case: the desk's links are already correct, the runtime dir is
+    # fresh, and a Flume that only compares link text reports success. Hermes
+    # will not create the target of a link, so the step must not log "verified"
+    # and must not mark itself done.
+    _project, role, env = _fixture(tmp_path)
+    env["PJANGLER_RUNTIME"] = str(role / "runtime")
+    # SOUL.md resolves (this step seeds runtime/SOUL.md); state.db is lazy.
+    env["PJANGLER_LINKS"] = "sessions SOUL.md state.db"
+
+    result = _run(role, env)
+
+    assert result.returncode != 0
+    assert "have no target (sessions)" in result.stderr
+    assert "singleton profile verified" not in result.stderr
+    assert not (role / ".scripts" / ".done-20-runtime-repo").exists()
+
+
+def test_provisioner_accepts_lazy_databases_and_foreign_links(tmp_path: Path) -> None:
+    # sqlite creates state.db and kanban.db through the link on first open, and
+    # a link that is not an owned runtime entry (the shared .env) is not this
+    # check's business: none of them may false-fail a healthy fresh hire.
+    _project, role, env = _fixture(tmp_path)
+    env["PJANGLER_RUNTIME"] = str(role / "runtime")
+    env["PJANGLER_LINKS"] = "state.db kanban.db SOUL.md MEMORY.md"
+    profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
+    profile.mkdir(parents=True)
+    (profile / ".env").symlink_to(Path(env["HOME"]) / ".hermes" / ".env")
+
+    result = _run(role, env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "singleton profile verified" in result.stderr
+    assert (role / ".scripts" / ".done-20-runtime-repo").exists()
 
 
 def test_provisioner_preserves_existing_runtime_and_refuses_stale_mapping(tmp_path: Path) -> None:
