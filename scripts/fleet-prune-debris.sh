@@ -5,8 +5,9 @@
 #
 # Conservative by design. It only AUTO-removes things that are unambiguously
 # dead:
-#   - a hardcoded allowlist of DISABLED stale units (old singleton gateways,
-#     the delodocs per-agent dashboard) — and only while they are NOT active;
+#   - a hardcoded allowlist of DISABLED stale units (old suffixed singleton
+#     gateways, the delodocs per-agent dashboard) -- never hermes-gateway.service,
+#     the live host gateway — and only while they are NOT active;
 #   - *.bak-* backup copies of hermes unit files;
 #   - hermes-<id>-pm-checkpoint.{service,timer} whose runtime has NO .git
 #     (already pure-local -> the checkpoint unit can never do anything again).
@@ -57,7 +58,17 @@ remove_unit(){
 
 printf '\n[1] disabled stale units (old singleton gateways / stale dashboard)\n'
 # From recon: these are DISABLED + superseded. Auto-remove only if not active.
-for u in hermes-gateway.service hermes-gateway-de01182b.service hermes-dashboard-delodocs-pm.service; do
+#
+# NEVER list hermes-gateway.service here. Since 2026-10-11 it is THE host
+# gateway (T1): it serves every profile and the Bloodbank lane. "Not active"
+# for it means mid-restart, watchdog-paused or crashed -- and this loop would
+# then disable and delete the one gateway the fleet has. The guard below
+# refuses it even if someone adds it back.
+HOST_GATEWAY_UNIT="hermes-gateway.service"
+for u in hermes-gateway-de01182b.service hermes-dashboard-delodocs-pm.service; do
+  if [ "$u" = "$HOST_GATEWAY_UNIT" ]; then
+    note "REFUSED: $u is the host gateway; this script never removes it"; continue
+  fi
   if exists "$u"; then
     if is_active "$u"; then note "MANUAL: $u is ACTIVE — expected disabled; confirm before removing";
     else remove_unit "$u"; fi
