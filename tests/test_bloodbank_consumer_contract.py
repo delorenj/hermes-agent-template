@@ -444,10 +444,9 @@ def test_registry_records_fleet_gateway_contract_without_consumer_unit(tmp_path:
         "gateway_scope": "fleet",
         "target_agent_id": "demo-pm",
     }
-    assert entry["systemd"] == {
-        "gateway_unit": "hermes-demo-pm-gateway.service",
-    }
-    assert "consumer_unit" not in entry["systemd"]
+    # The retired consumer_unit is stripped and nothing is projected in its
+    # place: the emptied systemd mapping is dropped from the row entirely.
+    assert "systemd" not in entry
 
 
 def test_registry_drops_retired_service_state_keys_and_keeps_role_state(
@@ -488,11 +487,53 @@ def test_registry_drops_retired_service_state_keys_and_keeps_role_state(
 
     assert result.returncode == 0, result.stderr
     systemd = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["systemd"]
-    assert systemd == {
-        "gateway_unit": "hermes-demo-pm-gateway.service",
-        "operator_policy": "manual-window",
-    }
+    assert systemd == {"operator_policy": "manual-window"}
     assert (role / "role.yaml").read_bytes() == role_before
+
+
+def test_registry_never_projects_per_agent_gateway_unit_and_strips_an_existing_one(
+    tmp_path: Path,
+) -> None:
+    """One host gateway (hermes-gateway.service) serves every profile since 2026-10-11.
+
+    80-registry.sh used to write systemd.gateway_unit = hermes-<agent>-gateway.service
+    into every row: a unit that does not exist (the daily report's "gateway units
+    unknown to systemd") and the column fleet-sync.sh fed to a raw try-restart. A
+    fresh row must not carry it, a re-provision must pop it from an old row, and the
+    host gateway must not be written into the row in its place.
+    """
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+
+    fresh = _run(role, "80-registry.sh", env)
+    assert fresh.returncode == 0, fresh.stderr
+    fresh_entry = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]
+    assert "systemd" not in fresh_entry
+
+    registry.write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": 1,
+                "gateways": {"host": {"unit": "hermes-gateway.service"}},
+                "agents": {
+                    "demo-pm": {
+                        "systemd": {"gateway_unit": "hermes-demo-pm-gateway.service"}
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    result = _run(role, "80-registry.sh", env)
+
+    assert result.returncode == 0, result.stderr
+    data = yaml.safe_load(registry.read_text(encoding="utf-8"))
+    assert "systemd" not in data["agents"]["demo-pm"]
+    assert "gateway_unit" not in registry.read_text(encoding="utf-8")
+    assert "hermes-demo-pm-gateway.service" not in registry.read_text(encoding="utf-8")
+    # The top-level host-gateway declaration is left alone.
+    assert data["gateways"] == {"host": {"unit": "hermes-gateway.service"}}
 
 
 def test_registry_merge_preserves_extensions_timestamp_and_is_byte_convergent(

@@ -35,8 +35,9 @@ of anything here: scope is unification, not upgrade.
 cd ~/.hermes/hermes-agent
 git status --short            # must be clean (untracked agents/ is the one known exception)
 git pull --ff-only            # tracks delorenj/main; never merge or reset here
-# restart only when idle: gateway_state.json active_agents == 0, no turn lease held
-systemctl --user restart hermes-gateway.service
+# restart the ONE host gateway only through the guarded wrapper (it waits for idle and
+# coalesces callers); never raw systemctl restart/reload/stop, kill -USR1 or `hermes gateway restart`
+hermes-gateway-restart --reason "picked up hermes-agent fast-forward"
 python3 ~/code/33GOD/hermes-agent-template/scripts/hermes-single-install-check.py
 ```
 
@@ -55,18 +56,18 @@ when the install does not track a `delorenj/*` branch, or when it is a blobless 
 wrapper's embedded fallback that names another path (shadowed by env/config today), a registry sha behind
 HEAD, and a gateway that booted from an older sha than HEAD. Run it by hand, or let candybar do it:
 since 2026-10-26 the `hermes-single-install-guard` candybar (33GOD/candybar migration ledger, story 7.8)
-starts `hermes-single-install-guard.service` every 15 minutes — the `.timer` is retired, never re-enable it —
+starts `hermes-single-install-guard.service` every 15 minutes — the `.timer` is retired, never re-enable it (its repo file was deleted 2026-11-03; git is the rollback) —
 and `infra-doctor` watches its `ok` stamp (`~/.cache/hermes-single-install/ok`, probe `hermes-single-install`).
 
 ## Rules that stay
 
 1. **Never run `hermes update` on big-chungus** (above).
-2. **Restart the gateway only when idle.** There is one gateway now; a restart interrupts every profile.
-   Check `~/.hermes/gateway_state.json` (`active_agents: 0`) and the session turn leases first.
+2. **Restart the gateway only with `hermes-gateway-restart --reason "<why>"`.** There is one gateway now; a restart
+   interrupts every profile. The wrapper waits for idle (`active_agents: 0`, no turn lease) and coalesces callers.
 3. **State migrations are one-way.** Every profile `config.yaml` is at `_config_version 50` and `state.db` at
    schema 31 (written by the upstream tree). Never run an older tree against them.
 4. **Release dirs are retired.** `~/.local/share/hermes-agent/retired-20261017/` holds the old ones; nothing
-   references them. Do not recreate `releases/<sha>`: `hermes-runtime-dropin.py` and `install-local.sh` refuse.
+   references them. Do not recreate `releases/<sha>`: `install-local.sh` refuses (`hermes-runtime-dropin.py` and `retrofit-70-envfile.sh` are retired stubs that refuse to run).
 
 ## The 1Password budget is a first-class constraint
 

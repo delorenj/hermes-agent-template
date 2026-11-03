@@ -10,9 +10,14 @@ set -euo pipefail
 #   contract  runtime/profile.yaml opts into config.inherit_from: default
 #   profile   ~/.hermes/profiles/<profile_name> is a REAL dir whose shared
 #             entries link to the fleet root and owned entries link to runtime
-#   units     systemd HERMES_HOME points at that profile dir
 #   role      <role_dir>/role.yaml profile: <profile_name>
-#   services  stale per-profile Bloodbank consumers retired; gateways restarted
+#   services  stale per-profile Bloodbank consumers retired
+#
+# HOST GATEWAY (since 2026-10-11): ONE hermes-gateway.service serves every
+# profile. There are no per-agent gateway units, so this script never restarts
+# a unit. When a change needs the host gateway to pick it up, it prints an
+# instruction to run `hermes-gateway-restart --reason "<why>"` once; it never
+# calls it and never runs a raw systemctl restart/reload/stop.
 #
 # SINGLETON-RUNTIME CONTRACT (supersedes the old profile-symlink model):
 # ~/.hermes/profiles/<name> MUST be a real directory, NOT a symlink to the
@@ -26,7 +31,8 @@ set -euo pipefail
 # store lives in the profile and <role_dir>/runtime/state.db links to it.
 #
 # Default is a DRY-RUN drift report (exit 1 when drift exists, 0 when clean).
-# --apply writes the fixes and restarts the changed agents' services.
+# --apply writes the fixes; if any agent changed it tells you to request ONE
+# host-gateway restart (see above).
 # Anything that would require destroying or merging existing data (real data
 # where a symlink belongs, a profile.yaml with foreign content) is reported as
 # MANUAL and never touched.
@@ -152,7 +158,7 @@ while [[ $# -gt 0 ]]; do
     --apply) APPLY=1 ;;
     --no-restart) RESTART=0 ;;
     --agent) shift; ONLY_AGENTS+=("$1") ;;
-    -h|--help) sed -n '3,21p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,40p' "$0"; exit 0 ;;
     *) echo "fleet-sync: unknown flag $1" >&2; exit 2 ;;
   esac
   shift
@@ -161,7 +167,8 @@ done
 [[ -f "$REGISTRY_FILE" ]] || { echo "fleet-sync: registry not found: $REGISTRY_FILE" >&2; exit 2; }
 [[ -f "$WRAPPER_TEMPLATE" ]] || { echo "fleet-sync: wrapper template not found: $WRAPPER_TEMPLATE" >&2; exit 2; }
 
-# Registry -> TSV: agent_id, role_dir, profile_name, gateway_unit, legacy_consumer_unit
+# Registry -> TSV: agent_id, role_dir, profile_name, legacy_consumer_unit
+# (systemd.gateway_unit is a retired 2026-10-11 projection and is ignored)
 read_registry() {
   python3 - "$REGISTRY_FILE" <<'PYEOF'
 import sys
@@ -182,7 +189,6 @@ for agent_id, a in sorted((data.get("agents") or {}).items()):
         agent_id,
         str(a.get("role_dir") or ""),
         str(a.get("profile_name") or agent_id),
-        str(systemd.get("gateway_unit") or ""),
         str(systemd.get("consumer_unit") or ""),
     ]))
 PYEOF
@@ -197,8 +203,7 @@ render_wrapper() {  # render_wrapper <agent_id> <profile_name>
 
 DRIFT=0
 FIXED=0
-UNITS_TOUCHED=0
-declare -a RESTART_UNITS=()
+HOST_GATEWAY_RESTART_NEEDED=0
 
 # Registry agents sharing a role_dir would overwrite each other's wrapper
 # and role.yaml on --apply; refuse to write into contested dirs.
@@ -339,7 +344,7 @@ wanted_agent() {
   return 1
 }
 
-while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_unit; do
+while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit; do
   wanted_agent "$agent_id" || continue
   if [[ -z "$role_dir" || ! -d "$role_dir" ]]; then
     note "$agent_id" DRIFT "role_dir missing: ${role_dir:-<unset>} (MANUAL: deprovision or fix registry)"
@@ -632,35 +637,11 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     fi
   fi
 
-  # 3b. systemd units must point HERMES_HOME at that profile dir. This is the
-  # split-brain that the old symlink rule masked: units ran against the profile
-  # while the launcher ran against the raw runtime, so an agent's interactive
-  # and daemon halves used different config, sessions, and auth.
-  for unit in "hermes-${agent_id}-gateway.service" \
-              "hermes-${agent_id}-heartbeat.service" \
-              "hermes-${agent_id}-checkpoint.service"; do
-    unit_path="$SYSTEMD_USER_DIR/$unit"
-    [[ -f "$unit_path" ]] || continue
-    current_home="$(sed -n 's/^Environment=HERMES_HOME=//p' "$unit_path" | head -1)"
-    [[ -n "$current_home" ]] || continue
-    [[ "$current_home" == "$profile_dir" ]] && continue
-    # Never point a unit at a profile dir that is still a symlink or absent —
-    # that is the very state that breaks profile identity. Migrate the layout
-    # first, then the unit repoint becomes safe.
-    if [[ ! -d "$profile_dir" || -L "$profile_dir" ]]; then
-      note "$agent_id" DRIFT "$unit HERMES_HOME=$current_home (expected $profile_dir; blocked until the profile dir is a real dir)"
-      DRIFT=$((DRIFT + 1))
-      continue
-    fi
-    if [[ $APPLY -eq 1 ]]; then
-      sed_inplace "s|^Environment=HERMES_HOME=.*|Environment=HERMES_HOME=$profile_dir|" "$unit_path"
-      note "$agent_id" FIXED "$unit HERMES_HOME -> $profile_dir"
-      changed=1; FIXED=$((FIXED + 1)); UNITS_TOUCHED=1
-    else
-      note "$agent_id" DRIFT "$unit HERMES_HOME=$current_home (expected $profile_dir)"
-      DRIFT=$((DRIFT + 1))
-    fi
-  done
+  # 3b. (retired 2026-10-11) Per-agent gateway/heartbeat/checkpoint units are
+  # gone: ONE host gateway (hermes-gateway.service) serves every profile through
+  # its control socket. This step used to rewrite their HERMES_HOME and queue a
+  # raw unit restart; neither belongs here. 70-systemd.sh retires a
+  # leftover per-agent unit at provision time.
 
   # 4. role.yaml binds the registry profile name.
   role_yaml="$role_dir/role.yaml"
@@ -787,7 +768,7 @@ PYEOF
   fi
 
   if [[ $changed -eq 1 && $RESTART -eq 1 ]]; then
-    [[ -n "$gateway_unit" ]] && RESTART_UNITS+=("$gateway_unit")
+    HOST_GATEWAY_RESTART_NEEDED=1
   fi
 done < <(read_registry)
 
@@ -815,14 +796,12 @@ if [[ $VOX_AVAILABLE -eq 0 ]]; then
   echo "      PM voice checks skipped — this is an optional capability, not drift."
 fi
 
-if [[ $UNITS_TOUCHED -eq 1 ]]; then
-  systemctl --user daemon-reload >/dev/null 2>&1 || true
-fi
-
-if [[ ${#RESTART_UNITS[@]} -gt 0 ]]; then
+if [[ $APPLY -eq 1 && $HOST_GATEWAY_RESTART_NEEDED -eq 1 ]]; then
   echo
-  echo "Restarting: ${RESTART_UNITS[*]}"
-  systemctl --user try-restart "${RESTART_UNITS[@]}" || true
+  echo "note: agent files changed. The ONE host gateway (hermes-gateway.service) serves every"
+  echo "      profile; fleet-sync does not restart it. When the change must take effect, run once:"
+  echo "          hermes-gateway-restart --reason \"fleet-sync applied\""
+  echo "      (it waits for idle and coalesces callers; never systemctl restart/reload/stop)."
 fi
 
 echo

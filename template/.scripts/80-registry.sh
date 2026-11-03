@@ -49,7 +49,6 @@ python3 - "$REGISTRY_FILE" "$AGENT_ID" "$REPO" "$ROLE" "$DISPLAY_NAME" \
   "$PLANE_WORKSPACE" "$PLANE_PROJECT_ID" "$(yaml_get plane.identifier)" \
   "$HERMES_BIN" "$HERMES_AGENT_REPO" "$HERMES_RUNTIME_GIT_URL" \
   "$HERMES_RUNTIME_GIT_REF" "$HERMES_RUNTIME_GIT_SHA" "$FLEET_ENV" \
-  "hermes-${AGENT_ID}-gateway.service" \
   "$ROLE_IDENTITY_JSON" <<'PYEOF'
 import datetime
 import copy
@@ -69,8 +68,8 @@ except ImportError:
  slack_status, slack_team_id, slack_team_name, slack_user_id, slack_bot_id,
  slack_username, role_yaml, plane_ws, plane_id,
  plane_ident, hermes_bin, hermes_repo, hermes_git_url,
- hermes_git_ref, hermes_git_sha, fleet_env, gw,
- identity_json) = sys.argv[1:30]
+ hermes_git_ref, hermes_git_sha, fleet_env,
+ identity_json) = sys.argv[1:29]
 p = pathlib.Path(path)
 if p.is_symlink():
     raise SystemExit(f"refusing to update registry symlink: {p}")
@@ -208,14 +207,13 @@ managed = {
     "git_sha": hermes_git_sha,
     "fleet_env": fleet_env,
   },
-  # Only the unit NAMES the handbook's systemd_lifecycle seam declares
-  # writable. Gateway state and heartbeat retirement live in role.yaml `service_state`
-  # (70-systemd.sh writes it, 99-summary.sh reads it); flume review derives the
-  # desired gateway state from the messaging declaration and reports any other
-  # systemd key on a row as `registry-retired-key`.
-  "systemd": {
-    "gateway_unit": gw,
-  },
+  # No `systemd` projection. Since 2026-10-11 ONE host gateway
+  # (hermes-gateway.service) serves every profile; it is declared once by the
+  # top-level registry `gateways` block, never per row. A per-agent
+  # `systemd.gateway_unit` named a unit that does not exist (the daily report's
+  # "gateway units unknown to systemd") and fed a raw try-restart in
+  # fleet-sync.sh. Gateway state lives in role.yaml `service_state`
+  # (70-systemd.sh writes it, 99-summary.sh reads it).
   "provisioned_at": provisioned_at,
 }
 # A channel the operator PARKED with `flume channel offline` stays parked: a
@@ -268,11 +266,16 @@ if not identity and isinstance(entry.get("identity"), str):
 # heartbeat_state (projected 2026-08-27 to 2026-09-23) duplicate role.yaml
 # service_state under keys the handbook does not declare. heartbeat_timer names
 # a retired unit; reprovisioning removes that old managed projection as well.
-RETIRED_SYSTEMD_KEYS = ("consumer_unit", "gateway_state", "heartbeat_state", "heartbeat_timer")
+# gateway_unit (retired 2026-10-11) named the per-agent hermes-<agent>-gateway.service;
+# the one host gateway is declared by the top-level `gateways` block instead.
+RETIRED_SYSTEMD_KEYS = ("consumer_unit", "gateway_state", "gateway_unit", "heartbeat_state", "heartbeat_timer")
 systemd = entry.get("systemd")
 if isinstance(systemd, dict):
     for retired_key in RETIRED_SYSTEMD_KEYS:
         systemd.pop(retired_key, None)
+    if not systemd:
+        # Nothing managed is left; an extension key someone added survives.
+        entry.pop("systemd", None)
 agents[agent_id] = entry
 rendered = yaml.safe_dump(data, sort_keys=False)
 p.parent.mkdir(parents=True, exist_ok=True)

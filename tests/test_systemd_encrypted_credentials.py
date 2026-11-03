@@ -65,6 +65,11 @@ Path(os.environ["CAPTURE_PATH"]).write_text(json.dumps({
         encoding="utf-8",
     )
     fake_hermes.chmod(0o755)
+    # Heartbeat mode execs the role's heartbeat.sh; stand in a capture script with
+    # the same observation surface (gateway mode is retired and never execs).
+    fake_heartbeat = scripts / "heartbeat.sh"
+    fake_heartbeat.write_text(fake_hermes.read_text(encoding="utf-8"), encoding="utf-8")
+    fake_heartbeat.chmod(0o755)
     env = dict(os.environ)
     env.update(
         {
@@ -92,7 +97,7 @@ def test_launcher_reads_volatile_credentials_and_forwards_only_key_name(
     env["CREDENTIALS_DIRECTORY"] = str(credentials)
 
     result = subprocess.run(
-        ["bash", str(role / ".scripts" / "credential-launch.sh"), "gateway"],
+        ["bash", str(role / ".scripts" / "credential-launch.sh"), "heartbeat"],
         env=env,
         text=True,
         capture_output=True,
@@ -106,25 +111,29 @@ def test_launcher_reads_volatile_credentials_and_forwards_only_key_name(
     assert observed["model_key"] == "model-runtime-secret"
     assert observed["home"].endswith("/.hermes/profiles/demo-director")
     assert observed["terminal_cwd"] == str(role.parents[2])
-    # A named profile rides on argv: `hermes profile list` identifies a gateway
-    # by its command line, and HERMES_HOME alone reports it "stopped".
-    assert observed["argv"] == [
-        "-p",
-        "demo-director",
-        "gateway",
-        "run",
-        "--replace",
-        "--model",
-        "hermes",
-        "--provider",
-        "custom",
-        "--base-url",
-        "https://gateway.example.test/v1",
-        "--api-mode",
-        "chat_completions",
-        "--key-env",
-        "DIRECTOR_LITELLM_KEY",
-    ]
+    assert observed["argv"] == []
+
+
+def test_launcher_gateway_mode_is_retired_and_refuses_to_take_over_the_host(
+    tmp_path: Path,
+) -> None:
+    """A per-agent unit pointing at `credential-launch.sh gateway` would
+    `gateway run --replace` the one host gateway (2026-10-20, 2026-11-02)."""
+    role, env = _role(tmp_path)
+
+    result = subprocess.run(
+        ["bash", str(role / ".scripts" / "credential-launch.sh"), "gateway"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "gateway mode is retired" in result.stderr
+    assert "hermes-gateway.service" in result.stderr
+    assert "hermes-gateway-restart" in result.stderr
+    assert not Path(env["CAPTURE_PATH"]).exists(), "refusal must not exec anything"
 
 
 def test_launcher_rejects_key_values_in_role_manifest(tmp_path: Path) -> None:
@@ -138,7 +147,7 @@ def test_launcher_rejects_key_values_in_role_manifest(tmp_path: Path) -> None:
     )
 
     result = subprocess.run(
-        ["bash", str(role / ".scripts" / "credential-launch.sh"), "gateway"],
+        ["bash", str(role / ".scripts" / "credential-launch.sh"), "heartbeat"],
         env=env,
         text=True,
         capture_output=True,
@@ -155,7 +164,7 @@ def test_launcher_scrubs_channel_env_but_preserves_model_env_fallback(tmp_path: 
     env["DIRECTOR_LITELLM_KEY"] = "runtime-env-model"
 
     result = subprocess.run(
-        ["bash", str(role / ".scripts" / "credential-launch.sh"), "gateway"],
+        ["bash", str(role / ".scripts" / "credential-launch.sh"), "heartbeat"],
         env=env,
         text=True,
         capture_output=True,
@@ -171,7 +180,7 @@ def test_launcher_scrubs_channel_env_but_preserves_model_env_fallback(tmp_path: 
 def test_unit_entrypoints_ship_executable() -> None:
     # Older templates wrote `ExecStart=<role>/.scripts/credential-launch.sh` and
     # systemd exec'd it directly (a 0644 copy failed with status=203/EXEC); it is
-    # still the manual `gateway` entrypoint, so it ships executable.
+    # still the manual `heartbeat` entrypoint, so it ships executable.
     # `flume remediate` copies a template file's executable bit, so the bit
     # has to be on the template file itself -- chmod at provisioning time does
     # not survive the next scaffold refresh.

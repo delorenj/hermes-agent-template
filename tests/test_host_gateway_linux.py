@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -511,3 +512,20 @@ def test_scripts_never_template_a_per_agent_gateway_unit(name: str) -> None:
     text = (SCRIPTS / name).read_text(encoding="utf-8")
     for fragment in ("[Service]", "ExecStart=", "enable --now \"$GW_UNIT\"", "WantedBy="):
         assert fragment not in text, f"{name} still renders or enables a per-agent unit: {fragment}"
+
+
+def test_fleet_sync_never_restarts_a_unit_and_points_at_the_guarded_wrapper() -> None:
+    text = (ROOT / "scripts" / "fleet-sync.sh").read_text(encoding="utf-8")
+    for fragment in ("try-restart", "RESTART_UNITS", 'systemd.get("gateway_unit")', "systemctl --user restart"):
+        assert fragment not in text, f"fleet-sync.sh still reaches for a raw restart: {fragment}"
+    assert "hermes-gateway-restart --reason" in text
+
+
+@pytest.mark.parametrize("script", ["retrofit-70-envfile.sh", "hermes-runtime-dropin.py"])
+def test_per_agent_unit_rewriters_are_retired_and_refuse(script: str) -> None:
+    path = ROOT / "scripts" / script
+    cmd = ["bash", str(path)] if script.endswith(".sh") else [sys.executable, str(path)]
+    result = subprocess.run(cmd + ["--apply"], text=True, capture_output=True, check=False)
+    assert result.returncode == 64
+    assert "RETIRED" in result.stderr
+    assert "hermes-gateway-restart" in result.stderr

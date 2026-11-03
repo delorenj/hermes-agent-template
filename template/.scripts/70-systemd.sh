@@ -324,8 +324,11 @@ retire_agent_gateway_unit
 #
 # The three jobs a heartbeat appeared to do are owned elsewhere now:
 #   liveness    -> the host gateway unit, hermes-gateway.service (Restart=always)
-#   scheduling  -> Bloodbank; krebs pull-subscribes
-#                  bloodbank.cmd.lifecycle.task.invoke
+#   scheduling  -> Candybar, the single clock (retired 2026-10-11: no heartbeat
+#                  timer, no per-agent timer, no private poll loop; recurring work
+#                  is a Candybar manifest). Bloodbank carries the resulting
+#                  command events (krebs pull-subscribes
+#                  bloodbank.cmd.lifecycle.task.invoke); it is not the clock.
 #   persistence -> krebs attempts/leases, which park a stalled ticket in
 #                  "Needs Attention" instead of ticking forever
 #
