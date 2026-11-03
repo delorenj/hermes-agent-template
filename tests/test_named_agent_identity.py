@@ -200,7 +200,7 @@ def test_telegram_adopts_an_existing_vault_reference_without_staging(tmp_path: P
     }
     registry_telegram = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["telegram"]
     assert registry_telegram["provisioning_status"] == "verified"
-    assert (runtime / ".env").read_text(encoding="utf-8") == 'TELEGRAM_ALLOWED_USERS="7777"\n'
+    assert (runtime / ".env").read_text(encoding="utf-8") == 'TELEGRAM_ALLOWED_USERS="7777,7564050286"\n'
 
 
 def test_telegram_refuses_a_token_and_a_reference_together(tmp_path: Path) -> None:

@@ -800,6 +800,12 @@ builtin source "$FLEET_ENV_LIBRARY"
 
 # Fleet source-of-truth (shared across all wrappers/provisioners).
 # Every default below resolves as: env var > fleet.env > config.toml > fallback.
+
+# The fleet's creator. Every Telegram bot this template wires allows these ids
+# in addition to anything else configured (30-telegram.sh). Override per host
+# with [telegram] operator_user_ids in config.toml.
+TELEGRAM_DEFAULT_OPERATOR_USER_IDS="7564050286"
+
 # Invocation authority is not fleet configuration. Capture the caller's board
 # gate before importing fleet.env so that file cannot weaken an MCP/CLI
 # SKIP_PLANE decision or re-enable credentials by assigning SKIP_PLANE=0.

@@ -234,7 +234,7 @@ def _assert_rotated_wiring(role: Path, registry: Path, home: Path) -> None:
         assert state["bot_username"] == "rotated_demo_bot"
         assert str(state["bot_id"]) == "989898"
     assert (role / "runtime" / ".env").read_text(encoding="utf-8") == (
-        'TELEGRAM_ALLOWED_USERS="222"\n'
+        'TELEGRAM_ALLOWED_USERS="222,7564050286"\n'
     )
 
 
@@ -398,7 +398,7 @@ def test_explicit_token_stores_only_reference_and_nonsecret_policy(tmp_path: Pat
     env_file = runtime / ".env"
     env_text = env_file.read_text(encoding="utf-8")
     assert "TELEGRAM_BOT_TOKEN" not in env_text
-    assert 'TELEGRAM_ALLOWED_USERS="111,222"' in env_text
+    assert 'TELEGRAM_ALLOWED_USERS="111,222,7564050286"' in env_text
     assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
     assert shared.read_text(encoding="utf-8") == "PROVIDER_KEY=keep-me\n"
     assert fleet.read_text(encoding="utf-8") == "TELEGRAM_ALLOWED_USERS=111,222\n"
@@ -419,6 +419,58 @@ def test_explicit_token_stores_only_reference_and_nonsecret_policy(tmp_path: Pat
         "bot_username": "verified_demo_bot",
         "bot_id": "424242",
     }
+
+
+def test_missing_allow_list_everywhere_still_wires_and_allows_operator(tmp_path: Path) -> None:
+    """Regression: no TELEGRAM_ALLOWED_USERS in the invocation, fleet.env or
+    ~/.hermes/.env used to kill the step silently (grep + pipefail, exit 1,
+    no message) right after getMe. It must wire and allow the operator."""
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    (home / ".hermes" / ".env").write_text("PROVIDER_KEY=keep-me\n", encoding="utf-8")
+
+    result = _run(
+        role,
+        registry,
+        home,
+        _fake_bin(tmp_path),
+        {
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "HERMES_TEMPLATE_CONFIG": str(tmp_path / "absent-config.toml"),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (runtime / ".env").read_text(encoding="utf-8") == (
+        'TELEGRAM_ALLOWED_USERS="7564050286"\n'
+    )
+    assert "denies all inbound users" not in result.stdout + result.stderr
+
+
+def test_configured_operator_ids_are_appended_once(tmp_path: Path) -> None:
+    role, runtime, registry = _make_role(tmp_path)
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    config = tmp_path / "config.toml"
+    config.write_text('[telegram]\noperator_user_ids = ["111", "999"]\n', encoding="utf-8")
+
+    result = _run(
+        role,
+        registry,
+        home,
+        _fake_bin(tmp_path),
+        {
+            "TELEGRAM_BOT_TOKEN": BOT_TOKEN,
+            "TELEGRAM_ALLOWED_USERS": "555, 111",
+            "HERMES_TEMPLATE_CONFIG": str(config),
+        },
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (runtime / ".env").read_text(encoding="utf-8") == (
+        'TELEGRAM_ALLOWED_USERS="555,111,999"\n'
+    )
 
 
 def test_transient_onepassword_outage_preserves_verified_telegram_wiring_and_recovers(

@@ -76,6 +76,12 @@ runtime_repo_owner = ""
 base = "https://plane.delo.sh"
 workspace = "33god"
 
+[telegram]
+# Telegram user ids every wired bot always allows (the fleet's operator).
+# 30-telegram.sh appends these to any TELEGRAM_ALLOWED_USERS it resolves, so a
+# new bot never comes up denying its creator. Built-in fallback: 7564050286.
+operator_user_ids = ["7564050286"]
+
 [hindsight]
 # Bank-template manifest a new agent's identity bank starts from (retain /
 # reflect / observations missions, entity labels, mental models, directives).

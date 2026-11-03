@@ -151,8 +151,8 @@ scoped runtime lock remains a second line of defense against duplicate pollers.
 
 A token the operator already stored in 1Password is adopted by reference
 instead of pasted: run `.scripts/30-telegram.sh` with
-`TELEGRAM_BOT_TOKEN_REF=op://DeLoSecrets/<item-uuid>/<field>` (and the usual
-`TELEGRAM_ALLOWED_USERS`). The token is read through
+`TELEGRAM_BOT_TOKEN_REF=op://DeLoSecrets/<item-uuid>/<field>` (the operator's
+id is always allowed; `TELEGRAM_ALLOWED_USERS` adds others). The token is read through
 `store-onepassword-secret.py --read-reference` into an unexported variable,
 verified with `getMe` and the same fleet ownership scan, and the profile maps
 the operator's own reference -- no second vault item is staged. Passing both

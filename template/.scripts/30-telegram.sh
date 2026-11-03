@@ -240,16 +240,41 @@ print("{}\t{}".format(
 IFS=$'\t' read -r bot_id bot_username <<< "$identity"
 log "    verified: @$bot_username (id=$bot_id)"
 
-# Resolve operator's allowed user id before taking the fleet claim lock.
+# Resolve the bot's allow-list before taking the fleet claim lock.
+#
+# Sources, first non-empty wins: the invocation's TELEGRAM_ALLOWED_USERS, then
+# fleet.env (both captured above), then a TELEGRAM_ALLOWED_USERS line in
+# ~/.hermes/.env. The operator ids ([telegram] operator_user_ids in
+# config.toml, built-in fallback: the fleet's creator) are then ALWAYS
+# appended: every bot answers its creator, whatever else is configured, so a
+# freshly wired bot can never come up denying everyone.
+#
+# The ~/.hermes/.env lookup must tolerate "no such line": under errexit +
+# pipefail a grep that matches nothing used to kill this step silently, right
+# after the "verified:" log line, with exit 1 and no message.
 if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -f "$HOME/.hermes/.env" ]]; then
-  TELEGRAM_ALLOWED_USERS=$(grep -E '^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=' "$HOME/.hermes/.env" \
+  TELEGRAM_ALLOWED_USERS=$( { grep -E '^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=' "$HOME/.hermes/.env" || true; } \
     | tail -1 | sed -E 's/^[[:space:]]*#?[[:space:]]*TELEGRAM_ALLOWED_USERS=//; s/^"//; s/"$//')
 fi
-if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" && -t 0 ]]; then
-  read -r -p "Your Telegram user id (allow-list for this bot): " TELEGRAM_ALLOWED_USERS
-fi
-if [[ -z "${TELEGRAM_ALLOWED_USERS:-}" ]]; then
-  warn "    Telegram is wired but denies all inbound users until TELEGRAM_ALLOWED_USERS is set"
+TELEGRAM_OPERATOR_USER_IDS="$(config_get telegram.operator_user_ids "$TELEGRAM_DEFAULT_OPERATOR_USER_IDS")"
+telegram_allow_list() {
+  local -a ids=() out=()
+  local -A seen=()
+  local id
+  IFS=$', \t' read -r -a ids <<<"$*"
+  for id in "${ids[@]}"; do
+    [[ -n "$id" && -z "${seen[$id]:-}" ]] || continue
+    seen[$id]=1
+    out+=("$id")
+  done
+  local IFS=,
+  printf '%s' "${out[*]}"
+}
+TELEGRAM_ALLOWED_USERS="$(telegram_allow_list "${TELEGRAM_ALLOWED_USERS:-}" "$TELEGRAM_OPERATOR_USER_IDS")"
+if [[ -z "$TELEGRAM_ALLOWED_USERS" ]]; then
+  warn "    Telegram is wired but denies all inbound users: no TELEGRAM_ALLOWED_USERS and no [telegram] operator_user_ids"
+else
+  log "    allow-list: $TELEGRAM_ALLOWED_USERS"
 fi
 
 # Reject token reuse, token rotation onto an identity owned by another agent,

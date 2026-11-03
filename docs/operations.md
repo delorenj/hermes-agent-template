@@ -248,10 +248,15 @@ ERROR naming `agents.<id>.bloodbank.enabled`.
    ```bash
    cd <project>/agents/hermes/<role>
    TELEGRAM_BOT_TOKEN='<bot-id>:<secret>' \
-     TELEGRAM_ALLOWED_USERS='<your-user-id>' \
      SKIP_TELEGRAM=0 ./.scripts/30-telegram.sh
    ./.scripts/70-systemd.sh
    ```
+
+The operator is always on the bot's allow-list: `30-telegram.sh` appends
+`[telegram] operator_user_ids` from config.toml (built-in fallback: the fleet
+creator's id) to whatever `TELEGRAM_ALLOWED_USERS` it resolves from the
+invocation, `fleet.env` or `~/.hermes/.env`. Pass `TELEGRAM_ALLOWED_USERS` only
+to allow additional users.
 
 The token is captured before shared fleet configuration is loaded, verified
 through Telegram `getMe`, checked against local token and bot-identity owners,
