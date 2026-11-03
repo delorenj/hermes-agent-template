@@ -21,7 +21,9 @@ set -euo pipefail
 # "default" and disables shared fleet auth. Shared entries (.env, skills)
 # symlink up to the fleet root; config.yaml is a generated real file rendered
 # from the fleet base plus config.delta.yaml; owned entries (memories, sessions,
-# state.db, ...) symlink back into <role_dir>/runtime.
+# SOUL.md, ...) symlink back into <role_dir>/runtime. state.db is the exception:
+# Hermes refuses a desk whose state.db resolves outside its profile, so the real
+# store lives in the profile and <role_dir>/runtime/state.db links to it.
 #
 # Default is a DRY-RUN drift report (exit 1 when drift exists, 0 when clean).
 # --apply writes the fixes and restarts the changed agents' services.
@@ -138,7 +140,9 @@ VOX_AVAILABLE=0
 # Singleton-runtime profile contract (mirrors src/parity/rules.ts).
 SHARED_PROFILE_ENTRIES=(.env skills)
 OWNED_PROFILE_ENTRIES=(memories sessions workspace logs cron plans hooks pairing audio_cache image_cache)
-OWNED_PROFILE_FILES=(SOUL.md state.db kanban.db)
+OWNED_PROFILE_FILES=(SOUL.md kanban.db)
+# Homed (PROFILE_HOMED_FILES): the real file lives in the profile, the runtime links to it.
+PROFILE_HOMED_FILES=(state.db)
 
 APPLY=0
 RESTART=1
@@ -580,6 +584,15 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name gateway_unit consumer_u
     done
     for entry in "${OWNED_PROFILE_FILES[@]}"; do
       ensure_profile_link "$entry" "$profile_dir/$entry" "$runtime/$entry" file
+    done
+    for entry in "${PROFILE_HOMED_FILES[@]}"; do
+      if [[ -L "$profile_dir/$entry" ]]; then
+        # Moving a live sqlite store (and its -wal/-shm) is flume's job, never a blind ln.
+        note "$agent_id" DRIFT "profile $entry is a link; Hermes refuses a store outside its profile (MANUAL: flume remediate hermes.runtime-singleton)"
+        DRIFT=$((DRIFT + 1))
+      else
+        ensure_profile_link "runtime-side $entry" "$runtime/$entry" "$profile_dir/$entry" file
+      fi
     done
 
     # config.yaml is GENERATED and must be a real file. Its only sources of

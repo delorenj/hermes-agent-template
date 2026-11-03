@@ -173,8 +173,13 @@ fi
 # initialize on every gateway start (pilot-pm, 2026-10-24 and 2026-10-28).
 # Current Flume materializes them; this keeps a stale FLUME_BIN /
 # fleet.flume_bin from passing the same desk. Only owned runtime links are
-# judged (`<entry> -> .../runtime/<entry>`). state.db and kanban.db are exempt:
-# sqlite creates them through the link on first open.
+# judged (`<entry> -> .../runtime/<entry>`). kanban.db is exempt: sqlite
+# creates it through the link on first open. state.db is the other way round:
+# Hermes >= v0.22.6 refuses a desk whose state.db resolves outside its profile,
+# so the real store lives there and only the runtime links to it.
+if [[ -L "$PROFILE_HOME/state.db" ]]; then
+  die "profile state.db is a link ($(readlink "$PROFILE_HOME/state.db")); Hermes refuses a store outside its profile. Upgrade Flume, then: flume remediate hermes.runtime-singleton '$PROJECT_PATH'"
+fi
 UNUSABLE_LINKS=()
 for link in "$PROFILE_HOME"/* "$PROFILE_HOME"/.[!.]*; do
   [[ -L "$link" ]] || continue

@@ -142,8 +142,8 @@ def test_provisioner_refuses_correct_links_over_a_fresh_runtime(tmp_path: Path) 
     # and must not mark itself done.
     _project, role, env = _fixture(tmp_path)
     env["PJANGLER_RUNTIME"] = str(role / "runtime")
-    # SOUL.md resolves (this step seeds runtime/SOUL.md); state.db is lazy.
-    env["PJANGLER_LINKS"] = "sessions SOUL.md state.db"
+    # SOUL.md resolves (this step seeds runtime/SOUL.md); kanban.db is lazy.
+    env["PJANGLER_LINKS"] = "sessions SOUL.md kanban.db"
 
     result = _run(role, env)
 
@@ -154,12 +154,12 @@ def test_provisioner_refuses_correct_links_over_a_fresh_runtime(tmp_path: Path) 
 
 
 def test_provisioner_accepts_lazy_databases_and_foreign_links(tmp_path: Path) -> None:
-    # sqlite creates state.db and kanban.db through the link on first open, and
-    # a link that is not an owned runtime entry (the shared .env) is not this
-    # check's business: none of them may false-fail a healthy fresh hire.
+    # sqlite creates kanban.db through the link on first open, and a link that
+    # is not an owned runtime entry (the shared .env) is not this check's
+    # business: none of them may false-fail a healthy fresh hire.
     _project, role, env = _fixture(tmp_path)
     env["PJANGLER_RUNTIME"] = str(role / "runtime")
-    env["PJANGLER_LINKS"] = "state.db kanban.db SOUL.md MEMORY.md"
+    env["PJANGLER_LINKS"] = "kanban.db SOUL.md MEMORY.md"
     profile = Path(env["HOME"]) / ".hermes" / "profiles" / "demo-pm"
     profile.mkdir(parents=True)
     (profile / ".env").symlink_to(Path(env["HOME"]) / ".hermes" / ".env")
@@ -169,6 +169,22 @@ def test_provisioner_accepts_lazy_databases_and_foreign_links(tmp_path: Path) ->
     assert result.returncode == 0, result.stdout + result.stderr
     assert "singleton profile verified" in result.stderr
     assert (role / ".scripts" / ".done-20-runtime-repo").exists()
+
+
+def test_provisioner_refuses_a_profile_state_db_link(tmp_path: Path) -> None:
+    # Hermes >= v0.22.6 refuses a desk whose state.db resolves outside its
+    # profile. A stale Flume that still links profile/state.db -> runtime must
+    # not pass this step as "verified", even though the link dangles lazily.
+    _project, role, env = _fixture(tmp_path)
+    env["PJANGLER_RUNTIME"] = str(role / "runtime")
+    env["PJANGLER_LINKS"] = "state.db kanban.db SOUL.md"
+
+    result = _run(role, env)
+
+    assert result.returncode != 0
+    assert "profile state.db is a link" in result.stderr
+    assert "singleton profile verified" not in result.stderr
+    assert not (role / ".scripts" / ".done-20-runtime-repo").exists()
 
 
 def test_provisioner_preserves_existing_runtime_and_refuses_stale_mapping(tmp_path: Path) -> None:
