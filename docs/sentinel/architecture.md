@@ -15,7 +15,7 @@ continuous-ticket-sentinel duties fold into the PM and run out-of-band, fired
 by Candybar (no heartbeat timer is installed).
 
 You provision it by provisioning the PM: run Copier with `--data role=pm` (the
-`70-systemd.sh` step installs only the profile gateway unit; no timer drives
+`70-systemd.sh` step installs no unit at all (the host gateway serves every profile); no timer drives
 the sentinel). For the exact commands, see [Development guide:
 provisioning](development.md#provisioning-the-pm-manual).
 

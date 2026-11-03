@@ -208,11 +208,13 @@ exit 1
     assert "Mode:           OPERATIONAL_WITH_GATEWAY_DEFERRED" in result.stderr
     assert "Heartbeat:      active" in result.stderr
     assert "Gateway:        deferred" in result.stderr
-    assert "do not start hermes-demo-pm-gateway.service manually" in result.stderr
+    # No per-agent gateway is ever started: the host gateway serves every profile.
+    assert "No per-agent gateway is ever" in result.stderr
+    assert "hermes-demo-pm-gateway.service" not in result.stderr
     assert "Provisioned:" not in result.stderr
 
 
-def test_summary_rejects_stale_active_gateway_claim_after_exit_78(tmp_path: Path) -> None:
+def test_summary_rejects_stale_active_gateway_claim_when_host_does_not_serve(tmp_path: Path) -> None:
     target = tmp_path / "rendered"
     rendered = _copy(target)
     assert rendered.returncode == 0, rendered.stdout + rendered.stderr
@@ -224,37 +226,13 @@ def test_summary_rejects_stale_active_gateway_claim_after_exit_78(tmp_path: Path
         encoding="utf-8",
     )
     home = tmp_path / "home"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    systemctl = fake_bin / "systemctl"
-    systemctl.write_text(
-        """#!/usr/bin/env bash
-case "$*" in
-  *"is-system-running"*) echo running; exit 0 ;;
-  *"is-active hermes-demo-pm-heartbeat.timer"*) echo active; exit 0 ;;
-  *"is-enabled hermes-demo-pm-heartbeat.timer"*) echo enabled; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.timer"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=active' 'SubState=waiting'; exit 0 ;;
-  *"show hermes-demo-pm-heartbeat.service"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=inactive' 'SubState=dead' \
-      'Result=success' 'ExecMainStatus=0' 'NRestarts=0' \
-      'ExecMainStartTimestampMonotonic=100' 'ExecMainExitTimestampMonotonic=200'; exit 0 ;;
-  *"is-active hermes-demo-pm-gateway.service"*) echo active; exit 0 ;;
-  *"is-enabled hermes-demo-pm-gateway.service"*) echo enabled; exit 0 ;;
-  *"show hermes-demo-pm-gateway.service"*)
-    printf '%s\n' 'LoadState=loaded' 'ActiveState=failed' 'SubState=failed' \
-      'Result=exit-code' 'ExecMainStatus=78' 'NRestarts=1'; exit 0 ;;
-esac
-exit 1
-""",
-        encoding="utf-8",
-    )
-    systemctl.chmod(0o755)
+    # A host gateway that cannot be shown serving this profile (here: no usable hermes
+    # launcher at all) is never summarized as operational.
     env = dict(os.environ)
     env.update(
         {
             "HOME": str(home),
-            "PATH": f"{fake_bin}:{env['PATH']}",
+            "HERMES_BIN": str(tmp_path / "missing-hermes"),
             "HERMES_FLEET_ENV": str(home / ".hermes" / "fleet.env"),
             "SKIP_PLANE": "1",
         }

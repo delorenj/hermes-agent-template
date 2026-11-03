@@ -169,8 +169,9 @@ def test_launcher_scrubs_channel_env_but_preserves_model_env_fallback(tmp_path: 
 
 
 def test_unit_entrypoints_ship_executable() -> None:
-    # 70-systemd.sh writes `ExecStart=<role>/.scripts/credential-launch.sh`,
-    # and systemd execs it directly: a 0644 copy fails with status=203/EXEC.
+    # Older templates wrote `ExecStart=<role>/.scripts/credential-launch.sh` and
+    # systemd exec'd it directly (a 0644 copy failed with status=203/EXEC); it is
+    # still the manual `gateway` entrypoint, so it ships executable.
     # `flume remediate` copies a template file's executable bit, so the bit
     # has to be on the template file itself -- chmod at provisioning time does
     # not survive the next scaffold refresh.

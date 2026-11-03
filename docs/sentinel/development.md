@@ -174,7 +174,7 @@ script checks its flag and skips cleanly.
 | `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile migration. No remote storage is created. |
 | `SKIP_PLANE` | Creating a Plane project. |
 | `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
-| `SKIP_SYSTEMD` | Installing the `systemd` profile gateway unit. |
+| `SKIP_SYSTEMD` | Reconciling the host gateway and retiring leftover per-agent units in `70-systemd.sh`. |
 
 For example, a local install that creates no cloud resources:
 
@@ -190,13 +190,13 @@ to the team key. Make the provider key available to the runner's environment:
 export it in the invoking shell, or write it into `~/.hermes/fleet.env`, which
 each adapter reads directly as its last resort.
 
-`SKIP_SYSTEMD` gates the profile gateway unit in `70-systemd.sh`. The gateway is
-what a chat platform talks to; the sentinel does not need it.
+`SKIP_SYSTEMD` gates `70-systemd.sh`, which makes the host gateway serve the
+profile (there is no per-agent unit). The gateway is what a chat platform talks
+to; the sentinel does not need it.
 
 The gateway keeps `HERMES_HOME` on the real named profile established by
 `flume remediate hermes.runtime-singleton`; nothing may reset it to the raw
-runtime path. When encrypted model credentials are present, it starts through
-the secret-free credential launcher.
+runtime path. The manual `credential-launch.sh` launcher stays secret-free.
 
 ## Scheduling a reconciliation pass
 

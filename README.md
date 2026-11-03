@@ -53,7 +53,7 @@ The template will:
 8. Defer Slack by default, or wire a dedicated app+bot pair through the same reference-only contract
 9. Create a Plane project in your configured workspace
 10. Mark Bloodbank ingress as fleet-scoped, with no per-profile consumer
-11. Install the systemd `--user` profile gateway unit (no heartbeat timer; provisioning deletes any an older install left)
+11. Make the host gateway serve the profile: no per-agent unit is written. On Linux, `hermes-gateway.service` (the one multiplexed gateway) is installed through the hermes CLI only if missing, never restarted, and the profile is confirmed served through its control socket; a leftover `hermes-<agent>-gateway.service` or heartbeat unit from an older install is retired
 12. Append the agent and its Bloodbank `target_agent_id` to `~/.hermes/agents-registry.yaml`
 
 ## Configuration
@@ -95,8 +95,8 @@ Provisioning runs on Linux (systemd) and macOS (launchd). The portable paths:
 | Fleet / project locks | `flock(1)` | no `flock(1)`: `.scripts/lib/fd-lock.py` takes the same `flock(2)` lock on the same inherited descriptor, so it excludes `flock(1)` holders on one lock file |
 | Atomic file exchange (`fleet.env`, channel CAS) | `renameat2(RENAME_EXCHANGE)` | `renamex_np(RENAME_SWAP)`; a volume without swap support fails closed before anything moves |
 | Hashing, relative paths, in-place edits | `sha256sum`, `realpath --relative-to`, `sed -i` | `shasum -a 256` / python, `os.path.relpath`, a temp-file rewrite (never a `.bak`) |
-| Service manager | one `hermes-<agent>-gateway.service` per agent unit file (`70-systemd.sh`) | **no per-agent units**: the one multiplexed gateway, LaunchAgent `ai.hermes.gateway`, is ensured through the fork (`hermes gateway install --if-missing`, `status`) only when the role's `service_state.gateway` is `active`; otherwise it is recorded `deferred`. A gateway that does not become supervised is never left running by the step |
-| Drift guard | systemd `ExecStart=` | plus `~/Library/LaunchAgents/ai.hermes.gateway*.plist` `ProgramArguments` |
+| Service manager | **no per-agent units**: the one multiplexed gateway, `hermes-gateway.service` (systemd `--user`), is ensured through the fork (`hermes gateway install --if-missing` only when missing; never restarted) and the profile is confirmed served via the host control-socket rescan, only when the role's `service_state.gateway` is `active`; otherwise `deferred`. A leftover `hermes-<agent>-gateway.service` is disabled and deleted (never `--now`-stopped while its process is the live host gateway: the operator is told to hand over with `hermes-gateway-restart --reason ...`). A host gateway that cannot be shown serving the profile is an `error` | **no per-agent units**: the one multiplexed gateway, LaunchAgent `ai.hermes.gateway`, is ensured through the fork (`hermes gateway install --if-missing`, `status`) only when the role's `service_state.gateway` is `active`; otherwise it is recorded `deferred`. A gateway that does not become supervised is never left running by the step |
+| Drift guard | `hermes-single-install-check.py` (the host gateway unit's `ExecStart=`) | plus `~/Library/LaunchAgents/ai.hermes.gateway*.plist` `ProgramArguments` |
 
 Checkout locations are configuration, not constants: `HERMES_CODE_ROOT`,
 `HERMES_TEMPLATE_REPO`, and `PJ_SKILLS_REGISTRY_ROOT` (env), or `[paths]` /

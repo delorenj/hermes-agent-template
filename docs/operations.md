@@ -178,19 +178,26 @@ step complete, so rerunning the idempotent provisioning step is safe.
 
 ## Start the daemon for an agent
 
-The gateway is the only per-agent unit. There is no heartbeat timer and no
+An agent has no systemd unit of its own: the one host gateway,
+`hermes-gateway.service`, serves every profile. There is no heartbeat timer and no
 timer of any kind: Candybar owns recurring schedules (it fires Bloodbank
-commands and Hermes invocations), and liveness is the gateway's own
-`Restart=on-failure`. To run reconciliation on a cadence, register a Candybar
+commands and Hermes invocations), and liveness is the host gateway's own
+`Restart=always`. To run reconciliation on a cadence, register a Candybar
 `exec` runner (see the README's "Running reconciliation on a cadence"); never
 add a `.timer`.
 
 ```bash
 AGENT=bloodbank-pm
 
-# Gateway will fail to start until at least one messaging platform is wired.
-# After running .scripts/30-telegram.sh or .scripts/31-slack.sh:
-systemctl --user start hermes-${AGENT}-gateway.service
+# The host gateway serves nothing for this agent until a messaging platform is wired.
+# After running .scripts/30-telegram.sh or .scripts/31-slack.sh, re-run the step: it
+# installs hermes-gateway.service only if missing (never restarts it), asks the host to
+# rescan profiles/, and records service_state.gateway=active once the profile is served.
+./agents/hermes/<role>/.scripts/70-systemd.sh
+
+# Never `systemctl --user start|enable hermes-${AGENT}-gateway.service`: a per-agent unit
+# fights the host gateway (or becomes it). To restart the host gateway use
+# hermes-gateway-restart --reason "<why>".
 ```
 
 ## Talk to an agent
@@ -325,26 +332,14 @@ extract the verified archive at the project root, run
 `flume remediate hermes.runtime-singleton /absolute/path/to/project`, and confirm
 the named profile is a real directory before enabling the services.
 
-### Inject an encrypted model credential from 1Password
+### Encrypted model credentials (retired with the per-agent unit)
 
-The commands below stream secrets directly from 1Password into
-`systemd-creds`; they do not create a plaintext file. Set `model.key_env` in
-`role.yaml` before creating the model credential.
-
-```bash
-AGENT=example-director
-CRED_DIR="$HOME/.config/hermes-agent/credentials"
-install -d -m 0700 "$CRED_DIR"
-env -u OP_API_TOKEN op read 'op://DeLoSecrets/<item>/<field>' \
-  | systemd-creds encrypt --user --name=model_api_key - \
-      "$CRED_DIR/${AGENT}-model-api-key.cred"
-chmod 0600 "$CRED_DIR/${AGENT}-model-api-key.cred"
-```
-
-Re-run `.scripts/70-systemd.sh`; it reconciles the unit definitions even after
-a completed installation, so no marker deletion is required. Never print,
-decrypt to disk, or commit the credential. Channel credentials use the native
-Hermes `secrets.onepassword.env` reference mapping instead of systemd files.
+Older templates could render `LoadCredentialEncrypted=model_api_key:...` into the per-agent
+gateway unit from `~/.config/hermes-agent/credentials/<agent>-model-api-key.cred`. An agent
+no longer has a unit, so `70-systemd.sh` renders no credential line and ignores any such
+`.cred` file. Provider keys reach the host gateway through its own unit and the profile's
+`secrets.onepassword.env` mapping (an `op://` reference, never a value). Never print, decrypt
+to disk, or commit a credential.
 
 ## Retire an agent (preserves runtime by default)
 
@@ -359,8 +354,11 @@ AGENT=bloodbank-pm
 RUNTIME="$PROJECT/agents/hermes/$ROLE/runtime"
 PROFILE="$HOME/.hermes/profiles/$AGENT"
 
-# The gateway is the agent's only unit.
-systemctl --user disable --now "hermes-${AGENT}-gateway.service"
+# The agent has no unit of its own, so there is nothing to stop. Never stop
+# hermes-gateway.service: it serves every other profile. The host gateway drops
+# the profile on its next rescan once the profile is parked or removed. (A
+# leftover hermes-${AGENT}-gateway.service from an older install is retired by
+# re-running ./.scripts/70-systemd.sh.)
 
 # The profile is a real directory. Do not unlink or recursively delete it;
 # no reviewed archive/retire tool for it exists yet.
@@ -399,7 +397,7 @@ part of profile or service retirement.
 - Check the profile's `config.delta.yaml` maps a `TELEGRAM_BOT_TOKEN` `op://`
   reference under `secrets.onepassword.env`, and that `op` can read it. No
   dotenv file carries the token.
-- `journalctl --user -u hermes-<agent>-gateway.service`
+- `journalctl --user -u hermes-gateway.service` (the one host gateway; there is no per-agent unit)
 - If "all configured messaging platforms failed to connect" — Telegram step wasn't run yet. Run `.scripts/30-telegram.sh` first.
 
 ### Bloodbank command not reaching an agent

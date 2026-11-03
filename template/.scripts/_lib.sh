@@ -1222,6 +1222,97 @@ launchd_wait_for_supervised() {
   return 1
 }
 
+# ─── Host service manager: Linux systemd --user ──────────────────────────────
+# Same standard as launchd: ONE multiplexed gateway per host, hermes-gateway.service
+# (`hermes gateway run`, HERMES_HOME=<fleet root>), serving every profile under
+# profiles/. Provisioning never writes or enables a per-agent gateway unit: a second
+# `gateway run` for a profile the host already serves refuses ("already serves
+# profile ..."), and one that starts FIRST becomes the host owner and strands
+# hermes-gateway.service in a restart loop (2026-11-02, tolt-pm).
+HOST_GATEWAY_UNIT="${HERMES_HOST_GATEWAY_UNIT:-hermes-gateway.service}"
+
+# Read-only unless $3 is 1, when it also asks the live owner to rescan profiles/ now
+# (gateway/host_attach.py request_serve_profile, the control-socket `rescan-profiles`).
+# Verdict, last line of stdout: ok|serving|<pid>, ok|not-serving|<pid>,
+# ok|standalone|<pid>, ok|no-host, or error|<why>.
+HOST_GATEWAY_PROBE_PY='
+import sys
+repo, profile, rescan = sys.argv[1:4]
+sys.path.insert(0, repo)
+try:
+    import hermes_bootstrap  # noqa: F401
+except Exception:
+    pass
+try:
+    from gateway.host_attach import host_gateway, request_serve_profile
+    owner = host_gateway(wait_for_channel=5.0)
+    if owner is None:
+        print("ok|no-host")
+    elif owner.serves(profile):
+        print("ok|serving|%d" % owner.pid)
+    elif rescan == "1":
+        answer = request_serve_profile(profile, owner=owner)
+        if answer is not None and answer.standalone:
+            print("ok|standalone|%d" % owner.pid)
+        elif answer is not None and answer.serves(profile):
+            print("ok|serving|%d" % answer.pid)
+        else:
+            print("ok|not-serving|%d" % owner.pid)
+    else:
+        print("ok|not-serving|%d" % owner.pid)
+except Exception as exc:
+    print("error|%s: %s" % (type(exc).__name__, (str(exc).splitlines() or [""])[0][:120]))
+'
+
+host_gateway_probe() {
+  # host_gateway_probe PROFILE [RESCAN=0|1]
+  local profile="$1" rescan="${2:-0}" launch py out
+  [[ -x "${HERMES_BIN:-}" ]] || { printf 'error|HERMES_BIN is not executable'; return 0; }
+  launch="$("$HERMES_BIN" --print-runtime-command 2>/dev/null | grep -E '^\[' | tail -1)" || launch=""
+  py="$(python3 -I -c 'import json, sys; print(json.loads(sys.stdin.read())[0])' <<<"$launch" 2>/dev/null)" || py=""
+  [[ -n "$py" && -x "$py" ]] \
+    || { printf 'error|cannot resolve the hermes runtime interpreter'; return 0; }
+  out="$(env HERMES_HOME="${HERMES_FLEET_HOME:-$HOME/.hermes}" "$py" -I -c "$HOST_GATEWAY_PROBE_PY" \
+    "$HERMES_AGENT_REPO" "$profile" "$rescan" 2>&1)" || true
+  out="$(grep -E '^(ok|error)\|' <<<"$out" | tail -1)" || out=""
+  printf '%s' "${out:-error|host gateway probe produced no verdict}"
+}
+
+# Polls (with a rescan each time) until the host gateway serves PROFILE. Prints the last
+# verdict; returns 0 only on ok|serving|*.
+host_gateway_wait_serving() {
+  local profile="$1" attempts="${HOST_GATEWAY_SERVE_ATTEMPTS:-4}"
+  local interval="${HOST_GATEWAY_SERVE_INTERVAL_SECONDS:-5}" sample="" n
+  for ((n = 1; n <= attempts; n++)); do
+    sample="$(host_gateway_probe "$profile" 1)"
+    [[ "$sample" == ok\|serving\|* ]] && { printf '%s' "$sample"; return 0; }
+    # An answerless or serve-less owner is retried: the host also rescans on its own every 30s.
+    (( n < attempts )) && sleep "$interval"
+  done
+  printf '%s' "$sample"
+  return 1
+}
+
+# Is PID inside UNIT's process tree? 0 yes, 1 no, 2 cannot tell. MainPID is not enough:
+# the unit's launcher may fork the gateway.
+systemd_unit_contains_pid() {
+  local unit="$1" pid="$2" shown key value main="" cgroup="" procs
+  shown="$(systemctl_user_show "$unit" MainPID ControlGroup)"
+  [[ "$shown" == ok\|* ]] || return 2
+  while IFS='=' read -r key value; do
+    case "$key" in
+      MainPID) main="$value" ;;
+      ControlGroup) cgroup="$value" ;;
+    esac
+  done <<< "${shown#ok|}"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 2
+  [[ "$main" == "$pid" ]] && return 0
+  [[ -n "$cgroup" ]] || return 1          # not running: no cgroup, no processes
+  procs="${SYSTEMD_CGROUP_ROOT:-/sys/fs/cgroup}${cgroup}/cgroup.procs"
+  [[ -r "$procs" ]] || return 2
+  grep -qx "$pid" "$procs" && return 0 || return 1
+}
+
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
 # Prefer the manifest-defined owning project, including non-Git projects.
 # A role's own nested Git repository is not the canonical project binding.

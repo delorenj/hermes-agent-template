@@ -85,7 +85,7 @@ All paths are relative to the repository root.
 | `template/.scripts/lib/ticket-provider.sh` | The adapter dispatcher (`tp`). The engine's only seam to a ticket system. |
 | `template/.scripts/providers/{linear,plane,trello}.sh` | The provider adapters. |
 | `template/.scripts/42-ticket-provider.sh` | Provisioning step that resolves or creates the board. |
-| `template/.scripts/70-systemd.sh` | Provisioning step that installs the profile gateway and board-reconciliation `heartbeat` timer. |
+| `template/.scripts/70-systemd.sh` | Provisioning step that makes the host gateway serve the profile (no per-agent unit, no heartbeat timer) and retires leftover per-agent units. |
 | `install-local.sh` | One-command local install (no cloud, macOS + Linux). |
 | `template/.scripts/heartbeat.sh` | The heartbeat runner: sentinel full-pass dispatch with its own cooldown and lock. |
 | `template/.scripts/sentinel.prompt.md.jinja` | The prompt the runner feeds to Hermes for a full reconciliation pass (rendered to `.scripts/sentinel.prompt.md`). |

@@ -44,7 +44,6 @@ FLEET_REFERENCE_ALLOWLIST = {
     "template/.scripts/05-fleet-env.sh",
     "template/.scripts/30-telegram.sh",
     "template/.scripts/31-slack.sh",
-    "template/.scripts/70-systemd.sh",
     "template/.scripts/80-registry.sh",
     "template/.scripts/99-summary.sh",
     "template/.scripts/_lib.sh",

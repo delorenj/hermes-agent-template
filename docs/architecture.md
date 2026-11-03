@@ -56,20 +56,20 @@ The named profile's `config.yaml` is generated —
 `deep_merge(~/.hermes/config.yaml, <profile>/config.delta.yaml)` — so every line
 in it is either fleet truth or an override someone had to justify in the delta.
 A project-specific `terminal.cwd` is neither, so provisioning never writes one.
-The manual wrapper, the gateway unit, and the credential launcher instead export
+The manual wrapper and the credential launcher instead export
 `TERMINAL_CWD` as a process-local value resolved from the role's Git root.
 
 ## Per-agent gateway route and secret references
 
 `role.yaml` may set `model.name`, `provider`, `base_url`, `api_mode`, and
-`key_env`. The generated systemd gateway launcher translates only those
-non-secret values into explicit `hermes gateway run` flags. Session `/model`
+`key_env`. The manual credential launcher (`.scripts/credential-launch.sh`) translates only those
+non-secret values into explicit `hermes gateway run` flags; the host gateway serving the
+profile reads the same values from the profile config. Session `/model`
 and channel overrides still take precedence. `key_env` is a variable name,
 never a key value.
 
-For systemd user services, an optional encrypted model credential named
-`<agent>-model-api-key.cred` under `~/.config/hermes-agent/credentials/` may be
-loaded with `LoadCredentialEncrypted`. Chat-channel credentials are stored in
+There is no per-agent systemd unit, so no per-agent `LoadCredentialEncrypted`
+model credential is rendered any more. Chat-channel credentials are stored in
 1Password and resolved natively by Hermes from the named profile's
 `secrets.onepassword.env` mapping. Raw chat tokens are forbidden in every
 dotenv file, including ignored `runtime/.env`.
@@ -83,17 +83,44 @@ Hindsight retains only memories/events explicitly written to its bank, while a
 secret manager retains only credentials explicitly stored there; neither is a
 complete runtime backup. See [Operations](operations.md#back-up-and-restore-an-agent).
 
+## One host gateway, no per-agent unit
+
+The fleet runs ONE multiplexed gateway per host (`gateway.multiplex_profiles`): on Linux
+`hermes-gateway.service` (`hermes gateway run`, `HERMES_HOME=~/.hermes`), on macOS the
+LaunchAgent `ai.hermes.gateway`. It serves every profile under `~/.hermes/profiles`, so an
+agent owns no gateway unit and `70-systemd.sh` never writes, enables or starts one on either
+OS. What it does instead, on Linux:
+
+1. Retires leftovers of older templates: the per-profile Bloodbank consumer, the heartbeat
+   timer/service and `hermes-<agent>-gateway.service` (disable, delete the file and its
+   drop-in, `daemon-reload`). A per-agent gateway unit whose process IS the live host gateway
+   (or cannot be proven not to be) is disabled and deleted but never stopped, because stopping
+   it kills every profile's gateway; the step warns loudly and tells the operator to hand the
+   gateway over with `hermes-gateway-restart --reason "..."`.
+2. When `service_state.gateway` should be `active` (a verified channel credential): installs
+   `hermes-gateway.service` through the hermes CLI only if it is missing, starts it only if it
+   is installed but down with nobody holding the host, never restarts a running one, then asks
+   the host to rescan `profiles/` through its control socket
+   (`gateway/host_attach.py` `request_serve_profile`) and records `service_state.gateway active`
+   once the profile is shown served. A gateway that cannot be shown serving it is recorded
+   `error`; with no credential it is `deferred`.
+
+Why: a second `gateway run` for a profile the host already serves refuses ("already serves
+profile ..."), and one that happens to start first becomes the host owner. On 2026-11-02 hiring
+`tolt-pm` enabled a per-agent unit that took over as host gateway for ~45 profiles while the
+canonical `hermes-gateway.service` restart-looped (~975 restarts).
+
 ## Board-reconciliation cadence
 
 There is no per-agent heartbeat timer. One used to run `.scripts/heartbeat.sh`
 about once a minute on every agent; it was retired on 2026-09-17 because the
 reconciliation pass behind it is gated on `role.yaml`'s `reconcile.enabled`,
 true in exactly one repo fleet-wide, so ~20,000 ticks a day fell through to a
-no-op. `70-systemd.sh` now removes any heartbeat unit it finds, and the gateway
-is the only per-agent unit. The three jobs the timer appeared to do are owned
-elsewhere:
+no-op. `70-systemd.sh` now removes any heartbeat unit it finds, and an agent has
+no systemd unit of its own at all (see below). The three jobs the timer appeared
+to do are owned elsewhere:
 
-- **liveness** — the gateway unit's `Restart=on-failure`
+- **liveness** — the host gateway unit's `Restart=always` (`hermes-gateway.service`)
 - **scheduling** — Candybar, the single clock, which fires Bloodbank commands
   and Hermes invocations; krebs pull-subscribes
   `bloodbank.cmd.lifecycle.task.invoke`
@@ -166,7 +193,7 @@ identity:
 - Flume's composer addresses the agent by `display_name`, names the personal
   bank in the SOUL's memory table and lists the recall banks.
 
-The post id never changes when an agent is named, so gateway units, Bloodbank
+The post id never changes when an agent is named, so Bloodbank
 routing, gitlinks and the profile directory are untouched. A named agent that
 moves to another post takes its `identity:` block (and chat bot) to the new
 role.yaml; its personal bank does not move.
