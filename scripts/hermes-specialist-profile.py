@@ -283,8 +283,8 @@ def project(request, check):
         desired = {
             "model.provider": "automaticai",
             "providers.automaticai.enabled": True,
-            "providers.automaticai.api": "https://api.automaticai.io/v1",
-            "providers.automaticai.base_url": "https://api.automaticai.io/v1",
+            "providers.automaticai.api": "https://api-direct.automaticai.io/v1",
+            "providers.automaticai.base_url": "https://api-direct.automaticai.io/v1",
             "providers.automaticai.api_key": "",
             "providers.automaticai.key_cmd": "",
             "providers.automaticai.key_env": "AUTOMATICAI_GATEWAY_KEY",

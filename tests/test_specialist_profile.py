@@ -55,7 +55,7 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     assert yaml.safe_load((profile / "config.delta.yaml").read_text())["skills"]["inherit_global"] is True
     assert json.loads((profile / "specialist-projection.json").read_text())["config"]["skills.inherit_global"] is True
     assert config["model"]["provider"] == "automaticai"
-    assert config["providers"]["automaticai"]["api"] == "https://api.automaticai.io/v1"
+    assert config["providers"]["automaticai"]["api"] == "https://api-direct.automaticai.io/v1"
     assert config["providers"]["automaticai"]["enabled"] is True
     assert config["providers"]["automaticai"]["key_env"] == "AUTOMATICAI_GATEWAY_KEY"
     assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == "op://DeLoSecrets/hermes-specialist/credential"
