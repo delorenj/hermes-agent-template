@@ -59,6 +59,20 @@ since 2026-10-26 the `hermes-single-install-guard` candybar (33GOD/candybar migr
 starts `hermes-single-install-guard.service` every 15 minutes — the `.timer` is retired, never re-enable it (its repo file was deleted 2026-11-03; git is the rollback) —
 and `infra-doctor` watches its `ok` stamp (`~/.cache/hermes-single-install/ok`, probe `hermes-single-install`).
 
+**The guard goes red after the install is rebased.** Rewriting `~/.hermes/hermes-agent` (reset/rebase onto a
+new `delorenj/main`) leaves every registry `git_sha` pointing at a pre-rebase commit, and each one fails as
+"not an ancestor of install HEAD" until it is refreshed. That is what kept the guard failing every run on
+2026-11-03 (37 failures, 17:20–23:45). Repair the pins without relaxing the guard:
+
+```bash
+python3 scripts/repair-rebased-hermes-shas.py          # dry run: old -> new, refuses ambiguous matches
+python3 scripts/repair-rebased-hermes-shas.py --apply  # flock'd, atomic rewrite of agents-registry.yaml
+```
+
+Each stale pin is mapped to the one reachable commit with the same author, author date and subject; anything
+else is refused and the registry is left alone. Whoever rebases the install runs it in the same step. A pin
+that is merely *behind* HEAD is a WARN that the next fleet-sync clears; do not hand-edit pins to silence it.
+
 ## Rules that stay
 
 1. **Never run `hermes update` on big-chungus** (above).
