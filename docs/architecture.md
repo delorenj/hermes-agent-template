@@ -232,9 +232,14 @@ bloodbank:
 ```
 
 The shared gateway subscribes once, resolves `data.target_agent_id` through the
-fleet registry, and routes the turn into that Hermes profile. Each profile's own
-messaging gateway remains independent; there is no per-profile NATS process,
-systemd consumer unit, or filesystem inbox bridge.
+fleet registry, and routes the turn into that Hermes profile. The host's
+`gateway.platforms.bloodbank.enabled` stays `true`; the profile renderer pins
+that transport flag to `false` in every named desk, including
+`fleet-bloodbank-gateway`. This disables duplicate transport ownership, not
+registry routing eligibility or `platform_toolsets.bloodbank`. Messaging
+adapters and the Bloodbank lane all run inside `hermes-gateway.service`;
+there is no per-profile NATS process, systemd consumer unit, or filesystem
+inbox bridge.
 
 No key means enabled. New roles render `bloodbank.enabled: true`, and an
 ABSENT `bloodbank.enabled` in `role.yaml` or in the registry row also means

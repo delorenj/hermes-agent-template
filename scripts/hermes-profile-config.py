@@ -563,12 +563,22 @@ def pin_terminal_cwd(config: dict, profile: str, registry: Path | None = None) -
 # Dotted paths whose generated value the RENDERER owns (derived from the host or the org chart, never
 # from the delta). A consumer that compared config.yaml against a bare deep_merge(base, delta) called
 # every pinned desk "out-of-band drift" and, when it wrote, stripped the pin again (2026-10-18).
-RENDER_PIN_PATHS = ("terminal.cwd", "mcp_servers.codegraph")
+RENDER_PIN_PATHS = ("terminal.cwd", "mcp_servers.codegraph", "gateway.platforms.bloodbank.enabled")
+
+
+def pin_bloodbank_transport(config: dict) -> dict:
+    """Named profiles receive routed turns; only the host owns the shared consumer."""
+    gateway = config.get("gateway")
+    platforms = gateway.get("platforms") if isinstance(gateway, dict) else None
+    bloodbank = platforms.get("bloodbank") if isinstance(platforms, dict) else None
+    if isinstance(bloodbank, dict):
+        bloodbank["enabled"] = False
+    return config
 
 
 def apply_render_pins(config: dict, profile: str, *, registry: Path | None = None) -> dict:
     """Every renderer pin, in render order. Add a new pin HERE and in ``RENDER_PIN_PATHS`` only."""
-    return pin_terminal_cwd(pin_codegraph_root(config), profile, registry)
+    return pin_bloodbank_transport(pin_terminal_cwd(pin_codegraph_root(config), profile, registry))
 
 
 def expected_config(base: dict, delta: dict, profile, *, registry: Path | None = None) -> dict:
