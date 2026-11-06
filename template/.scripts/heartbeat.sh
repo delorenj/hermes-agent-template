@@ -16,7 +16,13 @@ set -euo pipefail
 
 ROLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # agents/hermes/<role>
 RUNTIME="$ROLE_DIR/runtime"
-RUN_HOME="${HERMES_HOME:-$RUNTIME}"
+# The role launcher is the ONE place that knows how to boot this desk: it resolves
+# HERMES_HOME to the NAMED PROFILE (~/.hermes/profiles/<profile>), pins
+# TERMINAL_CWD to the repo root and CODEX_HOME, loads the fleet env, unsets the
+# chat bot tokens and refuses a missing or symlinked profile. Hermes is only ever
+# run through it. (This script used to default HERMES_HOME to runtime/, which is
+# not a Hermes home: a bare run died with "the gateway exited with status 1".)
+ROLE_LAUNCHER="$ROLE_DIR/hermes"
 PROMPT_FILE="$ROLE_DIR/.scripts/sentinel.prompt.md"
 STATE_FILE="$RUNTIME/continuous-ticket-sentinel-state.json"
 LOCK_FILE="$RUNTIME/continuous-ticket-sentinel.lock"
@@ -35,15 +41,23 @@ fi
 builtin source "$FLEET_ENV_LIBRARY"
 load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER"
 
-# Hermes binary: explicit env > ~/.config/hermes-agent/hermes-bin > PATH.
-HERMES_BIN="${HERMES_BIN:-${HERMES_FLEET_BIN:-}}"
-if [[ -z "$HERMES_BIN" ]]; then
-  if [[ -r "$HOME/.config/hermes-agent/hermes-bin" ]]; then
-    HERMES_BIN="$(cat "$HOME/.config/hermes-agent/hermes-bin")"
-  else
-    HERMES_BIN="$(command -v hermes || echo hermes)"
-  fi
-fi
+# The Hermes binary is the launcher's business too (HERMES_BIN > fleet.env >
+# config.toml > the shared install); a caller's HERMES_BIN still wins there.
+
+# Session source for the pass. `hermes chat --source` takes only a LOCAL creation
+# surface (cli, tui, gui, acp, tool, oneshot): `cron` is a label the profile
+# scheduler stamps on its own admitted runs (gateway/session_cron.py, hermes
+# `cron run`), so a client-created session tagged `cron` is refused by the state
+# store with "invalid_params". This pass is a deliberate machine-paced run, not a
+# scheduler fire, so it is a `tool` session: hidden from the human session pickers.
+SESSION_SOURCE="${SENTINEL_SESSION_SOURCE:-tool}"
+case "$SESSION_SOURCE" in
+  cli|tui|gui|acp|tool|oneshot) ;;
+  *)
+    printf 'heartbeat: SENTINEL_SESSION_SOURCE=%s is not a creatable Hermes session source (cli|tui|gui|acp|tool|oneshot; "cron" is scheduler-owned)\n' "$SESSION_SOURCE" >&2
+    exit 2
+    ;;
+esac
 
 ACTIVE_MAX_IDLE_SECONDS="${SENTINEL_ACTIVE_MAX_IDLE_SECONDS:-600}"
 FULL_RUN_COOLDOWN_SECONDS="${SENTINEL_FULL_RUN_COOLDOWN_SECONDS:-300}"
@@ -121,6 +135,12 @@ if [[ "$(reconcile_enabled)" != "true" ]]; then
   exit 0
 fi
 
+if [[ ! -x "$ROLE_LAUNCHER" || -d "$ROLE_LAUNCHER" ]]; then
+  printf 'heartbeat: role launcher %s is missing or not executable\n' "$ROLE_LAUNCHER" >&2
+  printf '  fix: flume remediate hermes.pm-scaffold <repo> (rewrites the hermes launcher)\n' >&2
+  exit 1
+fi
+
 decision="$(
   python3 - "$STATE_FILE" "$ACTIVE_MAX_IDLE_SECONDS" "$FULL_RUN_COOLDOWN_SECONDS" "$BLOCKED_FULL_RUN_COOLDOWN_SECONDS" <<'PYEOF'
 import json, subprocess, sys, time
@@ -196,19 +216,39 @@ tmp = path.with_suffix(path.suffix + ".tmp"); tmp.write_text(json.dumps(state, i
 PYEOF
 
 # Board-driver lease (momo E2/S2.3; not a WIP limit): serializes short board
-# selection/transition passes. Don't full-drive if the human-drivable Momo holds
-# it — it's driving the same board right now. A crashed holder's lease expires
-# (ttl) so the board is never wedged. Release on any exit.
+# selection/transition passes. Don't full-drive if the human-drivable Momo (or any
+# other owner) holds it fresh — it's driving the same board right now. A crashed
+# holder's lease expires (ttl) so the board is never wedged. Release on any exit.
+#
+# THIS LAUNCHER HOLDS THE LEASE FOR THE AGENT. It tells the agent so (env + a
+# literal section appended to the prompt) because the PM's SOUL says "acquire
+# before driving": under a fresh owner name that acquire is refused by this very
+# lease, and the PM concluded a sibling pass was running and backed off, zero
+# dispatch. The agent's rule is: the lease is yours, refresh/release it with this
+# exact owner, never re-acquire under another name; only a different owner means
+# back off. Acquire is reentrant only for the identical owner string.
 WIP_LOCK="$RUNTIME/wip-driver.lock"
-if ! python3 "$ROLE_DIR/.scripts/momo-wip-lock.py" acquire "$WIP_LOCK" "hermes:$AGENT_ID" --ttl 3600 >/dev/null 2>&1; then
-  printf '[heartbeat] board-driver lease held by Momo — skipping full reconcile pass this tick\n'
+LEASE_OWNER="hermes:$AGENT_ID"
+LEASE_TTL=3600
+LEASE_CLI="$ROLE_DIR/.scripts/momo-wip-lock.py"
+if ! lease_out="$(python3 "$LEASE_CLI" acquire "$WIP_LOCK" "$LEASE_OWNER" --ttl "$LEASE_TTL" 2>&1)"; then
+  printf '[heartbeat] board-driver lease not ours (%s) — skipping full reconcile pass this tick\n' "$lease_out"
   exit 0
 fi
-trap 'python3 "$ROLE_DIR/.scripts/momo-wip-lock.py" release "$WIP_LOCK" "hermes:$AGENT_ID" >/dev/null 2>&1 || true' EXIT
+trap 'python3 "$LEASE_CLI" release "$WIP_LOCK" "$LEASE_OWNER" >/dev/null 2>&1 || true' EXIT
+export HERMES_BOARD_LEASE_PATH="$WIP_LOCK" HERMES_BOARD_LEASE_OWNER="$LEASE_OWNER" HERMES_BOARD_LEASE_TTL="$LEASE_TTL"
 
 prompt="$(<"$PROMPT_FILE")"
+prompt+=$'\n\n## Board-driver lease for THIS pass (already held for you)\n\n'
+prompt+="The launcher that started this pass already acquired the board-driver lease for you, as owner \`$LEASE_OWNER\` (ttl ${LEASE_TTL}s). It is YOURS. Do not acquire it again: any other owner string is refused by your own lease, which is not a sibling pass. Use that exact owner:"$'\n\n'
+prompt+="\`\`\`bash"$'\n'
+prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py held    $WIP_LOCK $LEASE_OWNER   # 0 = still yours"$'\n'
+prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py refresh $WIP_LOCK $LEASE_OWNER   # during a long board pass"$'\n'
+prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py release $WIP_LOCK $LEASE_OWNER   # before waiting on workers"$'\n'
+prompt+="\`\`\`"$'\n\n'
+prompt+="(The same values are exported as HERMES_BOARD_LEASE_PATH / HERMES_BOARD_LEASE_OWNER; with the owner omitted the script reads it from the env.) Back off only if the lease is held fresh by an owner that is NOT \`$LEASE_OWNER\` (Momo, another agent). Releasing it early is fine; the launcher's own release at exit is then a no-op."$'\n'
 set +e
-env HERMES_HOME="$RUN_HOME" "$HERMES_BIN" chat -Q --source cron --max-turns 90 -q "$prompt"
+"$ROLE_LAUNCHER" chat -Q --source "$SESSION_SOURCE" --max-turns 90 -q "$prompt"
 status=$?
 set -e
 

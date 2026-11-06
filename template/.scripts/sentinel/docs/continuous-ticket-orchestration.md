@@ -16,6 +16,15 @@ with a `--blocks` relation instead of run blind in parallel. The short
 board-driver lease (`momo-wip-lock.py`) is not a WIP limit; it only serializes
 board selection/transition passes. Release it before waiting on a worker.
 
+When `heartbeat.sh` starts the pass it has already acquired that lease for the
+agent as owner `hermes:<agent_id>` and says so (`HERMES_BOARD_LEASE_PATH`,
+`HERMES_BOARD_LEASE_OWNER`, and a section appended to the prompt). The lease is
+then the agent's own: check/refresh/release it with that exact owner and never
+re-acquire it under a new name, because acquire is reentrant only for the
+identical owner string and the agent's own lease would otherwise refuse it. An
+agent acquiring with no launcher uses exactly `hermes:<agent_id>`. Back off only
+when the lease is held fresh by a different owner (`momo`, another agent).
+
 The sentinel owns the watch loop. Workers (codex, opencode, copilot, …) own
 implementation. The sentinel clears review-lane work via the autonomous
 adversarial review (act, do not wait) protocol

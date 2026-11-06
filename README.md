@@ -297,7 +297,7 @@ enabled = false                # enable only after a proven terminal invocation
 
 [candybar.runner]
 kind = "exec"
-argv = ["/usr/bin/env", "HERMES_HOME=/home/<user>/.hermes/profiles/<profile>", "/abs/path/agents/hermes/pm/.scripts/heartbeat.sh"]
+argv = ["/abs/path/agents/hermes/pm/.scripts/heartbeat.sh"]   # resolves the named profile itself, via the role launcher
 timeout_s = 900
 ```
 

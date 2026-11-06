@@ -207,14 +207,24 @@ it guarded is gated on `role.yaml`'s `reconcile.enabled`, which was true in one
 repo fleet-wide, so the other ~20,000 ticks a day did nothing at all.
 
 The runner is unchanged and still the entrypoint — it is invoked rather than
-timed. Give it the named profile; left to itself it falls back to the raw
-runtime directory, which is the topology the singleton contract exists to
-prevent:
+timed. It runs Hermes only through the role launcher (`agents/hermes/<role>/hermes`),
+which resolves `HERMES_HOME` to the named profile, pins `TERMINAL_CWD` and
+`CODEX_HOME` and refuses a missing or symlinked profile, so a bare invocation is
+enough and a caller's `HERMES_HOME` is ignored:
 
 ```bash
-# <profile> is the `profile:` field in agents/hermes/pm/role.yaml.
-HERMES_HOME="$HOME/.hermes/profiles/<profile>" agents/hermes/pm/.scripts/heartbeat.sh
+bash agents/hermes/pm/.scripts/heartbeat.sh
 ```
+
+The pass is a `--source tool` session (`SENTINEL_SESSION_SOURCE` overrides it with
+another creatable source: `cli|tui|gui|acp|tool|oneshot`). `cron` is refused: it is
+the label the profile scheduler stamps on its own admitted runs, and the state store
+rejects a client-created session carrying it (`invalid_params`).
+
+The runner also holds the board-driver lease for the agent (owner
+`hermes:<agent_id>`) and hands it over through `HERMES_BOARD_LEASE_PATH` /
+`HERMES_BOARD_LEASE_OWNER` and a prompt section: see
+`.scripts/sentinel/docs/continuous-ticket-orchestration.md`.
 
 `.scripts/credential-launch.sh heartbeat` does the same thing plus the encrypted
 model credential, and needs `HERMES_BIN` exported; that is the path the units

@@ -675,6 +675,14 @@ def test_real_rendered_heartbeat_uses_fleet_selected_hermes(tmp_path: Path) -> N
     subprocess.run(["git", "init", "--quiet"], cwd=project, check=True)
     shutil.copytree(TEMPLATE / ".scripts", role / ".scripts")
     (role / ".scripts" / "sentinel.prompt.md").write_text("fixture prompt\n", encoding="utf-8")
+    # The pass runs Hermes through the role launcher, which needs the named profile desk.
+    (home / ".hermes" / "profiles" / "heartbeat-fixture-pm").mkdir(parents=True)
+    launcher = role / "hermes"
+    launcher.write_text(
+        (TEMPLATE / "hermes.jinja").read_text(encoding="utf-8").replace("{{ agent_id }}", "heartbeat-fixture-pm"),
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
     (role / "role.yaml").write_text(
         "repo: heartbeat-fixture\n"
         "role: pm\n"
@@ -693,7 +701,7 @@ def test_real_rendered_heartbeat_uses_fleet_selected_hermes(tmp_path: Path) -> N
     )
     fake_hermes.chmod(0o755)
     fleet = home / ".hermes" / "fleet.env"
-    fleet.parent.mkdir(parents=True)
+    fleet.parent.mkdir(parents=True, exist_ok=True)
     fleet.write_text(
         "HERMES_FLEET_BIN=$'" + str(fake_hermes).replace("'", "\\'") + "'\n",
         encoding="utf-8",

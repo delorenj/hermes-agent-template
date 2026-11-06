@@ -21,6 +21,21 @@ Owners are free strings by convention: "momo" (interactive) or
 "hermes:<agent_id>" (the sentinel). There is one board-driver lease per
 runtime.
 
+Reentrancy: acquire is reentrant ONLY for the identical owner string. So a pass
+must never invent a fresh owner name (e.g. "hermes:<agent_id>:sentinel-<stamp>")
+while a wrapper already holds the lease for the agent: the lease is then HELD by
+"someone else" (really: yourself) and the pass backs off for nothing. The rules:
+  * A launcher (heartbeat.sh) that acquires the lease FOR the agent exports
+    HERMES_BOARD_LEASE_PATH, HERMES_BOARD_LEASE_OWNER and HERMES_BOARD_LEASE_TTL.
+    That lease is the agent's: refresh/release it with that exact owner, never
+    re-acquire under another name. `owner` may be omitted on acquire, refresh,
+    release and held; it then defaults to $HERMES_BOARD_LEASE_OWNER.
+  * An agent acquiring on its own (no launcher) uses exactly "hermes:<agent_id>"
+    so a later acquire/refresh from the same agent is reentrant.
+  * Only a fresh lease whose owner is NOT you (momo, another agent) means back off.
+A reentrant acquire keeps the existing ttl unless --ttl is given, so a wrapper's
+long pass lease is never shortened by the agent re-asserting it.
+
 Protocol:
   * Driver start:  acquire <lock> <me>   -> exit 0 → drive; exit 1 → HELD, back off.
   * While driving: refresh <lock> <me>   periodically (< ttl) so the lease stays fresh.
@@ -32,10 +47,15 @@ Commands (exit 0 = you hold it; 1 = someone else holds it fresh; 2 = usage/error
   acquire <lockfile> <owner> [--ttl S] [--steal]
   refresh <lockfile> <owner>
   release <lockfile> <owner>
+  held    <lockfile> [owner]             # exit 0 only if <owner> holds it fresh (yours); else 1
   status  <lockfile>                     # always exit 0
 """
 from __future__ import annotations
 import argparse, fcntl, json, os, socket, sys, tempfile, time
+
+
+DEFAULT_TTL = 300
+OWNER_ENV = "HERMES_BOARD_LEASE_OWNER"
 
 
 def _read(path: str):
@@ -65,17 +85,20 @@ def _guard(lockfile: str):
     return g
 
 
-def acquire(lockfile: str, owner: str, ttl: int, steal: bool) -> int:
+def acquire(lockfile: str, owner: str, ttl: int | None, steal: bool) -> int:
     now = time.time(); g = _guard(lockfile)
     try:
         cur = _read(lockfile)
         if cur and cur.get("owner") != owner and _fresh(cur, now) and not steal:
             print(f"HELD by {cur['owner']} (fresh, {int(now - cur['heartbeat_at'])}s ago) — back off")
             return 1
-        started = cur["started_at"] if (cur and cur.get("owner") == owner and "started_at" in cur) else now
+        mine = bool(cur) and cur.get("owner") == owner
+        started = cur["started_at"] if (mine and "started_at" in cur) else now
+        # Reentrant acquire keeps the lease's own ttl unless one is asked for.
+        eff_ttl = ttl if ttl is not None else (cur.get("ttl", DEFAULT_TTL) if mine else DEFAULT_TTL)
         _write_atomic(lockfile, {
             "owner": owner, "pid": os.getpid(), "host": socket.gethostname(),
-            "started_at": started, "heartbeat_at": now, "ttl": ttl,
+            "started_at": started, "heartbeat_at": now, "ttl": eff_ttl,
         })
         print(f"ACQUIRED by {owner}" + (" (stole stale lease)" if (cur and cur.get('owner') != owner) else ""))
         return 0
@@ -111,6 +134,17 @@ def release(lockfile: str, owner: str) -> int:
         fcntl.flock(g, fcntl.LOCK_UN); g.close()
 
 
+def held(lockfile: str, owner: str) -> int:
+    """0 = `owner` holds a fresh lease (it is yours: refresh/release it, never
+    re-acquire under another name); 1 = free, stale, or held by someone else."""
+    now = time.time(); cur = _read(lockfile)
+    if cur and cur.get("owner") == owner and _fresh(cur, now):
+        print(f"HELD BY YOU ({owner}) — fresh, {int(now - cur['heartbeat_at'])}s ago"); return 0
+    if cur and _fresh(cur, now):
+        print(f"HELD by {cur['owner']} (fresh) — not you ({owner}); back off"); return 1
+    print("NOT HELD (free or stale)"); return 1
+
+
 def status(lockfile: str) -> int:
     now = time.time(); cur = _read(lockfile)
     if not cur:
@@ -123,20 +157,25 @@ def status(lockfile: str) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("cmd", choices=["acquire", "refresh", "release", "status"])
+    ap.add_argument("cmd", choices=["acquire", "refresh", "release", "held", "status"])
     ap.add_argument("lockfile")
     ap.add_argument("owner", nargs="?")
-    ap.add_argument("--ttl", type=int, default=300, help="freshness window in seconds (default 300)")
+    ap.add_argument("--ttl", type=int, default=None,
+                    help=f"freshness window in seconds (default {DEFAULT_TTL}; a reentrant acquire keeps the lease's own)")
     ap.add_argument("--steal", action="store_true", help="take an explicitly stale lease immediately")
     a = ap.parse_args()
-    if a.cmd in ("acquire", "refresh", "release") and not a.owner:
-        print("owner required", file=sys.stderr); return 2
+    if a.cmd in ("acquire", "refresh", "release", "held") and not a.owner:
+        a.owner = os.environ.get(OWNER_ENV) or None
+    if a.cmd in ("acquire", "refresh", "release", "held") and not a.owner:
+        print(f"owner required (or export {OWNER_ENV})", file=sys.stderr); return 2
     if a.cmd == "acquire":
         return acquire(a.lockfile, a.owner, a.ttl, a.steal)
     if a.cmd == "refresh":
         return refresh(a.lockfile, a.owner)
     if a.cmd == "release":
         return release(a.lockfile, a.owner)
+    if a.cmd == "held":
+        return held(a.lockfile, a.owner)
     return status(a.lockfile)
 
 

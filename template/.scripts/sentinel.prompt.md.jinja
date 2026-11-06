@@ -36,6 +36,29 @@ tp create_issue "<title>" "<desc>"    # file a NEW ticket; --if-absent to dedupe
 Reason in **normalized states**, not provider terms. This pass works identically
 on Linear, Plane, or Trello.
 
+## Board-driver lease — yours if the launcher holds it
+
+The board-driver lease (`.scripts/momo-wip-lock.py`, `runtime/wip-driver.lock`) is
+a short board-write serializer, **not** a WIP limit. It exists so you and the
+human-drivable Momo never write the board in the same instant. One rule decides
+everything: **only an owner that is not you means back off.**
+
+- **The launcher already holds it for you** when this prompt ends with a
+  "Board-driver lease for THIS pass" section, or `HERMES_BOARD_LEASE_OWNER` /
+  `HERMES_BOARD_LEASE_PATH` are set. Then it is yours: check it with
+  `momo-wip-lock.py held <path> <owner>`, `refresh` it during a long pass and
+  `release` it before waiting on workers, always with **that exact owner**.
+  **Never re-acquire it under a new name** (`hermes:{{ agent_id }}:sentinel-...`,
+  a session id, a timestamp): your own lease would refuse you, and "held by
+  `hermes:{{ agent_id }}`" is you, never a sibling pass. Backing off from your own
+  lease dispatches nothing.
+- **No launcher** (a Bloodbank or manual turn)? Acquire with exactly
+  `hermes:{{ agent_id }}` (`acquire <lockfile> hermes:{{ agent_id }} --ttl 3600`),
+  so a second acquire or refresh from you is reentrant.
+- **Back off** (read-only pass, no dispatch) only when the lease is held fresh by
+  a different owner: `momo`, or another agent's `hermes:<other-id>`. Momo must
+  always be able to make you stand down.
+
 ## Pass
 
 **Trigger.** This pass runs both as a scheduled reconcile (`.scripts/heartbeat.sh`;
