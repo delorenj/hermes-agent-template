@@ -377,6 +377,7 @@ def test_list_issues_marks_exact_current_cycle_membership(tmp_path: Path) -> Non
         tmp_path,
         responses=[
             response("GET", "/states/", states),
+            response("GET", "/labels/", {"results": []}),
             response("GET", "/issues/", issues),
             response("GET", "/cycles/", cycles),
             response("GET", "/cycles/current-cycle/cycle-issues/", {"results": [issues["results"][0]]}),
@@ -488,6 +489,7 @@ def test_list_issues_paginates_every_plane_page(tmp_path: Path) -> None:
                 "/states/",
                 {"results": [{"id": "todo-state", "name": "Todo", "group": "unstarted"}]},
             ),
+            response("GET", "/labels/", {"results": []}),
             response(
                 "GET",
                 "/issues/",
