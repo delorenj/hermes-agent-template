@@ -7,8 +7,8 @@ Three bugs found 2026-11-06 while kicking off parked TOLT tickets:
    status 1". The pass must run through the role launcher, which resolves the named profile.
 2. It ran ``hermes chat --source cron``. ``cron`` is the label the profile scheduler stamps on its
    own admitted runs; a client-created session carrying it is refused by the state store
-   (``invalid_params``). A finite ``chat -q`` pass is a ``oneshot`` session (hidden from the human
-   pickers, still in the agent's own ``session_search``, unlike ``tool``).
+   (``invalid_params``). The pass runs as ``tool``: a ``oneshot`` session caps delegation at
+   ``delegation.oneshot_max_children`` (default 2), a hidden per-pass WIP limit.
 3. It acquired ``runtime/wip-driver.lock`` as ``hermes:<agent_id>`` and the PM, told by its SOUL to
    "acquire before driving", acquired under a different owner string, was refused by its own
    launcher's fresh lease, concluded a sibling pass was running and dispatched nothing. A single pass
@@ -230,7 +230,7 @@ def test_missing_launcher_is_refused_before_any_state_is_written(tmp_path: Path)
 # --- bug 2: the session source -------------------------------------------------------------------
 
 
-def test_pass_runs_as_a_oneshot_session_never_cron(tmp_path: Path) -> None:
+def test_pass_runs_as_a_tool_session_never_cron_or_oneshot(tmp_path: Path) -> None:
     role, _runtime, _profile, _project, env = _desk(tmp_path)
 
     result = _heartbeat(role, env)
@@ -238,19 +238,19 @@ def test_pass_runs_as_a_oneshot_session_never_cron(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     argv = _marker(env)["argv"]
     assert argv[0] == "chat" and "-Q" in argv
-    # oneshot, not tool: tool sessions are hidden from the agent's own session_search.
-    assert argv[argv.index("--source") + 1] == "oneshot"
+    # tool, not oneshot: oneshot caps the pass at delegation.oneshot_max_children (2) workers.
+    assert argv[argv.index("--source") + 1] == "tool"
     assert "cron" not in argv[: argv.index("-q")]
     assert argv[argv.index("--max-turns") + 1] == "90"
 
 
 def test_session_source_can_be_overridden_to_another_creatable_source(tmp_path: Path) -> None:
     role, _runtime, _profile, _project, env = _desk(tmp_path)
-    env["SENTINEL_SESSION_SOURCE"] = "tool"
+    env["SENTINEL_SESSION_SOURCE"] = "oneshot"
 
     assert _heartbeat(role, env).returncode == 0
     argv = _marker(env)["argv"]
-    assert argv[argv.index("--source") + 1] == "tool"
+    assert argv[argv.index("--source") + 1] == "oneshot"
 
 
 @pytest.mark.parametrize("bad", ["cron", "kanban", "telegram"])

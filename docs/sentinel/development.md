@@ -218,11 +218,12 @@ cannot point this desk's prompt and lease at another profile:
 bash agents/hermes/pm/.scripts/heartbeat.sh
 ```
 
-The pass is a `--source oneshot` session, the label Hermes gives a finite `chat -q`
-run: hidden from the human session pickers but still in the PM's own
-`session_search` (`tool`, the third-party integration label, is hidden from that
-too). `SENTINEL_SESSION_SOURCE` overrides it with another creatable source:
-`cli|tui|gui|acp|tool|oneshot`. `cron` is refused: it is the label the profile
+The pass is a `--source tool` session, the label for machine-paced integrations
+(hidden from the session pickers and from `session_search`; the pass report and
+state file are the record). Not `oneshot`: Hermes caps a oneshot session at
+`delegation.oneshot_max_children` subagents (default 2), which would be a hidden
+two-workers-per-pass WIP limit. `SENTINEL_SESSION_SOURCE` overrides it with another
+creatable source: `cli|tui|gui|acp|tool|oneshot`. `cron` is refused: it is the label the profile
 scheduler stamps on its own admitted runs, and the state store rejects a
 client-created session carrying it (`invalid_params`).
 
