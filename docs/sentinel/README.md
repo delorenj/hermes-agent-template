@@ -10,8 +10,8 @@ human) can pick up the work without prior context.
 ## What the heartbeat sentinel is
 
 The sentinel is the PM's continuous board-reconciliation loop, and its job is to
-keep a project moving: it makes sure exactly one implementation worker is
-advancing a ready ticket, or it records why none can. When a ticket reaches the
+keep a project moving: it makes sure every ready ticket has an implementation
+worker advancing it (in parallel), or it records why not. When a ticket reaches the
 review lane, it runs an independent, rigorous **adversarial review** and acts on
 the verdict autonomously — never parking work to wait on the operator. If the
 work hasn't drifted from the operator's locked intent and clears the gate, the

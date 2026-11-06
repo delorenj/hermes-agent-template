@@ -33,8 +33,6 @@ The sentinel reads the work-state file,
 `runtime/continuous-ticket-sentinel-state.json`, and chooses one of these
 decisions:
 
-- `skip:active-worker`: a healthy worker process is already moving the active
-  ticket, so there's nothing to do.
 - `skip:cooldown`: a full pass ran too recently (within
   `SENTINEL_FULL_RUN_COOLDOWN_SECONDS`, default 300).
 - `skip:blocker-cooldown`: the project is blocked and a full pass ran within
@@ -44,8 +42,7 @@ decisions:
 
 A full pass runs `hermes chat` with the rendered prompt,
 `sentinel.prompt.md`. The prompt tells the agent to reconcile
-the board, the local evidence, and live worker state, then either delegate one
-worker, monitor the active worker, run an autonomous adversarial review, or
+the board, the local evidence, and live worker state, then delegate a worker for every ready ticket, monitor the active workers, run an autonomous adversarial review, or
 record a blocker. A pass never ends in a "looks good, waiting on the operator"
 state: the adversarial review acts on its own verdict.
 
@@ -180,7 +177,7 @@ A full pass moves through these components in order:
    the prompt.
 3. The agent reads the runtime protocol docs and reconciles state by calling
    `tp` (the adapter) for board data.
-4. The agent delegates a worker, monitors one, records a blocker, or runs an
+4. The agent delegates workers, monitors them, records a blocker, or runs an
    autonomous adversarial review.
 5. An adversarial review runs the enforcement tools in `.scripts/sentinel/bin/`,
    which render an `accepted` or `held` verdict and emit a decision event; the
