@@ -17,22 +17,29 @@ the check-and-set so two acquirers can't race. A lease is respected while its
 heartbeat is fresh (now - heartbeat_at < ttl); a stale lease (holder died without
 releasing) can be stolen after it expires.
 
-Owners are free strings by convention: "momo" (interactive) or
-"hermes:<agent_id>" (the sentinel). There is one board-driver lease per
-runtime.
+Owners are free strings by convention: "momo" (interactive), "claude:<job>" (a
+wrapper job) or "hermes:<agent_id>:<pass-or-turn tag>" (a Hermes agent). ONE owner
+string per driving pass or turn, unique to it: two passes of the same agent (a
+heartbeat pass and a Telegram/Bloodbank turn) are two drivers and must serialize,
+so they never share the bare "hermes:<agent_id>". There is one board-driver lease
+per runtime.
 
 Reentrancy: acquire is reentrant ONLY for the identical owner string. So a pass
-must never invent a fresh owner name (e.g. "hermes:<agent_id>:sentinel-<stamp>")
-while a wrapper already holds the lease for the agent: the lease is then HELD by
-"someone else" (really: yourself) and the pass backs off for nothing. The rules:
-  * A launcher (heartbeat.sh) that acquires the lease FOR the agent exports
-    HERMES_BOARD_LEASE_PATH, HERMES_BOARD_LEASE_OWNER and HERMES_BOARD_LEASE_TTL.
-    That lease is the agent's: refresh/release it with that exact owner, never
-    re-acquire under another name. `owner` may be omitted on acquire, refresh,
-    release and held; it then defaults to $HERMES_BOARD_LEASE_OWNER.
-  * An agent acquiring on its own (no launcher) uses exactly "hermes:<agent_id>"
-    so a later acquire/refresh from the same agent is reentrant.
-  * Only a fresh lease whose owner is NOT you (momo, another agent) means back off.
+must never invent a fresh owner name while a wrapper already holds the lease for
+it: the lease is then HELD by "someone else" (really: yourself) and the pass backs
+off for nothing. The rules:
+  * A launcher (heartbeat.sh) that acquires the lease FOR the agent hands it the
+    exact owner in the prompt (and exports HERMES_BOARD_LEASE_PATH/_OWNER/_TTL for
+    its own child scripts; a gateway-run session's terminal never sees them). That
+    lease is the agent's: held/refresh/release, and re-acquire after an early
+    release, with that exact owner, never under another name. `owner` may be
+    omitted on acquire, refresh, release and held; it then defaults to
+    $HERMES_BOARD_LEASE_OWNER when that is set.
+  * An agent acquiring on its own (no launcher) picks one owner for the turn,
+    "hermes:<agent_id>:<turn tag>", writes it out literally and reuses that exact
+    string, so its own re-acquire/refresh is reentrant. It never regenerates it.
+  * Any other fresh owner (momo, a job, another agent, another pass of your own
+    desk) is another driver: back off.
 A reentrant acquire keeps the existing ttl unless --ttl is given, so a wrapper's
 long pass lease is never shortened by the agent re-asserting it.
 

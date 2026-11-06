@@ -210,20 +210,28 @@ The runner is unchanged and still the entrypoint — it is invoked rather than
 timed. It runs Hermes only through the role launcher (`agents/hermes/<role>/hermes`),
 which resolves `HERMES_HOME` to the named profile, pins `TERMINAL_CWD` and
 `CODEX_HOME` and refuses a missing or symlinked profile, so a bare invocation is
-enough and a caller's `HERMES_HOME` is ignored:
+enough and a caller's `HERMES_HOME` is ignored. The profile it boots is role.yaml's
+`profile:` (pinned as `HERMES_PROFILE_NAME`), so a caller's `HERMES_PROFILE_NAME`
+cannot point this desk's prompt and lease at another profile:
 
 ```bash
 bash agents/hermes/pm/.scripts/heartbeat.sh
 ```
 
-The pass is a `--source tool` session (`SENTINEL_SESSION_SOURCE` overrides it with
-another creatable source: `cli|tui|gui|acp|tool|oneshot`). `cron` is refused: it is
-the label the profile scheduler stamps on its own admitted runs, and the state store
-rejects a client-created session carrying it (`invalid_params`).
+The pass is a `--source oneshot` session, the label Hermes gives a finite `chat -q`
+run: hidden from the human session pickers but still in the PM's own
+`session_search` (`tool`, the third-party integration label, is hidden from that
+too). `SENTINEL_SESSION_SOURCE` overrides it with another creatable source:
+`cli|tui|gui|acp|tool|oneshot`. `cron` is refused: it is the label the profile
+scheduler stamps on its own admitted runs, and the state store rejects a
+client-created session carrying it (`invalid_params`).
 
-The runner also holds the board-driver lease for the agent (owner
-`hermes:<agent_id>`) and hands it over through `HERMES_BOARD_LEASE_PATH` /
-`HERMES_BOARD_LEASE_OWNER` and a prompt section: see
+The runner also holds the board-driver lease for the agent under a per-pass owner
+(`hermes:<agent_id>:pass-<utc>-<pid>`, never the bare `hermes:<agent_id>`, so a
+concurrent gateway turn of the same agent serializes with it) and hands that owner
+over in a section appended to the prompt. `HERMES_BOARD_LEASE_PATH` /
+`_OWNER` / `_TTL` are exported only for the runner's direct children: a gateway
+session's terminal never sees a client's `HERMES_*` names. See
 `.scripts/sentinel/docs/continuous-ticket-orchestration.md`.
 
 `.scripts/credential-launch.sh heartbeat` does the same thing plus the encrypted

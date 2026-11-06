@@ -49,8 +49,12 @@ load_fleet_environment "$FLEET_ENV" "$FLEET_ENV_PARSER"
 # scheduler stamps on its own admitted runs (gateway/session_cron.py, hermes
 # `cron run`), so a client-created session tagged `cron` is refused by the state
 # store with "invalid_params". This pass is a deliberate machine-paced run, not a
-# scheduler fire, so it is a `tool` session: hidden from the human session pickers.
-SESSION_SOURCE="${SENTINEL_SESSION_SOURCE:-tool}"
+# scheduler fire. It is a finite `chat -q` run, which Hermes stores as `oneshot`
+# (gateway/session_policy.py SURFACES, hermes_cli/gateway_chat.py): hidden from
+# the human session pickers, but still in the agent's own `session_search`, so the
+# PM can later answer "what did your last board pass do?". (`tool` is for
+# third-party integrations and is hidden from session_search too.)
+SESSION_SOURCE="${SENTINEL_SESSION_SOURCE:-oneshot}"
 case "$SESSION_SOURCE" in
   cli|tui|gui|acp|tool|oneshot) ;;
   *)
@@ -85,6 +89,12 @@ reconcile_enabled() {
 }
 
 AGENT_ID="$(yaml_get agent_id)"
+# The desk this pass boots, from the same role.yaml the lease owner and prompt come
+# from (credential-launch.sh reads the same key). The launcher would otherwise take
+# a caller's HERMES_PROFILE_NAME (a Kanban worker pins its own), and another
+# profile would drive this board under this agent's lease and prompt.
+PROFILE_NAME="$(yaml_get profile)"
+PROFILE_NAME="${PROFILE_NAME:-$AGENT_ID}"
 REPO_NAME="$(yaml_get repo)"
 PROVIDER="$(yaml_get ticket_provider.name)"
 
@@ -220,35 +230,52 @@ PYEOF
 # other owner) holds it fresh — it's driving the same board right now. A crashed
 # holder's lease expires (ttl) so the board is never wedged. Release on any exit.
 #
-# THIS LAUNCHER HOLDS THE LEASE FOR THE AGENT. It tells the agent so (env + a
-# literal section appended to the prompt) because the PM's SOUL says "acquire
-# before driving": under a fresh owner name that acquire is refused by this very
-# lease, and the PM concluded a sibling pass was running and backed off, zero
-# dispatch. The agent's rule is: the lease is yours, refresh/release it with this
-# exact owner, never re-acquire under another name; only a different owner means
-# back off. Acquire is reentrant only for the identical owner string.
+# THIS LAUNCHER HOLDS THE LEASE FOR THE AGENT. It tells the agent so (a literal
+# section appended to the prompt) because the PM's SOUL says "acquire before
+# driving": under a fresh owner name that acquire is refused by this very lease,
+# and the PM concluded a sibling pass was running and backed off, zero dispatch.
+# The agent's rule is: the lease is yours, refresh/release (and, after an early
+# release, re-acquire) it with this exact owner, never under another name; only a
+# different owner means back off. Acquire is reentrant only for the identical
+# owner string.
+#
+# The owner is unique PER PASS (hermes:<agent_id>:pass-<utc>-<pid>), never the bare
+# hermes:<agent_id>: a gateway turn of this same agent (Telegram, a Bloodbank or
+# Momo-crank delegation) is a different driver and acquires under its own unique
+# owner. A shared owner string would make both acquires "reentrant", two drivers
+# would write the board at once, and the first release would drop the lease out
+# from under the other. With one owner per pass they serialize like any two
+# drivers, and the exit trap below can only release this pass's own lease.
+#
+# The handoff is the prompt section. HERMES_BOARD_LEASE_* are exported too, but only
+# for scripts this process runs directly: `hermes chat` is a client of the host
+# gateway, which runs the PM's tools, and a client's HERMES_* names never reach
+# that session's terminal (agent/session_client_env.py).
 WIP_LOCK="$RUNTIME/wip-driver.lock"
-LEASE_OWNER="hermes:$AGENT_ID"
+LEASE_OWNER="hermes:$AGENT_ID:pass-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 LEASE_TTL=3600
 LEASE_CLI="$ROLE_DIR/.scripts/momo-wip-lock.py"
 if ! lease_out="$(python3 "$LEASE_CLI" acquire "$WIP_LOCK" "$LEASE_OWNER" --ttl "$LEASE_TTL" 2>&1)"; then
   printf '[heartbeat] board-driver lease not ours (%s) — skipping full reconcile pass this tick\n' "$lease_out"
   exit 0
 fi
-trap 'python3 "$LEASE_CLI" release "$WIP_LOCK" "$LEASE_OWNER" >/dev/null 2>&1 || true' EXIT
+# Replaces the mkdir-lock trap of the no-flock (macOS) path, so it removes that too.
+trap 'python3 "$LEASE_CLI" release "$WIP_LOCK" "$LEASE_OWNER" >/dev/null 2>&1 || true; [[ -z "${LOCK_DIR:-}" ]] || rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
 export HERMES_BOARD_LEASE_PATH="$WIP_LOCK" HERMES_BOARD_LEASE_OWNER="$LEASE_OWNER" HERMES_BOARD_LEASE_TTL="$LEASE_TTL"
 
+lease_cmd="python3 $LEASE_CLI"
 prompt="$(<"$PROMPT_FILE")"
 prompt+=$'\n\n## Board-driver lease for THIS pass (already held for you)\n\n'
-prompt+="The launcher that started this pass already acquired the board-driver lease for you, as owner \`$LEASE_OWNER\` (ttl ${LEASE_TTL}s). It is YOURS. Do not acquire it again: any other owner string is refused by your own lease, which is not a sibling pass. Use that exact owner:"$'\n\n'
+prompt+="The launcher that started this pass already acquired the board-driver lease for you, as owner \`$LEASE_OWNER\` (ttl ${LEASE_TTL}s). It is YOURS for this whole pass. That exact string is you; write it out literally in every lease command (your terminal does not see the launcher's environment, so never omit the owner). Never acquire the lease under any other owner name: your own lease would refuse it, and that refusal is not a sibling pass."$'\n\n'
 prompt+="\`\`\`bash"$'\n'
-prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py held    $WIP_LOCK $LEASE_OWNER   # 0 = still yours"$'\n'
-prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py refresh $WIP_LOCK $LEASE_OWNER   # during a long board pass"$'\n'
-prompt+="python3 $ROLE_DIR/.scripts/momo-wip-lock.py release $WIP_LOCK $LEASE_OWNER   # before waiting on workers"$'\n'
+prompt+="$lease_cmd held    $WIP_LOCK $LEASE_OWNER   # 0 = still yours"$'\n'
+prompt+="$lease_cmd refresh $WIP_LOCK $LEASE_OWNER   # during a long board pass"$'\n'
+prompt+="$lease_cmd release $WIP_LOCK $LEASE_OWNER   # before waiting on workers"$'\n'
+prompt+="$lease_cmd acquire $WIP_LOCK $LEASE_OWNER --ttl $LEASE_TTL   # write the board again after releasing"$'\n'
 prompt+="\`\`\`"$'\n\n'
-prompt+="(The same values are exported as HERMES_BOARD_LEASE_PATH / HERMES_BOARD_LEASE_OWNER; with the owner omitted the script reads it from the env.) Back off only if the lease is held fresh by an owner that is NOT \`$LEASE_OWNER\` (Momo, another agent). Releasing it early is fine; the launcher's own release at exit is then a no-op."$'\n'
+prompt+="Releasing early is fine; when the workers finish and you need to write the board again (Review, Done, a hold), re-acquire with exactly \`$LEASE_OWNER\` as above. If that acquire answers HELD by any other owner (\`momo\`, another agent, or another pass or turn of your own desk under a different owner string), another driver is writing the board: do not write it, and leave the transition for the next pass. The launcher's own release at exit is a no-op once you have released."$'\n'
 set +e
-"$ROLE_LAUNCHER" chat -Q --source "$SESSION_SOURCE" --max-turns 90 -q "$prompt"
+HERMES_PROFILE_NAME="$PROFILE_NAME" "$ROLE_LAUNCHER" chat -Q --source "$SESSION_SOURCE" --max-turns 90 -q "$prompt"
 status=$?
 set -e
 

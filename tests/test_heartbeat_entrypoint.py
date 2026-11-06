@@ -7,16 +7,24 @@ Three bugs found 2026-11-06 while kicking off parked TOLT tickets:
    status 1". The pass must run through the role launcher, which resolves the named profile.
 2. It ran ``hermes chat --source cron``. ``cron`` is the label the profile scheduler stamps on its
    own admitted runs; a client-created session carrying it is refused by the state store
-   (``invalid_params``). A deliberate machine-paced pass is a ``tool`` session.
+   (``invalid_params``). A finite ``chat -q`` pass is a ``oneshot`` session (hidden from the human
+   pickers, still in the agent's own ``session_search``, unlike ``tool``).
 3. It acquired ``runtime/wip-driver.lock`` as ``hermes:<agent_id>`` and the PM, told by its SOUL to
    "acquire before driving", acquired under a different owner string, was refused by its own
    launcher's fresh lease, concluded a sibling pass was running and dispatched nothing. A single pass
    must never fight itself, while a foreign fresh owner (Momo) still makes it back off.
+
+The launcher hands the PM its owner in the PROMPT: ``hermes chat`` is a client of the host gateway,
+which runs the PM's tools, and a client's ``HERMES_*`` names never reach that session's terminal. So the
+fake PM below reads its owner from the prompt, never from the env. The owner is unique per pass
+(``hermes:<agent_id>:pass-<utc>-<pid>``) so a concurrent gateway turn of the same agent, which acquires
+under its own owner, serializes with the pass instead of sharing (and releasing) one lease.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,15 +38,19 @@ ROOT = Path(__file__).parents[1]
 TEMPLATE = ROOT / "template"
 LOCK_CLI = TEMPLATE / ".scripts" / "momo-wip-lock.py"
 AGENT_ID = "heartbeat-demo-pm"
+PASS_OWNER = re.compile(rf"^hermes:{re.escape(AGENT_ID)}:pass-\d{{8}}T\d{{6}}Z-\d+$")
 LEASE_ENV = ("HERMES_BOARD_LEASE_PATH", "HERMES_BOARD_LEASE_OWNER", "HERMES_BOARD_LEASE_TTL")
 
 # Stands in for the Hermes binary. Records what the launcher gave it, then optionally plays the PM
-# (HB_FAKE_PM): it tries the lease the way a PM's SOUL tells it to, with the exact owner and with a
-# made-up one, and writes every answer down.
+# (HB_FAKE_PM): it reads its owner and lease path out of the PROMPT (the only carrier that reaches a
+# real gateway session), runs the lease the way the prompt tells it to, tries the names a confused PM
+# would invent, and writes every answer down. HB_FAKE_MOMO_AFTER=1: once the PM has released, Momo
+# takes the board, so the launcher's exit release must leave Momo's lease alone.
 FAKE_HERMES = """#!/usr/bin/env python3
-import json, os, subprocess, sys
+import json, os, re, subprocess, sys
+argv = sys.argv[1:]
 out = {
-    "argv": sys.argv[1:],
+    "argv": argv,
     "HERMES_HOME": os.environ.get("HERMES_HOME"),
     "TERMINAL_CWD": os.environ.get("TERMINAL_CWD"),
     "CODEX_HOME": os.environ.get("CODEX_HOME"),
@@ -46,21 +58,29 @@ out = {
     "lease_env": {k: os.environ.get(k) for k in (%(lease_env)r)},
 }
 if os.environ.get("HB_FAKE_PM"):
-    cli, path = os.environ["HB_LOCK_CLI"], os.environ["HERMES_BOARD_LEASE_PATH"]
-    owner = os.environ["HERMES_BOARD_LEASE_OWNER"]
-    def run(*a, env=None):
-        r = subprocess.run([sys.executable, cli, *a], capture_output=True, text=True, env=env)
+    prompt = argv[argv.index("-q") + 1]
+    owner = re.search(r"as owner `([^`]+)`", prompt).group(1)
+    path = re.search(r"momo-wip-lock.py held +(\\S+) ", prompt).group(1)
+    cli = os.environ["HB_LOCK_CLI"]
+    bare_env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_BOARD_LEASE_")}
+    def run(*a):
+        r = subprocess.run([sys.executable, cli, *a], capture_output=True, text=True, env=bare_env)
         return {"rc": r.returncode, "out": r.stdout.strip()}
-    env_no_owner = {k: v for k, v in os.environ.items()}
+    agent = owner.split(":")[1]
     out["pm"] = {
+        "owner": owner,
+        "path": path,
         "held_exact": run("held", path, owner),
-        "held_via_env": run("held", path),
         "acquire_exact": run("acquire", path, owner),
-        "acquire_invented": run("acquire", path, owner + ":sentinel-20261106T161733", "--ttl", "300"),
+        "acquire_bare_agent": run("acquire", path, "hermes:" + agent),
+        "acquire_invented": run("acquire", path, "hermes:" + agent + ":sentinel-20261106T161733", "--ttl", "300"),
         "refresh_exact": run("refresh", path, owner),
         "release_exact": run("release", path, owner),
-        "status": run("status", path),
+        "reacquire_exact": run("acquire", path, owner, "--ttl", "3600"),
+        "release_again": run("release", path, owner),
     }
+    if os.environ.get("HB_FAKE_MOMO_AFTER"):
+        out["pm"]["momo_takes_board"] = run("acquire", path, "momo", "--ttl", "3600")
 json.dump(out, open(os.environ["HB_MARKER"], "w"))
 """ % {"lease_env": LEASE_ENV}
 
@@ -169,6 +189,20 @@ def test_a_callers_hermes_home_cannot_redirect_the_pass(tmp_path: Path) -> None:
     assert seen["TELEGRAM_BOT_TOKEN"] is None
 
 
+def test_a_callers_profile_name_cannot_swap_the_desk(tmp_path: Path) -> None:
+    """role.yaml's profile is pinned for the launcher: a caller's HERMES_PROFILE_NAME (a Kanban worker pins
+    its own) must not boot another profile with this desk's prompt and lease owner."""
+    role, _runtime, profile_dir, _project, env = _desk(tmp_path)
+    other = profile_dir.parent / "some-kanban-worker"
+    other.mkdir()
+    env["HERMES_PROFILE_NAME"] = "some-kanban-worker"
+
+    result = _heartbeat(role, env)
+
+    assert result.returncode == 0, result.stderr
+    assert _marker(env)["HERMES_HOME"] == str(profile_dir)
+
+
 def test_missing_profile_fails_loud_and_never_boots_hermes(tmp_path: Path) -> None:
     role, _runtime, _profile, _project, env = _desk(tmp_path, profile=False)
 
@@ -196,7 +230,7 @@ def test_missing_launcher_is_refused_before_any_state_is_written(tmp_path: Path)
 # --- bug 2: the session source -------------------------------------------------------------------
 
 
-def test_pass_runs_as_a_tool_session_never_cron(tmp_path: Path) -> None:
+def test_pass_runs_as_a_oneshot_session_never_cron(tmp_path: Path) -> None:
     role, _runtime, _profile, _project, env = _desk(tmp_path)
 
     result = _heartbeat(role, env)
@@ -204,18 +238,19 @@ def test_pass_runs_as_a_tool_session_never_cron(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     argv = _marker(env)["argv"]
     assert argv[0] == "chat" and "-Q" in argv
-    assert argv[argv.index("--source") + 1] == "tool"
+    # oneshot, not tool: tool sessions are hidden from the agent's own session_search.
+    assert argv[argv.index("--source") + 1] == "oneshot"
     assert "cron" not in argv[: argv.index("-q")]
     assert argv[argv.index("--max-turns") + 1] == "90"
 
 
 def test_session_source_can_be_overridden_to_another_creatable_source(tmp_path: Path) -> None:
     role, _runtime, _profile, _project, env = _desk(tmp_path)
-    env["SENTINEL_SESSION_SOURCE"] = "oneshot"
+    env["SENTINEL_SESSION_SOURCE"] = "tool"
 
     assert _heartbeat(role, env).returncode == 0
     argv = _marker(env)["argv"]
-    assert argv[argv.index("--source") + 1] == "oneshot"
+    assert argv[argv.index("--source") + 1] == "tool"
 
 
 @pytest.mark.parametrize("bad", ["cron", "kanban", "telegram"])
@@ -243,23 +278,58 @@ def test_launcher_held_lease_is_the_agents_own_and_reentrant(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     seen = _marker(env)
-    owner = f"hermes:{AGENT_ID}"
+    pm = seen["pm"]
+    owner = pm["owner"]
+    # One owner per pass, never the bare agent id a concurrent gateway turn could also use.
+    assert PASS_OWNER.match(owner), owner
+    assert pm["path"] == str(lock)
+    # Exported for the launcher's direct children only (a gateway session never sees HERMES_* names).
     assert seen["lease_env"] == {
         "HERMES_BOARD_LEASE_PATH": str(lock),
         "HERMES_BOARD_LEASE_OWNER": owner,
         "HERMES_BOARD_LEASE_TTL": "3600",
     }
-    pm = seen["pm"]
-    # The lease the launcher took is the PM's: the exact owner, or none (read from the env), is "yours".
+    # The lease the launcher took is the PM's under the owner the prompt named (no env needed).
     assert pm["held_exact"]["rc"] == 0
-    assert pm["held_via_env"]["rc"] == 0
     assert pm["acquire_exact"]["rc"] == 0 and "ACQUIRED" in pm["acquire_exact"]["out"]
     assert pm["refresh_exact"]["rc"] == 0
     # Inventing a new owner name is exactly the bug: the agent's own lease refuses it.
+    assert pm["acquire_bare_agent"]["rc"] == 1 and f"HELD by {owner}" in pm["acquire_bare_agent"]["out"]
     assert pm["acquire_invented"]["rc"] == 1 and f"HELD by {owner}" in pm["acquire_invented"]["out"]
-    # Released early by the PM; the launcher's own exit release is then a harmless no-op.
+    # Released early before waiting on workers, then taken back with the same owner to write the board.
     assert pm["release_exact"]["rc"] == 0
+    assert pm["reacquire_exact"]["rc"] == 0
+    assert pm["release_again"]["rc"] == 0
     assert not lock.exists()
+
+
+def test_the_exit_release_only_drops_this_passs_own_lease(tmp_path: Path) -> None:
+    """The PM released early and Momo took the board: the launcher's exit trap must leave Momo's lease."""
+    role, runtime, _profile, _project, env = _desk(tmp_path)
+    env.update(HB_FAKE_PM="1", HB_FAKE_MOMO_AFTER="1")
+    lock = runtime / "wip-driver.lock"
+
+    result = _heartbeat(role, env)
+
+    assert result.returncode == 0, result.stderr
+    assert _marker(env)["pm"]["momo_takes_board"]["rc"] == 0
+    assert json.loads(lock.read_text())["owner"] == "momo"
+
+
+@pytest.mark.parametrize("turn_owner", [f"hermes:{AGENT_ID}", f"hermes:{AGENT_ID}:turn-telegram-42"])
+def test_a_concurrent_turn_of_the_same_agent_makes_the_pass_back_off(tmp_path: Path, turn_owner: str) -> None:
+    """A gateway turn of this same agent (Telegram, a Bloodbank or crank delegation) holding the lease is
+    another driver: the pass must not share it ("reentrant") and boot a second driver on the board."""
+    role, runtime, _profile, _project, env = _desk(tmp_path)
+    lock = runtime / "wip-driver.lock"
+    assert _lock("acquire", str(lock), turn_owner).returncode == 0
+
+    result = _heartbeat(role, env)
+
+    assert result.returncode == 0
+    assert f"HELD by {turn_owner}" in result.stdout
+    assert not Path(env["HB_MARKER"]).exists()
+    assert json.loads(lock.read_text())["owner"] == turn_owner
 
 
 def test_the_prompt_tells_the_pm_the_lease_is_already_theirs(tmp_path: Path) -> None:
@@ -267,14 +337,23 @@ def test_the_prompt_tells_the_pm_the_lease_is_already_theirs(tmp_path: Path) -> 
 
     assert _heartbeat(role, env).returncode == 0
 
-    argv = _marker(env)["argv"]
+    seen = _marker(env)
+    argv = seen["argv"]
     prompt = argv[argv.index("-q") + 1]
-    owner = f"hermes:{AGENT_ID}"
+    owner = seen["lease_env"]["HERMES_BOARD_LEASE_OWNER"]
+    lock = runtime / "wip-driver.lock"
+    assert PASS_OWNER.match(owner), owner
     assert prompt.startswith("fixture prompt")
     assert "Board-driver lease for THIS pass (already held for you)" in prompt
-    assert f"`{owner}`" in prompt
-    assert f"momo-wip-lock.py refresh {runtime / 'wip-driver.lock'} {owner}" in prompt
-    assert "Do not acquire it again" in prompt
+    assert f"as owner `{owner}`" in prompt
+    assert f"momo-wip-lock.py refresh {lock} {owner}" in prompt
+    assert f"momo-wip-lock.py release {lock} {owner}" in prompt
+    # Taking it back after an early release is allowed, with the same owner only.
+    assert f"momo-wip-lock.py acquire {lock} {owner} --ttl 3600" in prompt
+    assert "Never acquire the lease under any other owner name" in prompt
+    # The env is not a carrier inside a gateway session: the prompt must not lean on it.
+    assert "never omit the owner" in prompt
+    assert "reads it from the env" not in prompt
 
 
 def test_the_lease_is_released_when_the_pass_ends(tmp_path: Path) -> None:
@@ -309,7 +388,7 @@ def test_a_stale_foreign_lease_does_not_wedge_the_board(tmp_path: Path) -> None:
     result = _heartbeat(role, env)
 
     assert result.returncode == 0, result.stderr
-    assert _marker(env)["lease_env"]["HERMES_BOARD_LEASE_OWNER"] == f"hermes:{AGENT_ID}"
+    assert PASS_OWNER.match(_marker(env)["lease_env"]["HERMES_BOARD_LEASE_OWNER"])
 
 
 # --- the lease CLI itself -----------------------------------------------------------------------
@@ -331,7 +410,8 @@ def test_fresh_acquire_defaults_to_the_short_ttl(tmp_path: Path) -> None:
     assert json.loads(Path(lock).read_text())["ttl"] == 300
 
 
-def test_owner_defaults_to_the_launchers_exported_owner(tmp_path: Path) -> None:
+def test_owner_defaults_to_an_exported_owner_for_direct_child_scripts(tmp_path: Path) -> None:
+    # Only for scripts the launcher runs itself: a gateway-run PM's terminal never sees this env.
     lock = str(tmp_path / "l")
     assert _lock("acquire", lock, "hermes:x-pm", "--ttl", "3600").returncode == 0
     env = _owner_env(HERMES_BOARD_LEASE_OWNER="hermes:x-pm")
@@ -382,9 +462,16 @@ def test_sentinel_prompt_states_the_self_lease_rule() -> None:
     text = _render_prompt()
     flat = " ".join(text.split())
     assert "yours if the launcher holds it" in flat
-    assert "Never re-acquire it under a new name" in flat
-    assert f"acquire <lockfile> hermes:{AGENT_ID} --ttl 3600" in flat
-    assert "only an owner that is not you means back off" in flat
-    assert "HERMES_BOARD_LEASE_OWNER" in flat
+    assert "Never acquire it under any other name" in flat
+    assert "that exact owner written out literally" in flat
+    # No launcher: one unique owner per turn, reused verbatim, default ttl (a turn has no exit trap).
+    assert f"hermes:{AGENT_ID}:<turn tag>" in flat
+    assert "Never regenerate it" in flat
+    assert "--ttl 3600" not in flat
+    # Another pass of the same desk is a real sibling driver, not "you".
+    assert "another pass or turn of your own desk" in flat
+    assert "any other fresh owner means back off" in flat
+    # The launcher's env never reaches a gateway session, so the prompt must not test for it.
+    assert "HERMES_BOARD_LEASE_OWNER" not in flat
     # The lease stays a serializer, never a WIP limit.
     assert "not** a WIP limit" in text
