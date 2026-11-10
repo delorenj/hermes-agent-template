@@ -227,8 +227,12 @@ preference the owner set, add the invariants flume enforces:
   `fallback_providers: []`; `moa.presets.default.enabled: false` with gateway slots.
 - `hooks:` the bb-hook events calling `~/.agents/hooks/bb-hook --cli hermes --native <event>`
   (copy the client from `bloodbank/services/hook-hub/client/bb-hook`, 0755; it is
-  stdlib-only and fails open), `hooks_auto_accept: true`, and `BB_HOOK_HUB=off` in
-  every `.env` until the host has a hub and a reachable bus.
+  stdlib-only and fails open), `hooks_auto_accept: true`, and `BB_HOOK_HUB` in every
+  `.env`: `off` until the host runs a hook-hub and a reachable bus, `on` once it
+  does (the Mac has both since W2-2/W2-3; its base and profile envs are `on`).
+  Where a mise shim can break the client shebang (any cwd with an untrusted
+  `.mise.toml`), install the marked `/bin/sh` host wrapper described in
+  `bloodbank/services/hook-hub/README.md` instead of the bare symlink.
 - `memory.provider: hindsight` (+ `bank_id_template`), memory not in
   `agent.disabled_toolsets`; `tts.provider: vox` with the host's vox URL;
   `plugins.enabled: [hindsight, tts/vox]`; `gateway.multiplex_profiles: true`;
@@ -449,4 +453,4 @@ fork without pinning a versioned interpreter path.
   template writes.
 - A Bloodbank command lane and live hook publishing need a reachable bus and a
   hook-hub service on the host; until then rows are quarantined and
-  `BB_HOOK_HUB=off`.
+  `BB_HOOK_HUB=off`. With both present (the Mac since 2026-11-10) set it `on`.
