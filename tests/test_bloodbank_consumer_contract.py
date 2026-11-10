@@ -78,6 +78,23 @@ runtime:
     return role, registry
 
 
+def test_advisory_registry_never_claims_board_even_with_stale_binding(tmp_path: Path) -> None:
+    role, registry = _make_role(tmp_path)
+    env = _environment(tmp_path, registry)
+    manifest = role / "role.yaml"
+    manifest.write_text(manifest.read_text() + "\nboard_scope: advisory\nticket_provider:\n  name: plane\n  board_id: board-uuid\n")
+    (role / ".scripts" / ".plane-project-id").write_text("board-uuid\n")
+    registry.write_text("schema_version: 1\nagents:\n  demo-pm:\n    plane: {project_id: board-uuid, board_id: board-uuid, member_id: member-1}\n")
+    for _ in range(2):
+        result = _run(role, "80-registry.sh", env)
+        assert result.returncode == 0, result.stderr
+        row = yaml.safe_load(registry.read_text())["agents"]["demo-pm"]
+        assert row["board_scope"] == "advisory"
+        assert row["plane"]["member_id"] == "member-1"
+        assert "project_id" not in row["plane"] and "board_id" not in row["plane"]
+        assert yaml.safe_load(manifest.read_text())["ticket_provider"]["board_id"] == "board-uuid"
+
+
 def _environment(tmp_path: Path, registry: Path) -> dict[str, str]:
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)

@@ -99,6 +99,10 @@ ticket_provider:
   # ready_for_documentation: ""  # started group, e.g. "Ready for Documentation"
   # needs_re_evaluation: ""      # unstarted group, e.g. "Needs Re-evaluation"
 
+# An advisory employee can use ticket_provider to read/file/comment on the
+# repo board, but never claims tickets from the fleet command router.
+board_scope: {{ board_scope | tojson }}
+
 # Board-reconciliation knobs for the heartbeat sentinel pass.
 reconcile:
   enabled: {{ reconcile_enabled | tojson }}  # default on for PM operation; set false as the explicit checkpoint-only opt-out

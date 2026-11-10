@@ -121,6 +121,14 @@ reconcile_enabled:
   help: "Allow autonomous PM ticket-board reconciliation when the runner is invoked (Candybar fires it; no timer is installed)"
   default: true
 
+board_scope:
+  type: str
+  help: "Board routing ownership (owner claims the board; advisory can use it without claiming)"
+  default: owner
+  choices:
+    - owner
+    - advisory
+
 agent_identity:
   type: str
   help: >-
