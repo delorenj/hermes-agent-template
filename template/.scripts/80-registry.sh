@@ -29,6 +29,7 @@ PLANE_PROJECT_ID="$(cat "$ROLE_DIR/.scripts/.plane-project-id" 2>/dev/null || tr
 BOARD_SCOPE="$(yaml_get board_scope)"
 case "$BOARD_SCOPE" in
   ""|owner) ;;
+  \[*\]) ;;  # shared-board scoped mode: a list of repo:* labels (roles/pm.md); owner behaviour on its scope
   advisory) PLANE_PROJECT_ID="" ;;
   *) die "unsupported board_scope in role.yaml: $BOARD_SCOPE" ;;
 esac
@@ -77,7 +78,7 @@ except ImportError:
  hermes_git_ref, hermes_git_sha, fleet_env,
  identity_json) = sys.argv[1:29]
 board_scope = os.environ.get("BOARD_SCOPE", "")
-if board_scope not in ("", "owner", "advisory"):
+if board_scope not in ("", "owner", "advisory") and not (board_scope.startswith("[") and board_scope.endswith("]")):
     raise SystemExit(f"unsupported board_scope in role.yaml: {board_scope}")
 if board_scope == "advisory":
     plane_id = ""  # claimants resolve ONLY by plane.project_id / plane.board_id
