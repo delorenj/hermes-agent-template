@@ -124,8 +124,9 @@ to do are owned elsewhere:
 - **scheduling** — Candybar, the single clock, which fires Bloodbank commands
   and Hermes invocations; krebs pull-subscribes
   `bloodbank.cmd.lifecycle.task.invoke`
-- **persistence** — krebs attempts/leases, which park a stalled ticket in
-  "Needs Attention" instead of ticking forever
+- **persistence** — krebs (lifecycle v2): a failed turn is marked
+  `agent:failed`, a hold label that takes the ticket out of the flow (no slot,
+  no redispatch) instead of ticking forever
 
 `.scripts/heartbeat.sh` still renders into every role and is still the
 board-reconciliation sentinel's entrypoint — invoked on demand (or by a

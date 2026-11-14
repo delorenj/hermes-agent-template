@@ -85,13 +85,20 @@ concrete states, groups, or lists of its back end.
 | `in_review` | Implementation complete, awaiting review. |
 | `completed` | Done. |
 | `cancelled` | Intentionally rejected or abandoned; not done. |
+| `awaiting_decision` | Held on a person (aliases `needs_attention`, `waiting_reply`). |
 
-The mapping is configurable per project in `role.yaml` under
+The lane mapping is configurable per project in `role.yaml` under
 `ticket_provider`, so non-standard boards still work. For example, you can set
-`started: "In Progress"`, `in_review: "Ready for QA"`, `completed: "Done"`,
-and `cancelled: "Cancelled"` to match your board's column names. A configured
-name must resolve exactly in the expected provider group; the adapter never
-silently substitutes another lane from that group.
+`started: "In Progress"`, `completed: "Done"`, and `cancelled: "Cancelled"` to
+match your board's column names. A configured name must resolve exactly in the
+expected provider group; the adapter never silently substitutes another lane
+from that group.
+
+Plane boards follow Krebs lifecycle v2 (`krebs/spec/lifecycle.v2.yaml`): five
+stock lanes (Backlog, Todo, In Progress, Done, Cancelled), with review and holds
+carried by labels. On Plane, `in_review` lands in In Progress plus
+`lifecycle:review`, and `awaiting_decision` adds `lifecycle:needs-input`
+without moving the ticket. Linear and Trello still map both to a named lane.
 
 ## Autonomous adversarial review (act, do not wait)
 

@@ -82,23 +82,25 @@ ticket_provider:
   board: ""       # Trello board id (set by 42-ticket-provider.sh)
 {%- endif %}
   timezone: ""    # IANA project calendar; empty = TICKET_PROVIDER_TIMEZONE, TZ, then host-local
-  # Optional normalized-state name overrides for non-standard boards.
+  # Optional lane-name overrides for non-standard boards.
   backlog: ""     # e.g. "Backlog"
   unstarted: ""   # e.g. "Todo"
   started: ""     # e.g. "In Progress"
-  in_review: ""   # Krebs lifecycle v2: no review lane. Leave empty, or map to "In Progress" (review = In Progress + lifecycle:review)
+{%- if ticket_provider != 'plane' %}
+  in_review: ""   # e.g. "In Review"
+{%- endif %}
   completed: ""   # e.g. "Done"
   cancelled: ""   # e.g. "Cancelled"
-  # RETIRED by Krebs lifecycle v2 (five stock lanes): leave all of these unset.
-  # Optional extended transition targets. A role enables one by naming its
-  # lane here; left out, `tp transition <id> <state>` refuses it with
-  # "ticket_provider.<state> is required" (Plane defaults awaiting_decision to
-  # "Needs Attention"). Aliases: needs_attention/waiting_reply ->
-  # awaiting_decision, ready_for_e2e -> e2e_testing.
-  # awaiting_decision: ""        # started group, e.g. "Awaiting Decision"
-  # e2e_testing: ""              # started group, e.g. "E2E Testing & QA"
-  # ready_for_documentation: ""  # started group, e.g. "Ready for Documentation"
-  # needs_re_evaluation: ""      # unstarted group, e.g. "Needs Re-evaluation"
+{%- if ticket_provider == 'plane' %}
+  # Krebs lifecycle v2: a Plane board has exactly these five stock lanes.
+  # Review and holds are labels, not lanes: `tp transition <id> in_review` lands
+  # In Progress + lifecycle:review, and awaiting_decision (aliases
+  # needs_attention, waiting_reply) adds lifecycle:needs-input in place.
+{%- else %}
+  # Optional: name a lane to enable `tp transition <id> awaiting_decision`
+  # (aliases needs_attention, waiting_reply); left out, it is refused.
+  # awaiting_decision: ""   # started group, e.g. "Awaiting Decision"
+{%- endif %}
 
 # An advisory employee can use ticket_provider to read/file/comment on the
 # repo board, but never claims tickets from the fleet command router.

@@ -23,7 +23,7 @@ PROVIDER = (
 def stage_provider(
     tmp_path: Path,
     *,
-    in_review: str = "",
+    started: str = "",
     timezone: str = "",
     responses: list[dict[str, str]],
 ) -> tuple[Path, dict[str, str], Path]:
@@ -52,7 +52,7 @@ def stage_provider(
             "ticket_provider:",
             "  name: plane",
             f'  timezone: "{timezone}"',
-            f'  in_review: "{in_review}"',
+            f'  started: "{started}"',
             '  completed: "Done"',
             '  cancelled: "Cancelled"',
         ]
@@ -394,22 +394,23 @@ def test_list_issues_marks_exact_current_cycle_membership(tmp_path: Path) -> Non
     assert listed["issue-out"]["in_active_milestone"] is False
 
 
-def test_in_review_refuses_to_fall_back_to_first_started_lane(tmp_path: Path) -> None:
+def test_started_refuses_to_fall_back_to_another_started_lane(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "Doing", "group": "started"}]},
             )
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
-    assert "exact Plane state 'In Review'" in result.stderr
+    assert "exact Plane state 'In Progress'" in result.stderr
     assert "ok" not in result.stdout
     assert [entry["method"] for entry in requests(request_log)] == ["GET"]
 
@@ -417,7 +418,7 @@ def test_in_review_refuses_to_fall_back_to_first_started_lane(tmp_path: Path) ->
 def test_transition_patches_exact_state_and_requires_readback(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
@@ -425,47 +426,47 @@ def test_transition_patches_exact_state_and_requires_readback(tmp_path: Path) ->
                 {
                     "results": [
                         {"id": "doing-state", "name": "In Progress", "group": "started"},
-                        {"id": "qa-state", "name": "Ready for QA", "group": "started"},
+                        {"id": "other-state", "name": "Doing Elsewhere", "group": "started"},
                     ]
                 },
             ),
             response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7}),
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "other-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "read-back state" in result.stderr
     assert "ok" not in result.stdout
     sent = requests(request_log)
     assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET"]
-    assert json.loads(sent[1]["body"]) == {"state": "qa-state"}
+    assert json.loads(sent[1]["body"]) == {"state": "doing-state"}
 
 
 def test_transition_reports_ok_only_after_exact_readback(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7}),
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "qa-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok 7"
     sent = requests(request_log)
     assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET"]
-    assert json.loads(sent[1]["body"]) == {"state": "qa-state"}
+    assert json.loads(sent[1]["body"]) == {"state": "doing-state"}
 
 
 def test_list_issues_paginates_every_plane_page(tmp_path: Path) -> None:
@@ -569,43 +570,43 @@ def test_transition_confirms_ambiguous_patch_via_exact_readback(tmp_path: Path) 
     throttled_patch["fail_headers"] = {"Retry-After": "0"}
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             throttled_patch,
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "qa-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok 7"
     sent = requests(request_log)
     assert [entry["method"] for entry in sent] == ["GET", "PATCH", "GET"]
-    assert json.loads(sent[1]["body"]) == {"state": "qa-state"}
+    assert json.loads(sent[1]["body"]) == {"state": "doing-state"}
 
 
 def test_transition_never_claims_completion_without_matching_readback(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7}),
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "todo-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "read-back state" in result.stderr
@@ -625,19 +626,19 @@ def test_transition_ambiguous_patch_with_mismatch_readback_never_repatches(
     throttled_patch["fail_headers"] = {"Retry-After": "0"}
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             throttled_patch,
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "todo-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "ambiguous" in result.stderr
@@ -653,19 +654,19 @@ def test_transition_patch_transport_failure_with_mismatch_never_repatches(
     broken_patch["curl_exit"] = 7
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             broken_patch,
-            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7, "state": "todo-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "ambiguous" in result.stderr
@@ -676,19 +677,19 @@ def test_transition_patch_transport_failure_with_mismatch_never_repatches(
 def test_transition_wrong_issue_readback_never_repatches(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
                 "/states/",
-                {"results": [{"id": "qa-state", "name": "Ready for QA", "group": "started"}]},
+                {"results": [{"id": "doing-state", "name": "In Progress", "group": "started"}]},
             ),
             response("PATCH", "/issues/issue-uuid/", {"id": "issue-uuid", "sequence_id": 7}),
-            response("GET", "/issues/issue-uuid/", {"id": "different-issue", "sequence_id": 7, "state": "qa-state"}),
+            response("GET", "/issues/issue-uuid/", {"id": "different-issue", "sequence_id": 7, "state": "doing-state"}),
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "did not identify the requested issue" in result.stderr
@@ -701,12 +702,12 @@ def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -
     broken_readback = response(
         "GET",
         "/issues/issue-uuid/",
-        {"id": "issue-uuid", "sequence_id": 7, "state": "doing-state"},
+        {"id": "issue-uuid", "sequence_id": 7, "state": "todo-state"},
     )
     broken_readback["curl_exit"] = 28
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
@@ -714,8 +715,8 @@ def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -
                 {
                     "results": [
                         {
-                            "id": "qa-state",
-                            "name": "Ready for QA",
+                            "id": "doing-state",
+                            "name": "In Progress",
                             "group": "started",
                         }
                     ]
@@ -730,7 +731,7 @@ def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "curl exit 28" in result.stderr
@@ -746,7 +747,7 @@ def test_transition_readback_transport_failure_never_repatches(tmp_path: Path) -
 def test_transition_invalid_json_readback_never_repatches(tmp_path: Path) -> None:
     provider, env, request_log = stage_provider(
         tmp_path,
-        in_review="Ready for QA",
+        started="In Progress",
         responses=[
             response(
                 "GET",
@@ -754,8 +755,8 @@ def test_transition_invalid_json_readback_never_repatches(tmp_path: Path) -> Non
                 {
                     "results": [
                         {
-                            "id": "qa-state",
-                            "name": "Ready for QA",
+                            "id": "doing-state",
+                            "name": "In Progress",
                             "group": "started",
                         }
                     ]
@@ -770,7 +771,7 @@ def test_transition_invalid_json_readback_never_repatches(tmp_path: Path) -> Non
         ],
     )
 
-    result = run_provider(provider, env, "transition", "issue-uuid", "in_review")
+    result = run_provider(provider, env, "transition", "issue-uuid", "started")
 
     assert result.returncode != 0
     assert "not valid JSON" in result.stderr
