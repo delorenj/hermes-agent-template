@@ -12,7 +12,7 @@ Three bugs found 2026-11-06 while kicking off parked TOLT tickets:
 3. It acquired ``runtime/wip-driver.lock`` as ``hermes:<agent_id>`` and the PM, told by its SOUL to
    "acquire before driving", acquired under a different owner string, was refused by its own
    launcher's fresh lease, concluded a sibling pass was running and dispatched nothing. A single pass
-   must never fight itself, while a foreign fresh owner (Momo) still makes it back off.
+   must never fight itself, while a foreign fresh owner (an interactive session) still makes it back off.
 
 The launcher hands the PM its owner in the PROMPT: ``hermes chat`` is a client of the host gateway,
 which runs the PM's tools, and a client's ``HERMES_*`` names never reach that session's terminal. So the
@@ -36,7 +36,7 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 TEMPLATE = ROOT / "template"
-LOCK_CLI = TEMPLATE / ".scripts" / "momo-wip-lock.py"
+LOCK_CLI = TEMPLATE / ".scripts" / "board-lease.py"
 AGENT_ID = "heartbeat-demo-pm"
 PASS_OWNER = re.compile(rf"^hermes:{re.escape(AGENT_ID)}:pass-\d{{8}}T\d{{6}}Z-\d+$")
 LEASE_ENV = ("HERMES_BOARD_LEASE_PATH", "HERMES_BOARD_LEASE_OWNER", "HERMES_BOARD_LEASE_TTL")
@@ -44,8 +44,8 @@ LEASE_ENV = ("HERMES_BOARD_LEASE_PATH", "HERMES_BOARD_LEASE_OWNER", "HERMES_BOAR
 # Stands in for the Hermes binary. Records what the launcher gave it, then optionally plays the PM
 # (HB_FAKE_PM): it reads its owner and lease path out of the PROMPT (the only carrier that reaches a
 # real gateway session), runs the lease the way the prompt tells it to, tries the names a confused PM
-# would invent, and writes every answer down. HB_FAKE_MOMO_AFTER=1: once the PM has released, Momo
-# takes the board, so the launcher's exit release must leave Momo's lease alone.
+# would invent, and writes every answer down. HB_FAKE_INTERACTIVE_AFTER=1: once the PM has released, an interactive session
+# takes the board, so the launcher's exit release must leave the interactive lease alone.
 FAKE_HERMES = """#!/usr/bin/env python3
 import json, os, re, subprocess, sys
 argv = sys.argv[1:]
@@ -60,7 +60,7 @@ out = {
 if os.environ.get("HB_FAKE_PM"):
     prompt = argv[argv.index("-q") + 1]
     owner = re.search(r"as owner `([^`]+)`", prompt).group(1)
-    path = re.search(r"momo-wip-lock.py held +(\\S+) ", prompt).group(1)
+    path = re.search(r"board-lease.py held +(\\S+) ", prompt).group(1)
     cli = os.environ["HB_LOCK_CLI"]
     bare_env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_BOARD_LEASE_")}
     def run(*a):
@@ -79,8 +79,8 @@ if os.environ.get("HB_FAKE_PM"):
         "reacquire_exact": run("acquire", path, owner, "--ttl", "3600"),
         "release_again": run("release", path, owner),
     }
-    if os.environ.get("HB_FAKE_MOMO_AFTER"):
-        out["pm"]["momo_takes_board"] = run("acquire", path, "momo", "--ttl", "3600")
+    if os.environ.get("HB_FAKE_INTERACTIVE_AFTER"):
+        out["pm"]["interactive_takes_board"] = run("acquire", path, "interactive", "--ttl", "3600")
 json.dump(out, open(os.environ["HB_MARKER"], "w"))
 """ % {"lease_env": LEASE_ENV}
 
@@ -304,16 +304,16 @@ def test_launcher_held_lease_is_the_agents_own_and_reentrant(tmp_path: Path) -> 
 
 
 def test_the_exit_release_only_drops_this_passs_own_lease(tmp_path: Path) -> None:
-    """The PM released early and Momo took the board: the launcher's exit trap must leave Momo's lease."""
+    """The PM released early and an interactive session took the board: the launcher's exit trap must leave the interactive lease."""
     role, runtime, _profile, _project, env = _desk(tmp_path)
-    env.update(HB_FAKE_PM="1", HB_FAKE_MOMO_AFTER="1")
+    env.update(HB_FAKE_PM="1", HB_FAKE_INTERACTIVE_AFTER="1")
     lock = runtime / "wip-driver.lock"
 
     result = _heartbeat(role, env)
 
     assert result.returncode == 0, result.stderr
-    assert _marker(env)["pm"]["momo_takes_board"]["rc"] == 0
-    assert json.loads(lock.read_text())["owner"] == "momo"
+    assert _marker(env)["pm"]["interactive_takes_board"]["rc"] == 0
+    assert json.loads(lock.read_text())["owner"] == "interactive"
 
 
 @pytest.mark.parametrize("turn_owner", [f"hermes:{AGENT_ID}", f"hermes:{AGENT_ID}:turn-telegram-42"])
@@ -346,10 +346,10 @@ def test_the_prompt_tells_the_pm_the_lease_is_already_theirs(tmp_path: Path) -> 
     assert prompt.startswith("fixture prompt")
     assert "Board-driver lease for THIS pass (already held for you)" in prompt
     assert f"as owner `{owner}`" in prompt
-    assert f"momo-wip-lock.py refresh {lock} {owner}" in prompt
-    assert f"momo-wip-lock.py release {lock} {owner}" in prompt
+    assert f"board-lease.py refresh {lock} {owner}" in prompt
+    assert f"board-lease.py release {lock} {owner}" in prompt
     # Taking it back after an early release is allowed, with the same owner only.
-    assert f"momo-wip-lock.py acquire {lock} {owner} --ttl 3600" in prompt
+    assert f"board-lease.py acquire {lock} {owner} --ttl 3600" in prompt
     assert "Never acquire the lease under any other owner name" in prompt
     # The env is not a carrier inside a gateway session: the prompt must not lean on it.
     assert "never omit the owner" in prompt
@@ -364,7 +364,7 @@ def test_the_lease_is_released_when_the_pass_ends(tmp_path: Path) -> None:
     assert not (runtime / "wip-driver.lock").exists()
 
 
-@pytest.mark.parametrize("foreign", ["momo", "hermes:some-other-pm"])
+@pytest.mark.parametrize("foreign", ["interactive", "hermes:some-other-pm"])
 def test_a_foreign_fresh_owner_still_makes_the_pass_back_off(tmp_path: Path, foreign: str) -> None:
     role, runtime, _profile, _project, env = _desk(tmp_path)
     lock = runtime / "wip-driver.lock"
@@ -383,7 +383,7 @@ def test_a_foreign_fresh_owner_still_makes_the_pass_back_off(tmp_path: Path, for
 def test_a_stale_foreign_lease_does_not_wedge_the_board(tmp_path: Path) -> None:
     role, runtime, _profile, _project, env = _desk(tmp_path)
     lock = runtime / "wip-driver.lock"
-    lock.write_text(json.dumps({"owner": "momo", "heartbeat_at": time.time() - 7200, "ttl": 3600}))
+    lock.write_text(json.dumps({"owner": "interactive", "heartbeat_at": time.time() - 7200, "ttl": 3600}))
 
     result = _heartbeat(role, env)
 
@@ -406,7 +406,7 @@ def test_reentrant_acquire_keeps_the_leases_longer_ttl(tmp_path: Path) -> None:
 
 def test_fresh_acquire_defaults_to_the_short_ttl(tmp_path: Path) -> None:
     lock = str(tmp_path / "l")
-    assert _lock("acquire", lock, "momo").returncode == 0
+    assert _lock("acquire", lock, "interactive").returncode == 0
     assert json.loads(Path(lock).read_text())["ttl"] == 300
 
 
@@ -431,10 +431,10 @@ def test_owner_is_still_required_without_the_env(tmp_path: Path) -> None:
 def test_held_distinguishes_mine_foreign_and_free(tmp_path: Path) -> None:
     lock = str(tmp_path / "l")
     assert _lock("held", lock, "hermes:x-pm").returncode == 1  # free
-    assert _lock("acquire", lock, "momo", "--ttl", "3600").returncode == 0
+    assert _lock("acquire", lock, "interactive", "--ttl", "3600").returncode == 0
     foreign = _lock("held", lock, "hermes:x-pm")
     assert foreign.returncode == 1 and "back off" in foreign.stdout
-    assert _lock("held", lock, "momo").returncode == 0
+    assert _lock("held", lock, "interactive").returncode == 0
     Path(lock).write_text(json.dumps({"owner": "hermes:x-pm", "heartbeat_at": time.time() - 9999, "ttl": 300}))
     assert _lock("held", lock, "hermes:x-pm").returncode == 1  # stale is not held
 
@@ -444,7 +444,7 @@ def test_only_the_identical_owner_string_is_reentrant(tmp_path: Path) -> None:
     assert _lock("acquire", lock, "hermes:x-pm", "--ttl", "3600").returncode == 0
     invented = _lock("acquire", lock, "hermes:x-pm:sentinel-20261106T161733")
     assert invented.returncode == 1
-    assert _lock("acquire", lock, "momo").returncode == 1  # Momo can still be made to wait too
+    assert _lock("acquire", lock, "interactive").returncode == 1  # an interactive driver can still be made to wait too
 
 
 # --- the wording the PM reads --------------------------------------------------------------------
