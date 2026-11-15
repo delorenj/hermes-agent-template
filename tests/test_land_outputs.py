@@ -37,6 +37,7 @@ def make_repo(tmp: Path, role_yaml: str = 'agent_id: "demo-pm"\n') -> tuple[Path
     shutil.copy(SCRIPTS / "land-outputs.sh", role / ".scripts" / "land-outputs.sh")
     shutil.copy(SCRIPTS / "lib" / "role-yaml.py", role / ".scripts" / "lib" / "role-yaml.py")
     (role / "role.yaml").write_text(role_yaml)
+    (role / ".gitignore").write_text("runtime/\n")
     (repo / EVIDENCE).mkdir(parents=True)
     (repo / EVIDENCE / "GRUV-1.md").write_text("start\n")
     (repo / "src.txt").write_text("code\n")
@@ -131,11 +132,28 @@ def test_origin_moved_merges_in_the_object_store_without_touching_the_checkout(t
     assert run(repo).returncode == 0
     local = git(repo, "rev-parse", "main")
     remote = git(origin, "rev-parse", "main")
-    assert local != remote
-    assert subprocess.run(["git", "-C", str(origin), "merge-base", "--is-ancestor", local, remote]).returncode == 0
     assert "upstream.txt" in git(origin, "ls-tree", "--name-only", "main").splitlines()
-    assert not (repo / "upstream.txt").exists()  # the shared worktree was never merged into
+    # The checkout was fast-forwarded to the pushed merge (never merged in place) and the
+    # other agent's dirty file survived.
+    assert local == remote
+    assert (repo / "upstream.txt").exists()
     assert git(repo, "status", "--porcelain") == " M src.txt"
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    # A second pass with nothing new makes no further merge commit.
+    assert run(repo).returncode == 0
+    assert git(origin, "rev-parse", "main") == remote
+
+
+def test_fast_forward_is_skipped_when_a_dirty_file_is_in_the_way(tmp_path: Path) -> None:
+    repo, origin = make_repo(tmp_path)
+    push_upstream(tmp_path, origin, "src.txt", "upstream edit\n")
+    (repo / "src.txt").write_text("another agent's dirty edit\n")
+    (repo / EVIDENCE / "GRUV-8.md").write_text("x\n")
+    age(repo / EVIDENCE / "GRUV-8.md")
+    res = run(repo)
+    assert res.returncode == 0 and "could not fast-forward" in res.stdout
+    assert (repo / "src.txt").read_text() == "another agent's dirty edit\n"
+    assert f"{EVIDENCE}/GRUV-8.md" in git(origin, "ls-tree", "-r", "--name-only", "main").splitlines()
     assert not (repo / ".git" / "MERGE_HEAD").exists()
 
 
@@ -150,6 +168,7 @@ def test_conflict_with_origin_is_not_attempted(tmp_path: Path) -> None:
     assert git(origin, "rev-parse", "main") == before_remote
     assert not (repo / ".git" / "MERGE_HEAD").exists()
     assert git(repo, "status", "--porcelain") == ""  # committed locally, worktree untouched
+    assert "conflict" in (repo / "agents/hermes/pm/runtime/land-outputs-blocked.txt").read_text()
 
 
 def test_skips_paths_another_agent_staged(tmp_path: Path) -> None:
