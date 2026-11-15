@@ -272,3 +272,28 @@ def test_heartbeat_runs_land_outputs_after_the_pass() -> None:
     land = text.index('LAND_SCRIPT="$ROLE_DIR/.scripts/land-outputs.sh"')
     assert text.index("runner_exit=") < land < text.rindex('exit "$runner_exit"')
     assert '|| true' in text[land:text.rindex('exit "$runner_exit"')]
+
+
+def test_a_path_another_agent_stages_during_the_wait_is_left_alone(tmp_path: Path) -> None:
+    """Review of f274536: the staged snapshot was taken once, before the settle wait."""
+    import threading
+    repo, _ = make_repo(tmp_path)
+    theirs = repo / EVIDENCE / "GRUV-1.md"
+    theirs.write_text("start\ntheirs\n")
+    age(theirs)
+    (repo / EVIDENCE / "sentinel-pass-20261115T220000Z.md").write_text("report\n")
+
+    def other_agent() -> None:
+        time.sleep(1)
+        git(repo, "add", "--", f"{EVIDENCE}/GRUV-1.md")
+        theirs.write_text("start\ntheirs\nstill editing\n")
+        age(theirs)
+
+    t = threading.Thread(target=other_agent)
+    t.start()
+    res = run(repo, LAND_QUIET_SECONDS="3")
+    t.join()
+    assert res.returncode == 0, res.stderr
+    assert git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == [
+        f"{EVIDENCE}/sentinel-pass-20261115T220000Z.md"]
+    assert git(repo, "diff", "--cached", "--name-only") == f"{EVIDENCE}/GRUV-1.md"
