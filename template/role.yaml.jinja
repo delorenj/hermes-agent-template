@@ -113,6 +113,13 @@ reconcile:
   grace_hours: 0             # 0 = no human-approval wait (adversarially-reviewed review-lane = done); set >0 to require a wait
   auto_review: true          # autonomous adversarial review (act, do not wait) on/off
 
+# After every full pass, .scripts/land-outputs.sh commits and pushes the pass's own
+# evidence (no dangling work). ONE space-separated string of repo-relative paths;
+# omit for the default (BMAD issue-evidence dir + docs/operations/launch-readouts).
+# Turn it off for a run with LAND_OUTPUTS=0.
+# land:
+#   paths: "_bmad-output/implementation-artifacts/issue-evidence docs/operations/launch-readouts"
+
 # Plane project (1:1 with this agent) — retained for fleet-registry back-compat.
 plane:
   # Empty -> resolved from ~/.config/hermes-agent-template/config.toml [plane].workspace

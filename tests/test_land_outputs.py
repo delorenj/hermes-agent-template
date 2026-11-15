@@ -111,22 +111,76 @@ def test_does_not_land_on_a_side_branch_or_detached_head(tmp_path: Path) -> None
     assert res.returncode == 0 and "detached" in res.stdout
 
 
-def test_merges_when_origin_moved_and_keeps_other_dirty_files(tmp_path: Path) -> None:
-    repo, origin = make_repo(tmp_path)
-    other = tmp_path / "other"
+def push_upstream(tmp: Path, origin: Path, name: str, text: str) -> None:
+    other = tmp / f"other-{name}"
     subprocess.run(["git", "clone", "-q", str(origin), str(other)], check=True, capture_output=True)
     git(other, "config", "core.hooksPath", "/dev/null")
-    (other / "upstream.txt").write_text("from another agent\n")
-    git(other, "add", "upstream.txt")
+    (other / name).parent.mkdir(parents=True, exist_ok=True)
+    (other / name).write_text(text)
+    git(other, "add", name)
     git(other, "commit", "-q", "-m", "upstream")
     git(other, "push", "-q", "origin", "main")
+
+
+def test_origin_moved_merges_in_the_object_store_without_touching_the_checkout(tmp_path: Path) -> None:
+    repo, origin = make_repo(tmp_path)
+    push_upstream(tmp_path, origin, "upstream.txt", "from another agent\n")
     (repo / "src.txt").write_text("local dirty\n")
     (repo / EVIDENCE / "GRUV-4.md").write_text("x\n")
     age(repo / EVIDENCE / "GRUV-4.md")
     assert run(repo).returncode == 0
-    assert git(repo, "rev-parse", "HEAD") == git(origin, "rev-parse", "main")
-    assert (repo / "upstream.txt").exists()
-    assert " M src.txt" in git(repo, "status", "--porcelain")
+    local = git(repo, "rev-parse", "main")
+    remote = git(origin, "rev-parse", "main")
+    assert local != remote
+    assert subprocess.run(["git", "-C", str(origin), "merge-base", "--is-ancestor", local, remote]).returncode == 0
+    assert "upstream.txt" in git(origin, "ls-tree", "--name-only", "main").splitlines()
+    assert not (repo / "upstream.txt").exists()  # the shared worktree was never merged into
+    assert git(repo, "status", "--porcelain") == " M src.txt"
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+
+
+def test_conflict_with_origin_is_not_attempted(tmp_path: Path) -> None:
+    repo, origin = make_repo(tmp_path)
+    push_upstream(tmp_path, origin, f"{EVIDENCE}/GRUV-1.md", "theirs\n")
+    (repo / EVIDENCE / "GRUV-1.md").write_text("ours\n")
+    age(repo / EVIDENCE / "GRUV-1.md")
+    before_remote = git(origin, "rev-parse", "main")
+    res = run(repo)
+    assert res.returncode == 0 and "CONFLICT" in res.stdout
+    assert git(origin, "rev-parse", "main") == before_remote
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert git(repo, "status", "--porcelain") == ""  # committed locally, worktree untouched
+
+
+def test_skips_paths_another_agent_staged(tmp_path: Path) -> None:
+    repo, _ = make_repo(tmp_path)
+    (repo / EVIDENCE / "GRUV-1.md").write_text("partial\n")
+    git(repo, "add", f"{EVIDENCE}/GRUV-1.md")
+    (repo / EVIDENCE / "GRUV-1.md").write_text("partial\nmore unstaged\n")
+    (repo / EVIDENCE / "GRUV-7.md").write_text("x\n")
+    for f in (repo / EVIDENCE).iterdir():
+        age(f)
+    staged_blob = git(repo, "rev-parse", f":{EVIDENCE}/GRUV-1.md")
+    assert run(repo).returncode == 0
+    assert git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == [f"{EVIDENCE}/GRUV-7.md"]
+    assert git(repo, "rev-parse", f":{EVIDENCE}/GRUV-1.md") == staged_blob
+
+
+def test_guard_refusal_retries_file_by_file(tmp_path: Path) -> None:
+    repo, origin = make_repo(tmp_path)
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    (hooks / "pre-commit").write_text("#!/bin/sh\ngit diff --cached --name-only | grep -q leak && exit 1\nexit 0\n")
+    (hooks / "pre-commit").chmod(0o755)
+    git(repo, "config", "core.hooksPath", str(hooks))
+    (repo / EVIDENCE / "leak.md").write_text("x\n")
+    (repo / EVIDENCE / "fine.md").write_text("x\n")
+    for f in (repo / EVIDENCE).iterdir():
+        age(f)
+    res = run(repo)
+    assert res.returncode == 0 and "REFUSED" in res.stdout
+    assert git(origin, "show", "--name-only", "--format=", "main").splitlines() == [f"{EVIDENCE}/fine.md"]
+    assert "?? " + f"{EVIDENCE}/leak.md" in git(repo, "status", "--porcelain")
 
 
 def test_role_yaml_land_paths_override(tmp_path: Path) -> None:
