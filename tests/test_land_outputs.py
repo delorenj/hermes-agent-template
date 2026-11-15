@@ -92,10 +92,51 @@ def test_skips_files_still_being_written(tmp_path: Path) -> None:
     repo, _ = make_repo(tmp_path)
     (repo / EVIDENCE / "fresh.md").write_text("mid-write\n")
     head = git(repo, "rev-parse", "HEAD")
-    assert run(repo).returncode == 0
+    assert run(repo, LAND_SETTLE_SECONDS="0").returncode == 0
     assert git(repo, "rev-parse", "HEAD") == head
     assert run(repo, LAND_QUIET_SECONDS="0").returncode == 0
     assert git(repo, "rev-parse", "HEAD") != head
+
+
+def test_the_pass_report_written_just_before_lands_in_the_same_pass(tmp_path: Path) -> None:
+    """2026-11-15: the sentinel report is written seconds before landing, so it always landed a pass late."""
+    repo, origin = make_repo(tmp_path)
+    (repo / EVIDENCE / "sentinel-pass-20261115T200000Z.md").write_text("report\n")
+    res = run(repo, LAND_QUIET_SECONDS="2")
+    assert res.returncode == 0, res.stderr
+    assert "waiting" in res.stdout
+    assert git(repo, "show", "--name-only", "--format=", "HEAD").splitlines() == [
+        f"{EVIDENCE}/sentinel-pass-20261115T200000Z.md"]
+    assert git(origin, "rev-parse", "main") == git(repo, "rev-parse", "HEAD")
+    receipt = (repo / "agents" / "hermes" / "pm" / "runtime" / "land-outputs.log").read_text()
+    assert "committed 1 file(s)" in receipt and "pushed 1 commit(s)" in receipt
+
+
+def test_a_file_still_being_written_after_the_wait_is_left_alone(tmp_path: Path) -> None:
+    import threading
+    repo, _ = make_repo(tmp_path)
+    busy = repo / EVIDENCE / "busy.md"
+    busy.write_text("0\n")
+    stop = threading.Event()
+
+    def writer() -> None:
+        n = 0
+        while not stop.is_set():
+            n += 1
+            busy.write_text(f"{n}\n")
+            time.sleep(0.3)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    try:
+        head = git(repo, "rev-parse", "HEAD")
+        res = run(repo, LAND_QUIET_SECONDS="2")
+    finally:
+        stop.set()
+        t.join()
+    assert res.returncode == 0, res.stderr
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert "still changing" in res.stdout
 
 
 def test_does_not_land_on_a_side_branch_or_detached_head(tmp_path: Path) -> None:
