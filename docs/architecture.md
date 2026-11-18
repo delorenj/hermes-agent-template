@@ -146,7 +146,7 @@ receipts in `runtime/launch-receipts/`). Candybar `<repo>-pm-launch-pass` is its
 only clock, firing a Hermes job pinned `--scheduler external` whose wrappers
 (`launch-monitor.sh`, `launch-brief.sh`) are real files in the profile's
 `scripts/`. `flume launch status|enable|disable` wires it; in steady mode the
-monitor prints one fixed line and a fire costs 0 tokens. Behavior is
+monitor prints one fixed line and a fire costs 0 tokens. A monorepo parent may list child directories in `scopes:` of `.launch.yaml`; the pass then lists those scopes too and runs each write from the directory that owns the ref (a `create` may name a declared `scope`). Behavior is
 `flume/roles/pm.md`, "## Launch mode"; operations are `agent-fleet-operations`,
 "Launch mode".
 
