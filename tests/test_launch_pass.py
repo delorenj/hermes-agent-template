@@ -546,3 +546,18 @@ def test_without_scopes_a_child_directory_is_never_listed(tmp_path, monkeypatch)
     (kid / ".project.json").write_text("{}")
     (r.state / "board-kid.json").write_text(json.dumps({"board": "EARS", "tickets": [ticket(9, "Todo")]}))
     assert "EARS-9|" not in r.run("--monitor").stdout
+
+
+def test_inbox_for_a_ticket_the_pm_never_spoke_on_starts_at_the_declared_day(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[
+        ticket(2, "Todo", comments=[comment("old worker note", "2026-11-10T10:00:00+00:00"), comment("owner after", "2026-11-17T20:00:00+00:00")]),
+    ])
+    assert any(l.startswith("EARS-2|") and "owner-waiting:1" in l for l in r.run("--monitor").stdout.splitlines())
+
+
+def test_brief_shows_only_the_newest_untagged_comments(tmp_path, monkeypatch):
+    comments = [comment(f"note {n}", f"2026-11-18T{n % 24:02d}:{n // 24:02d}:00+00:00") for n in range(60)]
+    r = Repo(tmp_path, monkeypatch, tickets=[ticket(2, "Todo", comments=comments)])
+    out = r.run("--brief").stdout
+    assert "+20 older untagged comments not shown" in out
+    assert out.count("- EARS-2 2026-11-18T") == 40

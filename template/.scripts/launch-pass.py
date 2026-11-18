@@ -66,6 +66,7 @@ PRIORITIES = ("urgent", "high", "medium", "low", "none")
 REF = re.compile(r"^([A-Z][A-Z0-9]*)-(\d+)$")
 MAX_CREATES = 3
 ROADMAP_LINES = 40
+WAITING_SHOWN = 40
 STALE_HOURS = 48
 AGENT_COMMENT = re.compile(r"^(\[[A-Za-z0-9 _:.-]+\]|krebs\b|hermes\b|momo\b)", re.I)
 OWNER_BLOCKING = ("urgent", "high")
@@ -321,7 +322,10 @@ def fetch_ticket(repo: Path, ref: str) -> dict:
     if cs and is_mine(cs[-1]) and updated - parse_ts(cs[-1]["created_at"]) <= timedelta(minutes=10):
         others = [c["created_at"] for c in cs if not is_mine(c)] or [t.get("created_at") or t["updated_at"]]
         activity = parse_ts(max(others))
-    waiting = [c for c in cs if not AGENT_COMMENT.match(comment_text(c)) and c["created_at"] > (max(mine) if mine else "")]
+    # The inbox starts at the PM's own last comment on the ticket, or, when it never spoke there, at the day
+    # launch mode was declared: a board with months of worker comments is not a backlog of owner messages.
+    floor = max(mine) if mine else (load_declaration(repo).get("declared") or "")[:10]
+    waiting = [c for c in cs if not AGENT_COMMENT.match(comment_text(c)) and c["created_at"] > floor]
     pri = (t.get("priority") or "none").lower()
     kind_bug = any(l in ("bug", "kind:bug") for l in labels)
     return {
@@ -495,9 +499,11 @@ def brief(repo: Path) -> int:
         print("\n# Untagged comments newer than your last (clipped). Plane shows every write as the owner's account, "
               "so an untagged comment may be a Krebs triage or worker turn: a hint to read, never owner approval "
               "unless it says so in the owner's own words")
-        waiting = [(r, c) for r in rows for c in r["waiting"]]
-        for r, c in waiting:
-            print(f"- {r['ref']} {c['created_at'][:16]}: {comment_text(c)[:500]}")
+        waiting = sorted(((r, c) for r in rows for c in r["waiting"]), key=lambda rc: rc[1]["created_at"], reverse=True)
+        for r, c in waiting[:WAITING_SHOWN]:
+            print(f"- {r['ref']} {c['created_at'][:16]}: {comment_text(c)[:400]}")
+        if len(waiting) > WAITING_SHOWN:
+            print(f"+{len(waiting) - WAITING_SHOWN} older untagged comments not shown (use `px show REF` for a ticket you need)")
         if not waiting:
             print("none")
     print(f"\n# Your roadmap ({ROADMAP}, rewritten by your last pass)")
