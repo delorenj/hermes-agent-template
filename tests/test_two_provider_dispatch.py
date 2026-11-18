@@ -138,6 +138,54 @@ def test_boardless_explicit_lookup_still_dispatches(tmp_path: Path, provider: st
 
 
 @pytest.mark.parametrize("provider", ["plane", "trello"])
+@pytest.mark.parametrize("binding", [{"board_id": "legacy-untyped-board"}, {"type": "", "board_id": "legacy-untyped-board"}])
+def test_provisioning_refuses_existing_untyped_board(tmp_path: Path, provider: str, binding: dict) -> None:
+    scripts = tmp_path / "project/agents/hermes/pm/.scripts"
+    (scripts / "lib").mkdir(parents=True)
+    (scripts / "providers").mkdir()
+    shutil.copy2(DISPATCHER, scripts / "lib/ticket-provider.sh")
+    (scripts / "providers" / f"{provider}.sh").write_text('#!/bin/sh\nprintf called > "$CALL_LOG"\n')
+    manifest = tmp_path / "project/.project.json"
+    original = json.dumps({"ticket_provider": binding})
+    manifest.write_text(original)
+    log = tmp_path / "called"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; tp create_board Fixture FIX desc', "_", str(scripts / "lib/ticket-provider.sh")],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CALL_LOG": str(log), "TICKET_PROVIDER": provider, "TP_PROVISIONING": "1"},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2 and not log.exists(), result.stderr
+    assert "unsupported ticket provider" in result.stderr
+    assert manifest.read_text() == original
+
+
+@pytest.mark.parametrize("workspace", ["", "  ", None])
+def test_plane_board_bound_dispatch_refuses_missing_canonical_workspace(tmp_path: Path, workspace: str | None) -> None:
+    scripts = tmp_path / "project/agents/hermes/pm/.scripts"
+    (scripts / "lib").mkdir(parents=True)
+    (scripts / "providers").mkdir()
+    shutil.copy2(DISPATCHER, scripts / "lib/ticket-provider.sh")
+    (scripts / "providers/plane.sh").write_text('#!/bin/sh\nprintf called > "$CALL_LOG"\n')
+    binding = {"type": "plane", "board_id": "canonical-board"}
+    if workspace is not None:
+        binding["workspace"] = workspace
+    (tmp_path / "project/.project.json").write_text(json.dumps({"ticket_provider": binding}))
+    (scripts.parent / "role.yaml").write_text("ticket_provider:\n  workspace: stale-workspace\n  project: stale-board\n")
+    log = tmp_path / "called"
+    command = ["bash", "-c", 'source "$1"; tp "$2"', "_", str(scripts / "lib/ticket-provider.sh")]
+    env = {"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CALL_LOG": str(log), "PLANE_WORKSPACE": "env-workspace"}
+    for op in ("list_issues", "resolve", "create_issue"):
+        result = subprocess.run([*command, op], env=env, text=True, capture_output=True)
+        assert result.returncode == 2 and "ticket_provider.workspace is missing" in result.stderr
+        assert not log.exists(), f"{op} dispatched to an adapter"
+    for op in ("create_board", "describe_board"):
+        result = subprocess.run([*command, op], env=env, text=True, capture_output=True)
+        assert result.returncode == 0, result.stderr
+        assert log.read_text() == "called"
+        log.unlink()
+
+
+@pytest.mark.parametrize("provider", ["plane", "trello"])
 def test_supported_dispatch_uses_bound_adapter(tmp_path: Path, provider: str) -> None:
     role = tmp_path / "project/agents/hermes/pm"
     scripts = role / ".scripts"
@@ -146,7 +194,7 @@ def test_supported_dispatch_uses_bound_adapter(tmp_path: Path, provider: str) ->
     shutil.copy2(DISPATCHER, scripts / "lib/ticket-provider.sh")
     adapter = scripts / "providers" / f"{provider}.sh"
     adapter.write_text('#!/bin/sh\nprintf "%s" "$TICKET_PROVIDER" > "$CALL_LOG"\n')
-    (tmp_path / "project/.project.json").write_text(json.dumps({"ticket_provider": {"type": provider, "board_id": "fixture"}}))
+    (tmp_path / "project/.project.json").write_text(json.dumps({"ticket_provider": {"type": provider, "board_id": "fixture", "workspace": "fixture-space"}}))
     log = tmp_path / "called"
     result = subprocess.run(
         ["bash", "-c", 'source "$1"; tp list_issues', "_", str(scripts / "lib/ticket-provider.sh")],
@@ -189,7 +237,7 @@ def test_disposable_render_reads_manifest_before_provider_guidance(tmp_path: Pat
     assert "works identically" not in prompt
     assert not (role / ".scripts/providers/linear.sh").exists()
     assert prompt.index("## Provider gate") < prompt.index("This Trello render" if render_provider == "trello" else "**Krebs lifecycle")
-    (project / ".project.json").write_text(json.dumps({"ticket_provider": {"type": bound_provider, "board_id": "fixture"}}))
+    (project / ".project.json").write_text(json.dumps({"ticket_provider": {"type": bound_provider, "board_id": "fixture", "workspace": "fixture-space"}}))
     for provider in ("plane", "trello"):
         (role / f".scripts/providers/{provider}.sh").write_text('#!/bin/sh\nprintf "%s" "$TICKET_PROVIDER" > "$CALL_LOG"\n')
     log = tmp_path / "called"

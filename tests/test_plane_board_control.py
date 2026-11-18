@@ -206,6 +206,32 @@ def requests(path: Path) -> list[dict[str, str]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
+DISPATCHER = PROVIDER.parents[1] / "lib" / "ticket-provider.sh"
+
+
+def test_dispatcher_never_requests_plane_with_role_workspace_fallback(tmp_path: Path) -> None:
+    provider, env, request_log = stage_provider(tmp_path, responses=[
+        response("GET", "/projects/board-uuid/", {"id": "board-uuid", "name": "Fixture"}),
+    ])
+    dispatcher = provider.parents[1] / "lib" / "ticket-provider.sh"
+    dispatcher.parent.mkdir()
+    shutil.copy2(DISPATCHER, dispatcher)
+    role = provider.parents[2]
+    (role / "role.yaml").write_text("ticket_provider:\n  workspace: stale-role-space\n  project: stale-role-board\n", encoding="utf-8")
+    manifest = role.parents[2] / ".project.json"
+    binding = json.loads(manifest.read_text())
+    binding["ticket_provider"]["workspace"] = ""
+    manifest.write_text(json.dumps(binding))
+    env["PLANE_WORKSPACE"] = "ambient-space"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; tp list_issues', "_", str(dispatcher)],
+        env=env, text=True, capture_output=True,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "ticket_provider.workspace is missing" in result.stderr
+    assert requests(request_log) == [], "no request may reach the stale role or ambient workspace"
+
+
 def test_plane_comment_returns_only_a_proven_nonblank_comment_id(
     tmp_path: Path,
 ) -> None:

@@ -143,8 +143,12 @@ for parent in [start, *start.parents]:
                 binding = value.get("ticket_provider", {})
                 if not isinstance(binding, dict):
                     print("__TP_INVALID_MANIFEST__")
-                elif "type" not in binding:
-                    print("__TP_ABSENT_BINDING__")
+                elif "type" not in binding or binding["type"] == "":
+                    board = binding.get("board_id", "")
+                    if not isinstance(board, str) or board.strip():
+                        print("__TP_UNTYPED_BOUND__")
+                    else:
+                        print("__TP_ABSENT_BINDING__")
                 else:
                     print(binding["type"] if isinstance(binding["type"], str) else "__TP_INVALID_MANIFEST__")
         except Exception:
@@ -170,6 +174,29 @@ for parent in [start, *start.parents]:
         try:
             binding = json.loads(f.read_text()).get("ticket_provider")
             print(binding.get("board_id") if isinstance(binding, dict) and isinstance(binding.get("board_id"), str) else "")
+        except Exception:
+            print("")
+        break
+else:
+    print("")
+PY
+}
+
+# Read canonical Plane workspace without consulting role.yaml or ambient env.
+# An empty canonical workspace cannot authorize a board-bound Plane request.
+tp_plane_workspace() {
+  local role_dir
+  role_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
+  python3 - "$role_dir" <<'PY' 2>/dev/null
+import json, pathlib, sys
+start = pathlib.Path(sys.argv[1]).resolve()
+for parent in [start, *start.parents]:
+    f = parent / ".project.json"
+    if f.is_file():
+        try:
+            binding = json.loads(f.read_text()).get("ticket_provider")
+            workspace = binding.get("workspace") if isinstance(binding, dict) else None
+            print(workspace.strip() if isinstance(workspace, str) else "")
         except Exception:
             print("")
         break
@@ -222,8 +249,12 @@ tp() {
     __TP_NO_MANIFEST__|__TP_ABSENT_BINDING__|"")
       if [ "${TP_PROVISIONING:-0}" = "1" ]; then name="${TICKET_PROVIDER:-}"; else name=""; fi
       ;;
+    __TP_INVALID_MANIFEST__|__TP_UNTYPED_BOUND__)
+      echo "tp: unsupported ticket provider binding in .project.json; supported: plane, trello" >&2
+      return 2
+      ;;
     *)
-      if [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ] && [ "$name" != "__TP_INVALID_MANIFEST__" ]; then
+      if [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ]; then
         echo "tp: explicit provider conflicts with .project.json ticket_provider.type" >&2
         return 2
       fi
@@ -245,6 +276,10 @@ tp() {
     *)
       if [ -z "$(tp_board_id)" ]; then
         echo "tp: .project.json ticket_provider.board_id is missing; refusing board-bound $op" >&2
+        return 2
+      fi
+      if [ "$name" = plane ] && [ -z "$(tp_plane_workspace)" ]; then
+        echo "tp: .project.json ticket_provider.workspace is missing; refusing board-bound $op" >&2
         return 2
       fi
       ;;
