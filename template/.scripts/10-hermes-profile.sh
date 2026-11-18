@@ -29,10 +29,22 @@ PROFILE_DELTA_SEEDER="$ROLE_DIR/.scripts/lib/profile-config-seed.py"
 already_done 10-hermes-profile \
   && log "[10] profile marker found — revalidating required profile contract"
 
-# Canonical project identity and the desk's strict loadout are separate inputs.
-PROJECT_PATH="$(project_repo_path)" \
-  || die "cannot resolve the owning project; set PJANGLER_PROJECT_ROOT explicitly"
-SKILLEX_PROJECT_PATH="$PROJECT_PATH"
+# An explicit desk owns a loadout, not a fabricated project. Project-backed
+# roles retain their canonical resolver and project-discovery policy.
+PROJECT_PATH=""
+DESK_ONLY=0
+SKILLS_POLICY_ARGS=()
+if [[ -n "${HERMES_DESK_ROOT:-}" ]]; then
+  SKILLEX_PROJECT_PATH="$(owning_desk_path)" \
+    || die "cannot resolve the owning desk; use its real role directory and no PJANGLER_PROJECT_ROOT"
+  DESK_ONLY=1
+  SKILLS_POLICY_ARGS=(--desk-only)
+else
+  PROJECT_PATH="$(project_repo_path)" \
+    || die "cannot resolve the owning project; set PJANGLER_PROJECT_ROOT or HERMES_DESK_ROOT explicitly"
+  SKILLEX_PROJECT_PATH="$PROJECT_PATH"
+fi
+SELECTION_ROOT="$SKILLEX_PROJECT_PATH"
 if [[ -e "$PROFILE_HOME/.skillex-selection" || -L "$PROFILE_HOME/.skillex-selection" ]]; then
   [[ -d "$PROFILE_HOME/.skillex-selection" && ! -L "$PROFILE_HOME/.skillex-selection" ]] \
     || die "role selection must be a real directory: $PROFILE_HOME/.skillex-selection"
@@ -78,7 +90,7 @@ skillex_preflight() {
     die "legacy/invalid skills (skillex profile show exit $rc); use the preservation-first Skillex cutover: $CUTOVER_HINT"
   fi
   if [[ -z "$SKILLEX_PROJECT_PATH" ]]; then
-    SKILLEX_PROJECT_PATH="$(python3 -I - "$SKILLEX_SHOW_JSON" "$PROJECT_PATH" <<'PYEOF'
+    SKILLEX_PROJECT_PATH="$(python3 -I - "$SKILLEX_SHOW_JSON" "$SELECTION_ROOT" <<'PYEOF'
 import json, sys
 data = (json.loads(sys.argv[1]) or {}).get("data") or {}
 project = data.get("project")
@@ -114,6 +126,10 @@ strict_skill_sync() {
 # A runtime blocker applies only to the extra project binding. Strict desk
 # provisioning continues, and every rerun reassesses the actual fleet pin.
 project_skills_policy() {
+  if [[ "$DESK_ONLY" == "1" ]]; then
+    log "[10] desk-only loadout — no project discovery binding"
+    return 0
+  fi
   local rc=0 message
   message="$(python3 -I "$PROFILE_RENDERER" project-skills --profile "$PROFILE_NAME" \
     --project-root "$PROJECT_PATH" --role-dir "$ROLE_DIR")" || rc=$?
@@ -208,7 +224,7 @@ fi
 if [[ "$STRICT_DESK" == "1" ]]; then
   [[ -f "$PROFILE_RENDERER" && ! -L "$PROFILE_RENDERER" ]] \
     || die "canonical config renderer required for PM skill policy: $PROFILE_RENDERER"
-  python3 -I "$PROFILE_RENDERER" skills-policy --profile "$PROFILE_NAME" \
+  python3 -I "$PROFILE_RENDERER" skills-policy --profile "$PROFILE_NAME" "${SKILLS_POLICY_ARGS[@]}" \
     || die "could not keep isolated PM discovery"
   project_skills_policy
   strict_skill_sync
@@ -353,7 +369,7 @@ fi
 # then Skillex publishes the strict markers with the first strict sync.
 [[ -f "$PROFILE_RENDERER" && ! -L "$PROFILE_RENDERER" ]] \
   || die "canonical config renderer required for PM skill policy: $PROFILE_RENDERER"
-python3 -I "$PROFILE_RENDERER" skills-policy --profile "$PROFILE_NAME" \
+python3 -I "$PROFILE_RENDERER" skills-policy --profile "$PROFILE_NAME" "${SKILLS_POLICY_ARGS[@]}" \
   || die "could not establish isolated PM discovery"
 project_skills_policy
 strict_skill_sync

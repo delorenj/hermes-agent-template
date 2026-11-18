@@ -1319,6 +1319,25 @@ systemd_unit_contains_pid() {
   grep -qx "$pid" "$procs" && return 0 || return 1
 }
 
+# An explicit owning desk is not a project. Never infer it from ambient Git or
+# weaken project_repo_path (other steps use that function for project effects).
+owning_desk_path() {
+  [[ -n "${HERMES_DESK_ROOT:-}" && -z "${PJANGLER_PROJECT_ROOT:-}" ]] || return 1
+  python3 -I - "$HERMES_DESK_ROOT" "$ROLE_DIR" <<'PYEOF'
+import pathlib, sys
+root, role = (pathlib.Path(value).absolute() for value in sys.argv[1:])
+for path in (root, role):
+    if any(parent.is_symlink() for parent in (path, *path.parents)) or not path.is_dir():
+        raise SystemExit("owning desk must be a real directory without symlink ancestors")
+if root != role:
+    raise SystemExit("HERMES_DESK_ROOT must be the owning role directory")
+manifest = root / "role.yaml"
+if manifest.is_symlink() or not manifest.is_file():
+    raise SystemExit("owning desk role.yaml must be a regular file")
+print(root)
+PYEOF
+}
+
 # Resolve project repo path (the repo that holds agents/hermes/<role>/).
 # Prefer the manifest-defined owning project, including non-Git projects.
 # A role's own nested Git repository is not the canonical project binding.

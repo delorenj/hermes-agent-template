@@ -338,7 +338,16 @@ def project(request, check):
                 elif "config" in old and old["config"].get(key):
                     wanted = old["config"][key]
             elif leaf in node and node[leaf] != old.get("config", {}).get(key, wanted):
-                raise ValueError(f"ownership conflict: config {key}")
+                # The fleet route migration can reach the delta before Flume's
+                # receipt. Adopt ONLY this known owned transition, never an
+                # arbitrary endpoint or a change to another managed setting.
+                migrated_route = (
+                    key in ("providers.automaticai.api", "providers.automaticai.base_url")
+                    and old.get("config", {}).get(key) == "https://api.automaticai.io/v1"
+                    and node[leaf] == wanted
+                )
+                if not migrated_route:
+                    raise ValueError(f"ownership conflict: config {key}")
             node[leaf] = wanted
             managed[key] = wanted
         # Profile metadata and provider pin preserve unrelated handwritten keys.
