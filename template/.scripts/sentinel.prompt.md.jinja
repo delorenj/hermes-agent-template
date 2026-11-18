@@ -43,7 +43,10 @@ tp create_issue "<title>" "<desc>"    # file a NEW ticket in YOUR scope (label s
 ```
 
 Reason in **normalized states**, not provider terms. This pass works identically
-on Linear, Plane, or Trello.
+on Plane or Trello. The board binding is read from the repository's nearest
+`.project.json` `ticket_provider` block. If its type is missing or unsupported,
+stop before consulting credentials or an adapter; a legacy Linear record is
+inspectable data, not a supported binding.
 
 ## Board-driver lease — yours if the launcher holds it
 

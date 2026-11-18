@@ -27,9 +27,9 @@ reconciliation only. The engine itself lives under the PM at
 `.scripts/sentinel/`.
 
 It talks to the ticket board through a pluggable adapter, so the same engine
-runs on Linear, Plane, or Trello. The engine lives once in this template (the
-single source of truth) and propagates to every deployment with
-`copier update`.
+runs on Plane or Trello. The engine lives once in this template (the
+single source of truth) and propagates only when explicitly deployed; this
+branch does not update existing employees.
 
 ## Status at handoff
 
@@ -38,8 +38,8 @@ The following is true as of June 1, 2026.
 - The engine, the provider abstraction, and the autonomous adversarial-review
   enforcement are built, syntax-clean, and validated offline with a mock
   provider.
-- The **Linear** adapter is verified live against a real board (a real
-  `DEL` team: `resolve`, `list_issues` returning 93 issues, and `get_issue`).
+- Historical Linear bindings remain readable but are rejected before adapter
+  execution or network access.
 - The **Plane** adapter is verified live against a real workspace
   (`resolve`, `list_issues`, `get_issue`, `comment`, and a
   `transition` to `completed` on a disposable issue).
@@ -56,7 +56,7 @@ For a local, single-machine install (no Telegram and no NATS), use the
 one-command bootstrap. From inside the target project:
 
 ```bash
-export PLANE_API_KEY=<key>   # or LINEAR_API_KEY / TRELLO_KEY + TRELLO_TOKEN
+export PLANE_API_KEY=<key>   # or TRELLO_KEY + TRELLO_TOKEN
 curl -fsSL https://raw.githubusercontent.com/delorenj/hermes-agent-template/main/install-local.sh | sh
 ```
 
@@ -83,7 +83,7 @@ All paths are relative to the repository root.
 | `copier.yml` | Questions (`role`, `ticket_provider`) and the `_tasks` provisioning chain. |
 | `template/role.yaml.jinja` | The rendered role manifest, including the `ticket_provider` binding and the `reconcile` knobs (`grace_hours`, `auto_review`). |
 | `template/.scripts/lib/ticket-provider.sh` | The adapter dispatcher (`tp`). The engine's only seam to a ticket system. |
-| `template/.scripts/providers/{linear,plane,trello}.sh` | The provider adapters. |
+| `template/.scripts/providers/{plane,trello}.sh` | Supported provider adapters. |
 | `template/.scripts/42-ticket-provider.sh` | Provisioning step that resolves or creates the board. |
 | `template/.scripts/70-systemd.sh` | Provisioning step that makes the host gateway serve the profile (no per-agent unit, no heartbeat timer) and retires leftover per-agent units. |
 | `install-local.sh` | One-command local install (no cloud, macOS + Linux). |
@@ -111,9 +111,8 @@ the agent to read at run time. Keep the two in sync when behavior changes.
 
 The highest-value open work, in order:
 
-1. Live-verify the **Trello** adapter against a real board (Linear and Plane are
-   done). See [Providers: verifying an
-   adapter](providers.md#verifying-an-adapter-against-a-live-board).
+1. Verify the **Trello** adapter against a disposable board. Plane has
+   prior live verification; see [Providers: disposable board checks](providers.md#testing-provider-reads-against-a-disposable-board).
 2. Confirm `install-local.sh` on a real macOS machine. The Linux path and the
    Plane adapter are verified; the macOS `launchd` agent and `mkdir` lock get
    their first real run on a Mac.

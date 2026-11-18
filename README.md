@@ -20,8 +20,8 @@ runs second (for each agent role you want) to drop agents into it.
 
 The template provisions a single Hermes role per invocation. The `pm` role
 handles project management and triage, and also runs the continuous ticket
-sentinel out-of-band: a provider-agnostic board-reconciliation pass (Linear,
-Plane, or Trello) with an autonomous adversarial review (act, do not wait). The
+sentinel out-of-band: a provider-agnostic board-reconciliation pass (Plane or
+Trello) with an autonomous adversarial review (act, do not wait). The
 sentinel is the PM's `heartbeat.sh` reconciliation runner. **No timer is
 installed for it**: Candybar owns when it runs (see
 [Running reconciliation on a cadence](#running-reconciliation-on-a-cadence)).
@@ -110,7 +110,7 @@ refuses to run on macOS. Adopt an existing host with
 
 ## Ticket-provider adapters are vendored, not owned
 
-`template/.scripts/providers/{plane,linear,trello}.sh` are a **mirror**. The
+`template/.scripts/providers/{plane,trello}.sh` are the supported **mirrors**. The
 canonical copies live in Krebs at `krebs/adapters/tp/`, which
 `33god-platform/components/krebs.yaml` declares as its source of truth.
 

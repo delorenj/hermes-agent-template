@@ -65,10 +65,10 @@ The engine never calls a ticket system directly. It calls a normalized adapter
 contract, `template/.scripts/lib/ticket-provider.sh`, which exposes a single
 function, `tp`, that dispatches to one provider implementation under
 `template/.scripts/providers/`. The active provider is chosen at provision time
-through the `ticket_provider` question and recorded in `role.yaml` under
-`ticket_provider.name`.
+through `.project.json` `ticket_provider.type` and mirrored in `role.yaml` under
+`ticket_provider.name` for legacy readers.
 
-This is what lets one engine serve three back ends: Trello, Plane, and Linear.
+This is what lets one engine serve two supported back ends: Trello and Plane.
 For the full contract and the per-provider details, see
 [Providers](providers.md).
 
@@ -98,7 +98,7 @@ Plane boards follow Krebs lifecycle v2 (`krebs/spec/lifecycle.v2.yaml`): five
 stock lanes (Backlog, Todo, In Progress, Done, Cancelled), with review and holds
 carried by labels. On Plane, `in_review` lands in In Progress plus
 `lifecycle:review`, and `awaiting_decision` adds `lifecycle:needs-input`
-without moving the ticket. Linear and Trello still map both to a named lane.
+without moving the ticket. Trello maps both to named lanes.
 
 ## Autonomous adversarial review (act, do not wait)
 

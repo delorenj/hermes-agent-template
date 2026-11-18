@@ -41,7 +41,7 @@ still does not write application code or approve merges.
 All board access goes through the adapter (`tp`, from
 `.scripts/lib/ticket-provider.sh`) and reasons in normalized states:
 `backlog | unstarted | completed | cancelled` (read `started` only; never write it). Never call the provider
-directly — the engine is identical across Linear, Plane, and Trello.
+directly — the engine supports the bound Plane or Trello provider.
 
 ## Work-state feed
 

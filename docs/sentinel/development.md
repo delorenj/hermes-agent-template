@@ -130,7 +130,7 @@ The script:
 6. smoke-tests the board connection through the adapter.
 
 Useful environment overrides (skip the prompts): `HAT_REPO`, `HAT_PROVIDER`,
-`HAT_ROLES`, `HAT_PLANE_WORKSPACE`, `HAT_PLANE_PROJECT`, `HAT_LINEAR_TEAM`,
+`HAT_ROLES`, `HAT_PLANE_WORKSPACE`, `HAT_PLANE_PROJECT`,
 `HAT_TRELLO_BOARD`, and `HAT_DRY_RUN=1` to preview without changing anything.
 
 This local path does not wire Telegram or email. Those are convenience layers in
@@ -149,7 +149,7 @@ cd /path/to/your-project
 copier copy gh:delorenj/hermes-agent-template ./agents/hermes/pm \
   --data role=pm \
   --data target_repo=<repo> \
-  --data ticket_provider=<linear|plane|trello>
+  --data ticket_provider=<plane|trello>
 ```
 
 The `_tasks` chain in `copier.yml` runs the numbered provisioning scripts in
@@ -172,7 +172,7 @@ script checks its flag and skips cleanly.
 | --- | --- |
 | `SKIP_TELEGRAM` | The interactive BotFather token step. |
 | `SKIP_RUNTIME_REPO` | Legacy flag name: skip local runtime population/profile migration. No remote storage is created. |
-| `SKIP_PLANE` | Creating a Plane project. |
+| `SKIP_PLANE` | Legacy flag name: skip ticket-board provisioning for both Plane and Trello. |
 | `SKIP_BLOODBANK` | Compatibility no-op; Bloodbank ingress is fleet-shared. |
 | `SKIP_SYSTEMD` | Reconciling the host gateway and retiring leftover per-agent units in `70-systemd.sh`. |
 
@@ -181,13 +181,13 @@ For example, a local install that creates no cloud resources:
 ```bash
 SKIP_TELEGRAM=1 SKIP_RUNTIME_REPO=1 SKIP_PLANE=1 SKIP_BLOODBANK=1 \
   copier copy gh:delorenj/hermes-agent-template ./agents/hermes/pm \
-  --data role=pm --data target_repo=<repo> --data ticket_provider=linear
+  --data role=pm --data target_repo=<repo> --data ticket_provider=trello
 ```
 
-After provisioning, set the board binding in
-`agents/hermes/pm/role.yaml`. For Linear, set `ticket_provider.team`
-to the team key. Make the provider key available to the runner's environment:
-export it in the invoking shell, or write it into `~/.hermes/fleet.env`, which
+After provisioning, set the board binding in the repository's `.project.json`
+`ticket_provider` block (type and board_id); `role.yaml` is a compatibility
+mirror. Make the chosen provider's credentials available to the runner's environment:
+export them in the invoking shell, or write them into `~/.hermes/fleet.env`, which
 each adapter reads directly as its last resort.
 
 `SKIP_SYSTEMD` gates `70-systemd.sh`, which makes the host gateway serve the
@@ -302,11 +302,9 @@ These cost real debugging time. Watch for them.
 
 The following work is open for the incoming agent, roughly in priority order.
 
-1. **Live-verify the Trello adapter.** Linear and Plane are verified live
-   (Plane includes `transition` and `comment`). Trello is implemented against
-   the contract but unverified. Follow [Providers: verifying an
-   adapter](providers.md#verifying-an-adapter-against-a-live-board) with Trello
-   credentials, and fix any endpoint or field mismatches.
+1. **Verify the Trello adapter on disposable fixtures.** Plane has prior live
+   verification; Trello is implemented against the contract but not verified
+   live. See [Providers: disposable board checks](providers.md#testing-provider-reads-against-a-disposable-board).
 2. **Confirm `install-local.sh` on a real macOS machine.** The Linux path is
    verified end to end and the Plane adapter is verified live, but the `mkdir`
    lock and the assumption that the older Copier steps (`10-hermes-profile.sh`,

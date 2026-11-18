@@ -593,6 +593,24 @@ def test_done_marker_rerun_canonicalizes_live_plane_binding_and_preserves_unrela
     assert "revalidating canonical board binding" in result.stderr
 
 
+@pytest.mark.parametrize("provider", ["linear", "jira", ""])
+def test_provisioner_preserves_unsupported_existing_binding(
+    tmp_path: Path, provider: str
+) -> None:
+    project, role, env, call_log = _fixture(tmp_path)
+    path = project / ".project.json"
+    manifest = json.loads(path.read_text())
+    manifest["ticket_provider"].update(type=provider, board_id="historical-board")
+    path.write_text(json.dumps(manifest) + "\n")
+    before = path.read_bytes()
+    env["SKIP_PLANE"] = "0"
+    result = _run(role, env)
+    assert result.returncode != 0
+    assert ("unsupported ticket provider" if provider else "has no ticket_provider.type") in result.stderr
+    assert path.read_bytes() == before
+    assert not call_log.exists()
+
+
 @pytest.mark.parametrize("malformed", ["{", "[]\n", "null\n"])
 def test_malformed_project_manifest_is_preserved_before_any_provider_call(
     tmp_path: Path, malformed: str

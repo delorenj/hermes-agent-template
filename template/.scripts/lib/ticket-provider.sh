@@ -1,10 +1,10 @@
 # shellcheck shell=bash
 # Ticket-provider adapter dispatcher — the single seam between the Scrum Master
-# sentinel engine and a concrete ticket system (Linear | Plane | Trello).
+# sentinel engine and a concrete ticket system (Plane | Trello).
 #
 # The engine NEVER calls a provider directly. It calls `tp <op> [args...]`,
 # which dispatches to providers/<provider>.sh. Repo-root .project.json owns the
-# provider/board binding; role.yaml is only a legacy provider-name fallback.
+# provider/board binding; role.yaml is not an authority for dispatch.
 #
 # Contract (operations every provider must implement):
 #   resolve                       -> JSON {provider, board_id, board_url}
@@ -121,20 +121,15 @@ $issues
 EOF
 }
 
-# Resolve the provider name: explicit env wins, then repo-root .project.json
-# (the SOT), then role.yaml (self-parsed so this works even when _lib.sh /
-# yaml_get is not loaded), then default.
+# Resolve the provider from the repo-root .project.json (the SOT). A provisioner
+# can supply a provider explicitly only when the manifest has no type yet.
+# No missing or malformed binding defaults to Plane.
 tp_provider_name() {
-  if [ -n "${TICKET_PROVIDER:-}" ]; then
-    printf '%s\n' "$TICKET_PROVIDER"
-    return 0
-  fi
   # .project.json ticket_provider.type — walk up from the role dir to repo root.
   local role_dir
   role_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
   if [ -n "$role_dir" ]; then
-    local sot_type
-    sot_type="$(python3 - "$role_dir" <<'PY' 2>/dev/null
+    python3 - "$role_dir" <<'PY' 2>/dev/null
 import sys, json, pathlib
 start = pathlib.Path(sys.argv[1]).resolve()
 for parent in [start, *start.parents]:
@@ -145,26 +140,10 @@ for parent in [start, *start.parents]:
         except Exception:
             print("")
         break
+else:
+    print("__TP_NO_MANIFEST__")
 PY
-)"
-    [ -n "$sot_type" ] && { printf '%s\n' "$sot_type"; return 0; }
   fi
-  local role_yaml
-  role_yaml="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/role.yaml"
-  if [ -f "$role_yaml" ]; then
-    local name
-    name="$(python3 - "$role_yaml" <<'PY'
-import re, sys, pathlib
-t = pathlib.Path(sys.argv[1]).read_text()
-m = re.search(r'(?ms)^ticket_provider:\s*$(.*?)(?=^\S)', t + "\n\x00")
-block = m.group(1) if m else ""
-mm = re.search(r'(?m)^\s*name:\s*"?([^"\n]*)"?\s*$', block)
-print(mm.group(1).strip() if mm else "")
-PY
-)"
-    [ -n "$name" ] && { printf '%s\n' "$name"; return 0; }
-  fi
-  printf 'linear\n'
 }
 
 # Directory holding provider implementations (sibling of this lib).
@@ -207,6 +186,18 @@ tp() {
 
   local name impl
   name="$(tp_provider_name)"
+  if [ "$name" = "__TP_NO_MANIFEST__" ]; then
+    name="${TICKET_PROVIDER:-}"
+  elif [ -z "$name" ] && [ "${TP_PROVISIONING:-0}" = "1" ]; then
+    name="${TICKET_PROVIDER:-}"
+  elif [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ]; then
+    echo "tp: explicit provider conflicts with .project.json ticket_provider.type" >&2
+    return 2
+  fi
+  case "$name" in
+    plane|trello) ;;
+    *) echo "tp: unsupported ticket provider '$name' (supported: plane, trello)" >&2; return 2 ;;
+  esac
   impl="$(tp_providers_dir)/${name}.sh"
 
   if [ ! -f "$impl" ]; then
@@ -232,7 +223,7 @@ tp() {
 # v2 (krebs/spec/lifecycle.v2.yaml): five stock lanes, with review and holds
 # carried by labels, so plane.sh lands in_review in In Progress plus
 # lifecycle:review and awaiting_decision as +lifecycle:needs-input in place.
-# Linear and Trello still map both to a lane role.yaml names.
+# Trello maps both to lanes named in role.yaml.
 TP_STATES="backlog unstarted started in_review completed cancelled awaiting_decision needs_attention waiting_reply"
 
 tp_is_valid_state() {

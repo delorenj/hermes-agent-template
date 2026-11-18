@@ -1,7 +1,7 @@
 # Provider adapters
 
 This guide is the reference for the ticket-provider abstraction: the contract
-every adapter implements, the three adapters that ship today, and a
+every supported adapter implements, the two adapters that ship today, and a
 step-by-step process for adding a new provider or verifying an existing one
 against a live board. Read [Architecture](architecture.md) first for how the
 adapter fits into the engine.
@@ -10,7 +10,8 @@ adapter fits into the engine.
 
 Each adapter is a standalone POSIX shell script under
 `template/.scripts/providers/<name>.sh`. It reads its credentials from the
-environment and its board binding from `role.yaml` under `ticket_provider`. It
+environment and its board binding from `.project.json` `ticket_provider`.
+`role.yaml` holds a compatibility mirror, not provider-selection authority. It
 takes an operation as its first argument and writes JSON or a status string to
 standard output.
 
@@ -79,12 +80,10 @@ filing a duplicate. Callers should branch on `created` rather than assume it.
 
 ## The adapters that ship today
 
-The repository includes three adapters with different verification status.
+The repository supports Plane and Trello. A historical Linear binding may
+remain in `.project.json`, but the dispatcher refuses it before loading an
+adapter or making a request.
 
-- **Linear** (`providers/linear.sh`) is the reference implementation. It uses
-  the Linear GraphQL API. It's verified live against a real board. Linear's
-  `issue(id:)` field accepts both the UUID and the human identifier (for
-  example, `DEL-42`), so the engine can pass identifiers through.
 - **Plane** (`providers/plane.sh`) uses the Plane REST API with `X-API-Key`
   authentication. A Plane project maps to the board, a cycle maps to the
   milestone, and `state.group` maps to the state type. It's verified live. Note
@@ -101,29 +100,13 @@ The repository includes three adapters with different verification status.
   implemented but not yet verified against a live board. `create_issue` files
   the new card into the `backlog` list, falling back to `unstarted`.
 
-All three adapters implement `create_issue`. Plane uses
-`POST projects/<board>/issues/`, Trello uses `POST cards`, and Linear uses the
-`issueCreate` mutation; the Linear and Trello paths carry the same verification
-status as the rest of their adapter.
+Both supported adapters implement `create_issue`: Plane uses
+`POST projects/<board>/issues/`; Trello uses `POST cards`.
 
 ### Credentials and binding by provider
 
-Set credentials in the environment and the board binding in `role.yaml`.
-
-<details>
-<summary>Linear</summary>
-
-- Credentials: `LINEAR_API_KEY`.
-- Binding:
-
-  ```yaml
-  ticket_provider:
-    name: linear
-    team: DEL # Linear team key
-    project: "" # optional, scopes milestone and issue queries
-  ```
-
-</details>
+Set credentials in the environment and the board binding in `.project.json`.
+The provisioner mirrors supported values into `role.yaml` for legacy readers.
 
 <details>
 <summary>Plane</summary>
@@ -158,13 +141,13 @@ Set credentials in the environment and the board binding in `role.yaml`.
 
 ## Adding a provider
 
-To add a fourth provider, for example GitHub Issues or Jira, follow these steps.
+This is future extension guidance, not an advertised third provider. To add
+a provider later, first change the supported-provider allowlists and tests.
 
-1. Create `template/.scripts/providers/<name>.sh`. Start from `linear.sh` if the
-   back end uses GraphQL, or `plane.sh` if it uses REST with a single API key.
+1. Create `template/.scripts/providers/<name>.sh`. Start from `plane.sh`
+   for a REST API with a single key.
 2. Implement every operation in [the contract](#the-contract). Return the exact
-   JSON shapes shown in the table. Map your back end's states to the five
-   normalized states.
+   JSON shapes shown in the table. Map your back end's states to the normalized states.
 3. Fail fast and clean. Validate credentials at the top of the script, before
    any pipe, so a missing key prints one error line instead of a stack trace.
    The existing adapters call a `need_key` helper for this.
@@ -172,9 +155,8 @@ To add a fourth provider, for example GitHub Issues or Jira, follow these steps.
    appears as a choice.
 5. Extend `template/role.yaml.jinja` with a provider-specific binding block
    under the `{% if ticket_provider == '<name>' %}` branch.
-6. Teach `42-ticket-provider.sh` how to resolve or create the board for your
-   provider, if it differs from the existing `linear`, `plane`, and `trello`
-   cases.
+6. Teach `42-ticket-provider.sh` and the dispatcher how to resolve or create
+   the board for your provider and admit it explicitly.
 7. Validate and verify with the steps below.
 
 <!-- prettier-ignore -->
@@ -204,29 +186,28 @@ Before you touch a live board, confirm the adapter parses and fails cleanly.
    exit, with no Python traceback:
 
    ```bash
-   ( unset LINEAR_API_KEY; sh template/.scripts/providers/linear.sh resolve )
+   ( unset PLANE_API_KEY; sh template/.scripts/providers/plane.sh resolve )
    ```
 
-## Verifying an adapter against a live board
+## Testing provider reads against a disposable board
 
-When you have credentials, exercise the read operations against a real board.
+When you have credentials, exercise the read operations against a disposable board.
 The following pattern stages a minimal role directory and runs the adapter. It
-never closes or modifies a ticket, so it's safe to run.
+never closes or modifies a ticket, but it does make live read requests.
 
 ```bash
-# 1. Load the credential into the environment only (never print it).
-export LINEAR_API_KEY="$(grep -E '^(export )?LINEAR_API_KEY=' \
-  ~/.hermes/<agent>.env | head -1 | sed -E 's/^(export )?LINEAR_API_KEY=//; s/^"//; s/"$//')"
-
-# 2. Stage a role directory bound to the real board.
-T=$(mktemp -d); RD="$T/agents/hermes/pm"
+# Use only disposable boards and provider-specific credentials; never print keys.
+# 1. Stage a role directory and repo manifest bound to the disposable board.
+T="$(mktemp -d "${TMPDIR:?}/tp-verify.XXXXXX")"; RD="$T/agents/hermes/pm"
 mkdir -p "$RD/.scripts/lib" "$RD/.scripts/providers"
 cp template/.scripts/lib/ticket-provider.sh "$RD/.scripts/lib/"
-cp template/.scripts/providers/linear.sh "$RD/.scripts/providers/"
-printf 'repo: demo\nrole: pm\nticket_provider:\n  name: linear\n  team: DEL\n' \
-  > "$RD/role.yaml"
+cp template/.scripts/providers/trello.sh "$RD/.scripts/providers/"
+python3 - "$T/.project.json" <<'PY'
+import json, pathlib, sys
+pathlib.Path(sys.argv[1]).write_text(json.dumps({"ticket_provider": {"type": "trello", "board_id": "disposable-board-id"}}))
+PY
 
-# 3. Run the read operations.
+# 2. Run the read operations after setting TRELLO_KEY and TRELLO_TOKEN.
 LIB="$RD/.scripts/lib/ticket-provider.sh"
 bash -c '. "$1"; tp resolve' _ "$LIB"
 bash -c '. "$1"; tp list_issues' _ "$LIB" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)),"issues")'

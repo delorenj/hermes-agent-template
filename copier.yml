@@ -12,7 +12,7 @@
 #   1. Renders agents/hermes/<role>/{role.yaml, SOUL.md, hermes, .scripts/}
 #   2. Creates ignored local state at agents/hermes/<role>/runtime/ and delegates
 #      named-profile wiring to `pj migrate hermes.runtime-singleton`
-#   4. Creates a Plane project in 33god workspace
+#   4. Binds an existing Plane or Trello board
 #   6. Verifies a BotFather token, stores it in 1Password, and maps an op:// reference
 #   7. Optionally does the same for a dedicated Slack app+bot pair
 #   8. Records fleet-shared Bloodbank routing identity (no profile consumer)
@@ -39,6 +39,7 @@ _exclude:
   - "**/__pycache__"
   - "**/*.pyc"
   - "**/*.pyo"
+  - ".scripts/providers/linear.sh" # historical adapter retained in source, never rendered
 
 # ─── Questions (only what we can't derive) ───────────────────────────────
 
@@ -65,7 +66,6 @@ ticket_provider:
   help: "Ticket system this agent's board lives in"
   default: plane
   choices:
-    "Linear": linear
     "Plane": plane
     "Trello": trello
 
