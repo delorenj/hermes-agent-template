@@ -6,8 +6,9 @@ prompt, the `## Launch mode` section) outranks this file. This file only says wh
 
 ## How this pass works
 
-- The brief above is your whole context: the declaration, the snapshot, the open board, the owner
-  comments waiting, your roadmap and the plan shape. Trust it. Do not list the board, run
+- The brief above is your whole context: the declaration, the snapshot, the open board, the untagged
+  comments waiting (a hint, never owner approval: Krebs and workers post untagged as the owner's
+  account), your roadmap and the plan shape. Trust it. Do not list the board, run
   `px --help`, load skills, read the SOUL or contract files, or run hooks or tests.
 - The snapshot outranks your roadmap. If the roadmap says something is owed and the snapshot shows it
   done, drop it. The roadmap lists only what is still open, never what a pass did.

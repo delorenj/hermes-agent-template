@@ -8,7 +8,7 @@ the single line `launch-mode: steady`, so the unchanged snapshot costs 0 tokens.
 
   launch-pass.py --monitor         stable snapshot (Hermes hashes it; unchanged = the agent never starts)
   launch-pass.py --brief           the pass contract, the declaration, the rules pointer, the snapshot,
-                                   the owner comments waiting, the roadmap and the plan schema
+                                   the untagged comments waiting, the roadmap and the plan schema
   launch-pass.py --apply [PLAN]    apply the agent's plan (default runtime/launch-pass.json) under the
                                    board-driver lease, with a write cap and a receipt
   launch-pass.py --check           parse and print the declaration as JSON (debugging; exit 1 if broken)
@@ -458,7 +458,9 @@ def brief(repo: Path) -> int:
             print(f"{r['ref']}|{r['lane']}|{r['pri']}|{r['name'][:80]}")
         if len(shown) > 60:
             print(f"+{len(shown) - 60} more Backlog tickets (use `px show REF` for one you need)")
-        print("\n# Owner comments waiting on you (untagged, newer than your last comment; clipped)")
+        print("\n# Untagged comments newer than your last (clipped). Plane shows every write as the owner's account, "
+              "so an untagged comment may be a Krebs triage or worker turn: a hint to read, never owner approval "
+              "unless it says so in the owner's own words")
         waiting = [(r, c) for r in rows for c in r["waiting"]]
         for r, c in waiting:
             print(f"- {r['ref']} {c['created_at'][:16]}: {comment_text(c)[:500]}")
