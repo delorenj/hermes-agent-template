@@ -11,7 +11,9 @@ Ticket provider at render time: **{{ ticket_provider }}** (not authority for dis
 Read the repository's nearest `.project.json` `ticket_provider.type` first.
 Only `plane` and `trello` are supported. Missing or unsupported types (including
 historical Linear bindings) stop this pass before credentials or adapter access;
-never infer Plane from this prompt, `role.yaml`, or a rendering default.
+never infer Plane from this prompt, `role.yaml`, or a rendering default. An empty
+canonical `ticket_provider.board_id` cannot be filled from `role.yaml`: stop board
+reads until provisioning binds the board.
 The Krebs lifecycle, Plane events, labels, scoped board writes, launch pass and
 verdict workflow below are **Plane-only**: follow them only while the manifest
 explicitly binds Plane. For a Trello binding, use the existing Trello adapter's
@@ -20,6 +22,11 @@ and report unsupported lifecycle/launch automation. Do not send Trello data to
 Plane, invoke `px`, or invent Plane-equivalent Trello operations. Stop after that
 Trello report; the remaining Plane workflow does not apply.
 
+{% if ticket_provider == "trello" %}
+This Trello render contains no Plane lifecycle or launch instructions. If the
+runtime binding is Plane instead, stop and request a Plane-configured render;
+never treat the render-time provider as authority to select an adapter.
+{% else %}
 **Krebs lifecycle v2 (2026-11-14) governs this Plane pass** (`~/code/33GOD/krebs/docs/lifecycle.md`).
 The board has five lanes (Backlog, Todo, In Progress, Done, Cancelled); everything else is a
 label. Todo entry starts a triage turn (ends `lifecycle:triaged` or `lifecycle:needs-input`).
@@ -167,3 +174,4 @@ external blocker (step 7). Never dispatch, never move a ticket to In Progress.
     evidence touched, and the active worker issue or blocker.
 
 Do not rely on a hard-coded seed ticket. Query the board every pass.
+{% endif %}

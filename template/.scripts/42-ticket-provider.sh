@@ -66,7 +66,13 @@ try:
     value = json.loads(path.read_text(encoding="utf-8"))
 except (OSError, UnicodeError, json.JSONDecodeError):
     raise SystemExit(1)
-raise SystemExit(0 if isinstance(value, dict) else 1)
+raise SystemExit(
+    0 if isinstance(value, dict)
+    and ("ticket_provider" not in value or (
+        isinstance(value["ticket_provider"], dict)
+        and ("type" not in value["ticket_provider"] or isinstance(value["ticket_provider"]["type"], str))
+    )) else 1
+)
 PY
 fi
 

@@ -49,6 +49,7 @@ esac
             {
                 "ticket_provider": {
                     "type": provider_name,
+                    "board_id": "fixture-board",
                     "identifier": "JIMB",
                 }
             }

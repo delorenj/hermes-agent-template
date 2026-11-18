@@ -137,8 +137,16 @@ for parent in [start, *start.parents]:
     if f.is_file():
         try:
             value = json.loads(f.read_text())
-            binding = value.get("ticket_provider") if isinstance(value, dict) else None
-            print(binding.get("type") if isinstance(binding, dict) and isinstance(binding.get("type"), str) else "__TP_INVALID_MANIFEST__")
+            if not isinstance(value, dict):
+                print("__TP_INVALID_MANIFEST__")
+            else:
+                binding = value.get("ticket_provider", {})
+                if not isinstance(binding, dict):
+                    print("__TP_INVALID_MANIFEST__")
+                elif "type" not in binding:
+                    print("__TP_ABSENT_BINDING__")
+                else:
+                    print(binding["type"] if isinstance(binding["type"], str) else "__TP_INVALID_MANIFEST__")
         except Exception:
             print("__TP_INVALID_MANIFEST__")
         break
@@ -146,6 +154,28 @@ else:
     print("__TP_NO_MANIFEST__")
 PY
   fi
+}
+
+# A canonical manifest with no board must not fall through to a stale role.yaml
+# board. Only board creation and explicit board lookup can run without one.
+tp_board_id() {
+  local role_dir
+  role_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)"
+  python3 - "$role_dir" <<'PY' 2>/dev/null
+import json, pathlib, sys
+start = pathlib.Path(sys.argv[1]).resolve()
+for parent in [start, *start.parents]:
+    f = parent / ".project.json"
+    if f.is_file():
+        try:
+            binding = json.loads(f.read_text()).get("ticket_provider")
+            print(binding.get("board_id") if isinstance(binding, dict) and isinstance(binding.get("board_id"), str) else "")
+        except Exception:
+            print("")
+        break
+else:
+    print("")
+PY
 }
 
 # Directory holding provider implementations (sibling of this lib).
@@ -188,14 +218,17 @@ tp() {
 
   local name impl
   name="$(tp_provider_name)"
-  if [ "$name" = "__TP_NO_MANIFEST__" ]; then
-    if [ "${TP_PROVISIONING:-0}" = "1" ]; then name="${TICKET_PROVIDER:-}"; else name=""; fi
-  elif [ -z "$name" ] && [ "${TP_PROVISIONING:-0}" = "1" ]; then
-    name="${TICKET_PROVIDER:-}"
-  elif [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ] && [ "$name" != "__TP_INVALID_MANIFEST__" ]; then
-    echo "tp: explicit provider conflicts with .project.json ticket_provider.type" >&2
-    return 2
-  fi
+  case "$name" in
+    __TP_NO_MANIFEST__|__TP_ABSENT_BINDING__|"")
+      if [ "${TP_PROVISIONING:-0}" = "1" ]; then name="${TICKET_PROVIDER:-}"; else name=""; fi
+      ;;
+    *)
+      if [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ] && [ "$name" != "__TP_INVALID_MANIFEST__" ]; then
+        echo "tp: explicit provider conflicts with .project.json ticket_provider.type" >&2
+        return 2
+      fi
+      ;;
+  esac
   case "$name" in
     plane|trello) ;;
     *) echo "tp: unsupported ticket provider '$name' (supported: plane, trello)" >&2; return 2 ;;
@@ -206,6 +239,16 @@ tp() {
     echo "tp: unknown ticket provider '$name' (no $impl)" >&2
     return 2
   fi
+
+  case "$op" in
+    create_board|describe_board) ;;
+    *)
+      if [ -z "$(tp_board_id)" ]; then
+        echo "tp: .project.json ticket_provider.board_id is missing; refusing board-bound $op" >&2
+        return 2
+      fi
+      ;;
+  esac
 
   case "$op" in
     get_issue|comment|transition)
