@@ -42,4 +42,6 @@ recommendation and the default that applies on silence.
 - `rank` has no px verb. It posts a `launch rank N` comment. Say so once in the roadmap if you rely on it.
 - At most one `readout` comment per day on the epic. Post it only when something changed.
 - At most 3 creates per pass; every create carries a key so a retry never duplicates.
+- To put a ticket in the launch epic, `link` it with the epic or `create` it with the epic as
+  `parent`; the driver turns either into an epic membership. An epic never blocks.
 - Refs must be on this board.

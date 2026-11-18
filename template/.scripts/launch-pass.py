@@ -23,7 +23,9 @@ Declaration (`.launch.yaml`, no status inside):
 
 Allowed apply ops: comment, create, move, close, cancel, rank, link. Everything else is refused.
 `rank` has no px verb (px cannot reorder a lane), so it degrades to a `launch rank N` comment and the
-receipt says so. Moves are Backlog/Todo only: In Progress is Krebs' lane.
+receipt says so. Moves are Backlog/Todo only: In Progress is Krebs' lane. px refuses an epic at either
+end of a link or as a parent, so a `link` touching the declaration's epic, or a `create` whose `parent`
+is that epic, becomes an epic membership (`px epic add EPIC REF`).
 
 stdlib only, python3. The script lives in <repo>/agents/hermes/<role>/.scripts/ and finds the repo by
 walking up to `.project.json` (or `.git`); LAUNCH_REPO or --repo override. px runs with cwd = repo.
@@ -415,12 +417,13 @@ PLAN_SCHEMA = """\
 {"writes": [
   {"op": "comment", "ref": "<ID>-12", "text": "..."},
   {"op": "create",  "title": "...", "description": "...", "labels": ["bare-word"], "priority": "high",
-                    "state": "Todo", "key": "launch:slug", "parent": "<ID>-7"},
+                    "state": "Todo", "key": "launch:slug", "parent": "<EPIC>"},
   {"op": "move",    "ref": "<ID>-12", "lane": "Todo", "text": "why"},
   {"op": "close",   "ref": "<ID>-12", "text": "accepted: shipped in build X"},
   {"op": "cancel",  "ref": "<ID>-12", "text": "why it is not launch work and never will be"},
   {"op": "rank",    "ref": "<ID>-12", "rank": 1, "text": "why"},
-  {"op": "link",    "ref": "<ID>-12", "other": "<ID>-13", "blocks": true}],
+  {"op": "link",    "ref": "<ID>-12", "other": "<ID>-13", "blocks": true},
+  {"op": "link",    "ref": "<EPIC>", "other": "<ID>-12"}],
  "roadmap": "# whole new roadmap, at most 40 lines (omit on a quiet pass)",
  "note": "one line"}"""
 
@@ -459,6 +462,9 @@ def brief(repo: Path) -> int:
     print(f"\n# Plan\nWrite ONE file: {DEFAULT_PLAN} (write_file with `path` and `content` as a JSON string). "
           f"Allowed ops: {', '.join(ALLOWED_OPS)}. Lanes for `move`: {', '.join(LANES)} (In Progress is Krebs'). "
           f"Cap {write_cap()} writes, {MAX_CREATES} creates. `rank` has no px verb: it posts a `launch rank N` comment. "
+          f"The launch epic is {decl.get('epic') or 'not declared'}: a `link` with it on either side, or a `create` "
+          "whose `parent` is it, makes the ticket a member of it (an epic never blocks); any other `parent` is a "
+          "same-board sub-issue. "
           "Refs must be on this board (BOARD = " + (ident or "this board") + "). Comments are tagged "
           f"`{tag()}` by the driver. Shape:")
     print(PLAN_SCHEMA)
@@ -550,6 +556,7 @@ def apply(repo: Path, plan_arg: str | None) -> int:
         entries.append({"i": i, "op": w.get("op"), "ref": w.get("ref", ""), "status": status, "detail": detail})
 
     creates = 0
+    epic = str(decl.get("epic") or "")
     try:
         for i, w in enumerate(writes, 1):
             if not isinstance(w, dict):
@@ -626,6 +633,14 @@ def apply(repo: Path, plan_arg: str | None) -> int:
                 if not REF.match(other) or other == ref:
                     record(i, w, "skip", "bad or identical `other` ref")
                     continue
+                if epic and epic in (ref, other):
+                    if w.get("blocks"):
+                        record(i, w, "skip", f"{epic} is the launch epic: it joins members, it never blocks")
+                        continue
+                    member = other if ref == epic else ref
+                    ok, msg = px_write(repo, "epic", "add", epic, member)
+                    record(i, w, "ok" if ok else "error", msg)
+                    continue
                 ok, msg = px_write(repo, "link", "add", ref, other, *(["--blocks"] if w.get("blocks") else []))
                 record(i, w, "ok" if ok else "error", msg)
             elif op == "create":
@@ -650,11 +665,21 @@ def apply(repo: Path, plan_arg: str | None) -> int:
                     args += ["-l", ",".join(labels)]
                 if pri:
                     args += ["--priority", pri]
-                if w.get("parent") and REF.match(str(w["parent"])):
-                    args += ["--parent", str(w["parent"])]
+                parent = str(w.get("parent") or "")
+                join_epic = bool(epic) and parent == epic
+                if parent and not join_epic and REF.match(parent):
+                    args += ["--parent", parent]
                 creates += 1
                 ok, msg = px_write(repo, *args)
                 record(i, {**w, "ref": title[:60]}, "ok" if ok else "error", msg)
+                if ok and join_epic:
+                    board = re.escape(ident) if ident else "[A-Z][A-Z0-9]*"
+                    m = re.search(rf"\b({board}-\d+)\b", msg)
+                    if not m:
+                        record(i, {"op": "epic", "ref": title[:60]}, "error", f"created, but no ref in px output to join {epic}")
+                    else:
+                        ok, msg = px_write(repo, "epic", "add", epic, m.group(1))
+                        record(i, {"op": "epic", "ref": m.group(1)}, "ok" if ok else "error", msg)
     finally:
         if writes:
             lease("release", lock, owner)
@@ -689,18 +714,19 @@ def check(repo: Path) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2 or argv[1] not in ("--monitor", "--brief", "--apply", "--check"):
+    cmds = [a for a in argv[1:] if a in ("--monitor", "--brief", "--apply", "--check")]
+    if len(cmds) != 1:
         print(__doc__)
         return 2
     repo = find_repo()
-    cmd = argv[1]
+    cmd = cmds[0]
     if cmd == "--monitor":
         return monitor(repo)
     if cmd == "--brief":
         return brief(repo)
     if cmd == "--check":
         return check(repo)
-    rest = [a for i, a in enumerate(argv[2:], 2) if a != "--repo" and argv[i - 1] != "--repo"]
+    rest = [a for i, a in enumerate(argv[1:], 1) if a not in ("--apply", "--repo") and argv[i - 1] != "--repo"]
     return apply(repo, rest[0] if rest else None)
 
 

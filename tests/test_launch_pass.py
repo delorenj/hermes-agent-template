@@ -54,7 +54,10 @@ else:
     if os.environ.get("PX_SHIM_FAIL") == args[0]:
         print("px: boom", file=sys.stderr)
         sys.exit(1)
-    print("ok " + " ".join(args[:3]))
+    if args[:2] == ["task", "create"]:
+        print("created EARS-99 [" + args[args.index("--state") + 1] + "] " + args[2])
+    else:
+        print("ok " + " ".join(args[:3]))
 '''
 
 
@@ -275,6 +278,37 @@ def test_apply_runs_every_allowed_op_through_px_with_tag(repo):
     assert w[6][w[6].index("--state") + 1] == "Todo"
     assert "degraded: px has no rank verb" in out.stdout
     assert (repo.role / "runtime" / "launch-roadmap.md").read_text() == "# r\n- one\n"
+
+
+def test_apply_turns_links_and_parents_on_the_launch_epic_into_memberships(repo):
+    repo.plan({"writes": [
+        {"op": "link", "ref": "EARS-1", "other": "EARS-3"},
+        {"op": "link", "ref": "EARS-4", "other": "EARS-1"},
+        {"op": "link", "ref": "EARS-1", "other": "EARS-2", "blocks": True},
+        {"op": "create", "title": "Store listing", "state": "Todo", "parent": "EARS-1"},
+        {"op": "create", "title": "Sub task", "parent": "EARS-2"},
+    ]})
+    out = repo.run("--apply")
+    assert out.returncode == 0, out.stdout + out.stderr
+    w = repo.writes()
+    assert w[0] == ["epic", "add", "EARS-1", "EARS-3"]
+    assert w[1] == ["epic", "add", "EARS-1", "EARS-4"]
+    assert w[2][:3] == ["task", "create", "Store listing"] and "--parent" not in w[2]
+    assert w[3] == ["epic", "add", "EARS-1", "EARS-99"]
+    assert w[4][:3] == ["task", "create", "Sub task"] and w[4][w[4].index("--parent") + 1] == "EARS-2"
+    assert len(w) == 5
+    assert "launch epic: it joins members, it never blocks" in out.stdout
+
+
+def test_subcommand_may_follow_repo_flag(repo):
+    out = repo.run("--repo", str(repo.root), "--monitor")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert out.stdout.startswith("launch-mode: launch")
+
+
+def test_brief_names_the_launch_epic_for_memberships(repo):
+    out = repo.run("--brief")
+    assert "The launch epic is EARS-1" in out.stdout
 
 
 def test_apply_write_cap(repo):
