@@ -33,7 +33,8 @@ SHIM = r'''#!__PY__
 import json, os, sys
 state = os.environ["PX_SHIM_STATE"]
 args = sys.argv[1:]
-with open(state + "/board.json") as f:
+_own = state + "/board-" + os.path.basename(os.getcwd()) + ".json"
+with open(_own if os.path.exists(_own) else state + "/board.json") as f:
     board = json.load(f)
 if args[:2] == ["task", "list"]:
     issues = [{"sequence_id": t["seq"], "state_name": t["state_name"], "state_group": t["state_group"], "name": t["name"]}
@@ -41,7 +42,8 @@ if args[:2] == ["task", "list"]:
     print(json.dumps({"ok": True, "board": board["board"], "issues": issues}))
 elif args[:2] == ["task", "get"]:
     ref = args[2]
-    for t in board["tickets"]:
+    import glob  # a read works from any scope: search every board file
+    for t in [t for fn in sorted(glob.glob(state + "/board*.json")) for t in json.load(open(fn))["tickets"]]:
         if f"{board['board']}-{t['seq']}" == ref:
             print(json.dumps({"ticket": t}))
             break
@@ -51,6 +53,8 @@ elif args[:2] == ["task", "get"]:
 else:
     with open(state + "/writes.log", "a") as f:
         f.write(json.dumps(args) + "\n")
+    with open(state + "/cwd.log", "a") as f:
+        f.write(os.path.basename(os.getcwd()) + "\n")
     if os.environ.get("PX_SHIM_FAIL") == args[0]:
         print("px: boom", file=sys.stderr)
         sys.exit(1)
@@ -507,3 +511,38 @@ def test_script_is_executable_and_stdlib_only():
     assert src.startswith("#!/usr/bin/env python3")
     for banned in ("import yaml", "import requests", "import httpx"):
         assert banned not in src
+
+
+# ------------------------------------------------------------------------- monorepo child scopes
+
+def test_scopes_drive_child_scope_tickets_from_the_childs_directory(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration=DECL.replace("epic: EARS-1\n", "epic: EARS-1\nscopes: [kid]\n"), tickets=[ticket(2, "Todo")])
+    kid = r.root / "kid"
+    kid.mkdir()
+    (kid / ".project.json").write_text("{}")
+    (r.state / "board-kid.json").write_text(json.dumps({"board": "EARS", "tickets": [ticket(3, "Backlog"), ticket(4, "Todo")]}))
+    mon = r.run("--monitor").stdout
+    assert "EARS-2|" in mon and "EARS-3|" in mon and "EARS-4|" in mon  # the child's tickets are in the snapshot
+    r.plan({"writes": [
+        {"op": "comment", "ref": "EARS-3", "text": "child scope"},
+        {"op": "comment", "ref": "EARS-2", "text": "own scope"},
+        {"op": "create", "title": "child work", "scope": "kid", "parent": "EARS-1"},
+        {"op": "create", "title": "bad scope", "scope": "../etc"},
+    ]})
+    r.run("--apply")
+    cwd = (r.state / "cwd.log").read_text().split()
+    writes = r.writes()
+    assert writes[0][:2] == ["comment", "EARS-3"] and cwd[0] == "kid"
+    assert writes[1][:2] == ["comment", "EARS-2"] and cwd[1] == "repo"
+    assert writes[2][:2] == ["task", "create"] and cwd[2] == "kid"
+    assert writes[3][:3] == ["epic", "add", "EARS-1"] and cwd[3] == "repo"
+    assert len(writes) == 4  # the undeclared scope was skipped, nothing written for it
+
+
+def test_without_scopes_a_child_directory_is_never_listed(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[ticket(2, "Todo")])
+    kid = r.root / "kid"
+    kid.mkdir()
+    (kid / ".project.json").write_text("{}")
+    (r.state / "board-kid.json").write_text(json.dumps({"board": "EARS", "tickets": [ticket(9, "Todo")]}))
+    assert "EARS-9|" not in r.run("--monitor").stdout

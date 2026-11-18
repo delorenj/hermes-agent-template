@@ -17,6 +17,7 @@ Declaration (`.launch.yaml`, no status inside):
   mode: launch | steady          declared: YYYY-MM-DD       source: "<doc + owner decision>"
   finish_line: "<what launched means>"    target_date: YYYY-MM-DD or empty
   contract: [<repo-relative paths>]       epic: <BOARD-n>
+  scopes: [<child dirs>]         # optional, monorepo parent only: child directories whose px scope this PM also drives
   cut_line:                      # optional ranking hint; the board stays the truth
     launch_critical: [..]
     after_launch: [..]
@@ -71,7 +72,7 @@ OWNER_BLOCKING = ("urgent", "high")
 # board-taxonomy: a colon label is a closed, declared axis. A create may carry bare words and the fleet's
 # open facet axes only; lifecycle:/agent: are automation's, repo: is px's, epic: would mint an epic.
 OPEN_AXES = ("risk:", "needs:", "xp:")
-STRING_FIELDS = ("ref", "other", "parent", "text", "title", "description", "key", "lane", "state", "priority")
+STRING_FIELDS = ("ref", "other", "parent", "text", "title", "description", "key", "lane", "state", "priority", "scope")
 NEEDS_TEXT = ("comment", "close", "cancel")
 
 
@@ -249,6 +250,7 @@ def load_declaration(repo: Path) -> dict:
         target_date=str(data.get("target_date") or ""),
         contract=_list(data.get("contract")),
         epic=str(data.get("epic") or "").strip(),
+        scopes=_list(data.get("scopes")),
         launch_critical=_list(cut.get("launch_critical")),
         after_launch=_list(cut.get("after_launch")),
         sha=hashlib.sha256(raw.encode()).hexdigest()[:12],
@@ -343,10 +345,42 @@ def fetch_ticket(repo: Path, ref: str) -> dict:
     }
 
 
-def board(repo: Path) -> tuple[str, list[dict]]:
-    listing = px_json(repo, "task", "list")
-    ident = str(listing.get("board") or "")
-    refs = [f"{ident}-{i['sequence_id']}" for i in listing.get("issues", []) if i.get("state_group") in OPEN]
+def scope_dirs(repo: Path, decl: dict) -> dict[str, Path]:
+    """Child directories (declaration `scopes:`) whose px scope this PM also drives, by declared name.
+
+    A monorepo parent sees only its own `repo:*` scope from its own directory: px lists, writes and
+    stamps by the nearest `.project.json`. Each declared child must sit inside the repo and carry one."""
+    out: dict[str, Path] = {}
+    root = repo.resolve()
+    for name in decl.get("scopes") or []:
+        p = (repo / name).resolve()
+        if p != root and root in p.parents and (p / ".project.json").is_file():
+            out[name] = p
+    return out
+
+
+def board_dirs(repo: Path, decl: dict | None) -> list[Path]:
+    return [repo, *scope_dirs(repo, decl or {}).values()]
+
+
+def ref_dirs(repo: Path, decl: dict | None) -> tuple[str, dict[str, Path], dict[str, str]]:
+    """(board identifier, ref -> the directory whose scope owns it, ref -> state group) across every driven scope."""
+    ident = ""
+    where: dict[str, Path] = {}
+    groups: dict[str, str] = {}
+    for d in board_dirs(repo, decl):
+        listing = px_json(d, "task", "list")
+        ident = ident or str(listing.get("board") or "")
+        for i in listing.get("issues", []):
+            ref = f"{listing.get('board') or ident}-{i['sequence_id']}"
+            where.setdefault(ref, d)
+            groups.setdefault(ref, i.get("state_group") or "")
+    return ident, where, groups
+
+
+def board(repo: Path, decl: dict | None = None) -> tuple[str, list[dict]]:
+    ident, _, groups = ref_dirs(repo, decl)
+    refs = [r for r, g in groups.items() if g in OPEN]
     with ThreadPoolExecutor(8) as pool:
         rows = sorted(pool.map(lambda r: fetch_ticket(repo, r), refs), key=lambda r: r["seq"])
     return ident, rows
@@ -408,7 +442,7 @@ def snapshot(repo: Path) -> tuple[dict, list[str], list[dict] | None, str]:
     if not decl["active"]:
         return decl, ["launch-mode: steady"], None, ""
     try:
-        ident, rows = board(repo)
+        ident, rows = board(repo, decl)
     except Exception:
         return decl, snapshot_lines(decl, None), None, ""
     return decl, snapshot_lines(decl, rows), rows, ident
@@ -478,6 +512,12 @@ def brief(repo: Path) -> int:
           "Refs must be on this board (BOARD = " + (ident or "this board") + "). Comments are tagged "
           f"`{tag()}` by the driver. Shape:")
     print(PLAN_SCHEMA)
+    kids = scope_dirs(repo, decl)
+    if kids:
+        print(f"\nChild scopes you also drive (the board lists and writes them by ref): {', '.join(kids)}. "
+              "A `create` with `\"scope\": \"<one of them>\"` files the ticket from that child's directory "
+              "(its `repo:*` label); without `scope` it lands in the repo's own scope. Join it to the epic with "
+              "`parent` as usual. Never edit child code.")
     print(f"\nApply with: python3 {Path(__file__).resolve()} --apply")
     return 0
 
@@ -571,6 +611,15 @@ def apply(repo: Path, plan_arg: str | None) -> int:
         writes = writes[:cap]
 
     tickets: dict[str, dict | None] = {}
+    children = scope_dirs(repo, decl)
+    try:
+        where = ref_dirs(repo, decl)[1] if children else {}
+    except Exception:
+        where = {}  # board unreadable: every write falls back to the repo's own scope, px enforces the rest
+
+    def at(ref: str) -> Path:
+        """The directory px must run in for this ref: the child scope that owns it, else the repo."""
+        return where.get(ref, repo)
 
     def get(ref: str) -> dict | None:
         if ref not in tickets:
@@ -634,7 +683,7 @@ def apply(repo: Path, plan_arg: str | None) -> int:
                 for c in t["comments"]
             ):
                 return record(i, w, "skip", "one readout per day on the epic")
-            ok, msg = px_write(repo, "comment", ref, "-m", body)
+            ok, msg = px_write(at(ref), "comment", ref, "-m", body)
             return record(i, w, ("degraded" if op == "rank" and ok else "ok" if ok else "error"),
                           (f"px has no rank verb; posted as a comment: {msg}" if op == "rank" and ok else msg))
         if op in ("move", "close", "cancel"):
@@ -653,7 +702,7 @@ def apply(repo: Path, plan_arg: str | None) -> int:
             if t["working"]:
                 return record(i, w, "skip", "a live worker holds it (agent:working)")
             verb = ("move", ref, w["lane"], "-m", text) if op == "move" else (op, ref, "-m", text)
-            ok, msg = px_write(repo, *verb)
+            ok, msg = px_write(at(ref), *verb)
             tickets.pop(ref, None)
             return record(i, w, "ok" if ok else "error", msg)
         if op == "link":
@@ -668,7 +717,7 @@ def apply(repo: Path, plan_arg: str | None) -> int:
                 member = other if ref == epic else ref
                 ok, msg = px_write(repo, "epic", "add", epic, member)
                 return record(i, w, "ok" if ok else "error", msg)
-            ok, msg = px_write(repo, "link", "add", ref, other, *(["--blocks"] if w.get("blocks") is True else []))
+            ok, msg = px_write(at(ref), "link", "add", ref, other, *(["--blocks"] if w.get("blocks") is True else []))
             return record(i, w, "ok" if ok else "error", msg)
         # create. px parses its argv with node's strict parseArgs: a positional or a `-d` value that starts
         # with `-` (a markdown bullet) is a parse error, so the title loses leading dashes and every free-text
@@ -698,8 +747,11 @@ def apply(repo: Path, plan_arg: str | None) -> int:
             args += ["--priority", pri]
         if parent and not join_epic:
             args += ["--parent", parent]
+        scope = (w.get("scope") or "").strip()
+        if scope and scope not in children:
+            return record(i, {**w, "ref": title[:60]}, "skip", f"scope {scope!r} is not one of the declared child scopes {sorted(children)}")
         creates += 1
-        ok, msg = px_write(repo, *args)
+        ok, msg = px_write(children.get(scope, repo), *args)
         dropped = [l for l in wanted if l and l not in labels]
         record(i, {**w, "ref": title[:60]}, "ok" if ok else "error",
                msg + (f" (labels dropped, not bare words or an open axis: {', '.join(dropped)})" if dropped else ""))
