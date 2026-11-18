@@ -1,11 +1,12 @@
 """Exercise the real step 10 with a repo-less owning desk, never ambient CWD."""
 import json
+import os
 import shutil
 
 import pytest
 import yaml
 
-from test_skillex_profile import installed, fixture, provision, snapshot, succeeded
+from test_skillex_profile import installed, fixture, provision, run, snapshot, succeeded
 
 
 def desk_fixture(fixture):
@@ -83,6 +84,126 @@ def test_invalid_desk_refuses_before_profile_mutation(fixture, kind):
     before = snapshot(fixture["home"])
     result = provision(fixture)
     assert result.returncode != 0
-    assert "cannot resolve the owning desk" in result.stderr or "selection is missing" in result.stderr
+    assert "cannot resolve the owning desk" in result.stderr or "selection" in result.stderr
+    assert snapshot(fixture["home"]) == before
+    assert not (fixture["root"] / "hermes.log").exists()
+
+
+def unsafe_input(fixture, source, kind):
+    if kind == "missing":
+        source.unlink()
+    elif kind == "fifo":
+        source.unlink()
+        os.mkfifo(source)
+    elif kind == "directory":
+        source.unlink()
+        source.mkdir()
+    elif kind in ("symlink", "dangling"):
+        foreign = fixture["root"] / "foreign-input"
+        if kind == "symlink":
+            foreign.write_bytes(source.read_bytes())
+        source.unlink()
+        source.symlink_to(foreign)
+    elif kind == "ancestor":
+        foreign = fixture["root"] / "foreign-selection"
+        shutil.move(str(source.parent), foreign)
+        source.parent.symlink_to(foreign, target_is_directory=True)
+    else:
+        raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("stage", ["new", "partial", "strict"])
+@pytest.mark.parametrize("source,kind", [
+    ("SOUL.md", "missing"),
+    ("SOUL.md", "symlink"),
+    ("SOUL.md", "dangling"),
+    ("SOUL.md", "directory"),
+    ("SOUL.md", "fifo"),
+    (".agents/skills.json", "missing"),
+    (".agents/skills.json", "symlink"),
+    (".agents/skills.json", "dangling"),
+    (".agents/skills.json", "directory"),
+    (".agents/skills.json", "ancestor"),
+])
+def test_unsafe_desk_authored_input_refuses_without_profile_effects(fixture, stage, source, kind):
+    desk = desk_fixture(fixture)
+    if stage == "new":
+        fixture["profile"].rmdir()
+    elif stage == "strict":
+        succeeded(provision(fixture))
+    if stage != "new":
+        (fixture["profile"] / "state.db").write_bytes(b"runtime-owned")
+        (fixture["profile"] / "gateway.pid").write_text("4242\n")
+    unsafe_input(fixture, desk / source, kind)
+    before = snapshot(fixture["home"]), snapshot(fixture["registry"])
+    result = provision(fixture)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "owning desk" in result.stderr or "skills.json" in result.stdout + result.stderr
+    assert (snapshot(fixture["home"]), snapshot(fixture["registry"])) == before
+    assert not (fixture["root"] / "hermes.log").exists()
+
+
+def bind_selection(fixture, selection):
+    (selection / ".agents").mkdir(parents=True)
+    (selection / ".agents/skills.json").write_text('{"skills":[{"name":"delta"}]}\n')
+    succeeded(run([
+        fixture["env"]["SKILLEX_BIN"], "profile", "sync", "fixture-pm",
+        "--project", str(selection), "--skillex-only",
+    ], cwd=fixture["cwd"], env=fixture["env"]))
+
+
+@pytest.mark.parametrize("binding", ["persisted", "receipt"])
+def test_effective_persisted_selection_precedes_unsafe_unused_desk_selection(fixture, binding):
+    desk = desk_fixture(fixture)
+    succeeded(provision(fixture))
+    selection = (fixture["profile"] / ".skillex-selection" if binding == "persisted"
+                 else fixture["root"] / "recorded-selection")
+    bind_selection(fixture, selection)
+    unsafe_input(fixture, desk / ".agents/skills.json", "symlink")
+    before = snapshot(fixture["home"]), snapshot(selection)
+    succeeded(provision(fixture))
+    assert (snapshot(fixture["home"]), snapshot(selection)) == before
+    skills = fixture["profile"] / "skills"
+    assert {path.name for path in skills.iterdir()} == {"alpha", "gamma", "delta"}
+    for name in ("alpha", "gamma", "delta"):
+        assert (skills / name).is_symlink()
+        assert (skills / name).resolve() == fixture["registry"] / "all-skills" / name
+
+
+@pytest.mark.parametrize("binding", ["persisted", "receipt"])
+@pytest.mark.parametrize("kind", ["missing", "symlink", "dangling", "directory", "ancestor"])
+def test_unsafe_effective_persisted_selection_refuses_without_profile_effects(fixture, binding, kind):
+    desk = desk_fixture(fixture)
+    succeeded(provision(fixture))
+    selection = (fixture["profile"] / ".skillex-selection" if binding == "persisted"
+                 else fixture["root"] / "recorded-selection")
+    bind_selection(fixture, selection)
+    # The unused initial desk selection remains valid; it must not rescue the
+    # unsafe effective source by silently rebinding the employee's loadout.
+    assert (desk / ".agents/skills.json").is_file()
+    unsafe_input(fixture, selection / ".agents/skills.json", kind)
+    (fixture["profile"] / "state.db").write_bytes(b"runtime-owned")
+    before = snapshot(fixture["home"]), snapshot(fixture["root"] / "foreign-selection")
+    result = provision(fixture)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert (snapshot(fixture["home"]), snapshot(fixture["root"] / "foreign-selection")) == before
+    assert not (fixture["root"] / "hermes.log").exists()
+
+
+@pytest.mark.parametrize("stage", ["new", "partial", "strict"])
+def test_invalid_desk_identity_refuses_before_profile_mutation(fixture, stage):
+    desk = desk_fixture(fixture)
+    if stage == "new":
+        fixture["profile"].rmdir()
+    elif stage == "strict":
+        succeeded(provision(fixture))
+    role_path = desk / "role.yaml"
+    role = yaml.safe_load(role_path.read_text())
+    role["identity"] = {"name": "fixture-pm", "write_bank": "agent-fixture-pm"}
+    role_path.write_text(yaml.safe_dump(role))
+    before = snapshot(fixture["home"])
+    result = provision(fixture)
+    assert result.returncode != 0
+    assert "is a post id" in result.stderr
     assert snapshot(fixture["home"]) == before
     assert not (fixture["root"] / "hermes.log").exists()

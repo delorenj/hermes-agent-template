@@ -75,6 +75,21 @@ export PJ_SKILLS_REGISTRY_ROOT
 PROFILE_RENDERER="${PROFILE_RENDERER:-$HERMES_TEMPLATE_REPO/scripts/hermes-profile-config.py}"
 CUTOVER_HINT="python3 $PJ_SKILLS_REGISTRY_ROOT/scripts/hermes-skillex-cutover.py --profile $PROFILE_NAME --project '$PROJECT_PATH' --registry-root $PJ_SKILLS_REGISTRY_ROOT --renderer $HERMES_TEMPLATE_REPO/scripts/hermes-profile-config.py (preview, then --apply)"
 
+# Only the effective desk selection is an authored input: persisted role
+# selection and receipt bindings take precedence over the desk's initial one.
+# Validate path components, not skill targets (canonical skill links are valid).
+desk_selection_preflight() {
+  [[ "$DESK_ONLY" == "1" ]] || return 0
+  python3 -I - "$SKILLEX_PROJECT_PATH/.agents/skills.json" <<'PYEOF'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).absolute()
+if any(parent.is_symlink() or not parent.is_dir() for parent in source.parents):
+    raise SystemExit(f"desk selection must have real directory ancestors: {source}")
+if source.is_symlink() or not source.is_file():
+    raise SystemExit(f"desk selection must be a regular file: {source}")
+PYEOF
+}
+
 # Read-only Skillex preflight of an existing profile. Exit 0 is converged and
 # exit 6 is a pending sync (a selection change or catalog bump), which is what
 # this step exists to apply. Anything else (a refusal, an invalid manifest, a
@@ -99,6 +114,7 @@ if project is not None and (not isinstance(project, str) or not project.strip())
 print(project or sys.argv[2])
 PYEOF
     )" || die "cannot read the recorded Skillex selection project"
+    desk_selection_preflight || die "unsafe desk selection; no profile state changed"
     [[ -f "$SKILLEX_PROJECT_PATH/.agents/skills.json" ]] \
       || die "project selection is missing: $SKILLEX_PROJECT_PATH/.agents/skills.json; run skillex init --project '$SKILLEX_PROJECT_PATH'"
     # A receipt-less desk's first preview may have used the ambient cwd.
@@ -112,7 +128,7 @@ PYEOF
   fi
 }
 
-# Strict sync: preview first, then apply. Both refuse foreign skills/ content
+# Strict sync: preview first, then apply. Both refuse skill ownership conflicts
 # and non-empty skills.external_dirs without changing anything.
 strict_skill_sync() {
   [[ -f "$SKILLEX_PROJECT_PATH/.agents/skills.json" ]] \
@@ -141,6 +157,17 @@ project_skills_policy() {
     log "$message"
   fi
 }
+
+# Validate the declared identity before creating or changing a profile. Reuse
+# this answer when pinning memory below; the role reader owns its semantics.
+ROLE_IDENTITY_READER="$ROLE_DIR/.scripts/lib/role-identity.py"
+[[ -f "$ROLE_IDENTITY_READER" && ! -L "$ROLE_IDENTITY_READER" ]] \
+  || die "trusted role identity reader is unavailable: $ROLE_IDENTITY_READER"
+ROLE_IDENTITY_JSON="$(python3 -I "$ROLE_IDENTITY_READER" "$ROLE_YAML" "$AGENT_ID" "$PROFILE_NAME")" \
+  || die "role.yaml identity block is invalid"
+if [[ -n "$SKILLEX_PROJECT_PATH" ]]; then
+  desk_selection_preflight || die "unsafe desk selection; no profile state changed"
+fi
 
 log "[10] creating hermes profile: $PROFILE_NAME"
 
@@ -271,12 +298,8 @@ mkdir -p "$(dirname "$PROFILE_MEM_CFG")"
 # its durable personal bank follows the name, never the post/profile. role.yaml
 # is the source; 80-registry.sh projects it into the registry. This step runs
 # BEFORE step 80, so it reads role.yaml first and only falls back to a registry
-# declaration for rows named before role.yaml carried the block.
-ROLE_IDENTITY_READER="$ROLE_DIR/.scripts/lib/role-identity.py"
-[[ -f "$ROLE_IDENTITY_READER" && ! -L "$ROLE_IDENTITY_READER" ]] \
-  || die "trusted role identity reader is unavailable: $ROLE_IDENTITY_READER"
-ROLE_IDENTITY_JSON="$(python3 -I "$ROLE_IDENTITY_READER" "$ROLE_YAML" "$AGENT_ID" "$PROFILE_NAME")" \
-  || die "role.yaml identity block is invalid"
+# declaration for rows named before role.yaml carried the block. The role's
+# identity was already validated before profile mutation above.
 DECLARED_PERSONAL_BANK="$(python3 - "$REGISTRY_FILE" "$AGENT_ID" "$ROLE_IDENTITY_JSON" <<'PYEOF'
 import json
 import pathlib

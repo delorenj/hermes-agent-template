@@ -1331,9 +1331,10 @@ for path in (root, role):
         raise SystemExit("owning desk must be a real directory without symlink ancestors")
 if root != role:
     raise SystemExit("HERMES_DESK_ROOT must be the owning role directory")
-manifest = root / "role.yaml"
-if manifest.is_symlink() or not manifest.is_file():
-    raise SystemExit("owning desk role.yaml must be a regular file")
+for name in ("role.yaml", "SOUL.md"):
+    source = root / name
+    if source.is_symlink() or not source.is_file():
+        raise SystemExit(f"owning desk {name} must be a regular file")
 print(root)
 PYEOF
 }
