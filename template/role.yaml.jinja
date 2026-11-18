@@ -96,6 +96,8 @@ ticket_provider:
   # Review and holds are labels, not lanes: `tp transition <id> in_review` lands
   # In Progress + lifecycle:review, and awaiting_decision (aliases
   # needs_attention, waiting_reply) adds lifecycle:needs-input in place.
+  # lifecycle:human is the owner's own hold (the owner took the ticket by hand): agents
+  # never add, remove or work it.
 {%- else %}
   # Optional: name a lane to enable `tp transition <id> awaiting_decision`
   # (aliases needs_attention, waiting_reply); left out, it is refused.

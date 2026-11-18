@@ -121,9 +121,8 @@ no systemd unit of its own at all (see below). The three jobs the timer appeared
 to do are owned elsewhere:
 
 - **liveness** — the host gateway unit's `Restart=always` (`hermes-gateway.service`)
-- **scheduling** — Candybar, the single clock, which fires Bloodbank commands
-  and Hermes invocations; krebs pull-subscribes
-  `bloodbank.cmd.lifecycle.task.invoke`
+- **scheduling** — Candybar, the single clock, which fires `krebs tick`; krebs
+  dispatches over `bloodbank.cmd.agent.invocation.start`
 - **persistence** — krebs (lifecycle v2): a failed turn is marked
   `agent:failed`, a hold label that takes the ticket out of the flow (no slot,
   no redispatch) instead of ticking forever

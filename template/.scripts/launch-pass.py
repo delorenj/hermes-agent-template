@@ -350,7 +350,10 @@ def fetch_ticket(repo: Path, ref: str) -> dict:
         "origin": "agent" if (t.get("external_id") or t.get("external_source")) else "owner",
         "working": "agent:working" in labels,
         "review": "lifecycle:review" in labels,
-        "held": any(l in labels for l in ("lifecycle:needs-input", "lifecycle:blocked", "agent:failed")),
+        # lifecycle:human: the owner took the ticket by hand. A hold like the rest, but the launch pass also
+        # never plans or applies a write on it (comments included): only the owner removes the label.
+        "human": HUMAN_LABEL in labels,
+        "held": any(l in labels for l in ("lifecycle:needs-input", "lifecycle:blocked", "lifecycle:human", "agent:failed")),
         "activity": activity,
         "waiting": waiting,
         "comments": cs,
@@ -398,6 +401,9 @@ def board(repo: Path, decl: dict | None = None) -> tuple[str, list[dict]]:
     return ident, rows
 
 
+HUMAN_LABEL = "lifecycle:human"
+
+
 def occupies_slot(r: dict) -> bool:
     return r["group"] == "started" and not r["review"] and not r["held"]
 
@@ -435,7 +441,7 @@ def snapshot_lines(decl: dict, rows: list[dict] | None) -> list[str]:
         return lines + ["board UNAVAILABLE"]
     lc, al = set(decl["launch_critical"]), set(decl["after_launch"])
     for r in rows:
-        flags = ",".join(f for f, on in (("review", r["review"]), ("held", r["held"]), ("working", r["working"])) if on) or "-"
+        flags = ",".join(f for f, on in (("review", r["review"]), ("held", r["held"]), ("human", r["human"]), ("working", r["working"])) if on) or "-"
         cut = "lc" if r["ref"] in lc else "al" if r["ref"] in al else "-"
         lines.append("|".join([
             r["ref"], r["lane"], r["pri"], "bug" if r["bug"] else "-", flags, r["origin"], f"cut:{cut}",
@@ -594,9 +600,6 @@ def apply(repo: Path, plan_arg: str | None) -> int:
         print("launch-mode: steady: apply refused, nothing written.")
         return 0
     proj = project(repo)
-    if (proj.get("execution") or {}).get("mode") in ("managed", "shadow"):
-        print("REFUSED: this board is Krebs-managed (px writes need --actor and -f payloads); launch-pass drives legacy boards only. Nothing written.")
-        return 4
     if not LEASE_SCRIPT.is_file():
         print(f"ERROR: lease script missing: {LEASE_SCRIPT}. Nothing written.", file=sys.stderr)
         return 2
@@ -674,6 +677,14 @@ def apply(repo: Path, plan_arg: str | None) -> int:
             if not on_board(ref):
                 return record(i, w, "skip", f"ref is not on this board ({ident})")
         text = tagged(w.get("text") or "")
+        # The owner holds a lifecycle:human ticket by hand: no write of any op lands on it (as ref or `other`).
+        if op != "create":
+            for touched in (ref, w.get("other") or "") if op == "link" else (ref,):
+                if not REF.match(touched):
+                    continue
+                th = get(touched)
+                if th is not None and th["human"]:
+                    return record(i, w, "skip", f"{touched} is held by the owner (lifecycle:human)")
 
         if op in ("comment", "rank"):
             if op == "rank":

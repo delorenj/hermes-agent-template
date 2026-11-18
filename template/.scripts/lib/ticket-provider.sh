@@ -38,6 +38,9 @@
 #                                    is In Progress + lifecycle:review and
 #                                    awaiting_decision is a hold:
 #                                    +lifecycle:needs-input, lane unchanged.
+#                                    (lifecycle:human is the owner's own hold:
+#                                    never written, and a label write onto a
+#                                    ticket carrying it is refused.)
 #   create_board <name> <id> <d>  -> JSON {board_id, board_url}
 #   describe_board <ws> <board_id>
 #                                 -> JSON {board_id, identifier, workspace,
@@ -232,6 +235,7 @@ tp() {
 # v2 (krebs/spec/lifecycle.v2.yaml): five stock lanes, with review and holds
 # carried by labels, so plane.sh lands in_review in In Progress plus
 # lifecycle:review and awaiting_decision as +lifecycle:needs-input in place.
+# lifecycle:human is the owner's hold: agents never add, remove or work it.
 # Linear and Trello still map both to a lane role.yaml names.
 TP_STATES="backlog unstarted started in_review completed cancelled awaiting_decision needs_attention waiting_reply"
 

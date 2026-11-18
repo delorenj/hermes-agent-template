@@ -98,7 +98,10 @@ Plane boards follow Krebs lifecycle v2 (`krebs/spec/lifecycle.v2.yaml`): five
 stock lanes (Backlog, Todo, In Progress, Done, Cancelled), with review and holds
 carried by labels. On Plane, `in_review` lands in In Progress plus
 `lifecycle:review`, and `awaiting_decision` adds `lifecycle:needs-input`
-without moving the ticket. Linear and Trello still map both to a named lane.
+without moving the ticket. `lifecycle:human` is the owner's own hold, like
+`lifecycle:needs-input`, `lifecycle:blocked` and `agent:failed`: never dispatched, triaged or
+reviewed, holds no slot, and only the owner adds or removes it. Linear and Trello still map both
+to a named lane.
 
 ## Autonomous adversarial review (act, do not wait)
 

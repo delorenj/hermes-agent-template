@@ -242,9 +242,9 @@ extra invocation is cheap.
 
 In the fleet, scheduling is Candybar's (it fires Bloodbank commands and Hermes
 invocations; to run this pass on a cadence register a Candybar `exec` runner, see
-the README): krebs pull-subscribes
-`bloodbank.cmd.lifecycle.task.invoke`, and a stalled ticket parks in "Needs
-Attention" on a krebs lease instead of being re-ticked forever.
+the README): Candybar fires `krebs tick`, which dispatches over
+`bloodbank.cmd.agent.invocation.start`, and a stalled ticket is held by a label
+(`agent:failed`) instead of being re-ticked forever.
 
 ## Propagating changes
 

@@ -359,6 +359,34 @@ def test_apply_guards_in_progress_and_live_workers_and_duplicates(tmp_path, monk
         assert needle in out.stdout
 
 
+def test_apply_never_writes_on_a_lifecycle_human_ticket(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[
+        ticket(2, "Todo", labels=["lifecycle:human"]),
+        ticket(3, "Todo"),
+        ticket(4, "Backlog", labels=["lifecycle:human", "lifecycle:triaged"]),
+    ])
+    r.plan({"writes": [
+        {"op": "comment", "ref": "EARS-2", "text": "nudge"},
+        {"op": "rank", "ref": "EARS-2", "rank": 1, "text": "x"},
+        {"op": "move", "ref": "EARS-4", "lane": "Todo", "text": "x"},
+        {"op": "cancel", "ref": "EARS-2", "text": "x"},
+        {"op": "close", "ref": "EARS-2", "text": "x"},
+        {"op": "link", "ref": "EARS-3", "other": "EARS-2", "blocks": True},
+        {"op": "link", "ref": "EARS-2", "other": "EARS-3"},
+        {"op": "comment", "ref": "EARS-3", "text": "fine"},
+    ]})
+    out = r.run("--apply")
+    assert r.writes() == [["comment", "EARS-3", "-m", "[pm] fine"]]
+    assert out.stdout.count("lifecycle:human") >= 7
+
+
+def test_brief_marks_a_lifecycle_human_ticket_held(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[ticket(2, "In Progress", labels=["lifecycle:human"])])
+    out = r.run("--monitor")
+    assert "held,human" in out.stdout
+    assert "stale-claim" not in out.stdout  # a held ticket holds no slot
+
+
 def test_apply_one_readout_per_day_on_the_epic(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, tickets=[
         ticket(1, "Todo", comments=[comment("[pm] readout: 3 of 9 launch-critical done", "2026-11-17T15:00:00+00:00")]),
@@ -420,14 +448,6 @@ def test_apply_roadmap_is_capped_at_forty_lines(repo):
     repo.run("--apply")
     lines = (repo.role / "runtime" / "launch-roadmap.md").read_text().splitlines()
     assert len(lines) == 40 and "truncated" in lines[-1]
-
-
-def test_apply_refuses_krebs_managed_boards(tmp_path, monkeypatch):
-    r = Repo(tmp_path, monkeypatch, project={"ticket_provider": {"identifier": "EARS"}, "execution": {"mode": "managed"}},
-             tickets=[ticket(2, "Todo")])
-    r.plan({"writes": [{"op": "comment", "ref": "EARS-2", "text": "x"}]})
-    out = r.run("--apply")
-    assert out.returncode == 4 and r.writes() == []
 
 
 def test_apply_malformed_write_is_skipped_and_the_receipt_survives(repo):

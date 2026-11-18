@@ -9,6 +9,9 @@ labels. So on Plane two normalized targets are label writes:
 * `awaiting_decision` (aliases `needs_attention`, `waiting_reply`) is a hold:
   plus `lifecycle:needs-input`, lane unchanged, on a Todo or In Progress ticket
   only. krebs tick is the one thing that moves Todo -> In Progress.
+* `lifecycle:human` is the owner's own hold (the owner took the ticket by hand).
+  The adapter never writes it, and refuses a label write onto a ticket that
+  carries it.
 
 Plane's issue PATCH replaces the whole labels list, so the adapter re-reads the
 issue right before its single PATCH and adds only its label to that fresh set.
@@ -62,6 +65,7 @@ LIFECYCLE_LABELS = {
         {"id": "lbl-input", "name": "lifecycle:needs-input"},
         {"id": "lbl-blocked", "name": "lifecycle:blocked"},
         {"id": "lbl-failed", "name": "agent:failed"},
+        {"id": "lbl-human", "name": "lifecycle:human"},
         {"id": "lbl-scope", "name": "repo:game"},
     ]
 }
@@ -221,6 +225,25 @@ def test_plane_handback_refuses_a_board_without_the_review_label(tmp_path: Path)
 
     assert result.returncode != 0
     assert "lifecycle label 'lifecycle:review' does not exist" in result.stderr
+    assert patches(request_log) == []
+
+
+@pytest.mark.parametrize("target", ["in_review", "awaiting_decision"])
+def test_plane_label_write_refuses_a_lifecycle_human_ticket(tmp_path: Path, target: str) -> None:
+    """lifecycle:human is the owner's hold: no agent label write lands on a ticket that carries it."""
+    provider, env, request_log = stage_plane(
+        tmp_path,
+        responses=[
+            plane_response("GET", "/states/", STOCK_STATES),
+            plane_response("GET", "/labels/", LIFECYCLE_LABELS),
+            issue_reads({"id": "issue-uuid", "sequence_id": 12, "state": "doing", "labels": ["lbl-human"]}),
+        ],
+    )
+
+    result = run_plane(provider, env, "transition", "issue-uuid", target)
+
+    assert result.returncode != 0
+    assert "lifecycle:human" in result.stderr and "nothing was written" in result.stderr
     assert patches(request_log) == []
 
 
