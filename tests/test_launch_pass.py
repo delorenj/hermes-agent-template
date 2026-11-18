@@ -42,6 +42,10 @@ if args[:2] == ["task", "list"]:
     print(json.dumps({"ok": True, "board": board["board"], "issues": issues}))
 elif args[:2] == ["task", "get"]:
     ref = args[2]
+    if os.environ.get("PX_SHIM_FLAKY") and not os.path.exists(state + "/seen-" + ref):
+        open(state + "/seen-" + ref, "w").close()  # the first read of every ticket is refused, like a throttled Plane
+        print(json.dumps({"ok": False}))
+        sys.exit(1)
     import glob  # a read works from any scope: search every board file
     for t in [t for fn in sorted(glob.glob(state + "/board*.json")) for t in json.load(open(fn))["tickets"]]:
         if f"{board['board']}-{t['seq']}" == ref:
@@ -561,3 +565,9 @@ def test_brief_shows_only_the_newest_untagged_comments(tmp_path, monkeypatch):
     out = r.run("--brief").stdout
     assert "+20 older untagged comments not shown" in out
     assert out.count("- EARS-2 2026-11-18T") == 40
+
+
+def test_a_throttled_ticket_read_is_retried_not_reported_as_board_unavailable(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[ticket(2, "Todo")])
+    out = r.run("--monitor", PX_SHIM_FLAKY="1").stdout
+    assert "UNAVAILABLE" not in out and "EARS-2|" in out

@@ -312,7 +312,15 @@ def is_mine(c: dict) -> bool:
 
 
 def fetch_ticket(repo: Path, ref: str) -> dict:
-    t = px_json(repo, "task", "get", ref)["ticket"]
+    t = None
+    for attempt in range(4):  # Plane throttles a big board read: a refusal is retried, never a verdict
+        try:
+            t = px_json(repo, "task", "get", ref)["ticket"]
+            break
+        except Exception:
+            if attempt == 3:
+                raise
+            time.sleep(1 + 2 * attempt)
     cs = sorted(t.get("comments") or [], key=lambda c: c.get("created_at", ""))
     mine = [c["created_at"] for c in cs if is_mine(c)]
     labels = t.get("label_names") or []
