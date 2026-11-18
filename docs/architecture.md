@@ -276,8 +276,14 @@ never in type or subject tokens.
 
 The gateway uses the canonical lifecycle already defined by those schemas:
 
+- `bloodbank.agent.invocation.queued`: the gateway durably claimed the command,
+  before it waits for a slot. Carries the same `invocation_id` as the later
+  facts, plus `issuer`, `command_service` and the command's `context`. Every
+  `queued` closes with exactly one terminal invocation event. A command refused
+  before any turn started closes with `bloodbank.agent.invocation.failed`
+  (`error_code: rejected_pre_start`) and no `conversation.turn.*` facts.
 - `bloodbank.conversation.turn.started`
-- `bloodbank.agent.invocation.started`
+- `bloodbank.agent.invocation.started` (the real start, after any wait for a slot)
 - one terminal invocation event: `bloodbank.agent.invocation.completed` or
   `bloodbank.agent.invocation.failed`
 - `bloodbank.conversation.turn.completed`
@@ -286,6 +292,7 @@ The type carries no version token. Schema revision is tracked out of band, in
 `dataschema` / `schemaref`; a breaking payload change earns a new action or
 entity, never a `v<n>` segment in the type or the subject.
 
-There are no separate `received` or `accepted` lifecycle events. A JetStream
+There are no separate `received` or `accepted` lifecycle events (`queued` is the
+claim fact). A JetStream
 command is acknowledged only after Hermes processing completion and terminal
 event publication.

@@ -959,6 +959,7 @@ def test_documented_gateway_lifecycle_matches_canonical_bloodbank_contract() -> 
     architecture = (ROOT / "docs" / "architecture.md").read_text(encoding="utf-8")
 
     for event_type in (
+        "bloodbank.agent.invocation.queued",
         "bloodbank.conversation.turn.started",
         "bloodbank.agent.invocation.started",
         "bloodbank.agent.invocation.completed",
