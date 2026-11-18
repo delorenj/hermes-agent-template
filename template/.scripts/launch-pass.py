@@ -25,7 +25,10 @@ Allowed apply ops: comment, create, move, close, cancel, rank, link. Everything 
 `rank` has no px verb (px cannot reorder a lane), so it degrades to a `launch rank N` comment and the
 receipt says so. Moves are Backlog/Todo only: In Progress is Krebs' lane. px refuses an epic at either
 end of a link or as a parent, so a `link` touching the declaration's epic, or a `create` whose `parent`
-is that epic, becomes an epic membership (`px epic add EPIC REF`).
+is that epic, becomes an epic membership (`px epic add EPIC REF`). Every ref (`ref`, `other`, `parent`) must
+be on this board; a ticket carrying `agent:working` is never moved, closed or cancelled; `comment`, `close`
+and `cancel` need a `text`; create labels are bare words or a fleet open axis (risk:, needs:, xp:). A write
+whose fields have the wrong types is skipped, and the receipt is written whatever happens.
 
 stdlib only, python3. The script lives in <repo>/agents/hermes/<role>/.scripts/ and finds the repo by
 walking up to `.project.json` (or `.git`); LAUNCH_REPO or --repo override. px runs with cwd = repo.
@@ -65,6 +68,11 @@ ROADMAP_LINES = 40
 STALE_HOURS = 48
 AGENT_COMMENT = re.compile(r"^(\[[A-Za-z0-9 _:.-]+\]|krebs\b|hermes\b|momo\b)", re.I)
 OWNER_BLOCKING = ("urgent", "high")
+# board-taxonomy: a colon label is a closed, declared axis. A create may carry bare words and the fleet's
+# open facet axes only; lifecycle:/agent: are automation's, repo: is px's, epic: would mint an epic.
+OPEN_AXES = ("risk:", "needs:", "xp:")
+STRING_FIELDS = ("ref", "other", "parent", "text", "title", "description", "key", "lane", "state", "priority")
+NEEDS_TEXT = ("comment", "close", "cancel")
 
 
 # --------------------------------------------------------------------------------------- time
@@ -481,6 +489,28 @@ def write_cap() -> int:
         return 12
 
 
+def malformed(w: dict) -> str:
+    """Why a write's fields do not have the plan schema's types, or "" when they do."""
+    for k in STRING_FIELDS:
+        if w.get(k) is not None and not isinstance(w[k], str):
+            return f"`{k}` must be a string"
+    labels = w.get("labels")
+    if labels is not None and not (isinstance(labels, list) and all(isinstance(l, str) for l in labels)):
+        return "`labels` must be a list of strings"
+    if w.get("blocks") is not None and not isinstance(w["blocks"], bool):
+        return "`blocks` must be true or false"
+    if w.get("op") in NEEDS_TEXT and not (w.get("text") or "").strip():
+        return f"`{w['op']}` needs a `text` saying why"
+    return ""
+
+
+def label_ok(label: str) -> bool:
+    label = label.strip()
+    if not label or label.startswith("-") or "," in label:
+        return False
+    return ":" not in label or label.startswith(OPEN_AXES)
+
+
 def lease(cmd: str, lock: Path, owner: str, ttl: int = 300) -> bool:
     argv = [sys.executable, str(LEASE_SCRIPT), cmd, str(lock), owner]
     if cmd == "acquire":
@@ -557,134 +587,148 @@ def apply(repo: Path, plan_arg: str | None) -> int:
 
     creates = 0
     epic = str(decl.get("epic") or "")
+
+    def on_board(r: str) -> bool:
+        m = REF.match(r)
+        return bool(m) and (not ident or m.group(1) == ident)
+
+    def one(i: int, w) -> None:
+        nonlocal creates
+        if not isinstance(w, dict):
+            return record(i, {}, "skip", "write is not an object")
+        op = w.get("op")
+        if op not in ALLOWED_OPS:
+            return record(i, w, "skip", "op not allowed for the launch pass")
+        bad = malformed(w)
+        if bad:
+            return record(i, w, "skip", bad)
+        ref = w.get("ref") or ""
+        if op != "create":
+            if not REF.match(ref):
+                return record(i, w, "skip", "bad ref")
+            if not on_board(ref):
+                return record(i, w, "skip", f"ref is not on this board ({ident})")
+        text = tagged(w.get("text") or "")
+
+        if op in ("comment", "rank"):
+            if op == "rank":
+                try:
+                    rank = int(w.get("rank"))
+                    if rank < 1 or isinstance(w.get("rank"), bool):
+                        raise ValueError
+                except (TypeError, ValueError):
+                    return record(i, w, "skip", "rank needs an integer >= 1")
+                body = tagged(f"launch rank {rank}: {(w.get('text') or '').strip()}")
+            else:
+                body = text
+            t = get(ref)
+            if t is None:
+                return record(i, w, "error", "ticket unreadable")
+            if any(comment_text(c) == body for c in t["comments"]):
+                return record(i, w, "skip", "already posted")
+            low = re.sub(r"^\[[^\]]*\]\s*", "", body).lower()
+            if ref == decl.get("epic") and low.startswith("readout") and any(
+                is_mine(c) and comment_text(c).lower().startswith(f"{tag()} readout".lower()) and et_date(c["created_at"]) == today()
+                for c in t["comments"]
+            ):
+                return record(i, w, "skip", "one readout per day on the epic")
+            ok, msg = px_write(repo, "comment", ref, "-m", body)
+            return record(i, w, ("degraded" if op == "rank" and ok else "ok" if ok else "error"),
+                          (f"px has no rank verb; posted as a comment: {msg}" if op == "rank" and ok else msg))
+        if op in ("move", "close", "cancel"):
+            t = get(ref)
+            if t is None:
+                return record(i, w, "error", "ticket unreadable")
+            if t["group"] in ("completed", "cancelled"):
+                return record(i, w, "skip", f"already {t['lane']}")
+            if op == "move":
+                if w.get("lane") not in LANES:
+                    return record(i, w, "skip", f"lane {w.get('lane')!r} not in {list(LANES)}")
+                if t["group"] == "started":
+                    return record(i, w, "skip", "In Progress is Krebs' lane: comment instead")
+            # Krebs v2: agent:working is the pickup chip's and Krebs' lease. Moving, closing or cancelling under a
+            # live turn would end it behind the worker's back (and px strips the label on a close or cancel).
+            if t["working"]:
+                return record(i, w, "skip", "a live worker holds it (agent:working)")
+            verb = ("move", ref, w["lane"], "-m", text) if op == "move" else (op, ref, "-m", text)
+            ok, msg = px_write(repo, *verb)
+            tickets.pop(ref, None)
+            return record(i, w, "ok" if ok else "error", msg)
+        if op == "link":
+            other = w.get("other") or ""
+            if not REF.match(other) or other == ref:
+                return record(i, w, "skip", "bad or identical `other` ref")
+            if not on_board(other):
+                return record(i, w, "skip", f"`other` is not on this board ({ident})")
+            if epic and epic in (ref, other):
+                if w.get("blocks"):
+                    return record(i, w, "skip", f"{epic} is the launch epic: it joins members, it never blocks")
+                member = other if ref == epic else ref
+                ok, msg = px_write(repo, "epic", "add", epic, member)
+                return record(i, w, "ok" if ok else "error", msg)
+            ok, msg = px_write(repo, "link", "add", ref, other, *(["--blocks"] if w.get("blocks") is True else []))
+            return record(i, w, "ok" if ok else "error", msg)
+        # create. px parses its argv with node's strict parseArgs: a positional or a `-d` value that starts
+        # with `-` (a markdown bullet) is a parse error, so the title loses leading dashes and every free-text
+        # value rides in the `--flag=value` form.
+        title = (w.get("title") or "").strip().lstrip("-").strip()[:200]
+        if not title:
+            return record(i, w, "skip", "create needs a title")
+        if creates >= MAX_CREATES:
+            return record(i, w, "skip", f"at most {MAX_CREATES} creates per pass")
+        state = w.get("state") or "Backlog"
+        pri = (w.get("priority") or "").lower()
+        if state not in LANES or (pri and pri not in PRIORITIES):
+            return record(i, w, "skip", f"state must be one of {list(LANES)} and priority one of {list(PRIORITIES)}")
+        parent = w.get("parent") or ""
+        join_epic = bool(epic) and parent == epic
+        if parent and not join_epic and not on_board(parent):
+            return record(i, {**w, "ref": title[:60]}, "skip", f"parent {parent!r} is not a ticket on this board ({ident})")
+        wanted = [l.strip() for l in (w.get("labels") or [])]
+        labels = [l for l in wanted if label_ok(l)]
+        key = (w.get("key") or "").strip().lstrip("-").strip() or "launch:" + hashlib.sha1(title.lower().encode()).hexdigest()[:12]
+        args = ["task", "create", title, "--state", state, "--idempotency-source", "launch-pass", "--idempotency-key", key]
+        if (w.get("description") or "").strip():
+            args.append("--description=" + w["description"])
+        if labels:
+            args += ["-l", ",".join(labels)]
+        if pri:
+            args += ["--priority", pri]
+        if parent and not join_epic:
+            args += ["--parent", parent]
+        creates += 1
+        ok, msg = px_write(repo, *args)
+        dropped = [l for l in wanted if l and l not in labels]
+        record(i, {**w, "ref": title[:60]}, "ok" if ok else "error",
+               msg + (f" (labels dropped, not bare words or an open axis: {', '.join(dropped)})" if dropped else ""))
+        if ok and join_epic:
+            board_re = re.escape(ident) if ident else "[A-Z][A-Z0-9]*"
+            m = re.search(rf"\b({board_re}-\d+)\b", msg)
+            if not m:
+                return record(i, {"op": "epic", "ref": title[:60]}, "error", f"created, but no ref in px output to join {epic}")
+            ok, msg = px_write(repo, "epic", "add", epic, m.group(1))
+            record(i, {"op": "epic", "ref": m.group(1)}, "ok" if ok else "error", msg)
+
     try:
         for i, w in enumerate(writes, 1):
-            if not isinstance(w, dict):
-                record(i, {}, "skip", "write is not an object")
-                continue
-            op, ref = w.get("op"), str(w.get("ref") or "")
-            if op not in ALLOWED_OPS:
-                record(i, w, "skip", "op not allowed for the launch pass")
-                continue
-            if op != "create":
-                m = REF.match(ref)
-                if not m:
-                    record(i, w, "skip", "bad ref")
-                    continue
-                if ident and m.group(1) != ident:
-                    record(i, w, "skip", f"ref is not on this board ({ident})")
-                    continue
-            text = tagged(w.get("text", ""))
-
-            if op in ("comment", "rank"):
-                if op == "rank":
-                    try:
-                        rank = int(w.get("rank"))
-                        if rank < 1:
-                            raise ValueError
-                    except (TypeError, ValueError):
-                        record(i, w, "skip", "rank needs an integer >= 1")
-                        continue
-                    body = tagged(f"launch rank {rank}: {(w.get('text') or '').strip()}")
-                else:
-                    body = text
-                t = get(ref)
-                if t is None:
-                    record(i, w, "error", "ticket unreadable")
-                    continue
-                if any(comment_text(c) == body for c in t["comments"]):
-                    record(i, w, "skip", "already posted")
-                    continue
-                low = re.sub(r"^\[[^\]]*\]\s*", "", body).lower()
-                if ref == decl.get("epic") and low.startswith("readout") and any(
-                    is_mine(c) and comment_text(c).lower().startswith(f"{tag()} readout".lower()) and et_date(c["created_at"]) == today()
-                    for c in t["comments"]
-                ):
-                    record(i, w, "skip", "one readout per day on the epic")
-                    continue
-                ok, msg = px_write(repo, "comment", ref, "-m", body)
-                record(i, w, ("degraded" if op == "rank" and ok else "ok" if ok else "error"),
-                       (f"px has no rank verb; posted as a comment: {msg}" if op == "rank" and ok else msg))
-            elif op in ("move", "close", "cancel"):
-                t = get(ref)
-                if t is None:
-                    record(i, w, "error", "ticket unreadable")
-                    continue
-                if t["group"] in ("completed", "cancelled"):
-                    record(i, w, "skip", f"already {t['lane']}")
-                    continue
-                if op == "move":
-                    lane = w.get("lane")
-                    if lane not in LANES:
-                        record(i, w, "skip", f"lane {lane!r} not in {list(LANES)}")
-                        continue
-                    if t["group"] == "started":
-                        record(i, w, "skip", "In Progress is Krebs' lane: comment instead")
-                        continue
-                if op in ("move", "cancel") and t["working"]:
-                    record(i, w, "skip", "a live worker holds it (agent:working)")
-                    continue
-                verb = ("move", ref, w["lane"], "-m", text) if op == "move" else (op, ref, "-m", text)
-                ok, msg = px_write(repo, *verb)
-                record(i, w, "ok" if ok else "error", msg)
-                tickets.pop(ref, None)
-            elif op == "link":
-                other = str(w.get("other") or "")
-                if not REF.match(other) or other == ref:
-                    record(i, w, "skip", "bad or identical `other` ref")
-                    continue
-                if epic and epic in (ref, other):
-                    if w.get("blocks"):
-                        record(i, w, "skip", f"{epic} is the launch epic: it joins members, it never blocks")
-                        continue
-                    member = other if ref == epic else ref
-                    ok, msg = px_write(repo, "epic", "add", epic, member)
-                    record(i, w, "ok" if ok else "error", msg)
-                    continue
-                ok, msg = px_write(repo, "link", "add", ref, other, *(["--blocks"] if w.get("blocks") else []))
-                record(i, w, "ok" if ok else "error", msg)
-            elif op == "create":
-                title = str(w.get("title") or "").strip()[:200]
-                if not title:
-                    record(i, w, "skip", "create needs a title")
-                    continue
-                if creates >= MAX_CREATES:
-                    record(i, w, "skip", f"at most {MAX_CREATES} creates per pass")
-                    continue
-                state = w.get("state") or "Backlog"
-                pri = str(w.get("priority") or "").lower()
-                if state not in LANES or (pri and pri not in PRIORITIES):
-                    record(i, w, "skip", f"state must be one of {list(LANES)} and priority one of {list(PRIORITIES)}")
-                    continue
-                labels = [l for l in (w.get("labels") or []) if isinstance(l, str) and l and not l.startswith(("lifecycle:", "agent:", "repo:"))]
-                key = str(w.get("key") or "").strip() or "launch:" + hashlib.sha1(title.lower().encode()).hexdigest()[:12]
-                args = ["task", "create", title, "--state", state, "--idempotency-source", "launch-pass", "--idempotency-key", key]
-                if w.get("description"):
-                    args += ["-d", str(w["description"])]
-                if labels:
-                    args += ["-l", ",".join(labels)]
-                if pri:
-                    args += ["--priority", pri]
-                parent = str(w.get("parent") or "")
-                join_epic = bool(epic) and parent == epic
-                if parent and not join_epic and REF.match(parent):
-                    args += ["--parent", parent]
-                creates += 1
-                ok, msg = px_write(repo, *args)
-                record(i, {**w, "ref": title[:60]}, "ok" if ok else "error", msg)
-                if ok and join_epic:
-                    board = re.escape(ident) if ident else "[A-Z][A-Z0-9]*"
-                    m = re.search(rf"\b({board}-\d+)\b", msg)
-                    if not m:
-                        record(i, {"op": "epic", "ref": title[:60]}, "error", f"created, but no ref in px output to join {epic}")
-                    else:
-                        ok, msg = px_write(repo, "epic", "add", epic, m.group(1))
-                        record(i, {"op": "epic", "ref": m.group(1)}, "ok" if ok else "error", msg)
+            # Keep the lease fresh across a long apply, and stop the moment another driver owns the board.
+            if i > 1 and not lease("refresh", lock, owner):
+                entries.append({"op": "lease", "status": "error",
+                                "detail": f"lease lost before write {i}: stopped, {len(writes) - i + 1} write(s) not applied"})
+                break
+            try:
+                one(i, w)
+            except Exception as e:  # one malformed or surprising write never aborts the pass or its receipt
+                record(i, w if isinstance(w, dict) else {}, "error", f"{type(e).__name__}: {e}"[:240])
     finally:
         if writes:
             lease("release", lock, owner)
 
-    roadmap = (plan.get("roadmap") or "").strip()
+    roadmap = plan.get("roadmap")
+    if roadmap not in (None, "") and not isinstance(roadmap, str):
+        entries.append({"op": "roadmap", "status": "skip", "detail": "roadmap must be a string; kept the old one"})
+        roadmap = ""
+    roadmap = (roadmap or "").strip()
     if roadmap:
         lines = roadmap.splitlines()
         if len(lines) > ROADMAP_LINES:

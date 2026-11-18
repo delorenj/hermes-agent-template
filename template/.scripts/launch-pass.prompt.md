@@ -44,4 +44,7 @@ recommendation and the default that applies on silence.
 - At most 3 creates per pass; every create carries a key so a retry never duplicates.
 - To put a ticket in the launch epic, `link` it with the epic or `create` it with the epic as
   `parent`; the driver turns either into an epic membership. An epic never blocks.
-- Refs must be on this board.
+- Refs must be on this board: `ref`, `other` and `parent` alike.
+- A ticket carrying `agent:working` has a live turn on it: it is never moved, closed or cancelled.
+- `comment`, `close` and `cancel` need a `text`; a close cites the build that shipped it.
+- Create labels are bare words, or `risk:`, `needs:`, `xp:`; any other colon label is dropped.

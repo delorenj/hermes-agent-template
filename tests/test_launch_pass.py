@@ -422,6 +422,73 @@ def test_apply_refuses_krebs_managed_boards(tmp_path, monkeypatch):
     assert out.returncode == 4 and r.writes() == []
 
 
+def test_apply_malformed_write_is_skipped_and_the_receipt_survives(repo):
+    repo.plan({"writes": [
+        {"op": "comment", "ref": "EARS-3", "text": "first"},
+        {"op": "comment", "ref": "EARS-2", "text": {"not": "a string"}},
+        {"op": "create", "title": "x", "labels": "launch"},
+        {"op": "link", "ref": "EARS-3", "other": "EARS-2", "blocks": "false"},
+        {"op": "comment", "ref": "EARS-2", "text": "   "},
+        {"op": "close", "ref": "EARS-4"},
+        {"op": "comment", "ref": "EARS-2", "text": "last"},
+    ], "roadmap": ["not", "a", "string"]})
+    out = repo.run("--apply")
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert repo.writes() == [["comment", "EARS-3", "-m", "[pm] first"], ["comment", "EARS-2", "-m", "[pm] last"]]
+    for needle in ("`text` must be a string", "`labels` must be a list of strings", "`blocks` must be true or false",
+                   "`comment` needs a `text`", "`close` needs a `text`", "roadmap must be a string"):
+        assert needle in out.stdout, needle
+    assert len(list((repo.role / "runtime" / "launch-receipts").glob("*.json"))) == 1
+    assert not (repo.role / "runtime" / "launch-roadmap.md").exists()
+
+
+def test_apply_refuses_other_boards_in_other_parent_and_epic_members(repo):
+    repo.plan({"writes": [
+        {"op": "link", "ref": "EARS-3", "other": "HOLOC-9"},
+        {"op": "link", "ref": "EARS-1", "other": "HOLOC-4"},
+        {"op": "create", "title": "y", "parent": "HOLOC-3"},
+        {"op": "create", "title": "z", "parent": "not a ref"},
+    ]})
+    out = repo.run("--apply")
+    assert repo.writes() == []
+    assert out.stdout.count("not on this board") == 2 and out.stdout.count("is not a ticket on this board") == 2
+
+
+def test_apply_never_closes_under_a_live_worker(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, tickets=[ticket(6, "In Progress", labels=["agent:working", "lifecycle:review"])])
+    r.plan({"writes": [{"op": "close", "ref": "EARS-6", "text": "accepted: build 1.0.0"}]})
+    out = r.run("--apply")
+    assert r.writes() == [] and "live worker" in out.stdout
+
+
+def test_apply_create_survives_px_strict_argv_parsing(repo):
+    repo.plan({"writes": [{"op": "create", "title": "--state Done", "description": "- first bullet\n- second",
+                           "key": "-k", "labels": ["docs", "launch:step1", "risk:payments", "epic:x", "-l", "a,b"]}]})
+    out = repo.run("--apply")
+    assert out.returncode == 0, out.stdout + out.stderr
+    w = repo.writes()[0]
+    assert w[2] == "state Done"
+    assert "--description=- first bullet\n- second" in w and "-d" not in w
+    assert w[w.index("--idempotency-key") + 1] == "k"
+    assert w[w.index("-l") + 1] == "docs,risk:payments"
+    assert "labels dropped" in out.stdout and "launch:step1" in out.stdout
+
+
+def test_apply_stops_when_the_lease_is_lost_mid_pass(repo):
+    lock = repo.role / "runtime" / "wip-driver.lock"
+    lease = str(repo.role / ".scripts" / "board-lease.py")
+    # The px shim steals the lease on its first write, the way a driver that took over a stale lease would.
+    shim = Path(repo.env["PATH"].split(os.pathsep)[0]) / "px"
+    shim.write_text(shim.read_text().replace(
+        'with open(state + "/writes.log", "a") as f:',
+        f'import subprocess; subprocess.run([sys.executable, {lease!r}, "acquire", {str(lock)!r}, "thief", "--steal"], capture_output=True)\n'
+        '    with open(state + "/writes.log", "a") as f:'))
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    repo.plan({"writes": [{"op": "comment", "ref": "EARS-2", "text": f"n{i}"} for i in range(4)]})
+    out = repo.run("--apply")
+    assert len(repo.writes()) == 1
+    assert "lease lost before write 2" in out.stdout
+
 # ---------------------------------------------------------------------------------- declaration
 
 def test_check_parses_the_declaration(repo):
