@@ -134,6 +134,22 @@ Candybar `exec` runner, see the README) rather than on a timer. Its own cooldown
 reconciliation pass is worth running; see [the sentinel
 docs](sentinel/README.md).
 
+### Launch pass (PM launch mode)
+
+A launch runs on the repo's one PM, not on a director desk (launch-director,
+paired-launch-director and em roles are retired, 2026-11-18). Launch mode is repo
+data: the committed `<repo>/.launch.yaml` (`mode: launch|steady`; absent means
+steady). The role ships `.scripts/launch-pass.py` and `launch-pass.prompt.md`, an
+interval-driver pass (`--monitor` gate, `--brief`, `--apply plan.json`: the only
+board writer, under the board-driver lease, with an op allowlist, a write cap and
+receipts in `runtime/launch-receipts/`). Candybar `<repo>-pm-launch-pass` is its
+only clock, firing a Hermes job pinned `--scheduler external` whose wrappers
+(`launch-monitor.sh`, `launch-brief.sh`) are real files in the profile's
+`scripts/`. `flume launch status|enable|disable` wires it; in steady mode the
+monitor prints one fixed line and a fire costs 0 tokens. Behavior is
+`flume/roles/pm.md`, "## Launch mode"; operations are `agent-fleet-operations`,
+"Launch mode".
+
 Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters project Git.
 It lives only in ignored local storage unless the operator separately places a
 credential in the secret manager or includes the runtime in an encrypted
