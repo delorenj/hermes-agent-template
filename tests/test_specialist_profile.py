@@ -59,6 +59,7 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     assert config["providers"]["automaticai"]["enabled"] is True
     assert config["providers"]["automaticai"]["key_env"] == "AUTOMATICAI_GATEWAY_KEY"
     assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == "op://DeLoSecrets/hermes-specialist/credential"
+    assert (profile / ".no-bundled-skills").is_file()
     assert (fleet / "config.yaml").read_bytes() == base
     assert json.loads((profile / "hindsight/config.json").read_text())["bank_id"] == "agent-specialist"
     assert json.loads((profile / "hindsight/config.json").read_text())["recall_types"] == ["world", "experience", "observation"]
@@ -228,7 +229,7 @@ def test_raw_projected_config_credentials_refuse_without_writes(tmp_path, name):
 
 
 @pytest.mark.parametrize("refresh", [False, True])
-@pytest.mark.parametrize("after", ["SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml", "hindsight/config.json", ".skillex-only", "specialist-projection.json"])
+@pytest.mark.parametrize("after", ["SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml", "hindsight/config.json", ".skillex-only", ".no-bundled-skills", "specialist-projection.json"])
 def test_interrupted_publication_recovers_with_readonly_preview(tmp_path, refresh, after):
     fleet, profile, request, env = fixture(tmp_path)
     if refresh:

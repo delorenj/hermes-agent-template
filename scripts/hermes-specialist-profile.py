@@ -24,7 +24,8 @@ import yaml
 
 PENDING = ".specialist-pending.json"
 MANAGED_FILES = {"SOUL.md", "config.delta.yaml", "config.yaml", "profile.yaml",
-                 "hindsight/config.json", ".skillex-only", "specialist-projection.json"}
+                 "hindsight/config.json", ".skillex-only", ".no-bundled-skills", "specialist-projection.json"}
+LEGACY_MANAGED_FILES = MANAGED_FILES - {".no-bundled-skills"}
 
 
 spec = importlib.util.spec_from_file_location("specialist_renderer", Path(__file__).with_name("hermes-profile-config.py"))
@@ -218,8 +219,8 @@ def project(request, check):
         if pending is not None:
             if (not isinstance(pending, dict) or pending.get("id") != employee
                     or pending.get("definition") != request["definition"]
-                    or set(pending.get("files", {})) != MANAGED_FILES
-                    or set(pending.get("before", {})) != MANAGED_FILES
+                    or set(pending.get("files", {})) not in (MANAGED_FILES, LEGACY_MANAGED_FILES)
+                    or set(pending.get("before", {})) != set(pending.get("files", {}))
                     or not isinstance(pending.get("links", {}), dict)
                     or set(pending.get("links", {})) != set(pending.get("before_links", {}))):
                 raise ValueError("pending profile ownership conflict")
@@ -437,6 +438,7 @@ def project(request, check):
             "profile.yaml": r.dump_yaml(metadata),
             "hindsight/config.json": json.dumps(memory, indent=2, sort_keys=True) + "\n",
             ".skillex-only": "",
+            ".no-bundled-skills": "",
         }
         for name in files:
             path = profile / name
