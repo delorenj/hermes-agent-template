@@ -136,9 +136,11 @@ for parent in [start, *start.parents]:
     f = parent / ".project.json"
     if f.is_file():
         try:
-            print((json.loads(f.read_text()).get("ticket_provider") or {}).get("type", ""))
+            value = json.loads(f.read_text())
+            binding = value.get("ticket_provider") if isinstance(value, dict) else None
+            print(binding.get("type") if isinstance(binding, dict) and isinstance(binding.get("type"), str) else "__TP_INVALID_MANIFEST__")
         except Exception:
-            print("")
+            print("__TP_INVALID_MANIFEST__")
         break
 else:
     print("__TP_NO_MANIFEST__")
@@ -187,10 +189,10 @@ tp() {
   local name impl
   name="$(tp_provider_name)"
   if [ "$name" = "__TP_NO_MANIFEST__" ]; then
-    name="${TICKET_PROVIDER:-}"
+    if [ "${TP_PROVISIONING:-0}" = "1" ]; then name="${TICKET_PROVIDER:-}"; else name=""; fi
   elif [ -z "$name" ] && [ "${TP_PROVISIONING:-0}" = "1" ]; then
     name="${TICKET_PROVIDER:-}"
-  elif [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ]; then
+  elif [ -n "${TICKET_PROVIDER:-}" ] && [ "$TICKET_PROVIDER" != "$name" ] && [ "$name" != "__TP_INVALID_MANIFEST__" ]; then
     echo "tp: explicit provider conflicts with .project.json ticket_provider.type" >&2
     return 2
   fi

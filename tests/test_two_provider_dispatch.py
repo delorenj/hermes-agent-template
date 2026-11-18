@@ -39,6 +39,27 @@ def test_unsupported_provider_never_runs_adapter(tmp_path: Path, provider: str, 
     assert not log.exists()
 
 
+@pytest.mark.parametrize("manifest", [None, "{", json.dumps({"ticket_provider": {}})])
+def test_missing_or_invalid_manifest_does_not_accept_explicit_provider(
+    tmp_path: Path, manifest: str | None
+) -> None:
+    scripts = tmp_path / "project/agents/hermes/pm/.scripts"
+    (scripts / "lib").mkdir(parents=True)
+    (scripts / "providers").mkdir()
+    shutil.copy2(DISPATCHER, scripts / "lib/ticket-provider.sh")
+    (scripts / "providers/plane.sh").write_text('#!/bin/sh\nprintf called > "$CALL_LOG"\n')
+    if manifest is not None:
+        (tmp_path / "project/.project.json").write_text(manifest)
+    log = tmp_path / "called"
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; tp list_issues', "_", str(scripts / "lib/ticket-provider.sh")],
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "CALL_LOG": str(log), "TICKET_PROVIDER": "plane"},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert not log.exists()
+
+
 @pytest.mark.parametrize("provider", ["plane", "trello"])
 def test_supported_dispatch_uses_bound_adapter(tmp_path: Path, provider: str) -> None:
     role = tmp_path / "project/agents/hermes/pm"
