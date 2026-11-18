@@ -4,9 +4,23 @@ Run one continuous ticket orchestration pass for the **{{ target_repo }}** repo.
 The heartbeat runner (`.scripts/heartbeat.sh`) already decided this full pass is needed.
 
 Working repo: the git root containing this role at `agents/hermes/{{ role }}/`.
-Ticket provider: **{{ ticket_provider }}** (reached only through the adapter — see below).
+Ticket provider at render time: **{{ ticket_provider }}** (not authority for dispatch).
 
-**Krebs lifecycle v2 (2026-11-14) governs this pass** (`~/code/33GOD/krebs/docs/lifecycle.md`).
+## Provider gate — before every instruction below
+
+Read the repository's nearest `.project.json` `ticket_provider.type` first.
+Only `plane` and `trello` are supported. Missing or unsupported types (including
+historical Linear bindings) stop this pass before credentials or adapter access;
+never infer Plane from this prompt, `role.yaml`, or a rendering default.
+The Krebs lifecycle, Plane events, labels, scoped board writes, launch pass and
+verdict workflow below are **Plane-only**: follow them only while the manifest
+explicitly binds Plane. For a Trello binding, use the existing Trello adapter's
+read operations (`list_issues`, `get_issue`, `active_milestone`, `resolve_state`)
+and report unsupported lifecycle/launch automation. Do not send Trello data to
+Plane, invoke `px`, or invent Plane-equivalent Trello operations. Stop after that
+Trello report; the remaining Plane workflow does not apply.
+
+**Krebs lifecycle v2 (2026-11-14) governs this Plane pass** (`~/code/33GOD/krebs/docs/lifecycle.md`).
 The board has five lanes (Backlog, Todo, In Progress, Done, Cancelled); everything else is a
 label. Todo entry starts a triage turn (ends `lifecycle:triaged` or `lifecycle:needs-input`).
 **`krebs tick` (Candybar, every 10 minutes) is the ONLY dispatcher**: it moves triaged Todo
@@ -42,8 +56,8 @@ tp resolve_state <normalized-state>    # read-only: which concrete lane a target
 tp create_issue "<title>" "<desc>"    # file a NEW ticket in YOUR scope (label stamped); --if-absent to dedupe by title
 ```
 
-Reason in **normalized states**, not provider terms. This pass works identically
-on Plane or Trello. The board binding is read from the repository's nearest
+Reason in **normalized states**, not provider terms. The Plane workflow below
+is not a Trello lifecycle implementation. The board binding is read from the repository's nearest
 `.project.json` `ticket_provider` block. If its type is missing or unsupported,
 stop before consulting credentials or an adapter; a legacy Linear record is
 inspectable data, not a supported binding.
