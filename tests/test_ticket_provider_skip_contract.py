@@ -171,6 +171,43 @@ def _run(role: Path, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
     )
 
 
+@pytest.mark.parametrize("provider", ["plane", "trello"])
+@pytest.mark.parametrize("binding", [None, {}, {"type": ""}])
+def test_existing_manifest_without_type_bootstraps_selected_provider(tmp_path: Path, provider: str, binding: dict | None) -> None:
+    project, role, env, log = _fixture(tmp_path)
+    manifest = project / ".project.json"
+    value = json.loads(manifest.read_text())
+    if binding is None:
+        value.pop("ticket_provider")
+    else:
+        value["ticket_provider"] = binding
+    manifest.write_text(json.dumps(value))
+    role_yaml = role / "role.yaml"
+    role_yaml.write_text(role_yaml.read_text().replace("name: plane", f"name: {provider}"))
+    env.pop("PLANE_API_KEY")
+    env.pop("TRELLO_KEY")
+    result = _run(role, env)
+    assert result.returncode == 0, result.stderr
+    assert not log.exists()
+    updated = json.loads(manifest.read_text())["ticket_provider"]
+    assert updated["type"] == provider
+    assert updated["state"] == "deferred"
+
+
+@pytest.mark.parametrize("binding", [None, 17, "linear", {"type": 17}])
+def test_malformed_or_unsupported_binding_never_bootstraps(tmp_path: Path, binding: object) -> None:
+    project, role, env, log = _fixture(tmp_path)
+    manifest = project / ".project.json"
+    value = json.loads(manifest.read_text())
+    value["ticket_provider"] = binding if binding != "linear" else {"type": "linear"}
+    manifest.write_text(json.dumps(value))
+    before = manifest.read_bytes()
+    result = _run(role, env)
+    assert result.returncode != 0
+    assert manifest.read_bytes() == before
+    assert not log.exists()
+
+
 def _source_library(role: Path, env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [
@@ -591,6 +628,24 @@ def test_done_marker_rerun_canonicalizes_live_plane_binding_and_preserves_unrela
     assert all(value.endswith("Z") for value in stamps.values()), stamps
     assert updated["unrelated"] == {"preserve": [1, 2, 3]}
     assert "revalidating canonical board binding" in result.stderr
+
+
+@pytest.mark.parametrize("provider", ["linear", "jira", ""])
+def test_provisioner_preserves_unsupported_existing_binding(
+    tmp_path: Path, provider: str
+) -> None:
+    project, role, env, call_log = _fixture(tmp_path)
+    path = project / ".project.json"
+    manifest = json.loads(path.read_text())
+    manifest["ticket_provider"].update(type=provider, board_id="historical-board")
+    path.write_text(json.dumps(manifest) + "\n")
+    before = path.read_bytes()
+    env["SKIP_PLANE"] = "0"
+    result = _run(role, env)
+    assert result.returncode != 0
+    assert ("unsupported ticket provider" if provider else "has no ticket_provider.type") in result.stderr
+    assert path.read_bytes() == before
+    assert not call_log.exists()
 
 
 @pytest.mark.parametrize("malformed", ["{", "[]\n", "null\n"])

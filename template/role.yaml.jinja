@@ -66,16 +66,13 @@ slack:
   bot_id: ""
   bot_username: ""
 
-# Ticket-provider binding (linear | plane | trello).
+# Ticket-provider binding (plane | trello).
 # The heartbeat reconciliation pass talks ONLY to this via .scripts/lib/ticket-provider.sh;
 # swapping providers is a one-line change here. Filled in by 42-ticket-provider.sh.
 ticket_provider:
   name: {{ ticket_provider | tojson }}
   board_id: ""
-{%- if ticket_provider == 'linear' %}
-  team: ""        # Linear team key, e.g. DEL  (set before first sentinel run)
-  project: ""     # optional Linear project name to scope milestones/issues
-{%- elif ticket_provider == 'plane' %}
+{%- if ticket_provider == 'plane' %}
   workspace: {{ plane_workspace | tojson }}
   project: ""     # Plane project uuid (set by 42-ticket-provider.sh)
 {%- elif ticket_provider == 'trello' %}

@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from pathlib import Path
 import shutil
 import subprocess
-import threading
 
 import pytest
 
@@ -17,13 +15,6 @@ DISPATCHER = (
     / ".scripts"
     / "lib"
     / "ticket-provider.sh"
-)
-LINEAR_PROVIDER = (
-    Path(__file__).resolve().parents[1]
-    / "template"
-    / ".scripts"
-    / "providers"
-    / "linear.sh"
 )
 
 
@@ -58,6 +49,7 @@ esac
             {
                 "ticket_provider": {
                     "type": provider_name,
+                    "board_id": "fixture-board",
                     "identifier": "JIMB",
                 }
             }
@@ -92,7 +84,6 @@ def run_tp(dispatcher: Path, env: dict[str, str], *args: str) -> subprocess.Comp
     ("provider_name", "human_key", "listed_key"),
     [
         ("plane", "JIMB-207", 207),
-        ("linear", "JIMB-207", "JIMB-207"),
         ("trello", "abc123", "abc123"),
     ],
 )
@@ -162,123 +153,10 @@ def test_blank_issue_reference_fails_before_any_provider_call(
     assert not log.exists()
 
 
-def test_linear_native_id_resolves_beyond_first_issue_page(tmp_path: Path) -> None:
-    requests: list[dict[str, object]] = []
-    target_id = "11111111-2222-4333-8444-555555555555"
-
-    class LinearHandler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = json.loads(self.rfile.read(length))
-            requests.append(payload)
-            query = payload["query"]
-            variables = payload.get("variables") or {}
-
-            if "issues(first:100" in query and variables.get("after") is None:
-                nodes = [
-                    {
-                        "id": f"page-one-{index}",
-                        "identifier": f"TEST-{index}",
-                        "title": f"Page one {index}",
-                        "updatedAt": "2026-08-30T00:00:00Z",
-                        "url": f"https://linear.app/issue/TEST-{index}",
-                        "state": {"name": "Todo", "type": "unstarted"},
-                        "assignee": None,
-                    }
-                    for index in range(1, 101)
-                ]
-                data = {
-                    "issues": {
-                        "nodes": nodes,
-                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor-100"},
-                    }
-                }
-            elif "issues(first:100" in query and variables.get("after") == "cursor-100":
-                data = {
-                    "issues": {
-                        "nodes": [
-                            {
-                                "id": target_id,
-                                "identifier": "TEST-101",
-                                "title": "Page two target",
-                                "updatedAt": "2026-08-30T00:00:00Z",
-                                "url": "https://linear.app/issue/TEST-101",
-                                "state": {"name": "In Progress", "type": "started"},
-                                "assignee": {"name": "Agent"},
-                            }
-                        ],
-                        "pageInfo": {"hasNextPage": False, "endCursor": None},
-                    }
-                }
-            elif "issue(id:$id)" in query and variables.get("id") == target_id:
-                data = {
-                    "issue": {
-                        "id": target_id,
-                        "identifier": "TEST-101",
-                        "title": "Page two target",
-                        "description": "Found after page one.",
-                        "state": {"name": "In Progress", "type": "started"},
-                        "comments": {"nodes": []},
-                    }
-                }
-            else:
-                self.send_error(400, "unexpected Linear fixture request")
-                return
-
-            body = json.dumps({"data": data}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, _format: str, *_args: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), LinearHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        repo = tmp_path / "linear-real"
-        scripts = repo / "agents" / "hermes" / "pm" / ".scripts"
-        dispatcher = scripts / "lib" / "ticket-provider.sh"
-        provider = scripts / "providers" / "linear.sh"
-        dispatcher.parent.mkdir(parents=True)
-        provider.parent.mkdir(parents=True)
-        shutil.copy2(DISPATCHER, dispatcher)
-        shutil.copy2(LINEAR_PROVIDER, provider)
-        (repo / ".project.json").write_text(
-            json.dumps(
-                {
-                    "ticket_provider": {
-                        "type": "linear",
-                        "identifier": "TEST",
-                        "team": "TEST",
-                    }
-                }
-            ),
-            encoding="utf-8",
-        )
-        (scripts.parent / "role.yaml").write_text(
-            "ticket_provider:\n  name: linear\n  team: TEST\n",
-            encoding="utf-8",
-        )
-        env = os.environ.copy()
-        env["LINEAR_API_KEY"] = "test-key-never-printed"
-        env["LINEAR_GRAPHQL_URL"] = f"http://127.0.0.1:{server.server_port}/graphql"
-
-        result = run_tp(dispatcher, env, "get_issue", target_id)
-
-        assert result.returncode == 0, result.stderr
-        issue = json.loads(result.stdout)
-        assert issue["id"] == target_id
-        assert issue["key"] == "TEST-101"
-        assert [request.get("variables", {}).get("after") for request in requests[:2]] == [
-            None,
-            "cursor-100",
-        ]
-        assert requests[2].get("variables", {}).get("id") == target_id
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
+def test_historical_linear_binding_rejected_before_any_adapter_call(tmp_path: Path) -> None:
+    dispatcher, env, log = stage_dispatcher(tmp_path, "linear")
+    env["TP_TEST_ISSUES"] = json.dumps([{"id": "old", "key": "TEST-101"}])
+    result = run_tp(dispatcher, env, "get_issue", "TEST-101")
+    assert result.returncode == 2
+    assert "unsupported ticket provider 'linear'" in result.stderr
+    assert not log.exists()

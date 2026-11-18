@@ -65,10 +65,10 @@ The engine never calls a ticket system directly. It calls a normalized adapter
 contract, `template/.scripts/lib/ticket-provider.sh`, which exposes a single
 function, `tp`, that dispatches to one provider implementation under
 `template/.scripts/providers/`. The active provider is chosen at provision time
-through the `ticket_provider` question and recorded in `role.yaml` under
-`ticket_provider.name`.
+through `.project.json` `ticket_provider.type` and mirrored in `role.yaml` under
+`ticket_provider.name` for legacy readers.
 
-This is what lets one engine serve three back ends: Trello, Plane, and Linear.
+This is what lets one engine serve two supported back ends: Trello and Plane.
 For the full contract and the per-provider details, see
 [Providers](providers.md).
 
@@ -100,7 +100,7 @@ carried by labels. On Plane, `in_review` lands in In Progress plus
 `lifecycle:review`, and `awaiting_decision` adds `lifecycle:needs-input`
 without moving the ticket. `lifecycle:human` is the owner's own hold, like
 `lifecycle:needs-input`, `lifecycle:blocked` and `agent:failed`: never dispatched, triaged or
-reviewed, holds no slot, and only the owner adds or removes it. Linear and Trello still map both
+reviewed, holds no slot, and only the owner adds or removes it. Trello maps both
 to a named lane.
 
 ## Autonomous adversarial review (act, do not wait)

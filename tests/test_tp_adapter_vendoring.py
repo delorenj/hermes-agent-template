@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-ADAPTERS = ("plane.sh", "linear.sh", "trello.sh")
+ADAPTERS = ("plane.sh", "trello.sh")
 TEMPLATE_ROOT = Path(__file__).resolve().parents[1]
 MIRROR_DIR = TEMPLATE_ROOT / "template" / ".scripts" / "providers"
 

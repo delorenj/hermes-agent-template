@@ -1,8 +1,7 @@
 #!/usr/bin/env sh
 # DEPRECATED. Do not use this to adopt a host (macOS or Linux) into the 33GOD fleet.
 #
-#   - It writes literal provider credentials (LINEAR_API_KEY, PLANE_API_KEY,
-#     TRELLO_*) into files. The fleet rule is op:// references or process env only.
+#   - It writes literal provider credentials (PLANE_API_KEY, TRELLO_*) into files. The fleet rule is op:// references or process env only.
 #   - It describes and installs the RETIRED per-agent heartbeat timer. Liveness is
 #     the one multiplexed gateway, scheduling is Candybar, persistence is krebs.
 #   - It predates the single multiplexed gateway and the generated-profile model.
@@ -27,10 +26,10 @@
 #
 # Environment overrides (skip the prompts):
 #   HAT_REPO=<name>            project/repo name (default: basename of CWD)
-#   HAT_PROVIDER=linear|plane|trello   (default: plane)
+#   HAT_PROVIDER=plane|trello   (default: plane)
 #   HAT_ROLES="pm"                     roles to install (default: pm)
 #   HAT_DRY_RUN=1              print actions, change nothing
-#   Provider creds: LINEAR_API_KEY | PLANE_API_KEY+PLANE_BASE | TRELLO_KEY+TRELLO_TOKEN
+#   Provider creds: PLANE_API_KEY+PLANE_BASE | TRELLO_KEY+TRELLO_TOKEN
 set -eu
 
 # Fleet runtime: ONE install of the delorenj/hermes-agent fork, serving the gateway, every CLI wrapper and
@@ -144,8 +143,9 @@ TOML
 fi
 
 # --- 4. Provider credentials + board binding ---------------------------------
-ask HAT_PROVIDER "Ticket provider (linear|plane|trello)" "plane"
+ask HAT_PROVIDER "Ticket provider (plane|trello)" "plane"
 PROVIDER="$HAT_PROVIDER"
+case "$PROVIDER" in plane|trello) ;; *) die "unsupported ticket provider: $PROVIDER (supported: plane, trello)" ;; esac
 ask HAT_REPO "Project/repo name" "$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]')"
 REPO="$HAT_REPO"
 PM_ENV="$HOME/.hermes/${REPO}-pm.env"
@@ -153,7 +153,7 @@ PM_ENV="$HOME/.hermes/${REPO}-pm.env"
 # These get written into the pm role.yaml binding after render.
 # Pre-seed from optional env knobs so the install can run non-interactively.
 TP_WORKSPACE="${HAT_PLANE_WORKSPACE:-}"; TP_PROJECT="${HAT_PLANE_PROJECT:-}"
-TP_TEAM="${HAT_LINEAR_TEAM:-}"; TP_BOARD="${HAT_TRELLO_BOARD:-}"
+TP_BOARD="${HAT_TRELLO_BOARD:-}"
 case "$PROVIDER" in
   plane)
     ask PLANE_BASE "Plane base URL" "https://app.plane.so"
@@ -179,12 +179,6 @@ PY
     [ -n "$TP_PROJECT" ] || die "project UUID is required"
     CRED_LINES="PLANE_API_KEY=$PLANE_API_KEY
 PLANE_BASE=$PLANE_BASE"
-    ;;
-  linear)
-    : "${LINEAR_API_KEY:?Set LINEAR_API_KEY in your environment, then re-run}"
-    ask TP_TEAM "Linear team key (for example DEL)" ""
-    [ -n "$TP_TEAM" ] || die "team key is required"
-    CRED_LINES="LINEAR_API_KEY=$LINEAR_API_KEY"
     ;;
   trello)
     : "${TRELLO_KEY:?Set TRELLO_KEY in your environment, then re-run}"
@@ -214,17 +208,42 @@ for ROLE in $ROLES; do
   DEST="$PROJECT_DIR/agents/hermes/$ROLE"
   # Scrub provider creds from copier's environment so 42-ticket-provider skips
   # board CREATION; we bind to the existing board in step 6 instead.
-  run "env -u PLANE_API_KEY -u PLANE_33GOD_API_KEY -u LINEAR_API_KEY \
+  run "env -u PLANE_API_KEY -u PLANE_33GOD_API_KEY \
         -u TRELLO_KEY -u TRELLO_TOKEN \
         copier copy '$TEMPLATE_SRC' '$DEST' --trust --defaults --overwrite \
         --data target_repo='$REPO' --data role='$ROLE' --data ticket_provider='$PROVIDER'"
 done
 
 # --- 6. Bind the PM to the existing board ------------------------------------
+# Write the canonical binding before the read-only smoke test; role.yaml alone
+# cannot authorize a provider request in the dispatcher.
+if [ "${HAT_DRY_RUN:-0}" != "1" ]; then
+  TP_WORKSPACE="$TP_WORKSPACE" TP_PROJECT="$TP_PROJECT" \
+  TP_BOARD="$TP_BOARD" PROVIDER="$PROVIDER" python3 - "$PROJECT_DIR/.project.json" <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+try:
+    project = json.loads(path.read_text()) if path.is_file() else {}
+except (OSError, json.JSONDecodeError):
+    raise SystemExit("malformed .project.json; refusing board binding")
+if not isinstance(project, dict):
+    raise SystemExit(".project.json must be an object")
+provider = os.environ["PROVIDER"]
+board_id = os.environ["TP_PROJECT"] if provider == "plane" else os.environ["TP_BOARD"]
+binding = project.get("ticket_provider") or {}
+if not isinstance(binding, dict):
+    raise SystemExit("ticket_provider must be an object")
+if binding.get("type") not in (None, "", provider) or binding.get("board_id") not in (None, "", board_id):
+    raise SystemExit("existing board binding conflicts with requested provider or board; refusing overwrite")
+binding.update({"type": provider, "board_id": board_id, "workspace": os.environ["TP_WORKSPACE"] if provider == "plane" else ""})
+project["ticket_provider"] = binding
+path.write_text(json.dumps(project, indent=2) + "\n")
+PY
+fi
 PM_ROLE="$PROJECT_DIR/agents/hermes/pm/role.yaml"
 if [ -f "$PM_ROLE" ] && [ "${HAT_DRY_RUN:-0}" != "1" ]; then
   say "6. binding pm to your $PROVIDER board"
-  TP_WORKSPACE="$TP_WORKSPACE" TP_PROJECT="$TP_PROJECT" TP_TEAM="$TP_TEAM" \
+  TP_WORKSPACE="$TP_WORKSPACE" TP_PROJECT="$TP_PROJECT" \
   TP_BOARD="$TP_BOARD" PROVIDER="$PROVIDER" python3 - "$PM_ROLE" <<'PY'
 import os, re, sys, pathlib
 p = pathlib.Path(sys.argv[1]); t = p.read_text()
@@ -234,7 +253,6 @@ def setleaf(text, key, val):
     return new if n else text
 t = setleaf(t, "workspace", os.environ.get("TP_WORKSPACE",""))
 t = setleaf(t, "project",   os.environ.get("TP_PROJECT",""))
-t = setleaf(t, "team",      os.environ.get("TP_TEAM",""))
 t = setleaf(t, "board",     os.environ.get("TP_BOARD",""))
 p.write_text(t)
 print("   bound:", {k:v for k,v in os.environ.items() if k.startswith("TP_") and v})

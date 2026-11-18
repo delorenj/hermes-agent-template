@@ -10,7 +10,7 @@
 # reconciliation pass when local state says no worker is active, the worker
 # heartbeat is stale, or the last full run is outside the cooldown window. The
 # full pass executes the role's sentinel.prompt.md, which reasons about tickets
-# through the ticket-provider adapter (Linear | Plane | Trello) — never a
+# through the ticket-provider adapter (Plane | Trello) — never a
 # hardcoded backend. After the sentinel decision (skip OR full), it
 #
 # KREBS LIFECYCLE v2 (2026-11-14): this script and the pass it launches NEVER dispatch

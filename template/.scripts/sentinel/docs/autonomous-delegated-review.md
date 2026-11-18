@@ -20,7 +20,7 @@ actively tries to break the work, surface unmet acceptance criteria, hidden
 regressions, and drift. On a clean adversarial verdict the loop treats the
 ticket as done and moves on — through the ticket-provider adapter
 (`tp transition <id> <state>`) — and emits a BloodBank decision event carrying
-the full report. This works identically on Linear, Plane, or Trello.
+the full report. This works identically on Plane or Trello.
 
 The operator's verification is **deferred** to end-of-product QA over the review
 lane, backed by a queryable decision trail. A downstream regression rollback is
@@ -145,7 +145,7 @@ Write `<ISSUE>.review.md`; the script validates it:
 ```markdown
 # Autonomous Review Report: <ISSUE>
 ## Issue
-- Linear/Plane/Trello issue: <ISSUE>
+- Plane/Trello issue: <ISSUE>
 - Review lane reason:
 ## Reviewer
 - Reviewer agent: <independent-agent-id>

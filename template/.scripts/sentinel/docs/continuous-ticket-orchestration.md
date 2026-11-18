@@ -1,8 +1,15 @@
 # Continuous ticket orchestration (sentinel engine)
 
-Status: sentinel engine protocol (provider-agnostic)
+Status: Plane sentinel protocol. Read the nearest `.project.json` `ticket_provider.type`
+before following any workflow below; only an explicit `plane` binding activates
+this protocol. For `trello`, the existing adapter can read issues, milestones and
+states, but this document does not authorize Krebs labels, Todo dispatch, Plane
+events, launch ordering, or verdict transitions on Trello. Report unsupported
+lifecycle/launch automation instead. Missing or unsupported providers stop before
+adapter or credential access. `.project.json` is authoritative for the board ID;
+a missing/empty board ID is not supplied by `role.yaml`.
 
-## Krebs lifecycle v2 (2026-11-14): this engine no longer dispatches
+## Plane: Krebs lifecycle v2 (2026-11-14): this engine no longer dispatches
 
 The board has five lanes: Backlog, Todo, In Progress, Done, Cancelled. Lifecycle meaning lives
 in labels (`lifecycle:triaged`, `lifecycle:review`, `lifecycle:needs-input`,
@@ -38,10 +45,11 @@ still does not write application code or approve merges.
 
 ## Ticket access
 
-All board access goes through the adapter (`tp`, from
+All Plane board access goes through the adapter (`tp`, from
 `.scripts/lib/ticket-provider.sh`) and reasons in normalized states:
-`backlog | unstarted | completed | cancelled` (read `started` only; never write it). Never call the provider
-directly — the engine is identical across Linear, Plane, and Trello.
+`backlog | unstarted | completed | cancelled` (read `started` only; never write it). Never call Plane
+directly. The Trello adapter's existing read operations do not imply this Plane
+lifecycle is implemented for Trello.
 
 ## Work-state feed
 
