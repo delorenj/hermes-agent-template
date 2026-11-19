@@ -77,14 +77,23 @@ VOICE_CONFIG_TOOL="$SCRIPT_DIR/../template/.scripts/lib/voice-config.py"
 PROFILE_CONFIG_LOCK_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/profile-config-lock.py"
 PROFILE_CONFIG_SEED_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/profile-config-seed.py"
 PROFILE_CONFIG_TOOL="$SCRIPT_DIR/hermes-profile-config.py"
+# Ticket-provider adapter assets (providers + dispatcher)
+PROVIDER_PLANE_SOURCE="$SCRIPT_DIR/../template/.scripts/providers/plane.sh"
+PROVIDER_LINEAR_SOURCE="$SCRIPT_DIR/../template/.scripts/providers/linear.sh"
+PROVIDER_TRELLO_SOURCE="$SCRIPT_DIR/../template/.scripts/providers/trello.sh"
+TICKET_PROVIDER_SOURCE="$SCRIPT_DIR/../template/.scripts/lib/ticket-provider.sh"
 if [[ ! -f "$FLEET_ENV_LIBRARY_SOURCE" || -L "$FLEET_ENV_LIBRARY_SOURCE" \
    || ! -f "$FLEET_ENV_PARSER_SOURCE" || -L "$FLEET_ENV_PARSER_SOURCE" \
    || ! -f "$VOICE_CONFIG_TOOL" || -L "$VOICE_CONFIG_TOOL" \
    || ! -f "$PROFILE_CONFIG_LOCK_SOURCE" || -L "$PROFILE_CONFIG_LOCK_SOURCE" \
    || ! -f "$PROFILE_CONFIG_SEED_SOURCE" || -L "$PROFILE_CONFIG_SEED_SOURCE" \
    || ! -f "$HEARTBEAT_TEMPLATE" || -L "$HEARTBEAT_TEMPLATE" \
-   || ! -f "$PROFILE_CONFIG_TOOL" || -L "$PROFILE_CONFIG_TOOL" ]]; then
-  echo "fleet-sync: trusted fleet environment loader is unavailable" >&2
+   || ! -f "$PROFILE_CONFIG_TOOL" || -L "$PROFILE_CONFIG_TOOL" \
+   || ! -f "$PROVIDER_PLANE_SOURCE" || -L "$PROVIDER_PLANE_SOURCE" \
+   || ! -f "$PROVIDER_LINEAR_SOURCE" || -L "$PROVIDER_LINEAR_SOURCE" \
+   || ! -f "$PROVIDER_TRELLO_SOURCE" || -L "$PROVIDER_TRELLO_SOURCE" \
+   || ! -f "$TICKET_PROVIDER_SOURCE" || -L "$TICKET_PROVIDER_SOURCE" ]]; then
+  echo "fleet-sync: trusted fleet environment loader or adapter assets are unavailable" >&2
   exit 2
 fi
 # shellcheck source=../template/.scripts/lib/fleet-env.sh
@@ -410,6 +419,57 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit; do
       DRIFT=$((DRIFT + 1))
     fi
   fi
+  # Ticket-provider adapter assets: providers (plane, linear, trello) + dispatcher
+  role_providers_dir="$role_dir/.scripts/providers"
+  if [[ -L "$role_providers_dir" ]]; then
+    note "$agent_id" DRIFT "role .scripts/providers is a symlink (MANUAL: replace with a real directory)"
+    DRIFT=$((DRIFT + 1))
+    fleet_assets_eligible=0
+  else
+    for provider_asset in plane.sh linear.sh trello.sh; do
+      case "$provider_asset" in
+        plane.sh) source_asset="$PROVIDER_PLANE_SOURCE" ;;
+        linear.sh) source_asset="$PROVIDER_LINEAR_SOURCE" ;;
+        trello.sh) source_asset="$PROVIDER_TRELLO_SOURCE" ;;
+      esac
+      target_asset="$role_providers_dir/$provider_asset"
+      if [[ -L "$target_asset" ]]; then
+        note "$agent_id" DRIFT "$target_asset is a symlink (MANUAL: replace with an attested regular file)"
+        DRIFT=$((DRIFT + 1))
+        fleet_assets_eligible=0
+        continue
+      fi
+      if [[ ! -f "$target_asset" ]] || ! cmp -s "$source_asset" "$target_asset"; then
+        if [[ $APPLY -eq 1 ]]; then
+          mkdir -p "$role_providers_dir"
+          cp "$source_asset" "$target_asset"
+          chmod +x "$target_asset"
+          note "$agent_id" FIXED "provider asset refreshed: $provider_asset"
+          changed=1; FIXED=$((FIXED + 1))
+        else
+          note "$agent_id" DRIFT "provider asset differs: $provider_asset"
+          DRIFT=$((DRIFT + 1))
+        fi
+      fi
+    done
+    # ticket-provider.sh goes to .scripts/lib/
+    target_asset="$role_lib_dir/ticket-provider.sh"
+    if [[ -L "$target_asset" ]]; then
+      note "$agent_id" DRIFT "$target_asset is a symlink (MANUAL: replace with an attested regular file)"
+      DRIFT=$((DRIFT + 1))
+      fleet_assets_eligible=0
+    elif [[ ! -f "$target_asset" ]] || ! cmp -s "$TICKET_PROVIDER_SOURCE" "$target_asset"; then
+      if [[ $APPLY -eq 1 ]]; then
+        mkdir -p "$role_lib_dir"
+        cp "$TICKET_PROVIDER_SOURCE" "$target_asset"
+        note "$agent_id" FIXED "ticket-provider dispatcher refreshed"
+        changed=1; FIXED=$((FIXED + 1))
+      else
+        note "$agent_id" DRIFT "ticket-provider dispatcher differs"
+        DRIFT=$((DRIFT + 1))
+      fi
+    fi
+  fi
   if [[ $APPLY -eq 1 ]]; then
     for attestation in \
       "$FLEET_ENV_LIBRARY_SOURCE|$role_lib_dir/fleet-env.sh" \
@@ -419,7 +479,11 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit; do
       "$SCRIPT_DIR/../template/.scripts/lib/profile-renderer.py|$role_lib_dir/profile-renderer.py" \
       "$VOICE_CONFIG_TOOL|$role_lib_dir/voice-config.py" \
       "$SCRIPT_DIR/../template/.scripts/lib/role-yaml.py|$role_lib_dir/role-yaml.py" \
-      "$HEARTBEAT_TEMPLATE|$heartbeat_target"
+      "$HEARTBEAT_TEMPLATE|$heartbeat_target" \
+      "$PROVIDER_PLANE_SOURCE|$role_providers_dir/plane.sh" \
+      "$PROVIDER_LINEAR_SOURCE|$role_providers_dir/linear.sh" \
+      "$PROVIDER_TRELLO_SOURCE|$role_providers_dir/trello.sh" \
+      "$TICKET_PROVIDER_SOURCE|$role_lib_dir/ticket-provider.sh"
     do
       source_asset="${attestation%%|*}"
       target_asset="${attestation#*|}"
