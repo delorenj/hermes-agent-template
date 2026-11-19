@@ -193,6 +193,16 @@ def atomic(path: Path, text: str):
     return True
 
 
+def member_consumer(profile: str) -> str:
+    """Same deterministic gateway consumer contract as Flume's member helper."""
+    name = f"hermes-{profile}"
+    if len(name) <= 26:
+        return name
+    suffix = hashlib.sha1(profile.encode()).hexdigest()[:4]
+    keep = 26 - len("hermes-") - 1 - len(suffix)
+    return f"hermes-{profile[:keep].rstrip('-_')}-{suffix}"
+
+
 def project(request, check):
     employee = request["id"]
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,57}", employee):
@@ -291,7 +301,9 @@ def project(request, check):
             "dashboard.enabled": False,
             "dashboard.basic_auth.enabled": False,
             "dashboard.basic_auth.secret": "",
-            "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY": f"op://DeLoSecrets/hermes-{employee}/credential",
+            # A specialist's credential is provisioned by Flume after the
+            # profile exists; the projection owns no gateway token or field.
+            "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY": f"op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/{member_consumer(employee)}",
             "skills.external_dirs": [],
             "skills.project_discovery": False,
             # Global skill selection is SHARED operating guidance (the canonical
@@ -323,14 +335,11 @@ def project(request, check):
                 node = node[part]
             leaf = parts[-1]
             if key == "secrets.onepassword.env.AUTOMATICAI_GATEWAY_KEY":
-                flume39_ref = f"op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/hermes-{employee}"
-                valid_refs = {wanted, flume39_ref}
+                valid_refs = {wanted}
                 if "config" in old and key in old["config"]:
                     valid_refs.add(old["config"][key])
                 if leaf in node:
                     current_val = node[leaf]
-                    if isinstance(current_val, str) and re.match(r"^op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/[A-Za-z0-9][A-Za-z0-9_-]*$", current_val):
-                        valid_refs.add(current_val)
                     if current_val in valid_refs:
                         wanted = current_val
                     else:
