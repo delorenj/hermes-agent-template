@@ -269,7 +269,7 @@ if [ "${HAT_DRY_RUN:-0}" != "1" ] && [ -f "$PM_ROLE" ]; then
 fi
 
 say ""
-say "Done. Talk to the PM:   agents/hermes/pm/hermes chat \"status\""
+say "Done. Talk to the PM:   hermes-pm chat \"status\"   (or agents/hermes/pm/hermes chat \"status\")"
 if [ "$OS" = "Darwin" ]; then
   say "Sentinel (launchd):     launchctl list | grep $REPO-pm-heartbeat"
 else

@@ -2,7 +2,7 @@
 # https://mise.jdx.dev/configuration.html
 
 [env]
-_.path = [".mise/scripts", "agents/hermes/pm"]
+_.path = [".mise/scripts"]  # the PM launcher is NOT on PATH: use bin/hermes-pm (Story 7.1 AC4)
 _.file = [".env"]
 
 #

@@ -1,0 +1,44 @@
+#!/bin/sh
+# hermes-pm: talk to the PM of the repo you are standing in.
+#
+# Walks up from the current directory to the nearest agents/hermes/pm/hermes
+# (the per-repo PM launcher rendered from template/hermes.jinja) and execs it
+# with your arguments. The launcher pins HERMES_HOME to the repo's named PM
+# profile; everything else is plain Hermes.
+#
+# Why this exists (Story 7.1 AC4, 2026-11-19): mise used to put agents/hermes/pm
+# on PATH, so bare `hermes` meant "this repo's PM" inside every PM repo (and
+# every child repo, because mise merges parent configs) and the global Hermes
+# everywhere else. The launcher forces HERMES_HOME, so `hermes -p <profile>`
+# (Candybar's hermes runner, `flume launch`, bloodbank target-watch) ran as the
+# PM. Bare `hermes` is now always the ONE global Hermes; the PM is explicit.
+#
+#   hermes-pm chat "status"        # this repo's PM
+#   hermes-pm --pm-launcher        # print the launcher it would exec, run nothing
+#   HERMES_PM_FROM=~/code/flume hermes-pm status
+#
+# Exit 2 (usage/config) when no launcher exists at or above the start dir.
+set -eu
+
+start=${HERMES_PM_FROM:-$PWD}
+if ! dir=$(cd "$start" 2>/dev/null && pwd); then
+  echo "hermes-pm: cannot enter $start" >&2
+  exit 2
+fi
+
+while :; do
+  launcher="$dir/agents/hermes/pm/hermes"
+  if [ -f "$launcher" ] && [ -x "$launcher" ]; then
+    if [ "${1:-}" = "--pm-launcher" ]; then
+      printf '%s\n' "$launcher"
+      exit 0
+    fi
+    exec "$launcher" "$@"
+  fi
+  [ "$dir" = "/" ] && break
+  dir=$(dirname "$dir")
+done
+
+echo "hermes-pm: no PM launcher (agents/hermes/pm/hermes) at or above $start" >&2
+echo "  bare \`hermes\` is the global Hermes; a PM desk is rendered by \`flume hire pm\`" >&2
+exit 2

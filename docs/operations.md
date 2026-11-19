@@ -431,3 +431,12 @@ a Candybar manifest.
 
 ### `hermes` launcher complains about HERMES_BIN
 - Check the launcher script: `./agents/hermes/<role>/hermes` falls back to the shared install at `$HOME/.hermes/hermes-agent/.hermes/bin/hermes` (after `$HERMES_BIN`, `fleet.env`, and config.toml). Override with `HERMES_BIN=/path/to/hermes ./agents/hermes/pm/hermes status`.
+
+### Bare `hermes` in a repo is the global Hermes; the PM is `hermes-pm`
+- The PM launcher `agents/hermes/pm/hermes` is never on PATH (Story 7.1 AC4, 2026-11-19). mise used to
+  put `agents/hermes/pm` on PATH, which made bare `hermes` mean "this repo's PM" inside PM repos and their
+  children and forced the PM's `HERMES_HOME` onto every `hermes -p <profile>` call made there.
+- Talk to a repo's PM with `hermes-pm <args>` (`bin/hermes-pm`, symlinked into `~/.local/bin`): it walks up
+  from the cwd to the nearest `agents/hermes/pm/hermes` and execs it. `hermes-pm --pm-launcher` prints the
+  launcher without running it. The explicit path `./agents/hermes/pm/hermes` still works.
+- `pj audit` flags a carried `agents/hermes/pm` `_.path` entry; `pj migrate mise.config-root` removes it.
