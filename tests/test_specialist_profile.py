@@ -58,7 +58,7 @@ def test_project_refresh_noop_and_preservation(tmp_path):
     assert config["providers"]["automaticai"]["api"] == "https://api-direct.automaticai.io/v1"
     assert config["providers"]["automaticai"]["enabled"] is True
     assert config["providers"]["automaticai"]["key_env"] == "AUTOMATICAI_GATEWAY_KEY"
-    assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == "op://DeLoSecrets/hermes-specialist/credential"
+    assert config["secrets"]["onepassword"]["env"]["AUTOMATICAI_GATEWAY_KEY"] == "op://DeLoSecrets/yeurk5dpqkaarspvsn3cjtmkki/hermes-specialist"
     assert (profile / ".no-bundled-skills").is_file()
     assert (fleet / "config.yaml").read_bytes() == base
     assert json.loads((profile / "hindsight/config.json").read_text())["bank_id"] == "agent-specialist"
@@ -340,10 +340,11 @@ def test_flume39_gateway_key_accepted_in_delta(tmp_path):
     delta.setdefault("secrets", {}).setdefault("onepassword", {}).setdefault("env", {})["AUTOMATICAI_GATEWAY_KEY"] = flume39_ref
     delta_path.write_text(yaml.safe_dump(delta))
 
-    # check mode detects difference in specialist-projection.json
+    # The canonical reference is already projected on first hire; a check
+    # after a harmless YAML restyle need not rewrite the receipt.
     preview = run(request, env, "--check")
     assert preview.returncode == 0, preview.stderr
-    assert "specialist-projection.json" in json.loads(preview.stdout)["changed"]
+    assert json.loads(preview.stdout)["changed"] == []
 
     # refresh mode applies and converges
     result = run(request, env)
