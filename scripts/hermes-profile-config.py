@@ -1133,7 +1133,8 @@ def cmd_skills_policy(args) -> int:
         raise RuntimeError("skills-policy requires --profile; select a single desk explicitly")
     helper = load_policy_helper("skills-policy.py")
     for profile in _select(args):
-        outcome = helper.set_policy(profile, renderer=sys.modules[__name__], dry_run=args.dry_run)
+        outcome = helper.set_policy(profile, renderer=sys.modules[__name__], dry_run=args.dry_run,
+                                    desk_only=args.desk_only)
         print(f"skills-policy {profile.name}: {outcome}")
     return 0
 
@@ -1163,6 +1164,8 @@ def main() -> int:
         p.add_argument("--profile", help="operate on one profile (default: all)")
         p.add_argument("--all", action="store_true", help="all profiles (default)")
         p.add_argument("--dry-run", action="store_true", help="show, do not write")
+        if name == "skills-policy":
+            p.add_argument("--desk-only", action="store_true", help="disable project discovery for a repo-less owning desk")
         p.add_argument(
             "--no-prune-stale",
             action="store_true",

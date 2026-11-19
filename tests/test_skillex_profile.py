@@ -90,7 +90,7 @@ def _node_with_npm() -> Path:
 @pytest.fixture(scope="module")
 def installed():
     with tempfile.TemporaryDirectory(
-        prefix="hermes-template-skillex-", dir="/tmp"
+        prefix="hermes-template-skillex-"
     ) as tmp:
         root = Path(tmp).resolve()
         node = _node_with_npm()
@@ -213,6 +213,7 @@ def fixture(installed):
             "MISE_DATA_DIR": str(root / "mise-data"),
             "MISE_CACHE_DIR": str(root / "mise-cache"),
             "MISE_CONFIG_DIR": str(root / "mise-config"),
+            "MISE_NO_CONFIG": "1",
             "HERMES_FLEET_ENV": str(home / ".hermes/fleet.env"),
             "HERMES_BIN": str(hermes),
             "HERMES_LOG": str(root / "hermes.log"),

@@ -43,7 +43,20 @@ updates, so a partial apply must not be reported as fleet-wide success.
 Exit 1/2 indicates an invalid command or unreadable inventory.
 
 The standalone `skills-policy --profile demo-pm` command only enforces
-`skills.external_dirs: []`; it preserves project trust. Both commands delegate
+`skills.external_dirs: []`; it preserves project trust. With `--desk-only`, it
+also pins `skills.project_discovery: false` without changing shared-skill
+inheritance. Step 10 selects this mode when `HERMES_DESK_ROOT` explicitly names
+the real owning role directory (the directory containing `role.yaml`, `SOUL.md`
+and `.agents/skills.json`). Do not also supply `PJANGLER_PROJECT_ROOT`: conflicting
+roots, symlinks and a missing desk selection refuse before profile creation.
+The desk is passed to Skillex's `--project` **selection** API only; no repo,
+`.project.json`, project trust or registry binding is fabricated. Existing
+`.skillex-selection` and receipt selection roots still win on refresh. Other
+numbered steps retain their project requirements; this does not make the full
+project provisioning checklist a portable hire. Flume's named-definition path
+owns portable employment and its charter/provider projection.
+
+Both commands delegate
 to `template/.scripts/lib/skills-policy.py`, take `ProfileConfigLock` before
 reading the base/delta/generated config, and render inside that transaction
 without nested locking. Symlinks, ambiguous YAML, config drift and non-finite
