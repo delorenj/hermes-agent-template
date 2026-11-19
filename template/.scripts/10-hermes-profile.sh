@@ -244,6 +244,20 @@ PYEOF
   [[ -L "$PROFILE_ENV" ]] || chmod 600 "$PROFILE_ENV"
 fi
 
+# The multiplexed gateway fires a turn's hooks on the routed profile's own
+# plugin manager, so the Bloodbank final-answer observer must load in this
+# profile, not only in the launch home. Without this link every Bloodbank
+# command for the desk is rejected ("resolved profile lacks the final-answer
+# observer", BB-43). Harmless when the plugin is not enabled. Takes effect on
+# the next gateway restart.
+BB_PLUGIN_SRC="$HOME/.hermes/plugins/bloodbank-platform"
+BB_PLUGIN_DEST="$PROFILE_HOME/plugins/bloodbank-platform"
+if [[ -L "$BB_PLUGIN_SRC" && ! -e "$BB_PLUGIN_DEST" ]]; then
+  mkdir -p "$PROFILE_HOME/plugins"
+  ln -s "$(readlink -f "$BB_PLUGIN_SRC")" "$BB_PLUGIN_DEST"
+  log "    linked bloodbank-platform plugin into the profile (restart the gateway to load it)"
+fi
+
 # An established Skillex-only desk is converged in place: keep discovery
 # isolated (a no-op when the delta already says so), then apply any pending
 # selection or catalog change. Its config, SOUL, memory pin and runtime state
