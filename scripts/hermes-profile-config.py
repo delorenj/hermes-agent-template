@@ -52,8 +52,9 @@ Commands:
     project-skills bind proven PM projects through the pinned runtime adapter.
 
 Backups are written to ~/.hermes/.profile-config-backups/<timestamp>/<profile>/
--- deliberately NOT beside the file, because several profile dirs are symlinks
-into component repos where a stray .bak would be committed.
+-- deliberately NOT beside the file. Selection requires existing real profile
+folders directly beneath the canonical fleet profiles root; symlinked desks
+must be migrated separately, never repaired by this helper.
 """
 from __future__ import annotations
 
@@ -386,6 +387,23 @@ def dump_yaml(data: dict) -> str:
     return yaml.safe_dump(data, default_flow_style=False, sort_keys=False, width=100)
 
 
+def validate_profile(name: str) -> Path:
+    """Select one existing real desk directly under the canonical fleet profile root."""
+    if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name) is None:
+        raise ValueError(f"invalid profile name: {name!r}")
+    root = PROFILES.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"profile root is not a directory: {PROFILES}")
+    pdir = PROFILES / name
+    # Reject links even when their target resolves back into the root. Do not
+    # follow a broken link or accidentally repair an absent desk by selecting it.
+    if pdir.is_symlink() or not pdir.is_dir():
+        raise ValueError(f"profile must be an existing real directory: {name}")
+    if pdir.resolve(strict=True).parent != root:
+        raise ValueError(f"profile escapes fleet profile root: {name}")
+    return pdir
+
+
 def profile_dirs() -> list[Path]:
     if not PROFILES.is_dir():
         sys.exit(f"FATAL: {PROFILES} not found")
@@ -393,9 +411,10 @@ def profile_dirs() -> list[Path]:
     for child in sorted(PROFILES.iterdir()):
         if child.name in SKIP:
             continue
-        # Follow dir symlinks (several profiles point into component repos).
-        if child.is_dir():
-            out.append(child)
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", child.name):
+            out.append(validate_profile(child.name))
+        elif child.is_dir() or child.is_symlink():
+            raise ValueError(f"invalid profile entry: {child.name!r}")
     return out
 
 
@@ -811,7 +830,7 @@ def cmd_expected(args) -> int:
     """
     import json
 
-    if not args.profile:
+    if args.profile is None:
         sys.exit("FATAL: expected requires --profile")
     pdir = _select(args)[0]
     if args.delta_file == "-":
@@ -1106,13 +1125,8 @@ def _ensure_runtime_ignored(path: Path) -> None:
 
 
 def _select(args) -> list[Path]:
-    if getattr(args, "profile", None):
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.profile) is None:
-            sys.exit("FATAL: invalid profile name")
-        pdir = PROFILES / args.profile
-        if not pdir.is_dir():
-            sys.exit(f"FATAL: no such profile: {args.profile}")
-        return [pdir]
+    if getattr(args, "profile", None) is not None:
+        return [validate_profile(args.profile)]
     return profile_dirs()
 
 
@@ -1203,9 +1217,16 @@ def main() -> int:
     project.add_argument("--json", action="store_true")
     project.set_defaults(func=cmd_project_skills)
     args = ap.parse_args()
-    if not BASE.exists():
-        sys.exit(f"FATAL: fleet base not found: {BASE}")
     try:
+        # Preflight the complete selection before reading configs, taking locks,
+        # or running any delegated helper (including dry runs).
+        if args.cmd == "project-skills":
+            if args.profile is not None:
+                validate_profile(args.profile)
+        else:
+            _select(args)
+        if not BASE.exists():
+            sys.exit(f"FATAL: fleet base not found: {BASE}")
         return args.func(args)
     except PROFILE_LOCK.ProfileConfigLockError as exc:
         sys.exit(f"FATAL: {exc}")

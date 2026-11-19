@@ -459,7 +459,12 @@ def test_supported_project_writer_refuses_symlinks_without_pair_mutation(case, t
         moved.write_text("keep")
     path.symlink_to(moved)
     before = pair(profile)
-    assert project_run(case).returncode == 3
+    result = project_run(case)
+    if target == "profile":
+        assert result.returncode != 0
+        assert "existing real directory" in result.stderr
+    else:
+        assert result.returncode == 3
     assert pair(profile) == before
 
 
