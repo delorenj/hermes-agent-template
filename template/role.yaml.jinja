@@ -81,7 +81,12 @@ ticket_provider:
   timezone: ""    # IANA project calendar; empty = TICKET_PROVIDER_TIMEZONE, TZ, then host-local
   # Optional lane-name overrides for non-standard boards.
   backlog: ""     # e.g. "Backlog"
+  # Plane's stock board has two unstarted states; the repo manifest may override.
+{%- if ticket_provider == 'plane' %}
+  unstarted: "Todo"
+{%- else %}
   unstarted: ""   # e.g. "Todo"
+{%- endif %}
   started: ""     # e.g. "In Progress"
 {%- if ticket_provider != 'plane' %}
   in_review: ""   # e.g. "In Review"
