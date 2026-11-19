@@ -11,9 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 @pytest.mark.parametrize("provider,expected", [("plane", '  unstarted: "Todo"'), ("trello", '  unstarted: ""')])
 def test_generated_role_lane_default(tmp_path: Path, provider: str, expected: str) -> None:
     copier = shutil.which("copier")
-    if copier is None:
-        pytest.skip("Copier not installed")
-    assert copier is not None
+    assert copier is not None, "Copier >=9 is required; install with: uv tool install 'copier>=9,<10'"
     dest = tmp_path / "role"
     result = subprocess.run(
         [copier, "copy", "-T", "--trust", "--defaults", "-d", "target_repo=fixture",
