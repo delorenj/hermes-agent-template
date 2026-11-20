@@ -175,7 +175,7 @@ resolving to the old payload or checkout.
   Codex skill root), install npm skillex privately and never `mise use -g` it
   (`mise activate` would shadow the other one in every shell):
   ```sh
-  mise x node@24 -- npm install -g --prefix ~/.local/share/skillex-npm @delorenj/skillex@0.3.1
+  mise x node@24 -- npm install -g --prefix ~/.local/share/skillex-npm @delorenj/skillex@latest
   # ~/.local/bin/skillex-npm: exec ~/.local/bin/mise x node@24 -- node ~/.local/share/skillex-npm/lib/node_modules/@delorenj/skillex/dist/cli.js "$@"
   ```
   Pass it as `SKILLEX_BIN` to the skillex cutover and resync scripts (skillex >= aa59c85).

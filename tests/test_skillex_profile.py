@@ -15,7 +15,9 @@ import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.3"
+# Never pinned: the tests run the latest published Skillex (or SKILLEX_TEST_TARBALL),
+# the same canonical CLI every desk runs. VERSION is read from the installed package.
+VERSION = ""
 
 
 def run(command, *, cwd, env):
@@ -102,7 +104,7 @@ def installed():
             "PATH": f"{node.parent}{os.pathsep}/usr/bin{os.pathsep}/bin",
         }
         Path(env["HOME"]).mkdir()
-        package = os.environ.get("SKILLEX_TEST_TARBALL", f"@delorenj/skillex@{VERSION}")
+        package = os.environ.get("SKILLEX_TEST_TARBALL", "@delorenj/skillex@latest")
         succeeded(
             run(
                 [
@@ -121,12 +123,14 @@ def installed():
                 env=env,
             )
         )
-        assert (
-            succeeded(
-                run([str(prefix / "bin/skillex"), "--version"], cwd=root, env=env)
-            ).stdout.strip()
-            == VERSION
+        global VERSION
+        VERSION = succeeded(
+            run([str(prefix / "bin/skillex"), "--version"], cwd=root, env=env)
+        ).stdout.strip()
+        installed_pkg = json.loads(
+            (prefix / "lib/node_modules/@delorenj/skillex/package.json").read_text()
         )
+        assert VERSION == installed_pkg["version"]
         yield root, node, mise, prefix
 
 
@@ -358,12 +362,21 @@ def test_strict_rerun_keeps_curator_state_and_applies_a_pending_selection(fixtur
     assert snapshot(fixture["profile"] / "config.yaml") == config_before
 
 
-def test_strict_rerun_refuses_a_local_skill_without_changes(fixture):
+def test_strict_rerun_keeps_an_agent_written_skill_and_refuses_a_name_clash(fixture):
+    # Skillex >= 0.4.x (operator decision 2026-11-06, SKRILL-35): skills a desk's own
+    # agent wrote sit beside the projected links; one named like a selected skill is
+    # still refused, without changes.
     fixture["profile"].rmdir()
     succeeded(provision(fixture))
     local = fixture["profile"] / "skills" / "agent-made"
     local.mkdir()
     (local / "SKILL.md").write_text("---\nname: agent-made\ndescription: x\n---\n")
+    succeeded(provision(fixture))
+    assert (local / "SKILL.md").is_file() and not local.is_symlink()
+
+    clash = fixture["profile"] / "skills" / "agent-category" / "beta"
+    clash.mkdir(parents=True)
+    (clash / "SKILL.md").write_text("---\nname: beta\ndescription: x\n---\n")
     before = snapshot(fixture["profile"])
     refused = provision(fixture)
     assert refused.returncode != 0
@@ -485,14 +498,10 @@ def test_whole_skills_link_is_refused_without_following_it(fixture):
 def test_root_task_has_no_automatic_skill_writer():
     config = tomllib.loads((ROOT / "mise.toml").read_text())
     tasks = config["tasks"]
-    assert [name for name in tasks if name.startswith("skills:")] == ["skills:sync"]
-    assert tasks["skills:sync"]["tools"] == {
-        "npm:@delorenj/skillex": {"version": VERSION, "allow_low_downloads": True}
-    }
-    assert (
-        tasks["skills:sync"]["run"]
-        == "skillex sync --scope project --project '{{config_root}}'"
-    )
+    # skills:sync retired (2026-10-10 skill-operation-task policy) and Skillex is
+    # never pinned: no task or tools table may fork the canonical CLI.
+    assert [name for name in tasks if name.startswith("skills:")] == []
+    assert "npm:@delorenj/skillex" not in (ROOT / "mise.toml").read_text()
     for hook in config["hooks"]["enter"]:
         assert (
             "sync-skills" not in hook["script"]

@@ -166,11 +166,14 @@ contribution, while an independently selected global skill remains available.
 Select the required PM skills in those manifests instead of configuring the
 retired `canonical_skills_dir` or `symlinked_runtime_skills` template settings.
 
-The template repository's own `mise run skills:sync` task uses the same pinned
-release with `--scope project --project '{{config_root}}'`. No skills enter hook,
+Skillex is never pinned: every desk, task and test uses the one canonical CLI (the
+`skillex` launcher on PATH, upgraded with `33god-platform/scripts/cli-launchers.py
+upgrade @delorenj/skillex`). A pin forks the skill engine per repo. There is no
+`skills:sync` mise task (retired with the 2026-10-10 skill-operation-task policy);
+run `skillex sync --scope project --project .` directly. No skills enter hook,
 manifest watcher, or copied Python skill engine remains.
 
-Acceptance tests install the npm release under canonical `/tmp` paths. Run
+Acceptance tests install the latest npm release under canonical `/tmp` paths. Run
 `PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q tests/test_skillex_profile.py`.
 Before publication, supply `SKILLEX_TEST_TARBALL=/absolute/path/delorenj-skillex-<version>.tgz`
 to verify a prebuilt release candidate without a source dependency or rebuild.
