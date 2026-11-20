@@ -23,7 +23,7 @@ breaks them.
 | 2 | Every ticket reference has a compact hover preview: the gist. | The renderer reads each ticket at render time and embeds a card. The card shows the title, lane, priority, a one-line gist from the description's goal, and whether the ticket is waiting on Jarad. Hover shows it; on a phone, the first tap shows it and the link inside opens the ticket. |
 | 3 | Every item is actionable, and the action is stated explicitly. | `title` is an imperative action. Every item needs `steps` and `done_when`; `reply` (the exact words Jarad sends back) is needed wherever the PM cannot read completion itself. The validator refuses an item that is missing any of them. |
 | 4 | Items are laid out in order, like a runbook. | `order` together with `after` (the items that must be done first) gives one numbered sequence. Done items stay in place, collapsed and checked, so the numbering never shifts under Jarad. |
-| 5 | Every artifact mention is a link. | `artifacts` takes https URLs only. The renderer also links every repo path that exists in the repo (to its GitHub URL on `main`) and every bare https URL in any text. A `file://` link, a local path outside the repo, or a bucket key is refused. |
+| 5 | Every artifact mention is a link. | `artifacts` takes https URLs only. The renderer also links every repo path that exists in the repo (to its GitHub URL on `main`) and every bare https URL in any text. A `file://` link, a local path outside the repo (`/home/...`, `~/...`) or a bucket key (`projects/<id>/<date>/...`, `builds/...`, `share/...`) is refused. |
 | 6 | Steps of reasonable complexity are spelled out verbatim. | Items of kind `account`, `console`, `legal`, `money`, `credential` and `publish` need at least two concrete steps, and the first must name where to go (a full URL). "Acquire a D-U-N-S number" alone is refused. |
 | 7 | The set is complete: when every item is checked, the product can be published. | Completeness is computed on every render (see below). Any gap shows on the page as a red banner and in the PM's brief as work to do. The PM closes a gap by adding an item, filing an agent ticket or recording evidence. A gap is never hidden. |
 
@@ -125,7 +125,7 @@ Urgent bugs. Checking it off can never hide work in flight.
 From top to bottom:
 
 1. **Header.** The product, the finish line, the marketplaces, and the count of steps left, done
-   and gaps. It shows when the PM last verified the page, and how to reply: the PM's Telegram bot
+   and gaps. It shows when the page was last refreshed (every apply re-renders it), and how to reply: the PM's Telegram bot
    and "or comment on the linked ticket".
 2. **Banner.** "Incomplete" with the gap list, or "Complete: every barrier is on this page".
 3. **Your runbook.** One numbered card per item. Each card has a checkbox (the PM's verified state),
@@ -185,3 +185,9 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
 - **Repo-owned notes.** A repo may add `.scripts/launch-pass.repo.md`. `launch-pass.py --brief` prints it right
   after the shared pass contract. The scaffold never writes, compares or removes it (33GOD-114).
 
+- **Ticket reads are bounded.** A render reuses a ticket card read in the last 30 minutes while the ticket's lane group is
+  unchanged (`runtime/launch-dashboard-cards.json`) and stops reading after 90 seconds: the remaining cards come from
+  that cache (or show "unreadable"), the receipt and the page footer say how many are out of date, and the next apply
+  refreshes them. A long board never outlives the pass's tool call.
+- **Page privacy.** The page and `dashboard.json` are public at a guessable path. Ticket gists go public with them, and an
+  item must never carry tester names, emails or other personal data (the pass prompt says so).

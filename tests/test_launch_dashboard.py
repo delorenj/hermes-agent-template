@@ -168,6 +168,11 @@ REFUSALS = [
     ("a bucket key artifact", {"artifacts": [{"label": "x", "url": "projects/earshot/2026-11-18/x/index.html"}]}, "https URL"),
     ("a local path in a step", {"steps": ["Open https://play.google.com/console and go.", "Look at /home/delorenj/code/x/shot.png"]}, "local path"),
     ("an s3 key in the why", {"why": "see s3://projects/earshot/x"}, "local path"),
+    ("a bucket key in a step", {"steps": ["Open https://play.google.com/console and go.", "Read projects/earshot/2026-11-18/report/index.html"]}, "local path"),
+    ("a builds bucket key", {"why": "the page is builds/earshot/index.html"}, "local path"),
+    ("a home-relative path", {"steps": ["Open https://play.google.com/console and go.", "Attach ~/code/earshot/shot.png"]}, "local path"),
+    ("sign off on a release build", {"title": "Sign off on the release build"}, "verify, test or sign off"),
+    ("verify the new build", {"steps": ["Open https://play.google.com/console and go.", "Verify that the new build opens."]}, "verify, test or sign off"),
     ("a noun-phrase title", {"title": "The Play Console app"}, "imperative"),
     ("a question title", {"title": "Create the app?"}, "imperative"),
     ("a ref on another board", {"refs": ["OTHER-9"]}, "not on this board"),
@@ -185,6 +190,13 @@ def test_the_validator_refuses(dash, label, over, needle):
     mod = load_mod(dash)
     problems = mod.item_problems(good(**over), ctx_for(mod))
     assert any(needle in p for p in problems), (label, problems)
+
+
+def test_a_https_url_with_a_bucket_path_and_a_verify_your_identity_step_are_fine(dash):
+    mod = load_mod(dash)
+    item = good(steps=["Open https://play.google.com/console and go.", "Verify your identity with the code, then upload the build to Production.",
+                       "See https://s3.delo.sh/projects/earshot/2026-11-18/report/index.html and docs/builds/notes.md"])
+    assert mod.item_problems(item, ctx_for(mod)) == []
 
 
 def test_publish_needs_a_marketplace_and_a_second_step(dash):
@@ -333,7 +345,7 @@ def test_the_page_is_self_contained_themed_and_phone_safe(dash, tmp_path):
     assert "background:var(--bg)" in html and 'name="viewport"' in html and "env(safe-area-inset-left" in html
     assert "<title>Earshot launch dashboard</title>" in html
     assert "@earshot_pm_bot" in html and "comment on the linked ticket" in html
-    assert "Last verified" in html and "ET" in html or "EST" in html or "EDT" in html
+    assert "Last refreshed" in html and ("EST" in html or "EDT" in html)
     assert "Earshot is in the Play Store and a stranger can pay for it." in html
 
 
@@ -374,6 +386,9 @@ def test_a_catalog_row_with_no_entry_is_a_gap_and_a_conditional_row_still_needs_
     ({"status": "agent", "ref": "EARS-999"}, "not on the board"),
     ({"status": "owner", "item": "ghost"}, "does not exist"),
     ({"status": "na"}, "n/a with no reason"),
+    ({"status": "met", "evidence": "yes"}, "hollow evidence"),
+    ({"status": "met", "evidence": "Jarad said it is fine"}, "hollow evidence"),
+    ({"status": "na", "why": "n/a"}, "hollow reason"),
     ({"status": "agent"}, "agent with no ticket"),
 ])
 def test_a_requirement_entry_that_does_not_hold_up_is_a_gap(dash, tmp_path, entry, needle):
@@ -641,3 +656,117 @@ def test_the_scripts_are_executable_and_stdlib_only():
     assert src.startswith("#!/usr/bin/env python3") and path.stat().st_mode & 0o111
     for banned in ("import yaml", "import requests", "import httpx", "import jinja2"):
         assert banned not in src
+
+
+# ------------------------------------------------------------------ review fixes (FLUME-104)
+
+def test_the_store_table_stacks_on_a_phone_and_never_forces_a_wide_table(dash, tmp_path):
+    html, _ = render(dash, full_data(), tmp_path)
+    css = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
+    media = re.search(r"@media \(max-width:560px\)\{.*", css, re.S).group(0)
+    outside = css.replace(media, "")
+    for m in re.finditer(r"min-width:(\d+)px", outside):
+        assert int(m.group(1)) <= 360, f"a {m.group(0)} outside a media query forces sideways scroll on a phone"
+    assert "thead{display:none}" in media and "td:nth-child(2){order:-1}" in media, "each row becomes a card with the status first"
+
+
+def test_dot_slash_repo_paths_link_and_a_trailing_paren_stays_when_the_url_opened_one(dash, tmp_path):
+    (dash.root / ".github").mkdir()
+    (dash.root / ".github" / "ci.yml").write_text("x\n")
+    dash.git("add", ".github/ci.yml")
+    data = full_data()
+    data["items"][0]["why"] = "Read ./docs/launch.md and ./.github/ci.yml, then https://en.wikipedia.org/wiki/A_(b) or (see https://example.com/x)."
+    html, _ = render(dash, data, tmp_path)
+    assert 'href="https://github.com/delorenj/earshot/blob/main/docs/launch.md"' in html
+    assert 'href="https://github.com/delorenj/earshot/blob/main/.github/ci.yml"' in html
+    assert 'href="https://en.wikipedia.org/wiki/A_(b)"' in html and 'href="https://example.com/x"' in html
+
+
+def test_gaps_that_wait_on_him_lead_the_banner_and_the_catalog_tail_follows(dash, tmp_path):
+    data = {"schema": "launch-dashboard/1", "marketplaces": ["google_play"], "items": [], "requirements": {}}
+    _, model = render(dash, data, tmp_path)
+    kinds = [g["kind"] for g in model["gaps"]]
+    assert kinds == sorted(kinds, key=("waiting", "publish", "item", "board", "marketplace", "catalog").index)
+    assert kinds[0] in ("waiting", "publish") and kinds[-1] == "catalog"
+
+
+def test_a_gist_drops_a_heading_only_line(dash):
+    mod = load_mod(dash)
+    assert mod.gist({"description_text": "## Outcome\n\nDeliver a private build. More follows."}) == "Deliver a private build."
+
+
+def test_a_card_shows_what_an_item_covers(dash, tmp_path):
+    html, _ = render(dash, {**full_data(), "items": [good(), publish_item()]}, tmp_path)
+    assert "<h4>Covers</h4>" in html
+
+
+def test_the_header_says_refreshed_not_verified(dash, tmp_path):
+    html, _ = render(dash, full_data(), tmp_path)
+    assert "Last refreshed" in html and "Last verified" not in html
+
+
+def _counting_gather(dash, tmp_path, monkeypatch, **kw):
+    for k, v in dash.env.items():
+        monkeypatch.setenv(k, v)
+    mod = load_mod(dash)
+    gets = []
+    real = mod.LP.px_json
+
+    def counting(repo, *args):
+        if args[:2] == ("task", "get"):
+            gets.append(args[2])
+        return real(repo, *args)
+
+    mod.LP.px_json = counting
+    decl = mod.LP.load_declaration(dash.root)
+    proj = mod.project_info(dash.root)
+    cache = tmp_path / "cards.json"
+    return mod, gets, lambda **o: mod.gather(dash.root, decl, proj, set(), cache_file=cache, **{**kw, **o}), cache
+
+
+def test_ticket_cards_are_cached_so_a_second_render_reads_nothing(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    first = gather()
+    n = len(gets)
+    assert n >= 4 and cache.is_file() and not first.stale_cards
+    second = gather()
+    assert len(gets) == n, "a card read inside the TTL with the same lane group is reused"
+    assert second.tickets["EARS-2"]["gist"] == "Put the listing text in the Play API so nobody types it."
+
+
+def test_an_expired_card_is_read_again_and_a_changed_lane_group_is_never_served_from_cache(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    body["EARS-2"]["at"] = "2020-01-01T00:00:00Z"
+    body["EARS-4"]["group"] = "backlog"
+    cache.write_text(json.dumps(body))
+    gets.clear()
+    gather()
+    assert sorted(gets) == ["EARS-2", "EARS-4"]
+
+
+def test_a_spent_read_budget_serves_stale_cards_and_says_so(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    for e in body.values():
+        e["at"] = "2020-01-01T00:00:00Z"
+    cache.write_text(json.dumps(body))
+    gets.clear()
+    b = gather(budget=-1)
+    assert gets == [] and b.stale_cards and b.tickets["EARS-2"]["title"] == "Wire the store listing"
+    cache.unlink()
+    b = gather(budget=-1)
+    assert b.tickets["EARS-2"]["title"] == "(unreadable)" and "EARS-2" in b.stale_cards
+
+
+def test_a_render_with_stale_cards_says_so_in_the_receipt_and_the_footer(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    b = gather(budget=-1)
+    assert b.stale_cards
+    linker = mod.Linker(b, mod.RepoIndex(dash.root, mod.LP.load_declaration(dash.root)), {"EARS"}, mod.project_info(dash.root))
+    model = {"product": "Earshot", "finish_line": "", "epic": "", "marketplaces": [], "marketplace_names": {}, "items": [], "requirements": [],
+             "gaps": [], "agent_work": [], "counts": {"open": 0, "done": 0, "gaps": 0}, "complete": True, "catalog_checked": "x"}
+    page = mod.render_page(model, linker, b, "", mod.now(), "abc")
+    assert "ticket card(s) may be out of date" in page

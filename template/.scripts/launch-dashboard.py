@@ -54,6 +54,9 @@ RT = LP.RT
 DATA_FILE = RT / "launch-dashboard.json"
 LOCK_FILE = RT / "launch-dashboard.lock"
 SITE_DIR = RT / "launch-dashboard-site"
+CARDS_FILE = RT / "launch-dashboard-cards.json"
+CARD_TTL = 1800  # seconds a cached ticket card is trusted while its lane group is unchanged
+READ_BUDGET = 90  # seconds of ticket reads per render; the rest come from the cache and the page says so
 CATALOG_FILE = HERE / "lib" / "launch-marketplaces.json"
 PUBLISHER = Path(os.environ.get("LAUNCH_DASHBOARD_PUBLISHER") or Path.home() / ".agents" / "skills" / "artifacts" / "scripts" / "publish.py")
 PLANE_BASE = (os.environ.get("LAUNCH_PLANE_BASE") or "https://plane.delo.sh").rstrip("/")
@@ -69,6 +72,7 @@ REQ_STATUSES = ("met", "agent", "owner", "na")
 OP_NAMES = ("upsert", "check", "uncheck", "remove", "requirement", "marketplaces")
 MAX_OPS = 40
 WAIT_LABELS = ("lifecycle:needs-input", "lifecycle:human", "lifecycle:blocked")
+GAP_RANK = ("waiting", "publish", "item", "board", "marketplace", "catalog")
 AGENT_LIST_SHOWN = 30
 BANNER_SHOWN = 6
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
@@ -76,9 +80,13 @@ REQ_ID_RE = re.compile(r"^[a-z]{2}\.[a-z0-9][a-z0-9.-]*$")
 REF_ANY = re.compile(r"\b([A-Z][A-Z0-9]*)-(\d+)\b")
 URL_ANY = re.compile(r"https?://[^\s<>\"']+")
 FIRST_STEP_URL = re.compile(r"https://[^\s<>\"']+")
-BAD_LOCAL = re.compile(r"file://|\bs3://|(?<![\w/.:])/(?:home|tmp|Users|var|etc|root|mnt|opt)/\S+")
+BAD_LOCAL = re.compile(
+    r"file://|\bs3://|(?<![\w/.:])/(?:home|tmp|Users|var|etc|root|mnt|opt)/\S+"
+    r"|(?<![\w/.~])~/\S+"  # a home-relative path
+    r"|(?<![\w/.:@-])(?:projects/[\w.-]+/\d{4}-\d\d-\d\d|builds|share)/[\w.-]+\S*")  # a bucket key
+# The verb must govern the build itself: "Verify your identity ..., then upload the build" is a normal Play step.
 BAD_WORDS = re.compile(
-    r"\b(?:verify|sign[- ]?off(?: on)?|play[- ]?test|try out|qa)\b[^.\n]{0,60}\b(?:build|apk|ipa|candidate|gate)s?\b"
+    r"\b(?:verify|sign[- ]?off(?: on)?|play[- ]?test|try out|qa)\s+(?:on\s+)?(?:that\s+)?(?:the|this|that|a|our)\s+(?:(?:new|latest|current|final|release|play|ios|android)\s+){0,2}(?:build|apk|ipa|candidate|gate)s?\b"
     r"|\btest (?:out )?(?:the |this |that |a |our )?(?:new |latest |current )?(?:build|apk|ipa|candidate)s?\b"
     r"|\bapprove (?:the |this |that )?(?:build|candidate|gate|ticket)s?\b", re.I)
 NOT_IMPERATIVE = ("the", "a", "an", "this", "that", "pending", "waiting", "need", "needs", "todo", "task", "step", "we", "i", "it")
@@ -359,6 +367,8 @@ def requirement_problem(entry, ids: set[str]) -> str:
         return f"status must be one of {', '.join(REQ_STATUSES)}"
     if st == "met" and not is_str(entry.get("evidence")):
         return "met with no evidence"
+    if st == "met" and (len(entry["evidence"].strip()) < 8 or HOLLOW_EVIDENCE.match(entry["evidence"])):
+        return "met with hollow evidence (cite a URL, a ticket or a one-line read-back; Jarad's reply is never evidence)"
     if st == "agent" and not (isinstance(entry.get("ref"), str) and LP.REF.match(entry["ref"])):
         return "agent with no ticket ref"
     if st == "owner" and not is_str(entry.get("item")):
@@ -367,6 +377,8 @@ def requirement_problem(entry, ids: set[str]) -> str:
         return f"owner item {entry['item']!r} does not exist"
     if st == "na" and not is_str(entry.get("why")):
         return "n/a with no reason"
+    if st == "na" and len(entry["why"].strip()) < 8:
+        return "n/a with a hollow reason (say why the requirement does not apply)"
     return ""
 
 
@@ -503,7 +515,8 @@ def gist(raw: dict) -> str:
         or re.search(r"(?im)^\s*goal\s*:\s*(.+?)(?:\n\s*\n|\Z)", text, re.S)
     para = strip_md(m.group(1)) if m else ""
     if not para and text:
-        flat = strip_md(text)
+        body = "\n".join(l for l in text.splitlines() if not re.match(r"^\s*(?:#{1,6}\s*)?(?:outcome|goal|summary|overview|description|context|background)\s*:?\s*$", l, re.I))
+        flat = strip_md(body)
         para = re.split(r"(?<=[.!?])\s", flat, maxsplit=1)[0]
     return para[:180].rstrip() + ("..." if len(para) > 180 else "")
 
@@ -542,13 +555,17 @@ class Board:
         self.groups: dict[str, str] = {}
         self.tickets: dict[str, dict] = {}
         self.prefixes: set[str] = set()
+        self.stale_cards: list[str] = []  # refs shown from an old cache entry because the read budget ran out or a read failed
 
     def open_tickets(self) -> list[dict]:
         return sorted((t for t in self.tickets.values() if t["group"] in LP.OPEN), key=lambda t: int(t["ref"].rsplit("-", 1)[1]))
 
 
-def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict] | None = None) -> Board:
-    """Read the board once. With `rows` (the launch pass's own board read) only closed referenced tickets cost a read."""
+def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict] | None = None,
+           cache_file: Path | None = None, budget: float = READ_BUDGET) -> Board:
+    """Read the board once. With `rows` (the launch pass's own board read) only closed referenced tickets cost a read.
+    Without rows, a card read inside CARD_TTL with the same lane group is reused, and reading stops after `budget` seconds:
+    the rest come from the cache (marked stale) so a render never outlives the pass's tool call."""
     b = Board()
     try:
         _, where, groups = LP.ref_dirs(repo, decl)
@@ -566,21 +583,57 @@ def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict
     else:
         todo = []
         detail_refs = sorted({r for r, g in groups.items() if g in LP.OPEN} | {r for r in wanted if r in groups})
+    cache = read_json(cache_file, {}) if (cache_file is not None and rows is None) else {}
+    if not isinstance(cache, dict):
+        cache = {}
+    deadline = time.monotonic() + budget
+    stamp_now = now()
+
+    def fresh(ref):
+        e = cache.get(ref)
+        if not (isinstance(e, dict) and isinstance(e.get("info"), dict) and e.get("group") == groups.get(ref)):
+            return None
+        try:
+            age = (stamp_now - datetime.strptime(e["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            return None
+        return e["info"] if 0 <= age < CARD_TTL else None
+
     def read(ref):
+        hit = fresh(ref)
+        if hit is not None:
+            return ref, hit, "cache"
         for attempt in range(4):
+            if time.monotonic() > deadline:
+                return ref, None, "budget"
             try:
-                return ref, LP.px_json(repo, "task", "get", ref)["ticket"]
+                return ref, LP.px_json(repo, "task", "get", ref)["ticket"], "read"
             except Exception:
                 if attempt == 3:
-                    return ref, None
+                    return ref, None, "failed"
                 time.sleep(1 + 2 * attempt)
     with ThreadPoolExecutor(8) as pool:
-        for ref, raw in pool.map(read, detail_refs + todo):
-            if raw is not None:
+        for ref, raw, how in pool.map(read, detail_refs + todo):
+            if how == "cache":
+                b.tickets[ref] = raw
+            elif raw is not None:
                 b.tickets[ref] = info_from_raw(ref, raw, proj)
-            elif ref in groups:
-                b.tickets[ref] = {"ref": ref, "title": "(unreadable)", "lane": "?", "group": groups[ref], "pri": "none", "labels": [],
-                                  "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner"}
+                if cache_file is not None and rows is None:
+                    cache[ref] = {"at": iso(stamp_now), "group": groups.get(ref, ""), "info": b.tickets[ref]}
+            else:
+                old = cache.get(ref)
+                if isinstance(old, dict) and isinstance(old.get("info"), dict):
+                    b.tickets[ref] = {**old["info"], "group": groups.get(ref, old["info"].get("group", ""))}
+                    b.stale_cards.append(ref)
+                elif ref in groups:
+                    b.tickets[ref] = {"ref": ref, "title": "(unreadable)", "lane": "?", "group": groups[ref], "pri": "none", "labels": [],
+                                      "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner"}
+                    b.stale_cards.append(ref)
+    if cache_file is not None and rows is None:
+        try:
+            write_json(cache_file, {r: e for r, e in cache.items() if r in groups})
+        except OSError:
+            pass
     return b
 
 
@@ -624,7 +677,7 @@ class RepoIndex:
             self.roots.append((prefix, files, base))
 
     def url(self, path: str) -> str:
-        path = path.lstrip("./") if path.startswith("./") else path
+        path = path[2:] if path.startswith("./") else path
         for prefix, files, base in self.roots:
             for cand in ([path[len(prefix):]] if prefix and path.startswith(prefix) else []) + [path]:
                 if cand in files:
@@ -637,7 +690,17 @@ class RepoIndex:
 TOKEN = re.compile(
     r"(?P<url>https?://[^\s<>\"']+)"
     r"|(?P<ref>\b[A-Z][A-Z0-9]*-\d+\b)"
-    r"|(?P<path>(?<![\w/@:.+-])[\w][\w.+-]*(?:/[\w.+-]+)+/?|(?<![\w/@:.+-])[\w][\w+-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b)")
+    r"|(?P<path>(?<![\w/@:.+-])(?:\./)?[\w.][\w.+-]*(?:/[\w.+-]+)+/?|(?<![\w/@:.+-])[\w][\w+-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b)")
+
+
+def trim_url(tok: str) -> str:
+    """A bare URL minus trailing punctuation; a closing paren stays when the URL opened one (wiki-style links)."""
+    while tok:
+        if tok[-1] in ".,;:!?" or (tok[-1] == ")" and tok.count(")") > tok.count("(")):
+            tok = tok[:-1]
+        else:
+            break
+    return tok
 
 
 class Linker:
@@ -661,7 +724,7 @@ class Linker:
             pos = m.end()
             tok = m.group(0)
             if m.group("url"):
-                core = tok.rstrip(".,;:!?)")
+                core = trim_url(tok)
                 out.append(f'<a href="{esc(core)}" target="_blank" rel="noopener">{esc(core)}</a>' + esc(tok[len(core):]))
             elif m.group("ref"):
                 prefix = tok.split("-")[0]
@@ -716,6 +779,8 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
     for iid, probs in broken.items():
         for p in probs:
             gaps.append({"kind": "item", "id": iid, "text": f"Step {iid} breaks a rule: {p}."})
+    # The highest-value gaps first, so the banner never hides them behind a long catalog tail.
+    gaps.sort(key=lambda g: GAP_RANK.index(g["kind"]))
     return gaps
 
 
@@ -829,14 +894,17 @@ code,.mono{font:.86rem var(--mono);background:var(--sunk);padding:1px 6px;border
 #tkcard a{display:inline-block;margin-top:8px;font-weight:600}
 .agent{margin:0;padding:0;list-style:none;display:grid;gap:4px}.agent li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
-table{border-collapse:collapse;width:100%;min-width:560px}
+table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:.88rem}
 th{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);background:var(--sunk)}
 tr:last-child td{border-bottom:0}
 td .sub{display:block;color:var(--muted);font-size:.78rem;margin-top:2px}
 .muted{color:var(--muted)}
 footer{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem;display:flex;flex-wrap:wrap;gap:4px 18px}
-@media (max-width:560px){h1{font-size:1.4rem}details.step>summary{grid-template-columns:1fr;gap:0}.body{padding-left:14px}.num{font-size:1.1rem}}
+@media (max-width:560px){h1{font-size:1.4rem}details.step>summary{grid-template-columns:1fr;gap:0}.body{padding-left:14px}.num{font-size:1.1rem}
+.tablewrap{border:0;background:none;overflow:visible}table,tbody,tr,td{display:block;width:100%}thead{display:none}
+tr{background:var(--surface);border:1px solid var(--line);border-radius:8px;margin-bottom:8px;padding:8px 12px;display:flex;flex-direction:column;gap:4px}
+td{border:0;padding:0}td:nth-child(2){order:-1}}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 """
 
@@ -892,7 +960,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w(f"<p class=\"lede\"><b>Finish line.</b> {L(model['finish_line'])}</p>")
     w("<div class=\"pills\">" + ("".join(f"<span class=\"pill\">{esc(n)}</span>" for n in mp_names.values()) or "<span class=\"pill warn\">no marketplace declared</span>") + "</div>")
     w(f"<ul class=\"stats\"><li><b>{c['open']}</b> steps left</li><li><b>{c['done']}</b> done</li><li><b>{c['gaps']}</b> gaps</li></ul>")
-    w(f"<div class=\"meta\"><span>Last verified <b>{esc(et(now_dt))}</b></span>" + (f"<span>Epic {L(model['epic'])}</span>" if model["epic"] else "") + "</div>")
+    w(f"<div class=\"meta\"><span>Last refreshed <b>{esc(et(now_dt))}</b></span>" + (f"<span>Epic {L(model['epic'])}</span>" if model["epic"] else "") + "</div>")
     w(f"<p class=\"reply\">{reply_hint}</p></header>")
     if model["gaps"]:
         gaps = model["gaps"]
@@ -946,6 +1014,9 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w(f"<div class=\"f\"><h4>If you say nothing</h4><p>{L(it['default']) if is_str(it.get('default')) else '<span class=\"muted\">Nothing happens. This step waits for you.</span>'}</p></div>")
         if it.get("refs"):
             w("<div class=\"f\"><h4>Tickets</h4><p>" + " ".join(linker.chip(r) for r in it["refs"]) + "</p></div>")
+        if it.get("covers"):
+            titles = {r["id"]: r["title"] for r in model["requirements"]}
+            w("<div class=\"f\"><h4>Covers</h4><p>" + "; ".join(esc(titles.get(c, c)) for c in it["covers"]) + "</p></div>")
         arts = [a for a in it.get("artifacts") or [] if isinstance(a, dict) and is_str(a.get("url")) and a["url"].startswith("https://")]
         if arts:
             w("<div class=\"f\"><h4>Links</h4><ul>" + "".join(f"<li><a href=\"{esc(a['url'])}\" target=\"_blank\" rel=\"noopener\">{esc(a.get('label') or a['url'])}</a></li>" for a in arts) + "</ul></div>")
@@ -994,7 +1065,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w("</tbody></table></div>")
     if not model["marketplaces"]:
         w("<p class=\"muted\">Declare a marketplace and the store checklist appears here.</p>")
-    w(f"<footer><span>{esc(SCHEMA)}</span><span>Rendered {esc(et(now_dt))}</span><span>Driver {esc(driver_commit)}</span><a href=\"dashboard.json\">dashboard.json</a></footer>")
+    w(f"<footer><span>{esc(SCHEMA)}</span>" + (f"<span>{len(board.stale_cards)} ticket card(s) may be out of date</span>" if board.stale_cards else "") + f"<span>Rendered {esc(et(now_dt))}</span><span>Driver {esc(driver_commit)}</span><a href=\"dashboard.json\">dashboard.json</a></footer>")
     cards = {r: {k: t.get(k, "") for k in ("title", "lane", "pri", "gist", "waiting", "url")} for r, t in board.tickets.items() if r in linker.used}
     blob = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
     w(f"</div><script type=\"application/json\" id=\"tk-data\">{blob}</script><script>{JS}</script></body></html>")
@@ -1031,7 +1102,7 @@ def render(repo: Path, decl: dict, data: dict, out_dir: Path) -> tuple[dict, Boa
     catalog = load_catalog()
     proj = project_info(repo)
     prefixes = ticket_prefixes(repo, decl)
-    board = gather(repo, decl, proj, wanted_refs(data, prefixes))
+    board = gather(repo, decl, proj, wanted_refs(data, prefixes), cache_file=CARDS_FILE)
     repoidx = RepoIndex(repo, decl)
     model = build_model(repo, decl, data, catalog, board, repoidx, proj, prefixes)
     linker = Linker(board, repoidx, prefixes, proj)
@@ -1094,6 +1165,8 @@ def run_apply(repo: Path, decl: dict, ops, do_publish: bool = True) -> list[dict
             entries.append({"op": "dashboard", "ref": "render", "status": "error", "detail": f"{type(e).__name__}: {e}"[:200]})
             return entries
         detail = f"{model['counts']['open']} open, {model['counts']['done']} done, {model['counts']['gaps']} gaps"
+        if board.stale_cards:
+            detail += f"; {len(board.stale_cards)} ticket card(s) from cache or unreadable ({', '.join(board.stale_cards[:6])}{'...' if len(board.stale_cards) > 6 else ''})"
         entries.append({"op": "dashboard", "ref": "render", "status": "ok", "detail": detail})
         if do_publish:
             ok, msg = publish(repo, decl, SITE_DIR, first=not (data.get("published") or {}).get("url"))
