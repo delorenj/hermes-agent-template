@@ -54,6 +54,9 @@ RT = LP.RT
 DATA_FILE = RT / "launch-dashboard.json"
 LOCK_FILE = RT / "launch-dashboard.lock"
 SITE_DIR = RT / "launch-dashboard-site"
+CARDS_FILE = RT / "launch-dashboard-cards.json"
+CARD_TTL = 1800  # seconds a cached ticket card is trusted while its lane group is unchanged
+READ_BUDGET = 90  # seconds of ticket reads per render; the rest come from the cache and the page says so
 CATALOG_FILE = HERE / "lib" / "launch-marketplaces.json"
 PUBLISHER = Path(os.environ.get("LAUNCH_DASHBOARD_PUBLISHER") or Path.home() / ".agents" / "skills" / "artifacts" / "scripts" / "publish.py")
 PLANE_BASE = (os.environ.get("LAUNCH_PLANE_BASE") or "https://plane.delo.sh").rstrip("/")
@@ -69,19 +72,25 @@ REQ_STATUSES = ("met", "agent", "owner", "na")
 OP_NAMES = ("upsert", "check", "uncheck", "remove", "requirement", "marketplaces")
 MAX_OPS = 40
 WAIT_LABELS = ("lifecycle:needs-input", "lifecycle:human", "lifecycle:blocked")
-AGENT_LIST_SHOWN = 30
+GAP_RANK = ("waiting", "publish", "item", "board", "marketplace", "catalog")
 BANNER_SHOWN = 6
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REQ_ID_RE = re.compile(r"^[a-z]{2}\.[a-z0-9][a-z0-9.-]*$")
 REF_ANY = re.compile(r"\b([A-Z][A-Z0-9]*)-(\d+)\b")
 URL_ANY = re.compile(r"https?://[^\s<>\"']+")
 FIRST_STEP_URL = re.compile(r"https://[^\s<>\"']+")
-BAD_LOCAL = re.compile(r"file://|\bs3://|(?<![\w/.:])/(?:home|tmp|Users|var|etc|root|mnt|opt)/\S+")
+BAD_LOCAL = re.compile(
+    r"file://|\bs3://|(?<![\w/.:])/(?:home|tmp|Users|var|etc|root|mnt|opt)/\S+"
+    r"|(?<![\w/.~])~/\S+"  # a home-relative path
+    r"|(?<![\w/.:@-])(?:projects/[\w.-]+/\d{4}-\d\d-\d\d|builds|share)/[\w.-]+\S*")  # a bucket key
+# The verb must govern the build itself: "Verify your identity ..., then upload the build" is a normal Play step.
 BAD_WORDS = re.compile(
-    r"\b(?:verify|sign[- ]?off(?: on)?|play[- ]?test|try out|qa)\b[^.\n]{0,60}\b(?:build|apk|ipa|candidate|gate)s?\b"
+    r"\b(?:verify|sign[- ]?off(?: on)?|play[- ]?test|try out|qa)\s+(?:on\s+)?(?:that\s+)?(?:the|this|that|a|our)\s+(?:(?:new|latest|current|final|release|play|ios|android)\s+){0,2}(?:build|apk|ipa|candidate|gate)s?\b"
     r"|\btest (?:out )?(?:the |this |that |a |our )?(?:new |latest |current )?(?:build|apk|ipa|candidate)s?\b"
     r"|\bapprove (?:the |this |that )?(?:build|candidate|gate|ticket)s?\b", re.I)
+SENSITIVE_DEFAULT = re.compile(r"\b(?:accept|agree|consent|sign|pay|purchase|charge|publish|submit|release|deploy|authorize|grant|share|send|upload|enter|provide|create)\b[^.\n]{0,90}\b(?:agreement|terms|policy|legal|license|payment|fee|price|money|card|credential|password|token|secret|key|code|store|console|app|release|build|publication|access)\b|\b(?:agreement|terms|payment|credential|password|token|secret|key|code|release|app)\b[^.\n]{0,90}\b(?:accept|agree|consent|pay|publish|submit|authorize|share)\b", re.I)
 NOT_IMPERATIVE = ("the", "a", "an", "this", "that", "pending", "waiting", "need", "needs", "todo", "task", "step", "we", "i", "it")
+HOLLOW_STEP = re.compile(r"^(?:do it|follow the instructions|complete the process|fill out the form|submit|continue|confirm|as needed|tbd)\W*$", re.I)
 HOLLOW_EVIDENCE = re.compile(
     r"^\s*(?:(?:jarad|the owner|owner|he|user)\b.{0,40}\b(?:said|says|replied|reply|confirmed|told|messaged)\b|(?:done|ok|okay|yes|replied|confirmed)\W*$)", re.I)
 
@@ -226,6 +235,10 @@ def item_problems(it, ctx: dict) -> list[str]:
             out.append(f"a `{kind}` item needs at least two concrete steps (rule 6)")
         if not FIRST_STEP_URL.search(steps[0]):
             out.append(f"the first step of a `{kind}` item must name where to go with a full https URL (rule 6)")
+    if isinstance(steps, list):
+        for s in steps:
+            if isinstance(s, str) and HOLLOW_STEP.fullmatch(s.strip()):
+                out.append(f"step {s!r} is vague: spell out what to do (rule 6)")
     if kind != "publish" and not is_str(it.get("reply")):
         out.append("`reply` (the exact words Jarad sends back) is required (rule 3)")
     elif it.get("reply") is not None and not isinstance(it.get("reply"), str):
@@ -235,6 +248,8 @@ def item_problems(it, ctx: dict) -> list[str]:
         out.append("`default` must be null or a sentence")
     elif is_str(default) and kind not in DEFAULT_KINDS:
         out.append(f"a `{kind}` step has no default: only a reversible step the PM can take on silence (kinds {', '.join(DEFAULT_KINDS)}) may carry one")
+    if is_str(default) and SENSITIVE_DEFAULT.search(str(default)):
+        out.append("a legal, money, credential or publish action cannot proceed on silence, even if labelled decision, reply or device")
     mp = it.get("marketplace")
     if mp is not None and mp not in ctx["marketplaces"]:
         out.append(f"`marketplace` must be null or one of {', '.join(sorted(ctx['marketplaces'])) or '(none in the catalog)'}")
@@ -350,7 +365,13 @@ def broken_items(data: dict, ctx: dict) -> dict[str, list[str]]:
     return out
 
 
-def requirement_problem(entry, ids: set[str]) -> str:
+def catalog_row_valid(r, mp: str) -> bool:
+    return (isinstance(r, dict) and r.get("marketplace") == mp
+            and all(is_str(r.get(k)) for k in ("id", "title", "applies_when", "why", "verify", "doc_url", "checked"))
+            and isinstance(r.get("owner_steps"), list) and "owner_only" in r)
+
+
+def requirement_problem(entry, ids: set, rid: str = "", items: list[dict] | None = None, marketplace: str = "") -> str:
     """Why a requirements entry does not hold up (rule 7), or ""."""
     if not isinstance(entry, dict):
         return "entry must be an object"
@@ -359,14 +380,23 @@ def requirement_problem(entry, ids: set[str]) -> str:
         return f"status must be one of {', '.join(REQ_STATUSES)}"
     if st == "met" and not is_str(entry.get("evidence")):
         return "met with no evidence"
+    if st == "met" and (len(entry["evidence"].strip()) < 8 or HOLLOW_EVIDENCE.match(entry["evidence"])):
+        return "met with hollow evidence (cite a URL, a ticket or a one-line read-back; Jarad's reply is never evidence)"
     if st == "agent" and not (isinstance(entry.get("ref"), str) and LP.REF.match(entry["ref"])):
         return "agent with no ticket ref"
     if st == "owner" and not is_str(entry.get("item")):
         return "owner with no item"
     if st == "owner" and entry["item"] not in ids:
         return f"owner item {entry['item']!r} does not exist"
+    if st == "owner" and items is not None:
+        item = next((i for i in items if isinstance(i, dict) and i.get("id") == entry["item"]), None)
+        if (item is None or rid not in (item.get("covers") or []) or item.get("marketplace") not in (None, marketplace)
+                or item.get("kind") == "publish"):
+            return f"owner item {entry['item']!r} must cover {rid} for {marketplace} as an owner step"
     if st == "na" and not is_str(entry.get("why")):
         return "n/a with no reason"
+    if st == "na" and len(entry["why"].strip()) < 8:
+        return "n/a with a hollow reason (say why the requirement does not apply)"
     return ""
 
 
@@ -411,6 +441,8 @@ def apply_ops(data: dict, ops, catalog: dict, prefixes: set[str]) -> list[dict]:
             cand["status"] = (old or {}).get("status", "open")
             cand["evidence"] = (old or {}).get("evidence")
             cand["verified_at"] = (old or {}).get("verified_at")
+            if old and cand["status"] == "done" and any(cand.get(k) != old.get(k) for k in ("kind", "marketplace", "steps", "done_when", "refs")):
+                cand["status"] = "open"
             if cand["status"] == "open":
                 cand["evidence"] = cand["verified_at"] = None
             probs = item_problems({k: v for k, v in cand.items() if not (k in ("evidence", "verified_at") and v is None)}, ctx)
@@ -465,7 +497,9 @@ def apply_ops(data: dict, ops, catalog: dict, prefixes: set[str]) -> list[dict]:
                 out(name, str(rid or ""), False, "not a catalog requirement id")
                 continue
             entry = {k: raw[k] for k in ("status", "evidence", "ref", "item", "why") if k in raw}
-            probs = requirement_problem(entry, {i.get("id") for i in data["items"] if isinstance(i, dict)})
+            req = next((r for r in catalog["requirements"] if isinstance(r, dict) and r.get("id") == rid), None)
+            probs = requirement_problem(entry, {i.get("id") for i in data["items"] if isinstance(i, dict)},
+                                        rid, data["items"], req["marketplace"] if req else "")
             if probs:
                 out(name, rid, False, probs + (" (add the item first)" if "does not exist" in probs else ""))
             elif entry.get("status") == "agent" and prefixes and entry["ref"].split("-")[0] not in prefixes:
@@ -503,7 +537,8 @@ def gist(raw: dict) -> str:
         or re.search(r"(?im)^\s*goal\s*:\s*(.+?)(?:\n\s*\n|\Z)", text, re.S)
     para = strip_md(m.group(1)) if m else ""
     if not para and text:
-        flat = strip_md(text)
+        body = "\n".join(l for l in text.splitlines() if not re.match(r"^\s*(?:#{1,6}\s*)?(?:outcome|goal|summary|overview|description|context|background)\s*:?\s*$", l, re.I))
+        flat = strip_md(body)
         para = re.split(r"(?<=[.!?])\s", flat, maxsplit=1)[0]
     return para[:180].rstrip() + ("..." if len(para) > 180 else "")
 
@@ -542,13 +577,17 @@ class Board:
         self.groups: dict[str, str] = {}
         self.tickets: dict[str, dict] = {}
         self.prefixes: set[str] = set()
+        self.stale_cards: list[str] = []  # refs shown from an old cache entry because the read budget ran out or a read failed
 
     def open_tickets(self) -> list[dict]:
         return sorted((t for t in self.tickets.values() if t["group"] in LP.OPEN), key=lambda t: int(t["ref"].rsplit("-", 1)[1]))
 
 
-def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict] | None = None) -> Board:
-    """Read the board once. With `rows` (the launch pass's own board read) only closed referenced tickets cost a read."""
+def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict] | None = None,
+           cache_file: Path | None = None, budget: float = READ_BUDGET) -> Board:
+    """Read the board once. With `rows` (the launch pass's own board read) only closed referenced tickets cost a read.
+    Without rows, a card read inside CARD_TTL with the same lane group is reused, and reading stops after `budget` seconds:
+    the rest come from the cache (marked stale) so a render never outlives the pass's tool call."""
     b = Board()
     try:
         _, where, groups = LP.ref_dirs(repo, decl)
@@ -561,26 +600,66 @@ def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict
     if rows is not None:
         for r in rows:
             b.tickets[r["ref"]] = info_from_row(r, proj)
-        todo = [r for r in wanted if r in groups and r not in b.tickets and groups[r] not in LP.OPEN]
-        detail_refs: list[str] = []
+        detail_refs = sorted(r for r in wanted if r in groups)
     else:
-        todo = []
         detail_refs = sorted({r for r, g in groups.items() if g in LP.OPEN} | {r for r in wanted if r in groups})
+    cache = read_json(cache_file, {}) if (cache_file is not None and rows is None) else {}
+    if not isinstance(cache, dict):
+        cache = {}
+    deadline = time.monotonic() + budget
+    stamp_now = now()
+
+    def fresh(ref):
+        e = cache.get(ref)
+        if not (isinstance(e, dict) and isinstance(e.get("info"), dict) and e.get("group") == groups.get(ref)):
+            return None
+        try:
+            age = (stamp_now - datetime.strptime(e["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            return None
+        return e["info"] if 0 <= age < CARD_TTL else None
+
     def read(ref):
+        hit = fresh(ref)
+        if hit is not None:
+            return ref, hit, "cache"
         for attempt in range(4):
+            if time.monotonic() > deadline:
+                return ref, None, "budget"
             try:
-                return ref, LP.px_json(repo, "task", "get", ref)["ticket"]
+                return ref, LP.px_json(repo, "task", "get", ref)["ticket"], "read"
             except Exception:
                 if attempt == 3:
-                    return ref, None
+                    return ref, None, "failed"
                 time.sleep(1 + 2 * attempt)
+        return ref, None, "failed"
+    stale = []
     with ThreadPoolExecutor(8) as pool:
-        for ref, raw in pool.map(read, detail_refs + todo):
-            if raw is not None:
+        for ref, raw, how in pool.map(read, detail_refs):
+            if how == "cache":
+                b.tickets[ref] = raw
+            elif raw is not None:
                 b.tickets[ref] = info_from_raw(ref, raw, proj)
-            elif ref in groups:
-                b.tickets[ref] = {"ref": ref, "title": "(unreadable)", "lane": "?", "group": groups[ref], "pri": "none", "labels": [],
-                                  "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner"}
+                if cache_file is not None and rows is None:
+                    cache[ref] = {"at": iso(stamp_now), "group": groups.get(ref, ""), "info": b.tickets[ref]}
+            else:
+                stale.append(ref)
+                old = cache.get(ref)
+                if isinstance(old, dict) and isinstance(old.get("info"), dict):
+                    b.tickets[ref] = {**old["info"], "group": groups.get(ref, old["info"].get("group", ""))}
+                    b.stale_cards.append(ref)
+                elif ref in groups:
+                    b.tickets[ref] = {"ref": ref, "title": "(unreadable)", "lane": "?", "group": groups[ref], "pri": "none", "labels": [],
+                                      "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner"}
+                    b.stale_cards.append(ref)
+    if cache_file is not None and rows is None:
+        try:
+            write_json(cache_file, {r: e for r, e in cache.items() if r in groups})
+        except OSError:
+            pass
+    if stale:
+        b.ok = False
+        b.error = f"ticket details unavailable: {', '.join(sorted(stale))}"
     return b
 
 
@@ -624,7 +703,7 @@ class RepoIndex:
             self.roots.append((prefix, files, base))
 
     def url(self, path: str) -> str:
-        path = path.lstrip("./") if path.startswith("./") else path
+        path = path[2:] if path.startswith("./") else path
         for prefix, files, base in self.roots:
             for cand in ([path[len(prefix):]] if prefix and path.startswith(prefix) else []) + [path]:
                 if cand in files:
@@ -637,7 +716,17 @@ class RepoIndex:
 TOKEN = re.compile(
     r"(?P<url>https?://[^\s<>\"']+)"
     r"|(?P<ref>\b[A-Z][A-Z0-9]*-\d+\b)"
-    r"|(?P<path>(?<![\w/@:.+-])[\w][\w.+-]*(?:/[\w.+-]+)+/?|(?<![\w/@:.+-])[\w][\w+-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b)")
+    r"|(?P<path>(?<![\w/@:.+-])(?:\./)?[\w.][\w.+-]*(?:/[\w.+-]+)+/?|(?<![\w/@:.+-])[\w][\w+-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b)")
+
+
+def trim_url(tok: str) -> str:
+    """A bare URL minus trailing punctuation; a closing paren stays when the URL opened one (wiki-style links)."""
+    while tok:
+        if tok[-1] in ".,;:!?" or (tok[-1] == ")" and tok.count(")") > tok.count("(")):
+            tok = tok[:-1]
+        else:
+            break
+    return tok
 
 
 class Linker:
@@ -661,7 +750,7 @@ class Linker:
             pos = m.end()
             tok = m.group(0)
             if m.group("url"):
-                core = tok.rstrip(".,;:!?)")
+                core = trim_url(tok)
                 out.append(f'<a href="{esc(core)}" target="_blank" rel="noopener">{esc(core)}</a>' + esc(tok[len(core):]))
             elif m.group("ref"):
                 prefix = tok.split("-")[0]
@@ -683,7 +772,20 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
     if not data["marketplaces"]:
         gaps.append({"kind": "marketplace", "id": "", "text": "No marketplace is declared: set one with a `marketplaces` op so the catalog applies."})
     if not board.ok:
-        gaps.append({"kind": "board", "id": "", "text": f"The board could not be read ({board.error or 'px unavailable'}): ticket checks are not done, so completeness is unproven."})
+        gaps.append({"kind": "board", "id": "", "text": f"The board could not be read completely ({board.error or 'px unavailable'}): ticket checks are not done, so completeness is unproven."})
+    if board.ok:
+        for it in items:
+            for ref in sorted(refs_in_item(it, prefixes | board.prefixes) - set(board.groups)):
+                gaps.append({"kind": "item", "id": it.get("id", ""), "text": f"Step {it.get('id', '?')} references {ref}, which is not on the board: preview unavailable until the ticket is resolved."})
+    if not catalog["requirements"]:
+        gaps.append({"kind": "catalog", "id": "", "text": catalog.get("error") or "The marketplace catalog has no requirements: coverage cannot be proved."})
+    known_marketplaces = set(catalog.get("marketplaces") or {})
+    for mp in data["marketplaces"]:
+        if not any(catalog_row_valid(r, mp) for r in catalog["requirements"]):
+            gaps.append({"kind": "catalog", "id": str(mp), "text": f"Marketplace {mp!r} has no valid catalog requirements: coverage cannot be proved."})
+    for mp in data["marketplaces"]:
+        if mp not in known_marketplaces:
+            gaps.append({"kind": "marketplace", "id": str(mp), "text": f"Marketplace {mp!r} is not in the shared catalog: coverage cannot be proved."})
     for req in catalog["requirements"]:
         if req.get("marketplace") not in data["marketplaces"]:
             continue
@@ -693,8 +795,8 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
         if entry is None:
             gaps.append({"kind": "catalog", "id": req["id"], "text": f"{label} has no entry{cond}."})
             continue
-        why = requirement_problem(entry, ids)
-        if not why and entry["status"] == "agent" and board.ok:
+        why = requirement_problem(entry, ids, req["id"], items, req["marketplace"])
+        if not why and entry["status"] == "agent" and entry.get("ref"):
             ref = entry["ref"]
             if ref not in board.groups:
                 why = f"agent ticket {ref} is not on the board"
@@ -716,6 +818,8 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
     for iid, probs in broken.items():
         for p in probs:
             gaps.append({"kind": "item", "id": iid, "text": f"Step {iid} breaks a rule: {p}."})
+    # The highest-value gaps first, so the banner never hides them behind a long catalog tail.
+    gaps.sort(key=lambda g: GAP_RANK.index(g["kind"]))
     return gaps
 
 
@@ -745,7 +849,7 @@ def build_model(repo: Path, decl: dict, data: dict, catalog: dict, board: Board,
         entry = data["requirements"].get(req["id"])
         state, why = "gap", ""
         if entry is not None:
-            why = requirement_problem(entry, set(number))
+            why = requirement_problem(entry, set(number), req["id"], data["items"], req["marketplace"])
             if not why and entry["status"] == "agent" and board.ok and (entry["ref"] not in board.groups or board.groups[entry["ref"]] == "cancelled"):
                 why = "ticket is not on the board"
             state = "gap" if why else entry["status"]
@@ -829,14 +933,17 @@ code,.mono{font:.86rem var(--mono);background:var(--sunk);padding:1px 6px;border
 #tkcard a{display:inline-block;margin-top:8px;font-weight:600}
 .agent{margin:0;padding:0;list-style:none;display:grid;gap:4px}.agent li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
-table{border-collapse:collapse;width:100%;min-width:560px}
+table{border-collapse:collapse;width:100%}
 th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top;font-size:.88rem}
 th{font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);background:var(--sunk)}
 tr:last-child td{border-bottom:0}
 td .sub{display:block;color:var(--muted);font-size:.78rem;margin-top:2px}
 .muted{color:var(--muted)}
 footer{margin-top:44px;padding-top:14px;border-top:1px solid var(--line);color:var(--muted);font-size:.8rem;display:flex;flex-wrap:wrap;gap:4px 18px}
-@media (max-width:560px){h1{font-size:1.4rem}details.step>summary{grid-template-columns:1fr;gap:0}.body{padding-left:14px}.num{font-size:1.1rem}}
+@media (max-width:560px){h1{font-size:1.4rem}details.step>summary{grid-template-columns:1fr;gap:0}.body{padding-left:14px}.num{font-size:1.1rem}
+.tablewrap{border:0;background:none;overflow:visible}table,tbody,tr,td{display:block;width:100%}thead{display:none}
+tr{background:var(--surface);border:1px solid var(--line);border-radius:8px;margin-bottom:8px;padding:8px 12px;display:flex;flex-direction:column;gap:4px}
+td{border:0;padding:0}td:nth-child(2){order:-1}}
 @media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 """
 
@@ -892,7 +999,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w(f"<p class=\"lede\"><b>Finish line.</b> {L(model['finish_line'])}</p>")
     w("<div class=\"pills\">" + ("".join(f"<span class=\"pill\">{esc(n)}</span>" for n in mp_names.values()) or "<span class=\"pill warn\">no marketplace declared</span>") + "</div>")
     w(f"<ul class=\"stats\"><li><b>{c['open']}</b> steps left</li><li><b>{c['done']}</b> done</li><li><b>{c['gaps']}</b> gaps</li></ul>")
-    w(f"<div class=\"meta\"><span>Last verified <b>{esc(et(now_dt))}</b></span>" + (f"<span>Epic {L(model['epic'])}</span>" if model["epic"] else "") + "</div>")
+    w(f"<div class=\"meta\"><span>Last refreshed <b>{esc(et(now_dt))}</b></span>" + (f"<span>Epic {L(model['epic'])}</span>" if model["epic"] else "") + "</div>")
     w(f"<p class=\"reply\">{reply_hint}</p></header>")
     if model["gaps"]:
         gaps = model["gaps"]
@@ -946,6 +1053,9 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w(f"<div class=\"f\"><h4>If you say nothing</h4><p>{L(it['default']) if is_str(it.get('default')) else '<span class=\"muted\">Nothing happens. This step waits for you.</span>'}</p></div>")
         if it.get("refs"):
             w("<div class=\"f\"><h4>Tickets</h4><p>" + " ".join(linker.chip(r) for r in it["refs"]) + "</p></div>")
+        if it.get("covers"):
+            titles = {r["id"]: r["title"] for r in model["requirements"]}
+            w("<div class=\"f\"><h4>Covers</h4><p>" + "; ".join(esc(titles.get(c, c)) for c in it["covers"]) + "</p></div>")
         arts = [a for a in it.get("artifacts") or [] if isinstance(a, dict) and is_str(a.get("url")) and a["url"].startswith("https://")]
         if arts:
             w("<div class=\"f\"><h4>Links</h4><ul>" + "".join(f"<li><a href=\"{esc(a['url'])}\" target=\"_blank\" rel=\"noopener\">{esc(a.get('label') or a['url'])}</a></li>" for a in arts) + "</ul></div>")
@@ -960,11 +1070,9 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
                 w("<p class=\"muted\">None: no launch-critical ticket and no owner-filed High or Urgent bug is open.</p>")
             else:
                 w("<ul class=\"agent\">")
-                for t in work[:AGENT_LIST_SHOWN]:
+                for t in work:
                     w(f"<li>{linker.chip(t['ref'])} <span>{esc(t['title'])}</span><span class=\"pill{' warn' if t['waiting'] else ''}\">{esc(t['lane'])}{' - waiting on you' if t['waiting'] else ''}</span>"
                       + (f"<span class=\"pill bad\">{esc(t['why'])}</span>" if t["why"] != "launch-critical" else "") + "</li>")
-                if len(work) > AGENT_LIST_SHOWN:
-                    w(f"<li class=\"muted\">+{len(work) - AGENT_LIST_SHOWN} more open launch-critical tickets</li>")
                 w("</ul>")
             w("</div>")
         w("</div></details>")
@@ -994,7 +1102,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w("</tbody></table></div>")
     if not model["marketplaces"]:
         w("<p class=\"muted\">Declare a marketplace and the store checklist appears here.</p>")
-    w(f"<footer><span>{esc(SCHEMA)}</span><span>Rendered {esc(et(now_dt))}</span><span>Driver {esc(driver_commit)}</span><a href=\"dashboard.json\">dashboard.json</a></footer>")
+    w(f"<footer><span>{esc(SCHEMA)}</span>" + (f"<span>{len(board.stale_cards)} ticket card(s) may be out of date</span>" if board.stale_cards else "") + f"<span>Rendered {esc(et(now_dt))}</span><span>Driver {esc(driver_commit)}</span><a href=\"dashboard.json\">dashboard.json</a></footer>")
     cards = {r: {k: t.get(k, "") for k in ("title", "lane", "pri", "gist", "waiting", "url")} for r, t in board.tickets.items() if r in linker.used}
     blob = json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")
     w(f"</div><script type=\"application/json\" id=\"tk-data\">{blob}</script><script>{JS}</script></body></html>")
@@ -1031,7 +1139,7 @@ def render(repo: Path, decl: dict, data: dict, out_dir: Path) -> tuple[dict, Boa
     catalog = load_catalog()
     proj = project_info(repo)
     prefixes = ticket_prefixes(repo, decl)
-    board = gather(repo, decl, proj, wanted_refs(data, prefixes))
+    board = gather(repo, decl, proj, wanted_refs(data, prefixes), cache_file=CARDS_FILE)
     repoidx = RepoIndex(repo, decl)
     model = build_model(repo, decl, data, catalog, board, repoidx, proj, prefixes)
     linker = Linker(board, repoidx, prefixes, proj)
@@ -1043,9 +1151,15 @@ def render(repo: Path, decl: dict, data: dict, out_dir: Path) -> tuple[dict, Boa
     (out_dir / "index.html").write_text(page)
     mirror = {k: v for k, v in model.items()}
     mirror.update(generated_at=iso(when), tickets={r: t for r, t in board.tickets.items() if r in linker.used},
-                  url=(data.get("published") or {}).get("url", ""))
+                  url=(data.get("published") or {}).get("url") if (data.get("published") or {}).get("url") == declared_url(repo, decl) else "")
     write_json(out_dir / "dashboard.json", mirror)
     return model, board
+
+
+def declared_url(repo: Path, decl: dict) -> str:
+    proj = project_info(repo)
+    date = (decl.get("declared") or "")[:10] or LP.today()
+    return f"https://s3.delo.sh/projects/{proj['id']}/{date}/launch-dashboard/index.html"
 
 
 def publish(repo: Path, decl: dict, site: Path, first: bool) -> tuple[bool, str]:
@@ -1094,15 +1208,21 @@ def run_apply(repo: Path, decl: dict, ops, do_publish: bool = True) -> list[dict
             entries.append({"op": "dashboard", "ref": "render", "status": "error", "detail": f"{type(e).__name__}: {e}"[:200]})
             return entries
         detail = f"{model['counts']['open']} open, {model['counts']['done']} done, {model['counts']['gaps']} gaps"
+        if board.stale_cards:
+            detail += f"; {len(board.stale_cards)} ticket card(s) from cache or unreadable ({', '.join(board.stale_cards[:6])}{'...' if len(board.stale_cards) > 6 else ''})"
         entries.append({"op": "dashboard", "ref": "render", "status": "ok", "detail": detail})
         if do_publish:
-            ok, msg = publish(repo, decl, SITE_DIR, first=not (data.get("published") or {}).get("url"))
+            expected = declared_url(repo, decl)
+            prior = (data.get("published") or {}).get("url")
+            site = read_json(SITE_DIR / "dashboard.json", {})
+            site["url"] = expected
+            write_json(SITE_DIR / "dashboard.json", site)
+            ok, msg = publish(repo, decl, SITE_DIR, first=prior != expected)
+            if ok and msg != expected:
+                ok, msg = False, f"publisher returned {msg}, expected {expected}; refusing to record the wrong declaration URL"
             if ok:
                 data["published"] = {"url": msg, "at": iso(now())}
                 write_json(DATA_FILE, data)
-                site = read_json(SITE_DIR / "dashboard.json", {})
-                site["url"] = msg
-                write_json(SITE_DIR / "dashboard.json", site)
             entries.append({"op": "dashboard", "ref": "publish", "status": "ok" if ok else "error", "detail": msg})
     return entries
 
@@ -1134,7 +1254,9 @@ def brief_section(repo: Path, decl: dict, rows: list[dict] | None = None) -> str
     items = order_items([i for i in data["items"] if isinstance(i, dict) and isinstance(i.get("id"), str)])
     done = [i for i in items if i.get("status") == "done"]
     left = [i for i in items if i.get("status") != "done"]
-    url = (data.get("published") or {}).get("url") or "not published yet (the apply publishes it)"
+    url = (data.get("published") or {}).get("url")
+    if url != declared_url(repo, decl):
+        url = "not published for this declaration yet (the apply publishes it)"
     out = [f"\n# Launch dashboard ({url})",
            "The owner's runbook: every step you cannot finish without him. The rules are in docs/launch-dashboard.md; the driver enforces them. "
            "A step is Jarad's only when no agent path exists. Never add a verify-the-build step. Check a step only after you read its `done_when`.",
@@ -1178,10 +1300,13 @@ def check(repo: Path, decl: dict, data_path: Path) -> int:
         if rid not in ctx["catalog_ids"]:
             problems.append(f"requirement {rid}: not a catalog id")
         else:
-            why = requirement_problem(entry, ids)
+            why = requirement_problem(entry, ids, rid, data["items"],
+                                      next((r.get("marketplace", "") for r in catalog["requirements"] if isinstance(r, dict) and r.get("id") == rid), ""))
             if why:
                 problems.append(f"requirement {rid}: {why}")
     for mp in data["marketplaces"]:
+        if not any(catalog_row_valid(r, mp) for r in catalog["requirements"]):
+            problems.append(f"marketplace {mp!r} has no valid catalog requirements")
         if mp not in ctx["marketplaces"]:
             problems.append(f"marketplace {mp!r} is not in the catalog")
     print(json.dumps({"schema": SCHEMA, "ok": not problems, "problems": problems, "items": len(data["items"]),

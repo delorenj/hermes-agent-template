@@ -303,7 +303,12 @@ def px_run(repo: Path, *args: str, timeout: int = 120):
 
 def px_json(repo: Path, *args: str) -> dict:
     r = px_run(repo, *args, "--json", timeout=60)
-    return json.loads(r.stdout)
+    if r.returncode != 0:
+        raise RuntimeError(f"px {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[:240]}")
+    body = json.loads(r.stdout)
+    if not isinstance(body, dict) or body.get("ok") is False:
+        raise RuntimeError(f"px {' '.join(args)} returned failure: {str(body.get('error', body))[:240] if isinstance(body, dict) else 'invalid response'}")
+    return body
 
 
 def px_write(repo: Path, *args: str) -> tuple[bool, str]:
@@ -863,7 +868,10 @@ def apply(repo: Path, plan_arg: str | None) -> int:
     dash_ops = plan.get("dashboard")
     try:
         mod = dashboard_module()
-        if mod is not None:
+        if mod is None:
+            entries.append({"op": "dashboard", "ref": "apply", "status": "error",
+                            "detail": "launch-dashboard.py is missing: run flume remediate hermes.pm-scaffold; page not refreshed"})
+        else:
             if dash_ops is not None and not isinstance(dash_ops, list):
                 entries.append({"op": "dashboard", "ref": "ops", "status": "refused", "detail": "`dashboard` must be a list of ops"})
                 dash_ops = None

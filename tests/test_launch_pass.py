@@ -38,6 +38,9 @@ _own = state + "/board-" + os.path.basename(os.getcwd()) + ".json"
 with open(_own if os.path.exists(_own) else state + "/board.json") as f:
     board = json.load(f)
 if args[:2] == ["task", "list"]:
+    if os.environ.get("PX_SHIM_LIST_FAIL"):
+        print(json.dumps({"ok": False, "error": "permission denied"}))
+        sys.exit(1 if os.environ["PX_SHIM_LIST_FAIL"] == "exit" else 0)
     issues = [{"sequence_id": t["seq"], "state_name": t["state_name"], "state_group": t["state_group"], "name": t["name"]}
               for t in board["tickets"]]
     print(json.dumps({"ok": True, "board": board["board"], "issues": issues}))
@@ -77,6 +80,8 @@ args = sys.argv[1:]
 site = Path(args[0])
 with open(os.environ["PUBLISH_STUB_LOG"], "a") as f:
     f.write(json.dumps({"args": args, "files": sorted(p.name for p in site.iterdir())}) + "\n")
+if (site / "dashboard.json").is_file():
+    (Path(os.environ["PUBLISH_STUB_LOG"]).parent / "published-dashboard.json").write_bytes((site / "dashboard.json").read_bytes())
 if os.environ.get("PUBLISH_STUB_FAIL"):
     print("publisher: boom", file=sys.stderr)
     sys.exit(1)

@@ -155,9 +155,11 @@ REFUSALS = [
     ("no recommendation", {"recommend": None}, "`recommend`"),
     ("one step for a console item", {"steps": ["Open https://play.google.com/console and press Create app."]}, "at least two"),
     ("first step names no URL", {"steps": ["Go to the Play Console.", "Press Create app."]}, "full https URL"),
+    ("vague second step", {"steps": ["Open https://play.google.com/console and select the account.", "Follow the instructions."]}, "vague"),
     ("http first step is not a full https URL", {"steps": ["Open http://play.google.com/console now.", "Press Create app."]}, "full https URL"),
     ("a default on a money step", {"kind": "money", "default": "Pay it for him."}, "no default"),
     ("a default on a legal step", {"kind": "legal", "default": "Accept for him."}, "no default"),
+    ("a default on a publish step", {"kind": "publish", "default": "Press publish for him."}, "no default"),
     ("unknown kind", {"kind": "chore"}, "`kind`"),
     ("verify the build in the title", {"title": "Verify the build on your phone"}, "verify, test or sign off"),
     ("test the build in a step", {"steps": ["Open https://play.google.com/console and go.", "Test the new APK on the S26."]}, "verify, test or sign off"),
@@ -168,6 +170,11 @@ REFUSALS = [
     ("a bucket key artifact", {"artifacts": [{"label": "x", "url": "projects/earshot/2026-11-18/x/index.html"}]}, "https URL"),
     ("a local path in a step", {"steps": ["Open https://play.google.com/console and go.", "Look at /home/delorenj/code/x/shot.png"]}, "local path"),
     ("an s3 key in the why", {"why": "see s3://projects/earshot/x"}, "local path"),
+    ("a bucket key in a step", {"steps": ["Open https://play.google.com/console and go.", "Read projects/earshot/2026-11-18/report/index.html"]}, "local path"),
+    ("a builds bucket key", {"why": "the page is builds/earshot/index.html"}, "local path"),
+    ("a home-relative path", {"steps": ["Open https://play.google.com/console and go.", "Attach ~/code/earshot/shot.png"]}, "local path"),
+    ("sign off on a release build", {"title": "Sign off on the release build"}, "verify, test or sign off"),
+    ("verify the new build", {"steps": ["Open https://play.google.com/console and go.", "Verify that the new build opens."]}, "verify, test or sign off"),
     ("a noun-phrase title", {"title": "The Play Console app"}, "imperative"),
     ("a question title", {"title": "Create the app?"}, "imperative"),
     ("a ref on another board", {"refs": ["OTHER-9"]}, "not on this board"),
@@ -185,6 +192,13 @@ def test_the_validator_refuses(dash, label, over, needle):
     mod = load_mod(dash)
     problems = mod.item_problems(good(**over), ctx_for(mod))
     assert any(needle in p for p in problems), (label, problems)
+
+
+def test_a_https_url_with_a_bucket_path_and_a_verify_your_identity_step_are_fine(dash):
+    mod = load_mod(dash)
+    item = good(steps=["Open https://play.google.com/console and go.", "Verify your identity with the code, then upload the build to Production.",
+                       "See https://s3.delo.sh/projects/earshot/2026-11-18/report/index.html and docs/builds/notes.md"])
+    assert mod.item_problems(item, ctx_for(mod)) == []
 
 
 def test_publish_needs_a_marketplace_and_a_second_step(dash):
@@ -220,6 +234,18 @@ def test_upsert_adds_replaces_and_keeps_the_checked_state(dash):
     assert e["detail"] == "replaced" and len(data["items"]) == 1
     assert data["items"][0]["status"] == "done" and data["items"][0]["evidence"].startswith("edits.insert")
     assert data["items"][0]["title"].endswith("the Play Console")
+
+
+def test_upsert_reopens_done_step_when_its_completion_contract_changes(dash):
+    mod = load_mod(dash)
+    data = mod.empty_data()
+    apply(mod, data, [{"op": "upsert", "item": good()}])
+    apply(mod, data, [{"op": "check", "id": "play-create-app", "evidence": "Play API lists the package now"}])
+    changed = good(done_when="The account's API lists the new package and its release.")
+    e = apply(mod, data, [{"op": "upsert", "item": changed}])[0]
+    assert e["status"] == "ok"
+    assert data["items"][0]["status"] == "open"
+    assert data["items"][0]["evidence"] is None and data["items"][0]["verified_at"] is None
 
 
 def test_upsert_refuses_an_invalid_item_and_says_why_and_changes_nothing(dash):
@@ -333,7 +359,7 @@ def test_the_page_is_self_contained_themed_and_phone_safe(dash, tmp_path):
     assert "background:var(--bg)" in html and 'name="viewport"' in html and "env(safe-area-inset-left" in html
     assert "<title>Earshot launch dashboard</title>" in html
     assert "@earshot_pm_bot" in html and "comment on the linked ticket" in html
-    assert "Last verified" in html and "ET" in html or "EST" in html or "EDT" in html
+    assert "Last refreshed" in html and ("EST" in html or "EDT" in html)
     assert "Earshot is in the Play Store and a stranger can pay for it." in html
 
 
@@ -374,6 +400,9 @@ def test_a_catalog_row_with_no_entry_is_a_gap_and_a_conditional_row_still_needs_
     ({"status": "agent", "ref": "EARS-999"}, "not on the board"),
     ({"status": "owner", "item": "ghost"}, "does not exist"),
     ({"status": "na"}, "n/a with no reason"),
+    ({"status": "met", "evidence": "yes"}, "hollow evidence"),
+    ({"status": "met", "evidence": "Jarad said it is fine"}, "hollow evidence"),
+    ({"status": "na", "why": "n/a"}, "hollow reason"),
     ({"status": "agent"}, "agent with no ticket"),
 ])
 def test_a_requirement_entry_that_does_not_hold_up_is_a_gap(dash, tmp_path, entry, needle):
@@ -430,6 +459,78 @@ def test_an_unreadable_board_is_a_gap_so_the_page_never_claims_complete(dash, tm
     assert any(g["kind"] == "board" for g in model["gaps"]) and model["complete"] is False
     assert "Complete: every barrier" not in html
 
+
+@pytest.mark.parametrize("failure", ["exit", "json"])
+def test_failed_board_list_does_not_certify_completeness(dash, tmp_path, failure):
+    data = full_data()
+    data["items"][0]["refs"] = []
+    path = write_data(dash, data)
+    out = dash_run(dash, "--render", "--out", str(tmp_path / failure), "--data", str(path), PX_SHIM_LIST_FAIL=failure)
+    assert out.returncode == 0, out.stderr
+    model = json.loads((tmp_path / failure / "dashboard.json").read_text())
+    assert model["complete"] is False and any(g["kind"] == "board" for g in model["gaps"])
+
+def test_missing_marketplace_catalog_is_a_gap_not_a_complete_page(dash, tmp_path):
+    (dash.role / ".scripts" / "lib" / "launch-marketplaces.json").unlink()
+    html, model = render(dash, full_data(), tmp_path)
+    assert model["complete"] is False and any(g["kind"] == "catalog" and "missing" in g["text"] for g in model["gaps"])
+    assert "Complete: every barrier" not in html
+
+
+def test_an_unknown_marketplace_in_old_data_never_computes_complete(dash, tmp_path):
+    data = full_data()
+    data["marketplaces"] = ["steam"]
+    data["items"][0]["marketplace"] = "steam"
+    html, model = render(dash, data, tmp_path)
+    assert model["complete"] is False
+    assert any(g["kind"] == "marketplace" and "steam" in g["text"] for g in model["gaps"])
+    assert "Complete: every barrier" not in html
+
+
+def test_catalog_with_only_other_marketplace_rows_refuses_completion_and_check(dash, tmp_path):
+    path = dash.role / ".scripts" / "lib" / "launch-marketplaces.json"
+    catalog = json.loads(path.read_text())
+    catalog["requirements"] = [r for r in catalog["requirements"] if r["marketplace"] == "app_store"]
+    path.write_text(json.dumps(catalog))
+    data = full_data()
+    data["requirements"] = {}
+    _, model = render(dash, data, tmp_path)
+    assert not model["complete"]
+    assert any(g["kind"] == "catalog" and g["id"] == "google_play" for g in model["gaps"])
+    check = dash_run(dash, "--check", "--data", str(write_data(dash, data)))
+    assert check.returncode == 1 and not json.loads(check.stdout)["ok"]
+
+
+def test_absent_item_ref_is_an_explicit_unavailable_preview_gap(dash, tmp_path):
+    data = full_data()
+    data["items"][0]["refs"] = ["EARS-999"]
+    html, model = render(dash, data, tmp_path)
+    assert not model["complete"]
+    assert any(g["id"] == "publish-google-play" and "preview unavailable" in g["text"] for g in model["gaps"])
+    assert 'data-ref="EARS-999"' in html
+    assert 'Not found on this board' in html
+
+
+def test_owner_requirement_must_be_covered_by_a_matching_owner_step(dash, tmp_path):
+    data = full_data()
+    data["requirements"]["gp.create-app"] = {"status": "owner", "item": "publish-google-play"}
+    _, model = render(dash, data, tmp_path)
+    assert not model["complete"]
+    assert next(r for r in model["requirements"] if r["id"] == "gp.create-app")["state"] == "gap"
+    check = dash_run(dash, "--check", "--data", str(write_data(dash, data)))
+    assert check.returncode == 1
+    mod = load_mod(dash)
+    assert apply(mod, data, [{"op": "requirement", "id": "gp.create-app", "status": "owner", "item": "publish-google-play"}])[0]["status"] == "refused"
+    data["items"].append(good(id="wrong-store", marketplace="app_store", covers=["gp.create-app"]))
+    assert apply(mod, data, [{"op": "requirement", "id": "gp.create-app", "status": "owner", "item": "wrong-store"}])[0]["status"] == "refused"
+
+
+@pytest.mark.parametrize("kind", ["decision", "reply", "device"])
+@pytest.mark.parametrize("action", ["Accept the developer agreement", "Pay the store fee", "Share the console credential", "Publish the release"])
+def test_sensitive_default_cannot_be_relabelled(dash, kind, action):
+    mod = load_mod(dash)
+    item = good(kind=kind, default=f"{action} if you are silent.")
+    assert any("cannot proceed on silence" in p for p in mod.item_problems(item, ctx_for(mod)))
 
 def test_complete_only_when_there_are_no_gaps(dash, tmp_path):
     data = full_data()
@@ -512,6 +613,16 @@ def test_a_publish_item_lists_open_launch_critical_work_and_owner_filed_blockers
     assert html.count("Agent work still open") == 1
 
 
+def test_a_publish_item_lists_every_open_launch_critical_ticket(dash, tmp_path):
+    many = [ticket(n, "Todo", name=f"Critical {n}") for n in range(20, 54)]
+    dash.set_board(many)
+    html, model = render(dash, full_data(), tmp_path)
+    assert len(model["agent_work"]) == len(many)
+    block = html[html.index("Agent work still open"):]
+    assert 'data-ref="EARS-53"' in block and "+4 more" not in block
+    assert block.count('class="tk"') >= len(many)
+
+
 def test_an_item_that_is_not_a_publish_item_has_no_agent_list(dash, tmp_path):
     data = full_data()
     data["items"] = [good()]
@@ -536,6 +647,7 @@ def test_ops_apply_render_and_publish_to_the_stable_url_and_record_it(dash):
     calls = [json.loads(l) for l in (dash.state / "publish.log").read_text().splitlines()]
     assert "--no-index" in calls[1]["args"], "a republish skips the index rebuild"
     assert json.loads((dash.role / "runtime" / "launch-dashboard-site" / "dashboard.json").read_text())["url"] == url
+    assert json.loads((dash.state / "published-dashboard.json").read_text())["url"] == url
 
 
 def test_a_refused_op_prints_why_and_a_failed_publish_is_reported_not_fatal(dash):
@@ -595,14 +707,90 @@ def test_apply_a_publish_failure_never_undoes_the_board_writes(dash):
     assert read_data(dash)["marketplaces"] == ["app_store"], "the ops landed even though the page did not"
 
 
+def test_apply_reports_missing_dashboard_driver_in_receipt(dash):
+    (dash.role / ".scripts" / "launch-dashboard.py").unlink()
+    dash.plan({"writes": []})
+    out = dash.run("--apply")
+    assert out.returncode == 0 and "dashboard apply: error: launch-dashboard.py is missing" in out.stdout
+    receipt = json.loads(next((dash.role / "runtime" / "launch-receipts").glob("*.json")).read_text())
+    assert any(e["op"] == "dashboard" and e["status"] == "error" for e in receipt["results"])
+    assert not (dash.role / "runtime" / "launch-dashboard-site").exists()
+
+
 def test_apply_with_dashboard_ops_that_are_not_a_list_is_refused_not_fatal(dash):
     dash.plan({"writes": [], "dashboard": {"op": "upsert"}})
     out = dash.run("--apply")
     assert out.returncode == 0 and "dashboard ops: refused: `dashboard` must be a list of ops" in out.stdout
 
 
-# --------------------------------------------------------------------------------------------- brief
+def test_a_referenced_ticket_detail_failure_is_a_board_gap_not_false_completeness(dash, monkeypatch):
+    monkeypatch.setenv("PATH", dash.env["PATH"])
+    monkeypatch.setenv("PX_SHIM_STATE", dash.env["PX_SHIM_STATE"])
+    mod = load_mod(dash)
+    original = mod.LP.px_json
+    monkeypatch.setattr(mod.LP, "px_json", lambda repo, *args: (_ for _ in ()).throw(OSError("detail refused"))
+                        if args[:3] == ("task", "get", "EARS-2") else original(repo, *args))
+    monkeypatch.setattr(mod.time, "sleep", lambda _: None)
+    data = full_data()
+    data["items"][0]["refs"] = ["EARS-2"]
+    proj = mod.project_info(dash.root)
+    board = mod.gather(dash.root, mod.LP.load_declaration(dash.root), proj, {"EARS-2"}, rows=[])
+    assert board.ok is False and "EARS-2" in board.error
+    model = mod.build_model(dash.root, mod.LP.load_declaration(dash.root), data, mod.load_catalog(), board,
+                            mod.RepoIndex(dash.root, mod.LP.load_declaration(dash.root)), proj, {"EARS"})
+    assert model["complete"] is False and any(g["kind"] == "board" and "EARS-2" in g["text"] for g in model["gaps"])
 
+
+def test_brief_reloads_referenced_open_ticket_details_for_current_hover(dash, monkeypatch):
+    data = full_data()
+    data["items"][0]["refs"] = ["EARS-2"]
+    write_data(dash, data)
+    out = dash.run("--brief")
+    assert out.returncode == 0, out.stderr
+    monkeypatch.setenv("PATH", dash.env["PATH"])
+    monkeypatch.setenv("PX_SHIM_STATE", dash.env["PX_SHIM_STATE"])
+    mod = load_mod(dash)
+    decl = mod.LP.load_declaration(dash.root)
+    _, rows = mod.LP.board(dash.root, decl)
+    board = mod.gather(dash.root, decl, mod.project_info(dash.root), {"EARS-2"}, rows=rows)
+    assert board.tickets["EARS-2"]["gist"] == "Put the listing text in the Play API so nobody types it."
+
+
+def test_no_op_apply_reflects_controlled_board_change_without_another_plan(dash):
+    data = full_data()
+    write_data(dash, data)
+    dash.plan({"writes": []})
+    first = dash.run("--apply")
+    assert first.returncode == 0 and "dashboard publish: ok" in first.stdout
+    before = json.loads((dash.role / "runtime" / "launch-dashboard-site" / "dashboard.json").read_text())
+    assert "EARS-5" in {t["ref"] for t in before["agent_work"]}
+    dash.set_board([ticket(2, "Done", name="Listing closed"), ticket(5, "Done", labels=["bug"], name="Crash closed")])
+    dash.plan({"writes": []})
+    second = dash.run("--apply")
+    assert second.returncode == 0 and "dashboard publish: ok" in second.stdout
+    after = json.loads((dash.role / "runtime" / "launch-dashboard-site" / "dashboard.json").read_text())
+    assert "EARS-5" not in {t["ref"] for t in after["agent_work"]}
+    assert before["url"] == after["url"]
+    assert dash.writes() == []
+
+
+def test_a_redeclaration_uses_its_new_stable_url_and_rebuilds_the_index(dash):
+    assert send(dash, [{"op": "marketplaces", "value": ["google_play"]}]).returncode == 0
+    old_url = read_data(dash)["published"]["url"]
+    (dash.root / ".launch.yaml").write_text(DASH_DECL.replace("2026-11-18", "2026-12-02"))
+    brief = dash_run(dash, "--brief")
+    assert old_url not in brief.stdout and "not published for this declaration" in brief.stdout
+    dash.plan({"writes": []})
+    out = dash.run("--apply")
+    new_url = "https://s3.delo.sh/projects/earshot/2026-12-02/launch-dashboard/index.html"
+    assert out.returncode == 0 and f"dashboard publish: ok: {new_url}" in out.stdout
+    assert read_data(dash)["published"]["url"] == new_url
+    calls = [json.loads(l) for l in (dash.state / "publish.log").read_text().splitlines()]
+    assert "--no-index" not in calls[-1]["args"]
+    assert calls[-1]["args"][calls[-1]["args"].index("--date") + 1] == "2026-12-02"
+
+
+# --------------------------------------------------------------------------------------------- brief
 def test_brief_section_lists_open_steps_gaps_the_url_and_the_ops_shape(dash):
     send(dash, [{"op": "marketplaces", "value": ["google_play"]}, {"op": "upsert", "item": good()}])
     out = dash_run(dash, "--brief").stdout
@@ -641,3 +829,117 @@ def test_the_scripts_are_executable_and_stdlib_only():
     assert src.startswith("#!/usr/bin/env python3") and path.stat().st_mode & 0o111
     for banned in ("import yaml", "import requests", "import httpx", "import jinja2"):
         assert banned not in src
+
+
+# ------------------------------------------------------------------ review fixes (FLUME-104)
+
+def test_the_store_table_stacks_on_a_phone_and_never_forces_a_wide_table(dash, tmp_path):
+    html, _ = render(dash, full_data(), tmp_path)
+    css = re.search(r"<style>(.*?)</style>", html, re.S).group(1)
+    media = re.search(r"@media \(max-width:560px\)\{.*", css, re.S).group(0)
+    outside = css.replace(media, "")
+    for m in re.finditer(r"min-width:(\d+)px", outside):
+        assert int(m.group(1)) <= 360, f"a {m.group(0)} outside a media query forces sideways scroll on a phone"
+    assert "thead{display:none}" in media and "td:nth-child(2){order:-1}" in media, "each row becomes a card with the status first"
+
+
+def test_dot_slash_repo_paths_link_and_a_trailing_paren_stays_when_the_url_opened_one(dash, tmp_path):
+    (dash.root / ".github").mkdir()
+    (dash.root / ".github" / "ci.yml").write_text("x\n")
+    dash.git("add", ".github/ci.yml")
+    data = full_data()
+    data["items"][0]["why"] = "Read ./docs/launch.md and ./.github/ci.yml, then https://en.wikipedia.org/wiki/A_(b) or (see https://example.com/x)."
+    html, _ = render(dash, data, tmp_path)
+    assert 'href="https://github.com/delorenj/earshot/blob/main/docs/launch.md"' in html
+    assert 'href="https://github.com/delorenj/earshot/blob/main/.github/ci.yml"' in html
+    assert 'href="https://en.wikipedia.org/wiki/A_(b)"' in html and 'href="https://example.com/x"' in html
+
+
+def test_gaps_that_wait_on_him_lead_the_banner_and_the_catalog_tail_follows(dash, tmp_path):
+    data = {"schema": "launch-dashboard/1", "marketplaces": ["google_play"], "items": [], "requirements": {}}
+    _, model = render(dash, data, tmp_path)
+    kinds = [g["kind"] for g in model["gaps"]]
+    assert kinds == sorted(kinds, key=("waiting", "publish", "item", "board", "marketplace", "catalog").index)
+    assert kinds[0] in ("waiting", "publish") and kinds[-1] == "catalog"
+
+
+def test_a_gist_drops_a_heading_only_line(dash):
+    mod = load_mod(dash)
+    assert mod.gist({"description_text": "## Outcome\n\nDeliver a private build. More follows."}) == "Deliver a private build."
+
+
+def test_a_card_shows_what_an_item_covers(dash, tmp_path):
+    html, _ = render(dash, {**full_data(), "items": [good(), publish_item()]}, tmp_path)
+    assert "<h4>Covers</h4>" in html
+
+
+def test_the_header_says_refreshed_not_verified(dash, tmp_path):
+    html, _ = render(dash, full_data(), tmp_path)
+    assert "Last refreshed" in html and "Last verified" not in html
+
+
+def _counting_gather(dash, tmp_path, monkeypatch, **kw):
+    for k, v in dash.env.items():
+        monkeypatch.setenv(k, v)
+    mod = load_mod(dash)
+    gets = []
+    real = mod.LP.px_json
+
+    def counting(repo, *args):
+        if args[:2] == ("task", "get"):
+            gets.append(args[2])
+        return real(repo, *args)
+
+    mod.LP.px_json = counting
+    decl = mod.LP.load_declaration(dash.root)
+    proj = mod.project_info(dash.root)
+    cache = tmp_path / "cards.json"
+    return mod, gets, lambda **o: mod.gather(dash.root, decl, proj, set(), cache_file=cache, **{**kw, **o}), cache
+
+
+def test_ticket_cards_are_cached_so_a_second_render_reads_nothing(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    first = gather()
+    n = len(gets)
+    assert n >= 4 and cache.is_file() and not first.stale_cards
+    second = gather()
+    assert len(gets) == n, "a card read inside the TTL with the same lane group is reused"
+    assert second.tickets["EARS-2"]["gist"] == "Put the listing text in the Play API so nobody types it."
+
+
+def test_an_expired_card_is_read_again_and_a_changed_lane_group_is_never_served_from_cache(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    body["EARS-2"]["at"] = "2020-01-01T00:00:00Z"
+    body["EARS-4"]["group"] = "backlog"
+    cache.write_text(json.dumps(body))
+    gets.clear()
+    gather()
+    assert sorted(gets) == ["EARS-2", "EARS-4"]
+
+
+def test_a_spent_read_budget_serves_stale_cards_and_says_so(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    for e in body.values():
+        e["at"] = "2020-01-01T00:00:00Z"
+    cache.write_text(json.dumps(body))
+    gets.clear()
+    b = gather(budget=-1)
+    assert gets == [] and b.stale_cards and b.tickets["EARS-2"]["title"] == "Wire the store listing"
+    cache.unlink()
+    b = gather(budget=-1)
+    assert b.tickets["EARS-2"]["title"] == "(unreadable)" and "EARS-2" in b.stale_cards
+
+
+def test_a_render_with_stale_cards_says_so_in_the_receipt_and_the_footer(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    b = gather(budget=-1)
+    assert b.stale_cards
+    linker = mod.Linker(b, mod.RepoIndex(dash.root, mod.LP.load_declaration(dash.root)), {"EARS"}, mod.project_info(dash.root))
+    model = {"product": "Earshot", "finish_line": "", "epic": "", "marketplaces": [], "marketplace_names": {}, "items": [], "requirements": [],
+             "gaps": [], "agent_work": [], "counts": {"open": 0, "done": 0, "gaps": 0}, "complete": True, "catalog_checked": "x"}
+    page = mod.render_page(model, linker, b, "", mod.now(), "abc")
+    assert "ticket card(s) may be out of date" in page
