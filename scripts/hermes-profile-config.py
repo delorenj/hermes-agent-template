@@ -409,7 +409,8 @@ def profile_dirs() -> list[Path]:
         sys.exit(f"FATAL: {PROFILES} not found")
     out = []
     for child in sorted(PROFILES.iterdir()):
-        if child.name in SKIP:
+        if child.name in SKIP or child.name.startswith("."):
+            # dot entries are archives (`flume retire --archive-desk` -> .deleted), never desks
             continue
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", child.name):
             out.append(validate_profile(child.name))
