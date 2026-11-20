@@ -72,9 +72,9 @@ ITEM_FIELDS = ("id", "order", "title", "why", "kind", "marketplace", "steps", "r
 REQ_STATUSES = ("met", "agent", "owner", "na")
 OP_NAMES = ("upsert", "check", "uncheck", "remove", "requirement", "marketplaces")
 MAX_OPS = 40
-WAIT_LABELS = ("lifecycle:needs-input", "lifecycle:human", "lifecycle:blocked")
-GAP_RANK = ("waiting", "publish", "item", "board", "marketplace", "catalog")
-AGENT_LIST_SHOWN = 30
+# "Waiting on you" means the owner: needs-input or human. lifecycle:blocked alone is usually another ticket or scope.
+WAIT_LABELS = ("lifecycle:needs-input", "lifecycle:human")
+GAP_RANK = ("waiting", "unreadable", "publish", "item", "board", "marketplace", "catalog")
 BANNER_SHOWN = 6
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REQ_ID_RE = re.compile(r"^[a-z]{2}\.[a-z0-9][a-z0-9.-]*$")
@@ -577,13 +577,18 @@ def plane_url(info: dict, ref: str) -> str:
     return f"{PLANE_BASE}/{info['workspace']}/browse/{ref}/" if info["workspace"] else ""
 
 
+def owner_waiting(labels, group: str) -> bool:
+    """Waiting on the owner: a needs-input or human label on a ticket that is still open. A closed ticket never waits."""
+    return group in LP.OPEN and any(l in WAIT_LABELS for l in (labels or []))
+
+
 def info_from_raw(ref: str, t: dict, proj: dict) -> dict:
     labels = [str(l) for l in (t.get("label_names") or [])]
     return {
         "ref": ref, "title": t.get("name") or "", "lane": t.get("state_name") or "?", "group": t.get("state_group") or "",
         "pri": (t.get("priority") or "none").lower(), "labels": labels,
         "url": t.get("url") or plane_url(proj, ref), "gist": gist(t),
-        "waiting": any(l in WAIT_LABELS for l in labels),
+        "waiting": owner_waiting(labels, t.get("state_group") or ""),
         "bug": any(l in ("bug", "kind:bug") for l in labels),
         "origin": "agent" if (t.get("external_id") or t.get("external_source")) else "owner",
     }
@@ -593,7 +598,7 @@ def info_from_row(row: dict, proj: dict) -> dict:
     labels = list(row["labels"])
     return {
         "ref": row["ref"], "title": row["name"], "lane": row["lane"], "group": row["group"], "pri": row["pri"], "labels": labels,
-        "url": plane_url(proj, row["ref"]), "gist": "", "waiting": any(l in WAIT_LABELS for l in labels),
+        "url": plane_url(proj, row["ref"]), "gist": "", "waiting": owner_waiting(labels, row["group"]),
         "bug": row["bug"], "origin": row["origin"],
     }
 
@@ -608,9 +613,21 @@ class Board:
         self.tickets: dict[str, dict] = {}
         self.prefixes: set[str] = set()
         self.stale_cards: list[str] = []  # refs shown from an old cache entry because the read budget ran out or a read failed
+        self.unreadable: list[str] = []  # refs with no card at all: the read failed or ran out of budget and no cache entry existed
+        self.failed_reads: list[str] = []  # refs whose read failed after every retry
+        self.skipped_reads: list[str] = []  # refs not read because the budget ran out
+        self.off_list: set[str] = set()  # refs read on request that the board listing does not carry (outside the epic or cut line)
+        self.dirs: list[Path] = []
+
+    def known(self, ref: str) -> bool:
+        """The ref resolves on a driven board: listed, or fetched by its ref."""
+        return ref in self.groups or ref in self.off_list
+
+    def group(self, ref: str) -> str:
+        return self.groups.get(ref) or (self.tickets.get(ref) or {}).get("group", "")
 
     def open_tickets(self) -> list[dict]:
-        return sorted((t for t in self.tickets.values() if t["group"] in LP.OPEN), key=lambda t: int(t["ref"].rsplit("-", 1)[1]))
+        return sorted((t for t in self.tickets.values() if t["group"] in LP.OPEN and t["ref"] in self.groups), key=lambda t: int(t["ref"].rsplit("-", 1)[1]))
 
 
 def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict] | None = None,
@@ -627,11 +644,16 @@ def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict
     b.groups = groups
     b.prefixes = {r.split("-")[0] for r in groups}
     b.ok = True
+    b.dirs = LP.board_dirs(repo, decl)
+    # A ref on a driven board that the listing does not carry (outside the launch epic or cut line) still gets a card.
+    unlisted = sorted(r for r in wanted if r not in groups and r.split("-")[0] in b.prefixes)
     if rows is not None:
         for r in rows:
             b.tickets[r["ref"]] = info_from_row(r, proj)
-        detail_refs = sorted(r for r in wanted if r in groups)
+        todo = [r for r in wanted if r in groups and r not in b.tickets and groups[r] not in LP.OPEN]
+        detail_refs: list[str] = []
     else:
+        todo = []
         detail_refs = sorted({r for r, g in groups.items() if g in LP.OPEN} | {r for r in wanted if r in groups})
     cache = read_json(cache_file, {}) if (cache_file is not None and rows is None) else {}
     if not isinstance(cache, dict):
@@ -641,31 +663,37 @@ def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict
 
     def fresh(ref):
         e = cache.get(ref)
-        if not (isinstance(e, dict) and isinstance(e.get("info"), dict) and e.get("group") == groups.get(ref)):
+        if not (isinstance(e, dict) and isinstance(e.get("info"), dict) and (ref not in groups or e.get("group") == groups.get(ref))):
             return None
         try:
             age = (stamp_now - datetime.strptime(e["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)).total_seconds()
         except (KeyError, ValueError, TypeError):
             return None
-        return e["info"] if 0 <= age < CARD_TTL else None
+        return reflag(e["info"]) if 0 <= age < CARD_TTL else None
+
+    def reflag(info):
+        """A cached card is re-judged by today's rule for waiting, so an old entry never keeps a stale chip."""
+        return {**info, "waiting": owner_waiting(info.get("labels"), info.get("group", ""))}
 
     def read(ref):
         hit = fresh(ref)
         if hit is not None:
             return ref, hit, "cache"
-        for attempt in range(4):
+        listed = ref in groups
+        for attempt in range(4 if listed else 2):
             if time.monotonic() > deadline:
                 return ref, None, "budget"
-            try:
-                return ref, LP.px_json(repo, "task", "get", ref)["ticket"], "read"
-            except Exception:
-                if attempt == 3:
-                    return ref, None, "failed"
-                time.sleep(1 + 2 * attempt)
-        return ref, None, "failed"
-    stale = []
+            # Any scope can read any ref; try each driven scope so a ref outside the listing still resolves.
+            for d in ([repo] if listed else b.dirs):
+                try:
+                    return ref, LP.px_json(d, "task", "get", ref)["ticket"], "read"
+                except Exception:
+                    pass
+            if attempt == (3 if listed else 1):
+                return ref, None, "failed"
+            time.sleep(1 + 2 * attempt)
     with ThreadPoolExecutor(8) as pool:
-        for ref, raw, how in pool.map(read, detail_refs):
+        for ref, raw, how in pool.map(read, detail_refs + todo + unlisted):
             if how == "cache":
                 b.tickets[ref] = raw
             elif raw is not None:
@@ -673,23 +701,29 @@ def gather(repo: Path, decl: dict, proj: dict, wanted: set[str], rows: list[dict
                 if cache_file is not None and rows is None:
                     cache[ref] = {"at": iso(stamp_now), "group": groups.get(ref, ""), "info": b.tickets[ref]}
             else:
-                stale.append(ref)
+                if how == "failed":
+                    b.failed_reads.append(ref)
+                else:
+                    b.skipped_reads.append(ref)
                 old = cache.get(ref)
                 if isinstance(old, dict) and isinstance(old.get("info"), dict):
-                    b.tickets[ref] = {**old["info"], "group": groups.get(ref, old["info"].get("group", ""))}
+                    b.tickets[ref] = {**reflag(old["info"]), "group": groups.get(ref, old["info"].get("group", ""))}
                     b.stale_cards.append(ref)
                 elif ref in groups:
                     b.tickets[ref] = {"ref": ref, "title": "(unreadable)", "lane": "?", "group": groups[ref], "pri": "none", "labels": [],
-                                      "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner"}
+                                      "url": plane_url(proj, ref), "gist": "", "waiting": False, "bug": False, "origin": "owner", "unreadable": True}
                     b.stale_cards.append(ref)
+                    b.unreadable.append(ref)
+            if ref in b.tickets and ref not in groups:
+                b.off_list.add(ref)
     if cache_file is not None and rows is None:
         try:
-            write_json(cache_file, {r: e for r, e in cache.items() if r in groups})
+            write_json(cache_file, {r: e for r, e in cache.items() if r in groups or r in b.off_list})
         except OSError:
             pass
-    if stale:
+    if b.unreadable:
         b.ok = False
-        b.error = f"ticket details unavailable: {', '.join(sorted(stale))}"
+        b.error = f"ticket details unavailable: {', '.join(sorted(b.unreadable))}"
     return b
 
 
@@ -749,6 +783,21 @@ TOKEN = re.compile(
     r"|(?P<path>(?<![\w/@:.+-])(?:\./)?[\w.][\w.+-]*(?:/[\w.+-]+)+/?|(?<![\w/@:.+-])[\w][\w+-]*\.[A-Za-z][A-Za-z0-9]{0,7}\b)")
 
 
+CODE_SPAN = re.compile(r"`([^`\n]+)`")
+
+
+def inline(s, plain=esc) -> str:
+    """Escape `s`; text in backticks becomes <code> (escaped), the rest goes through `plain`."""
+    s = str(s if s is not None else "")
+    out, pos = [], 0
+    for m in CODE_SPAN.finditer(s):
+        out.append(plain(s[pos:m.start()]))
+        out.append(f"<code>{esc(m.group(1))}</code>")
+        pos = m.end()
+    out.append(plain(s[pos:]))
+    return "".join(out)
+
+
 def trim_url(tok: str) -> str:
     """A bare URL minus trailing punctuation; a closing paren stays when the URL opened one (wiki-style links)."""
     while tok:
@@ -773,7 +822,9 @@ class Linker:
         return inner
 
     def text(self, s) -> str:
-        s = str(s if s is not None else "")
+        return inline(s, self.linked)
+
+    def linked(self, s: str) -> str:
         out, pos = [], 0
         for m in TOKEN.finditer(s):
             out.append(esc(s[pos:m.start()]))
@@ -830,9 +881,9 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
         why = requirement_problem(entry, ids, req["id"], items, req["marketplace"])
         if not why and entry["status"] == "agent" and entry.get("ref"):
             ref = entry["ref"]
-            if ref not in board.groups:
+            if not board.known(ref):
                 why = f"agent ticket {ref} is not on the board"
-            elif board.groups[ref] == "cancelled":
+            elif board.group(ref) == "cancelled":
                 why = f"agent ticket {ref} is cancelled"
         if why:
             gaps.append({"kind": "catalog", "id": req["id"], "text": f"{label}: {why}."})
@@ -844,6 +895,11 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
         for t in board.open_tickets():
             if t["ref"] in crit and t["waiting"] and t["ref"] not in referenced:
                 gaps.append({"kind": "waiting", "id": t["ref"], "text": f"{t['ref']} is launch-critical and waiting on you ({', '.join(l for l in t['labels'] if l in WAIT_LABELS)}) but no step references it: {t['title']}"})
+        if board.unreadable:
+            refs = sorted(board.unreadable, key=lambda r: (r.split("-")[0], int(r.rsplit("-", 1)[1])))
+            n = len(refs)
+            gaps.append({"kind": "unreadable", "id": refs[0], "text": f"{n} ticket{'s' if n != 1 else ''} could not be read: {', '.join(refs)}; the page cannot prove completeness "
+                                                                       f"(a ticket waiting on you may be among them). The next apply reads them again."})
     for mp in data["marketplaces"]:
         if not any(i.get("kind") == "publish" and i.get("marketplace") == mp for i in items):
             gaps.append({"kind": "publish", "id": mp, "text": f"{(catalog.get('marketplaces') or {}).get(mp, mp)} has no `publish` item: add the final submit or publish step."})
@@ -882,7 +938,7 @@ def build_model(repo: Path, decl: dict, data: dict, catalog: dict, board: Board,
         state, why = "gap", ""
         if entry is not None:
             why = requirement_problem(entry, set(number), req["id"], data["items"], req["marketplace"])
-            if not why and entry["status"] == "agent" and board.ok and (entry["ref"] not in board.groups or board.groups[entry["ref"]] == "cancelled"):
+            if not why and entry["status"] == "agent" and board.ok and (not board.known(entry["ref"]) or board.group(entry["ref"]) == "cancelled"):
                 why = "ticket is not on the board"
             state = "gap" if why else entry["status"]
         rows.append({"id": req["id"], "marketplace": req["marketplace"], "title": req["title"], "applies_when": req.get("applies_when", "always"),
@@ -963,6 +1019,7 @@ code,.mono{font:.86rem var(--mono);background:var(--sunk);padding:1px 6px;border
 #tkcard b{display:block;font-size:.9rem}#tkcard .m{color:var(--muted);font-size:.78rem;margin-top:2px}#tkcard p{margin:6px 0 0}
 #tkcard .w{display:inline-block;margin-top:6px;color:var(--warn);background:var(--warn-bg);padding:0 7px;border-radius:4px;font-weight:600;font-size:.78rem}
 #tkcard a{display:inline-block;margin-top:8px;font-weight:600}
+.agentwork{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:12px 14px}.agentwork .f p{margin-bottom:8px}
 .agent{margin:0;padding:0;list-style:none;display:grid;gap:4px}.agent li{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
 .tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}
 table{border-collapse:collapse;width:100%}
@@ -1017,6 +1074,32 @@ STATE_WORD = {"met": "met", "agent": "agent", "owner": "you", "na": "n/a", "gap"
 STATE_CLASS = {"met": "ok", "agent": "", "owner": "warn", "na": "", "gap": "bad"}
 
 
+def agent_pointer(model: dict, board: Board) -> str:
+    work = model["agent_work"]
+    if not board.ok:
+        return "<span class=\"muted\">Unknown: the board could not be read.</span>"
+    if not work:
+        return "<span class=\"muted\">None open.</span>"
+    return f"<a href=\"#agent-work\">{len(work)} agent ticket{'s' if len(work) != 1 else ''} still open</a>, listed once above."
+
+
+def agent_section(model: dict, board: Board, linker: Linker) -> str:
+    work = model["agent_work"]
+    out = ["<section class=\"agentwork\" id=\"agent-work\"><div class=\"f\"><h4>Agent work still open</h4>"]
+    if not board.ok:
+        out.append("<p class=\"muted\">The board could not be read, so this list is unknown.</p>")
+    elif not work:
+        out.append("<p class=\"muted\">None: no launch-critical ticket and no owner-filed High or Urgent bug is open.</p>")
+    else:
+        out.append(f"<p class=\"muted\">{len(work)} open launch-critical ticket{'s' if len(work) != 1 else ''} and owner-filed High or Urgent bug{'s' if len(work) != 1 else ''} stand between the product and the publish step.</p><ul class=\"agent\">")
+        for t in work:
+            out.append(f"<li>{linker.chip(t['ref'])} <span>{inline(t['title'])}</span><span class=\"pill{' warn' if t['waiting'] else ''}\">{esc(t['lane'])}{' - waiting on you' if t['waiting'] else ''}</span>"
+                       + (f"<span class=\"pill bad\">{esc(t['why'])}</span>" if t["why"] != "launch-critical" else "") + "</li>")
+        out.append("</ul>")
+    out.append("</div></section>")
+    return "".join(out)
+
+
 def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_dt: datetime, driver_commit: str) -> str:
     L = linker.text
     mp_names = model["marketplace_names"]
@@ -1039,7 +1122,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         for g in gaps:
             kinds[g["kind"]] = kinds.get(g["kind"], 0) + 1
         names = {"catalog": "store requirements without a verified entry", "waiting": "tickets waiting on you with no step", "publish": "missing publish steps",
-                 "item": "steps that break a rule", "marketplace": "no marketplace declared", "board": "board unreadable"}
+                 "item": "steps that break a rule", "unreadable": "unreadable ticket groups", "marketplace": "no marketplace declared", "board": "board unreadable"}
         w(f"<div class=\"banner bad\" role=\"alert\"><strong>Incomplete: {len(gaps)} gap{'s' if len(gaps) != 1 else ''} before this page proves the product can be published</strong>"
           f"<span class=\"muted\">{esc('; '.join(f'{n} {names.get(k, k)}' for k, n in kinds.items()))}. Every gap is the PM's work.</span><ul>")
         shown = gaps[:BANNER_SHOWN]
@@ -1055,7 +1138,11 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
     w("<h2>Your runbook</h2><div class=\"steps\">")
     if not model["items"]:
         w("<p class=\"muted\">No steps yet. The PM adds each step only you can take, in order, with every click spelled out.</p>")
+    agent_listed = False
     for it in model["items"]:
+        if it.get("kind") == "publish" and not agent_listed:
+            agent_listed = True  # the list goes up once, right before the first publish item; every publish card points to it
+            w(agent_section(model, board, linker))
         done = it.get("status") == "done"
         n = it["number"]
         tags = [f"<span class=\"pill\">{esc(it.get('kind'))}</span>"]
@@ -1071,7 +1158,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         w(f"<details class=\"step{' done' if done else ''}\" id=\"step-{n}\"{'' if done else ' open'}><summary><span class=\"num\">{n}</span>"
           f"<span class=\"sum\"><span class=\"t\"><span class=\"box\"></span>{L(it.get('title'))}</span><span class=\"tags\">{''.join(tags)}</span></span></summary><div class=\"body\">")
         for p in it["problems"]:
-            w(f"<div class=\"f\"><span class=\"pill bad\">rule</span> {esc(p)}</div>")
+            w(f"<div class=\"f\"><span class=\"pill bad\">rule</span> {inline(p)}</div>")
         if it.get("why"):
             w(f"<div class=\"f\"><h4>Why</h4><p>{L(it['why'])}</p></div>")
         if isinstance(it.get("steps"), list):
@@ -1094,19 +1181,7 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
         if done:
             w(f"<div class=\"f\"><h4>Evidence</h4><p>{L(it.get('evidence'))}" + (f" <span class=\"muted\">(verified {esc(et(LP.parse_ts(it['verified_at'])))})</span>" if it.get("verified_at") else "") + "</p></div>")
         if it.get("kind") == "publish":
-            work = model["agent_work"]
-            w("<div class=\"f\"><h4>Agent work still open</h4>")
-            if not board.ok:
-                w("<p class=\"muted\">The board could not be read, so this list is unknown.</p>")
-            elif not work:
-                w("<p class=\"muted\">None: no launch-critical ticket and no owner-filed High or Urgent bug is open.</p>")
-            else:
-                w("<ul class=\"agent\">")
-                for t in work:
-                    w(f"<li>{linker.chip(t['ref'])} <span>{esc(t['title'])}</span><span class=\"pill{' warn' if t['waiting'] else ''}\">{esc(t['lane'])}{' - waiting on you' if t['waiting'] else ''}</span>"
-                      + (f"<span class=\"pill bad\">{esc(t['why'])}</span>" if t["why"] != "launch-critical" else "") + "</li>")
-                w("</ul>")
-            w("</div>")
+            w(f"<div class=\"f\"><h4>Agent work</h4><p>{agent_pointer(model, board)}</p></div>")
         w("</div></details>")
     w("</div>")
     w("<h2>Store checklist</h2>")
@@ -1126,11 +1201,11 @@ def render_page(model: dict, linker: Linker, board: Board, reply_hint: str, now_
             elif st == "na":
                 detail = L(e.get("why"))
             else:
-                detail = esc(r["problem"] or "No entry yet") if r["problem"] else "No entry yet"
+                detail = inline(r["problem"]) if r["problem"] else "No entry yet"
             cond = "" if r["applies_when"] == "always" else f"<span class=\"sub\">Applies when: {esc(r['applies_when'])}</span>"
             doc = f" <a href=\"{esc(r['doc_url'])}\" target=\"_blank\" rel=\"noopener\">docs</a>" if r["doc_url"] else ""
-            cav = f"<span class=\"sub\">{esc(r['caveat'])}</span>" if r["caveat"] else ""
-            w(f"<tr><td>{esc(r['title'])}{doc}{cond}{cav}</td><td><span class=\"pill {STATE_CLASS[st]}\">{STATE_WORD[st]}</span></td><td>{detail}</td></tr>")
+            cav = f"<span class=\"sub\">{inline(r['caveat'])}</span>" if r["caveat"] else ""
+            w(f"<tr><td>{inline(r['title'])}{doc}{cond}{cav}</td><td><span class=\"pill {STATE_CLASS[st]}\">{STATE_WORD[st]}</span></td><td>{detail}</td></tr>")
         w("</tbody></table></div>")
     if not model["marketplaces"]:
         w("<p class=\"muted\">Declare a marketplace and the store checklist appears here.</p>")
@@ -1223,6 +1298,23 @@ class Locked:
         self.fh.close()
 
 
+def read_trouble(board: Board) -> str:
+    """The receipt's one line on ticket-card trouble: reads that failed, reads skipped, cards served stale, cards with nothing."""
+    if not (board.failed_reads or board.skipped_reads or board.stale_cards or board.unreadable):
+        return ""
+    stale = [r for r in board.stale_cards if r not in board.unreadable]
+    parts = []
+    if board.failed_reads:
+        parts.append(f"{len(board.failed_reads)} ticket read(s) failed")
+    if board.skipped_reads:
+        parts.append(f"{len(board.skipped_reads)} not read (the {READ_BUDGET}s budget ran out)")
+    if stale:
+        parts.append(f"{len(stale)} card(s) from stale cache ({', '.join(stale[:6])}{'...' if len(stale) > 6 else ''})")
+    if board.unreadable:
+        parts.append(f"{len(board.unreadable)} card(s) unreadable ({', '.join(board.unreadable[:6])}{'...' if len(board.unreadable) > 6 else ''}): the page shows a gap and is not Complete")
+    return "; ".join(parts)
+
+
 def run_apply(repo: Path, decl: dict, ops, do_publish: bool = True) -> list[dict]:
     """Apply `ops` (may be empty), re-render and publish. Returns receipt entries; a publish failure never raises."""
     entries: list[dict] = []
@@ -1240,8 +1332,9 @@ def run_apply(repo: Path, decl: dict, ops, do_publish: bool = True) -> list[dict
             entries.append({"op": "dashboard", "ref": "render", "status": "error", "detail": f"{type(e).__name__}: {e}"[:200]})
             return entries
         detail = f"{model['counts']['open']} open, {model['counts']['done']} done, {model['counts']['gaps']} gaps"
-        if board.stale_cards:
-            detail += f"; {len(board.stale_cards)} ticket card(s) from cache or unreadable ({', '.join(board.stale_cards[:6])}{'...' if len(board.stale_cards) > 6 else ''})"
+        trouble = read_trouble(board)
+        if trouble:
+            detail += "; " + trouble
         entries.append({"op": "dashboard", "ref": "render", "status": "ok", "detail": detail})
         if do_publish:
             expected = declared_url(repo, decl)
