@@ -27,6 +27,7 @@ prompt, the `## Launch mode` section) outranks this file. This file only says wh
    The brief's launch dashboard section is part of this decision: **every gap it lists is work**. Close
    each one this pass when you can (add the step, file the agent ticket in the launch epic, or record the
    evidence) with ops in the plan's `dashboard` list. Check a step only after you read its `done_when`.
+   The page and its data are public: never put tester names, emails or other personal data in an item.
 3. One `write_file`: `path` is the plan path the brief gives, `content` is the plan as one JSON string
    (not an object; both fields are required). The plan never exists when a pass starts; do not read it.
    Dashboard ops ride in the same plan as `"dashboard": [...]`: no extra tool call. Leave the key out when

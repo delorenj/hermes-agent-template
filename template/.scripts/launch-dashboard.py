@@ -58,6 +58,7 @@ CARDS_FILE = RT / "launch-dashboard-cards.json"
 CARD_TTL = 1800  # seconds a cached ticket card is trusted while its lane group is unchanged
 READ_BUDGET = 90  # seconds of ticket reads per render; the rest come from the cache and the page says so
 CATALOG_FILE = HERE / "lib" / "launch-marketplaces.json"
+CATALOG_IDENTITIES_FILE = HERE / "lib" / "launch-marketplace-identities.json"
 PUBLISHER = Path(os.environ.get("LAUNCH_DASHBOARD_PUBLISHER") or Path.home() / ".agents" / "skills" / "artifacts" / "scripts" / "publish.py")
 PLANE_BASE = (os.environ.get("LAUNCH_PLANE_BASE") or "https://plane.delo.sh").rstrip("/")
 
@@ -73,6 +74,7 @@ OP_NAMES = ("upsert", "check", "uncheck", "remove", "requirement", "marketplaces
 MAX_OPS = 40
 WAIT_LABELS = ("lifecycle:needs-input", "lifecycle:human", "lifecycle:blocked")
 GAP_RANK = ("waiting", "publish", "item", "board", "marketplace", "catalog")
+AGENT_LIST_SHOWN = 30
 BANNER_SHOWN = 6
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 REQ_ID_RE = re.compile(r"^[a-z]{2}\.[a-z0-9][a-z0-9.-]*$")
@@ -150,11 +152,39 @@ def load_data(path: Path) -> dict:
     return out
 
 
+def catalog_identity_problems(cat: dict) -> list[str]:
+    manifest = read_json(CATALOG_IDENTITIES_FILE, None)
+    if not isinstance(manifest, dict) or manifest.get("schema") != "launch-marketplace-identities/1":
+        return [f"catalog identity manifest {CATALOG_IDENTITIES_FILE} is missing or invalid"]
+    expected = manifest.get("marketplaces")
+    if not isinstance(expected, dict) or not expected or not isinstance(cat.get("marketplaces"), dict):
+        return ["catalog identity manifest or marketplace declarations are invalid"]
+    if set(expected) != set(cat["marketplaces"]):
+        return ["catalog identity marketplace declarations do not match the manifest"]
+    problems = []
+    rows = cat.get("requirements", [])
+    for mp, ids in expected.items():
+        if not isinstance(ids, list) or not ids or not all(isinstance(rid, str) for rid in ids) or len(ids) != len(set(ids)):
+            problems.append(f"catalog identity manifest for {mp} is invalid")
+            continue
+        actual = [r.get("id") for r in rows if isinstance(r, dict) and r.get("marketplace") == mp]
+        missing = sorted(set(ids) - set(actual))
+        extra = sorted(set(actual) - set(ids), key=str)
+        duplicates = sorted({rid for rid in actual if actual.count(rid) > 1}, key=str)
+        if missing or extra or duplicates:
+            problems.append(f"catalog identity mismatch for {mp}: missing {missing}; unexpected {extra}; duplicates {duplicates}")
+    unknown = [r for r in rows if not isinstance(r, dict) or r.get("marketplace") not in expected]
+    if unknown:
+        problems.append("catalog identity includes rows outside the declared marketplaces")
+    return problems
+
+
 def load_catalog() -> dict:
     cat = read_json(CATALOG_FILE, None)
     if not isinstance(cat, dict) or cat.get("schema") != CATALOG_SCHEMA or not isinstance(cat.get("requirements"), list):
         return {"schema": CATALOG_SCHEMA, "marketplaces": {}, "requirements": [], "error": f"{CATALOG_FILE} is missing or not {CATALOG_SCHEMA}"}
     cat.setdefault("marketplaces", {})
+    cat["identity_problems"] = catalog_identity_problems(cat)
     return cat
 
 
@@ -777,6 +807,8 @@ def compute_gaps(data: dict, catalog: dict, board: Board, decl: dict, broken: di
         for it in items:
             for ref in sorted(refs_in_item(it, prefixes | board.prefixes) - set(board.groups)):
                 gaps.append({"kind": "item", "id": it.get("id", ""), "text": f"Step {it.get('id', '?')} references {ref}, which is not on the board: preview unavailable until the ticket is resolved."})
+    for problem in catalog.get("identity_problems", []):
+        gaps.append({"kind": "catalog", "id": "", "text": problem})
     if not catalog["requirements"]:
         gaps.append({"kind": "catalog", "id": "", "text": catalog.get("error") or "The marketplace catalog has no requirements: coverage cannot be proved."})
     known_marketplaces = set(catalog.get("marketplaces") or {})
@@ -1285,6 +1317,7 @@ def check(repo: Path, decl: dict, data_path: Path) -> int:
     problems: list[str] = []
     if catalog.get("error"):
         problems.append(catalog["error"])
+    problems.extend(catalog.get("identity_problems", []))
     seen = set()
     for req in catalog["requirements"]:
         for key in ("id", "marketplace", "title", "applies_when", "why", "owner_only", "owner_steps", "verify", "doc_url", "checked"):

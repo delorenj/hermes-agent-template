@@ -117,7 +117,8 @@ class Repo:
         for name in ("launch-pass.py", "board-lease.py", "launch-pass.prompt.md", "launch-dashboard.py"):
             (scripts / name).write_text((SCRIPTS / name).read_text())
         (scripts / "lib").mkdir()
-        (scripts / "lib" / "launch-marketplaces.json").write_text((SCRIPTS / "lib" / "launch-marketplaces.json").read_text())
+        for name in ("launch-marketplaces.json", "launch-marketplace-identities.json"):
+            (scripts / "lib" / name).write_text((SCRIPTS / "lib" / name).read_text())
         (self.role / "role.yaml").write_text('agent_id: "demo-pm"\n')
         (self.role / "SOUL.md").write_text("# soul\n")
         (self.root / ".project.json").write_text(json.dumps(project or {"ticket_provider": {"identifier": "EARS"}}))

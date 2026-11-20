@@ -1,0 +1,31 @@
+{
+  "schema": "launch-marketplace-identities/1",
+  "marketplaces": {
+    "google_play": [
+      "gp.aab-upload", "gp.account-deletion", "gp.account-type-organization-duns", "gp.ads-declaration",
+      "gp.advertising-id-declaration", "gp.app-access", "gp.closed-test-12-testers-14-days",
+      "gp.content-rating", "gp.create-app", "gp.data-safety", "gp.developer-account",
+      "gp.developer-verification-package-registration", "gp.device-verification", "gp.families-policy",
+      "gp.financial-features-declaration", "gp.government-apps-declaration", "gp.health-apps-declaration",
+      "gp.identity-verification", "gp.native-16kb-page-size", "gp.native-64bit", "gp.news-app-declaration",
+      "gp.payments-profile-merchant", "gp.play-app-signing", "gp.play-billing-library",
+      "gp.pricing-free-or-paid", "gp.privacy-policy", "gp.production-access-application",
+      "gp.production-release", "gp.sensitive-permissions-declarations", "gp.store-category-contact",
+      "gp.store-listing-feature-graphic", "gp.store-listing-icon", "gp.store-listing-screenshots",
+      "gp.store-listing-text", "gp.target-api-level", "gp.target-audience-and-content", "gp.trader-status"
+    ],
+    "app_store": [
+      "as.accept-latest-agreements", "as.accessibility-nutrition-labels", "as.account-deletion",
+      "as.age-assurance-regional", "as.age-rating", "as.app-icon-1024", "as.app-privacy-details",
+      "as.app-review-information", "as.app-tracking-transparency", "as.approved-and-released",
+      "as.build-uploaded-and-attached", "as.bundle-id-and-app-record", "as.categories-content-rights",
+      "as.demo-account", "as.developer-program-membership", "as.dsa-trader-status",
+      "as.duns-organization", "as.export-compliance", "as.game-center-config",
+      "as.guideline-completeness", "as.in-app-purchases-ready", "as.kids-category",
+      "as.min-deployment-ios13", "as.paid-apps-agreement-tax-banking", "as.pricing-and-availability",
+      "as.privacy-manifest-required-reason-apis", "as.privacy-policy-url", "as.regional-licensing",
+      "as.screenshots", "as.sign-in-with-apple", "as.submit-for-review", "as.support-url",
+      "as.version-metadata-text", "as.version-release-option", "as.xcode-26-sdk"
+    ]
+  }
+}

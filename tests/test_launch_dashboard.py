@@ -487,6 +487,32 @@ def test_an_unknown_marketplace_in_old_data_never_computes_complete(dash, tmp_pa
     assert "Complete: every barrier" not in html
 
 
+def test_partial_catalog_identity_corruption_fails_closed(dash, tmp_path):
+    path = dash.role / ".scripts" / "lib" / "launch-marketplaces.json"
+    original = json.loads(path.read_text())
+    cases = {
+        "partial deletion": [r for r in original["requirements"] if r["id"] == "gp.create-app" or r["marketplace"] != "google_play"],
+        "duplicate id": original["requirements"] + [original["requirements"][0]],
+        "wrong marketplace": [{**r, "marketplace": "app_store"} if r["id"] == "gp.create-app" else r for r in original["requirements"]],
+    }
+    for label, rows in cases.items():
+        path.write_text(json.dumps({**original, "requirements": rows}))
+        data = full_data()
+        data["requirements"] = {r["id"]: {"status": "na", "why": "not relevant in this fixture"} for r in rows if r["marketplace"] == "google_play"}
+        html, model = render(dash, data, tmp_path)
+        assert not model["complete"], label
+        assert any(g["kind"] == "catalog" and "identity" in g["text"] for g in model["gaps"]), label
+        checked = dash_run(dash, "--check")
+        assert checked.returncode != 0 and any("identity" in p for p in json.loads(checked.stdout)["problems"]), label
+        assert "Complete: every barrier" not in html, label
+    path.write_text(json.dumps(original))
+    assert json.loads(dash_run(dash, "--check").stdout)["ok"] is True
+    (path.parent / "launch-marketplace-identities.json").unlink()
+    html, model = render(dash, full_data(), tmp_path)
+    assert not model["complete"] and any("identity manifest" in g["text"] for g in model["gaps"])
+    assert dash_run(dash, "--check").returncode == 1
+
+
 def test_catalog_with_only_other_marketplace_rows_refuses_completion_and_check(dash, tmp_path):
     path = dash.role / ".scripts" / "lib" / "launch-marketplaces.json"
     catalog = json.loads(path.read_text())

@@ -95,7 +95,7 @@
    "verify": "Owner confirms the declaration shows as complete under Manage account > Account details > About you.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/17594752",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). Deadline 2027-02-01 is for existing accounts; the 2026-10-29 policy announcement also says declaration is required starting November 2026. Scope: Every active developer account; new accounts at creation, existing accounts by 2027-02-01."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. Deadline 2027-02-01 is for existing accounts; the 2026-10-29 policy announcement also says declaration is required starting November 2026. Scope: Every active developer account; new accounts at creation, existing accounts by 2027-02-01."
   },
   {
    "id": "gp.payments-profile-merchant",
@@ -193,7 +193,7 @@
    "verify": "Agent: the first AAB upload is accepted and signed by the upload key; Manage Play app signing in the console shows the key fingerprints.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9842756",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). The signing page gives \"Protected with Play > Play Store protection > Manage Play app signing\", not \"Test and release > App integrity\"."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. The signing page gives \"Protected with Play > Play Store protection > Manage Play app signing\", not \"Test and release > App integrity\"."
   },
   {
    "id": "gp.native-16kb-page-size",
@@ -290,7 +290,7 @@
    "verify": "Agent: curl -sI <policy URL> returns 200 over valid TLS from outside the network; the policy text covers collection, use, sharing and deletion. Owner confirms the App content page row shows complete.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859455",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). Scope: Even if no personal data is collected."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. Scope: Even if no personal data is collected."
   },
   {
    "id": "gp.data-safety",
@@ -325,7 +325,7 @@
    "verify": "Owner confirms Content rating shows a rating on the App content page. Agent can pre-answer the questions in a ticket from the game's actual content.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859655",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). Play Console menu labels disagree across Help pages (Policy > App content, or Monitor and improve > Policy and programs > App content): confirm in the live console."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. Play Console menu labels disagree across Help pages (Policy > App content, or Monitor and improve > Policy and programs > App content): confirm in the live console."
   },
   {
    "id": "gp.target-audience-and-content",
@@ -342,7 +342,7 @@
    "verify": "Owner confirms the row is complete on the App content page.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9867159",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md)."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content."
   },
   {
    "id": "gp.families-policy",
@@ -373,7 +373,7 @@
    "verify": "Owner confirms the Ads row is complete; agent verifies the build contains or lacks ad SDKs consistent with the answer.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859455",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md)."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content."
   },
   {
    "id": "gp.app-access",
@@ -390,7 +390,7 @@
    "verify": "Agent: the demo account in the instructions actually logs in against the production backend from a clean install.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859455",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). Scope: Declare all functionality available, or provide credentials/instructions when any part is gated by login, membership, paywall or location. Play Console menu labels disagree across Help pages (Policy > App content, or Monitor and improve > Policy and programs > App content): confirm in the live console."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. Scope: Declare all functionality available, or provide credentials/instructions when any part is gated by login, membership, paywall or location. Play Console menu labels disagree across Help pages (Policy > App content, or Monitor and improve > Policy and programs > App content): confirm in the live console."
   },
   {
    "id": "gp.account-deletion",
@@ -423,7 +423,7 @@
    "verify": "Owner confirms the row is complete on App content / Policy status.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/13849271",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md). Scope: Apps with no financial features must still certify that."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content. Scope: Apps with no financial features must still certify that."
   },
   {
    "id": "gp.health-apps-declaration",
@@ -519,7 +519,7 @@
    "verify": "Agent: edits.listings.get returns title <=30, shortDescription <=80, fullDescription <=4000 for the default language.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859152",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md)."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content."
   },
   {
    "id": "gp.store-listing-icon",
@@ -575,7 +575,7 @@
    "verify": "Agent: edits.details.get returns contactEmail.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/9859152",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md)."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content."
   },
   {
    "id": "gp.pricing-free-or-paid",
@@ -591,7 +591,7 @@
    "verify": "Agent: edits.countryavailability.get lists the intended countries.",
    "doc_url": "https://support.google.com/googleplay/android-developer/answer/6334373",
    "checked": "2026-11-20",
-   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content (see marketplaces-notes.md)."
+   "caveat": "Menu path quoted from the cited Play Console Help page as read on 2026-11-20; Play Console menus change and different Help pages show different labels for App content."
   },
   {
    "id": "gp.production-release",
