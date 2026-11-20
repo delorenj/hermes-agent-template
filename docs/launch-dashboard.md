@@ -178,7 +178,7 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
   `cut_line.launch_critical` hint plus every open ticket in Todo, since Todo holds only launch-critical work.
 - **Agent work still open** (one section before the first publish item, not repeated per card) is those tickets plus
   owner-filed High or Urgent bugs.
-- **Inline code.** Text in backticks in any field renders as `<code>` (escaped); an unpaired backtick stays literal.
+- **Inline code.** Text in backticks in any field renders as `<code>` (escaped), on the page and in the hover card's title and gist; an unpaired backtick stays literal.
 - **No marketplace declared** is itself a gap, and so is a board the driver could not read: the page never says
   "Complete" on an unproven check. An `agent` requirement whose ticket is Done still holds; a cancelled or
   missing one does not.

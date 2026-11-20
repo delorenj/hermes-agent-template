@@ -905,6 +905,25 @@ def test_backticks_render_as_escaped_code_in_every_field(dash, tmp_path, monkeyp
     assert "`px" not in page and "list`" not in page
 
 
+def test_hover_card_renders_backticks_as_code_like_the_page(dash, monkeypatch):
+    import shutil
+    js = _inproc(dash, monkeypatch).JS
+    assert "rich('b',ref+' '+t.title)" in js and "rich('p',t.gist)" in js, "card title and gist go through rich()"
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node not installed")
+    fns = re.search(r"function el\(.*?\n(?=function show)", js, re.S).group(0)
+    harness = r"""
+var document={createElement:function(t){return {tag:t,kids:[],set textContent(v){this.kids=[String(v)]},appendChild:function(k){this.kids.push(k)}}},
+  createTextNode:function(s){return s}};
+""" + fns + r"""
+function dump(n){return n.kids.map(function(k){return typeof k==='string'?k:'<'+k.tag+'>'+dump(k)+'</'+k.tag+'>'}).join('')}
+console.log(JSON.stringify([dump(rich('b','POOL-1 Fix `px show` output')),dump(rich('p','a `b` c `d')),dump(rich('p','no ticks'))]));
+"""
+    out = subprocess.run([node, "-e", harness], capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == ["POOL-1 Fix <code>px show</code> output", "a <code>b</code> c `d", "no ticks"], "pairs left to right; an unpaired tick stays literal"
+
+
 def test_the_receipt_counts_failed_reads_and_stale_cards(dash, tmp_path, monkeypatch):
     mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
     gather()

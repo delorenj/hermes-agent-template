@@ -972,11 +972,13 @@ var data={};try{data=JSON.parse(document.getElementById('tk-data').textContent)}
 var card=document.createElement('div');card.id='tkcard';card.hidden=true;document.body.appendChild(card);
 var cur=null,timer=null,touch=false;try{touch=matchMedia('(hover: none)').matches}catch(e){}
 function el(tag,cls,txt){var n=document.createElement(tag);if(cls)n.className=cls;if(txt!=null)n.textContent=txt;return n}
+function rich(tag,txt){var n=el(tag),p=String(txt).split('`'),odd=p.length%2===0;
+  p.forEach(function(s,i){if(odd&&i===p.length-1){n.appendChild(document.createTextNode('`'+s));return}if(!s)return;n.appendChild(i%2?el('code',null,s):document.createTextNode(s))});return n}
 function show(a){
   var ref=a.getAttribute('data-ref'),t=data[ref];clearTimeout(timer);cur=a;card.textContent='';
   if(!t){card.appendChild(el('b',null,ref));card.appendChild(el('div','m','Not found on this board.'))}
-  else{card.appendChild(el('b',null,ref+' '+t.title));card.appendChild(el('div','m',t.lane+' · '+t.pri+' priority'));
-    if(t.gist)card.appendChild(el('p',null,t.gist));
+  else{card.appendChild(rich('b',ref+' '+t.title));card.appendChild(el('div','m',t.lane+' · '+t.pri+' priority'));
+    if(t.gist)card.appendChild(rich('p',t.gist));
     if(t.waiting)card.appendChild(el('span','w','Waiting on you'));
     if(t.url){var o=el('a',null,'Open ticket');o.href=t.url;o.target='_blank';o.rel='noopener';var d=el('div');d.appendChild(o);card.appendChild(d)}}
   card.hidden=false;
