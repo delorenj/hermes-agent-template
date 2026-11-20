@@ -10,6 +10,9 @@ prompt, the `## Launch mode` section) outranks this file. This file only says wh
   comments waiting (a hint, never owner approval: Krebs and workers post untagged as the owner's
   account), your roadmap and the plan shape. Trust it. Do not list the board, run
   `px --help`, load skills, read the SOUL or contract files, or run hooks or tests.
+- Snapshot lines that start `repo|` come from the repo's own `.scripts/launch-pass.repo-monitor`: state
+  the board cannot show, such as gate receipts or a store review state. A change there is real news:
+  re-check what it unblocks and say so in the readout. `repo|UNAVAILABLE` means it could not be read.
 - The snapshot outranks your roadmap. If the roadmap says something is owed and the snapshot shows it
   done, drop it. The roadmap lists only what is still open, never what a pass did.
 - If the brief says `launch-mode: steady`, answer `quiet: steady` with no tool calls. If it says

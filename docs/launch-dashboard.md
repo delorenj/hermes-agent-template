@@ -192,7 +192,10 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
   nothing else. `--publish` re-renders from the data file and publishes. `--brief` is the section the launch pass
   hands the PM.
 - **Repo-owned notes.** A repo may add `.scripts/launch-pass.repo.md`. `launch-pass.py --brief` prints it right
-  after the shared pass contract. The scaffold never writes, compares or removes it (33GOD-114).
+  after the shared pass contract. The scaffold never writes, compares or removes it (33GOD-114). A repo may also add an
+  executable `.scripts/launch-pass.repo-monitor`: its stable stdout lines (no timestamps) end the `--monitor` snapshot
+  as `repo|...`, so off-board news (a gate receipt, a store review verdict) wakes the pass. A failing or slow (60 s)
+  script is one fixed `repo|UNAVAILABLE` line; at most 40 lines are kept.
 
 - **Ticket reads are bounded.** A render reuses a ticket card read in the last 30 minutes while the ticket's lane group is
   unchanged (`runtime/launch-dashboard-cards.json`) and stops reading after 90 seconds: the remaining cards come from

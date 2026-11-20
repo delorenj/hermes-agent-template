@@ -8,7 +8,8 @@ and never edits it. Only `launch` is active. No file, `steady` (pre-launch or in
 `launch-mode: steady` or `launch-mode: live`, so the unchanged snapshot costs 0 tokens. The lifecycle
 is `launch` -> `live`; `steady` is for projects that are neither.
 
-  launch-pass.py --monitor         stable snapshot (Hermes hashes it; unchanged = the agent never starts)
+  launch-pass.py --monitor         stable snapshot (Hermes hashes it; unchanged = the agent never starts), ending with
+                                   the repo's own .scripts/launch-pass.repo-monitor lines (off-board state), if any
   launch-pass.py --brief           the pass contract (then the repo's own .scripts/launch-pass.repo.md, if any), the
                                    declaration, the rules pointer, the snapshot, the untagged comments waiting, the
                                    roadmap, the plan schema and the launch dashboard section
@@ -67,6 +68,9 @@ RT = ROLE_DIR / "runtime"
 LEASE_SCRIPT = HERE / "board-lease.py"
 PROMPT = HERE / "launch-pass.prompt.md"
 REPO_PROMPT = HERE / "launch-pass.repo.md"  # optional, repo-owned: the scaffold never writes, compares or removes it
+REPO_MONITOR = HERE / "launch-pass.repo-monitor"  # optional, repo-owned executable: off-board state (gate receipts) for the snapshot
+REPO_MONITOR_TIMEOUT_S = 60
+REPO_MONITOR_MAX_LINES = 40
 DASHBOARD = HERE / "launch-dashboard.py"
 ROADMAP = RT / "launch-roadmap.md"
 DEFAULT_PLAN = RT / "launch-pass.json"
@@ -468,6 +472,23 @@ def snapshot_lines(decl: dict, rows: list[dict] | None) -> list[str]:
     return lines
 
 
+def repo_monitor_lines(repo: Path) -> list[str]:
+    """The repo's own off-board state, so a change the board cannot show (a gate receipt, a store review state) wakes
+    the pass. Optional and repo-owned: `.scripts/launch-pass.repo-monitor` prints stable lines (no timestamps). Each is
+    prefixed `repo|`; a missing, failing or slow script is one fixed line, never an error."""
+    if not REPO_MONITOR.is_file():
+        return []
+    try:
+        out = subprocess.run([str(REPO_MONITOR)], cwd=repo, capture_output=True, text=True, timeout=REPO_MONITOR_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return ["repo|UNAVAILABLE"]
+    if out.returncode != 0:
+        return ["repo|UNAVAILABLE"]
+    lines = [l.rstrip() for l in out.stdout.splitlines() if l.strip()]
+    extra = len(lines) - REPO_MONITOR_MAX_LINES
+    return ["repo|" + l for l in lines[:REPO_MONITOR_MAX_LINES]] + ([f"repo|{extra} more line(s) dropped"] if extra > 0 else [])
+
+
 def snapshot(repo: Path) -> tuple[dict, list[str], list[dict] | None, str]:
     decl = load_declaration(repo)
     if not decl["active"]:
@@ -475,8 +496,8 @@ def snapshot(repo: Path) -> tuple[dict, list[str], list[dict] | None, str]:
     try:
         ident, rows = board(repo, decl)
     except Exception:
-        return decl, snapshot_lines(decl, None), None, ""
-    return decl, snapshot_lines(decl, rows), rows, ident
+        return decl, snapshot_lines(decl, None) + repo_monitor_lines(repo), None, ""
+    return decl, snapshot_lines(decl, rows) + repo_monitor_lines(repo), rows, ident
 
 
 def monitor(repo: Path) -> int:

@@ -226,6 +226,34 @@ def test_monitor_changes_when_the_board_or_declaration_changes(repo):
     assert repo.run("--monitor").stdout != before
 
 
+def _repo_monitor(repo, body):
+    path = repo.role / ".scripts" / "launch-pass.repo-monitor"
+    path.write_text("#!/bin/sh\n" + body + "\n")
+    path.chmod(0o755)
+    return path
+
+
+def test_monitor_appends_the_repo_monitor_and_wakes_on_its_change(repo):
+    base = repo.run("--monitor").stdout
+    assert "repo|" not in base, "no repo monitor, no repo lines"
+    _repo_monitor(repo, "echo 'gate cohort UNMET'; echo; echo 'review APPROVED'")
+    lines = repo.run("--monitor").stdout.splitlines()
+    assert lines[-2:] == ["repo|gate cohort UNMET", "repo|review APPROVED"], "blank lines dropped, each prefixed"
+    first = repo.run("--monitor").stdout
+    _repo_monitor(repo, "echo 'gate cohort PASS'; echo 'review APPROVED'")
+    assert repo.run("--monitor").stdout != first, "an off-board change wakes the pass"
+    assert "repo|gate cohort PASS" in repo.run("--brief").stdout, "the brief carries the same lines"
+
+
+def test_a_failing_or_noisy_repo_monitor_is_one_fixed_line(repo):
+    _repo_monitor(repo, "echo partial; exit 3")
+    out = repo.run("--monitor")
+    assert out.returncode == 0 and out.stdout.splitlines()[-1] == "repo|UNAVAILABLE" and "partial" not in out.stdout
+    _repo_monitor(repo, "i=0; while [ $i -lt 45 ]; do echo line$i; i=$((i+1)); done")
+    lines = [l for l in repo.run("--monitor").stdout.splitlines() if l.startswith("repo|")]
+    assert len(lines) == 41 and lines[-1] == "repo|5 more line(s) dropped"
+
+
 def test_monitor_flags_owner_comments_waiting_and_stale_claims(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, tickets=[
         ticket(2, "Todo", comments=[comment("[pm] launch rank 1: x", "2026-11-16T10:00:00+00:00"), comment("please look", "2026-11-16T11:00:00+00:00")]),
