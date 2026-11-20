@@ -70,12 +70,30 @@ else:
 '''
 
 
-def ticket(seq, lane="Backlog", group=None, pri="none", labels=(), comments=(), external=None, updated="2026-11-17T12:00:00+00:00"):
+PUBLISH_STUB = r'''#!__PY__
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+site = Path(args[0])
+with open(os.environ["PUBLISH_STUB_LOG"], "a") as f:
+    f.write(json.dumps({"args": args, "files": sorted(p.name for p in site.iterdir())}) + "\n")
+if os.environ.get("PUBLISH_STUB_FAIL"):
+    print("publisher: boom", file=sys.stderr)
+    sys.exit(1)
+get = lambda k: args[args.index(k) + 1]
+print("verified 2 objects")
+print(f"https://s3.delo.sh/projects/{get('--project')}/{get('--date')}/{get('--name')}/index.html")
+'''
+
+
+def ticket(seq, lane="Backlog", group=None, pri="none", labels=(), comments=(), external=None, updated="2026-11-17T12:00:00+00:00",
+           name=None, description=None, url=None):
     group = group or {"Backlog": "backlog", "Todo": "unstarted", "In Progress": "started", "Done": "completed", "Cancelled": "cancelled"}[lane]
     return {
-        "seq": seq, "name": f"ticket {seq}", "state_name": lane, "state_group": group, "priority": pri,
+        "seq": seq, "name": name or f"ticket {seq}", "state_name": lane, "state_group": group, "priority": pri,
         "label_names": list(labels), "comments": list(comments), "external_id": external,
         "created_at": "2026-11-10T12:00:00+00:00", "updated_at": updated,
+        **({"description_text": description} if description else {}), **({"url": url} if url else {}),
     }
 
 
@@ -91,8 +109,10 @@ class Repo:
         self.role = self.root / "agents" / "hermes" / "pm"
         scripts = self.role / ".scripts"
         scripts.mkdir(parents=True)
-        for name in ("launch-pass.py", "board-lease.py", "launch-pass.prompt.md"):
+        for name in ("launch-pass.py", "board-lease.py", "launch-pass.prompt.md", "launch-dashboard.py"):
             (scripts / name).write_text((SCRIPTS / name).read_text())
+        (scripts / "lib").mkdir()
+        (scripts / "lib" / "launch-marketplaces.json").write_text((SCRIPTS / "lib" / "launch-marketplaces.json").read_text())
         (self.role / "role.yaml").write_text('agent_id: "demo-pm"\n')
         (self.role / "SOUL.md").write_text("# soul\n")
         (self.root / ".project.json").write_text(json.dumps(project or {"ticket_provider": {"identifier": "EARS"}}))
@@ -106,10 +126,15 @@ class Repo:
         px = shim_dir / "px"
         px.write_text(SHIM.replace("__PY__", sys.executable))
         px.chmod(0o755)
+        self.publisher = tmp_path / "publish-stub.py"
+        self.publisher.write_text(PUBLISH_STUB.replace("__PY__", sys.executable))
+        self.publisher.chmod(0o755)
         self.env = {
             **os.environ,
             "PATH": f"{shim_dir}{os.pathsep}{os.environ['PATH']}",
             "PX_SHIM_STATE": str(self.state),
+            "LAUNCH_DASHBOARD_PUBLISHER": str(self.publisher),
+            "PUBLISH_STUB_LOG": str(self.state / "publish.log"),
             "LAUNCH_PASS_DATE": "2026-11-17",
             "LAUNCH_LEASE_WAIT": "0",
             "PYTHONDONTWRITEBYTECODE": "1",

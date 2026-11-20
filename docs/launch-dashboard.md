@@ -157,3 +157,31 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
   ticket (in the launch epic), or record the evidence.
 - When the last publish item is checked, the finish line is met on evidence. File the exit ticket
   (the charter's exit rule).
+
+## How the driver reads the rules
+
+`template/.scripts/launch-dashboard.py` is the driver. Where the rules above need a precise reading, this is it:
+
+- **Required fields.** `id`, `order`, `title`, `why`, `kind`, `steps`, `done_when` and `recommend` on every item;
+  `reply` on every kind except `publish` (the final press is read from the store, not from a reply). A `publish`
+  item also names its `marketplace`. Unknown fields are refused, so a typo cannot hide.
+- **Default.** Only `decision`, `reply` and `device` items may carry a `default`: those are the steps the PM can
+  take on silence. Account, console, legal, money, credential and publish steps need Jarad's own hands, so their
+  `default` is `null`.
+- **Launch-critical** (the waiting-ticket gap and the publish card's agent list) means the declaration's
+  `cut_line.launch_critical` hint plus every open ticket in Todo, since Todo holds only launch-critical work.
+- **Agent work still open** on a publish card is those tickets plus owner-filed High or Urgent bugs.
+- **No marketplace declared** is itself a gap, and so is a board the driver could not read: the page never says
+  "Complete" on an unproven check. An `agent` requirement whose ticket is Done still holds; a cancelled or
+  missing one does not.
+- **Ticket links.** `ABC-123` is linked when `ABC` is a ticket prefix of this board or a driven child scope. A
+  ref in an item's `refs` must be on this board. The hover card is built from the ticket at render time.
+- **Repo paths** link when `git ls-files` lists them in the repo, or in a child scope that is its own repo, and the
+  remote is on GitHub. The link is the `main` blob.
+- **Modes.** `--check` validates the data and the catalog (exit 1 on a problem). `--ops FILE` applies ops, then
+  renders and publishes. `--render [--out DIR] [--data FILE]` writes `index.html` and `dashboard.json` and touches
+  nothing else. `--publish` re-renders from the data file and publishes. `--brief` is the section the launch pass
+  hands the PM.
+- **Repo-owned notes.** A repo may add `.scripts/launch-pass.repo.md`. `launch-pass.py --brief` prints it right
+  after the shared pass contract. The scaffold never writes, compares or removes it (33GOD-114).
+

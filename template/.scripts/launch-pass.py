@@ -9,8 +9,9 @@ and never edits it. Only `launch` is active. No file, `steady` (pre-launch or in
 is `launch` -> `live`; `steady` is for projects that are neither.
 
   launch-pass.py --monitor         stable snapshot (Hermes hashes it; unchanged = the agent never starts)
-  launch-pass.py --brief           the pass contract, the declaration, the rules pointer, the snapshot,
-                                   the untagged comments waiting, the roadmap and the plan schema
+  launch-pass.py --brief           the pass contract (then the repo's own .scripts/launch-pass.repo.md, if any), the
+                                   declaration, the rules pointer, the snapshot, the untagged comments waiting, the
+                                   roadmap, the plan schema and the launch dashboard section
   launch-pass.py --apply [PLAN]    apply the agent's plan (default runtime/launch-pass.json) under the
                                    board-driver lease, with a write cap and a receipt
   launch-pass.py --check           parse and print the declaration as JSON (debugging; exit 1 if broken)
@@ -35,6 +36,10 @@ is that epic, becomes an epic membership (`px epic add EPIC REF`). Every ref (`r
 be on this board; a ticket carrying `agent:working` is never moved, closed or cancelled; `comment`, `close`
 and `cancel` need a `text`; create labels are bare words or a fleet open axis (risk:, needs:, xp:). A write
 whose fields have the wrong types is skipped, and the receipt is written whatever happens.
+
+The plan may also carry `"dashboard": [ops]` (docs/launch-dashboard.md). They apply after the board writes through
+launch-dashboard.py, and every apply then re-renders and republishes the launch dashboard. A refused dashboard op
+says why; a failed publish is reported in the receipt and never undoes the board writes.
 
 stdlib only, python3. The script lives in <repo>/agents/hermes/<role>/.scripts/ and finds the repo by
 walking up to `.project.json` (or `.git`); LAUNCH_REPO or --repo override. px runs with cwd = repo.
@@ -61,6 +66,8 @@ ROLE = ROLE_DIR.name
 RT = ROLE_DIR / "runtime"
 LEASE_SCRIPT = HERE / "board-lease.py"
 PROMPT = HERE / "launch-pass.prompt.md"
+REPO_PROMPT = HERE / "launch-pass.repo.md"  # optional, repo-owned: the scaffold never writes, compares or removes it
+DASHBOARD = HERE / "launch-dashboard.py"
 ROADMAP = RT / "launch-roadmap.md"
 DEFAULT_PLAN = RT / "launch-pass.json"
 RECEIPTS = RT / "launch-receipts"
@@ -491,7 +498,31 @@ PLAN_SCHEMA = """\
   {"op": "link",    "ref": "<ID>-12", "other": "<ID>-13", "blocks": true},
   {"op": "link",    "ref": "<EPIC>", "other": "<ID>-12"}],
  "roadmap": "# whole new roadmap, at most 40 lines (omit on a quiet pass)",
+ "dashboard": [{"op": "upsert|check|uncheck|remove|requirement|marketplaces", "...": "ops and fields are in the dashboard section below; omit when nothing changed"}],
  "note": "one line"}"""
+
+
+def dashboard_module():
+    """launch-dashboard.py, loaded beside this file, or None when it is not shipped (an old scaffold)."""
+    if not DASHBOARD.is_file():
+        return None
+    mod = sys.modules.get("launch_dashboard")
+    if mod is None:
+        import importlib.util
+        sys.modules.setdefault("launch_pass", sys.modules[__name__])
+        spec = importlib.util.spec_from_file_location("launch_dashboard", DASHBOARD)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["launch_dashboard"] = mod
+        spec.loader.exec_module(mod)
+    return mod
+
+
+def dashboard_brief(repo: Path, decl: dict, rows: list[dict] | None) -> str:
+    try:
+        mod = dashboard_module()
+        return mod.brief_section(repo, decl, rows) if mod else "\n# Launch dashboard\n(launch-dashboard.py is missing: run flume remediate hermes.pm-scaffold)"
+    except Exception as e:  # the dashboard never breaks the pass's brief
+        return f"\n# Launch dashboard\n(unavailable: {type(e).__name__}: {e})"
 
 
 def brief(repo: Path) -> int:
@@ -506,6 +537,9 @@ def brief(repo: Path) -> int:
             print(f"(.launch.yaml is unreadable: {decl['error']}. Treated as steady. Tell the owner in the pass note.)")
         return 0
     print(_read(PROMPT).rstrip() or "(launch-pass.prompt.md is missing: run flume remediate hermes.pm-scaffold)")
+    repo_notes = _read(REPO_PROMPT).strip()
+    if repo_notes:
+        print(f"\n# This repo's own launch-pass notes ({REPO_PROMPT.name}, owned by the repo)\n{repo_notes}")
     print("\n# Declaration (.launch.yaml, read-only, committed by the owner)")
     print(decl["raw"].rstrip())
     print(f"\n# Launch-mode rules\nThe rulebook is the `## Launch mode` section of your SOUL ({ROLE_DIR / 'SOUL.md'}). "
@@ -547,6 +581,7 @@ def brief(repo: Path) -> int:
               "A `create` with `\"scope\": \"<one of them>\"` files the ticket from that child's directory "
               "(its `repo:*` label); without `scope` it lands in the repo's own scope. Join it to the epic with "
               "`parent` as usual. Never edit child code.")
+    print(dashboard_brief(repo, decl, rows))
     print(f"\nApply with: python3 {Path(__file__).resolve()} --apply")
     return 0
 
@@ -824,6 +859,17 @@ def apply(repo: Path, plan_arg: str | None) -> int:
         ROADMAP.parent.mkdir(parents=True, exist_ok=True)
         ROADMAP.write_text("\n".join(lines).rstrip() + "\n")
         entries.append({"op": "roadmap", "status": "ok", "detail": str(ROADMAP)})
+
+    dash_ops = plan.get("dashboard")
+    try:
+        mod = dashboard_module()
+        if mod is not None:
+            if dash_ops is not None and not isinstance(dash_ops, list):
+                entries.append({"op": "dashboard", "ref": "ops", "status": "refused", "detail": "`dashboard` must be a list of ops"})
+                dash_ops = None
+            entries += mod.run_apply(repo, decl, dash_ops or [])
+    except Exception as e:  # never fatal to the board writes above
+        entries.append({"op": "dashboard", "ref": "apply", "status": "error", "detail": f"{type(e).__name__}: {e}"[:240]})
 
     stamp = f"{now():%Y%m%dT%H%M%SZ}"
     RECEIPTS.mkdir(parents=True, exist_ok=True)
