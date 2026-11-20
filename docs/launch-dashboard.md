@@ -110,15 +110,20 @@ A render reports a gap for each of the following:
 
    Conditional requirements (`applies_when` is not `always`) still need an entry: `na` with the
    reason the condition does not hold.
-2. **A launch-critical ticket waiting on Jarad.** An open ticket labelled `lifecycle:needs-input`,
-   `lifecycle:human` or `lifecycle:blocked` that no item references.
+2. **A launch-critical ticket waiting on Jarad.** An open ticket labelled `lifecycle:needs-input` or
+   `lifecycle:human` that no item references. `lifecycle:blocked` alone is not waiting on him (it is usually
+   another ticket or scope), and a Done or Cancelled ticket never waits.
+   **Tickets that could not be read.** When a ticket card cannot be read and no cached copy exists, one gap names
+   them ("N tickets could not be read: REF, REF; the page cannot prove completeness"): a launch-critical ticket
+   waiting on him may be among them, so the page never says Complete on missing data.
 3. **A missing publish item.** A declared marketplace has no item of kind `publish`.
 4. **An item that breaks a rule** (the table above).
 
 Gaps are not errors: the page still renders. But it says "incomplete" and names each gap, and the
 brief hands the same list to the PM as its work list. Every publish item also shows, automatically,
 the agent work still open on the path: open launch-critical tickets, plus owner-filed High or
-Urgent bugs. Checking it off can never hide work in flight.
+Urgent bugs. Checking it off can never hide work in flight. The list is rendered once, as its own section right
+before the first publish item; each publish card carries a one-line pointer with the count.
 
 ## The page
 
@@ -131,7 +136,8 @@ From top to bottom:
 3. **Your runbook.** One numbered card per item. Each card has a checkbox (the PM's verified state),
    the action, why it matters, the verbatim numbered steps, "When done, reply", "The PM checks",
    the recommendation and default, ticket chips with hover cards, artifact links, and "after step N"
-   for each dependency. A publish card adds "Agent work still open".
+   for each dependency. A publish card adds a one-line "Agent work" pointer to the single "Agent work still open"
+   section placed before the first publish item.
 4. **Store checklist.** One row per catalog requirement for each marketplace. The status is one of:
    met (with an evidence link), agent (with a ticket chip), you (step N), n/a (with the reason),
    or GAP.
@@ -170,12 +176,15 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
   `default` is `null`.
 - **Launch-critical** (the waiting-ticket gap and the publish card's agent list) means the declaration's
   `cut_line.launch_critical` hint plus every open ticket in Todo, since Todo holds only launch-critical work.
-- **Agent work still open** on a publish card is those tickets plus owner-filed High or Urgent bugs.
+- **Agent work still open** (one section before the first publish item, not repeated per card) is those tickets plus
+  owner-filed High or Urgent bugs.
+- **Inline code.** Text in backticks in any field renders as `<code>` (escaped); an unpaired backtick stays literal.
 - **No marketplace declared** is itself a gap, and so is a board the driver could not read: the page never says
   "Complete" on an unproven check. An `agent` requirement whose ticket is Done still holds; a cancelled or
   missing one does not.
 - **Ticket links.** `ABC-123` is linked when `ABC` is a ticket prefix of this board or a driven child scope. A
-  ref in an item's `refs` must be on this board. The hover card is built from the ticket at render time.
+  ref in an item's `refs` must carry this board's prefix. A ref the board listing does not carry (outside the launch
+  epic or cut line) is still read by ref and gets a card; "not on the board" is only for a ref that does not resolve. The hover card is built from the ticket at render time.
 - **Repo paths** link when `git ls-files` lists them in the repo, or in a child scope that is its own repo, and the
   remote is on GitHub. The link is the `main` blob.
 - **Modes.** `--check` validates the data and the catalog (exit 1 on a problem). `--ops FILE` applies ops, then
@@ -187,7 +196,7 @@ It works at phone width, in light and dark modes, and needs no sign-in to read.
 
 - **Ticket reads are bounded.** A render reuses a ticket card read in the last 30 minutes while the ticket's lane group is
   unchanged (`runtime/launch-dashboard-cards.json`) and stops reading after 90 seconds: the remaining cards come from
-  that cache (or show "unreadable"), the receipt and the page footer say how many are out of date, and the next apply
+  that cache (or show "unreadable"), the receipt (reads failed, reads skipped, cards from stale cache, cards unreadable) and the page footer say how many are out of date, and the next apply
   refreshes them. A long board never outlives the pass's tool call.
 - **Page privacy.** The page and `dashboard.json` are public at a guessable path. Ticket gists go public with them, and an
   item must never carry tester names, emails or other personal data (the pass prompt says so).

@@ -39,10 +39,13 @@ with open(_own if os.path.exists(_own) else state + "/board.json") as f:
     board = json.load(f)
 if args[:2] == ["task", "list"]:
     issues = [{"sequence_id": t["seq"], "state_name": t["state_name"], "state_group": t["state_group"], "name": t["name"]}
-              for t in board["tickets"]]
+              for t in board["tickets"] if not t.get("unlisted")]  # unlisted: real, but outside the listing (off the epic)
     print(json.dumps({"ok": True, "board": board["board"], "issues": issues}))
 elif args[:2] == ["task", "get"]:
     ref = args[2]
+    if ref in os.environ.get("PX_SHIM_DEAD", "").split(","):  # always refused: a Plane that keeps answering 500
+        print(json.dumps({"ok": False}))
+        sys.exit(1)
     if os.environ.get("PX_SHIM_FLAKY") and not os.path.exists(state + "/seen-" + ref):
         open(state + "/seen-" + ref, "w").close()  # the first read of every ticket is refused, like a throttled Plane
         print(json.dumps({"ok": False}))

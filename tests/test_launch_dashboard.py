@@ -524,7 +524,7 @@ def test_a_publish_item_lists_open_launch_critical_work_and_owner_filed_blockers
     assert "EARS-6" not in refs and "EARS-7" not in refs                     # an agent-filed bug and a closed ticket
     block = html[html.index("Agent work still open"):]
     assert 'data-ref="EARS-2"' in block and 'data-ref="EARS-5"' in block and "waiting on you" in block
-    assert html.count("Agent work still open") == 1
+    assert html.count("Agent work still open") == 1 and html.count('class="agentwork"') == 1
 
 
 def test_an_item_that_is_not_a_publish_item_has_no_agent_list(dash, tmp_path):
@@ -770,3 +770,164 @@ def test_a_render_with_stale_cards_says_so_in_the_receipt_and_the_footer(dash, t
              "gaps": [], "agent_work": [], "counts": {"open": 0, "done": 0, "gaps": 0}, "complete": True, "catalog_checked": "x"}
     page = mod.render_page(model, linker, b, "", mod.now(), "abc")
     assert "ticket card(s) may be out of date" in page
+
+
+# ------------------------------------------------------------------- dogfood fixes (FLUME-104)
+
+def _inproc(dash, monkeypatch, dead=()):
+    for k, v in dash.env.items():
+        monkeypatch.setenv(k, v)
+    if dead:
+        monkeypatch.setenv("PX_SHIM_DEAD", ",".join(dead))
+    mod = load_mod(dash)
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    return mod
+
+
+def _render_inproc(mod, dash, data, tmp_path):
+    decl = mod.LP.load_declaration(dash.root)
+    out = tmp_path / "inproc"
+    model, board = mod.render(dash.root, decl, data, out)
+    return model, board, (out / "index.html").read_text()
+
+
+def _add_tickets(dash, *tickets):
+    path = dash.state / "board.json"
+    body = json.loads(path.read_text())
+    body["tickets"] += list(tickets)
+    path.write_text(json.dumps(body))
+
+
+def test_an_unreadable_card_is_an_explicit_gap_and_the_page_never_says_complete(dash, tmp_path, monkeypatch):
+    mod = _inproc(dash, monkeypatch, dead=("EARS-4",))
+    data = full_data()
+    data["items"].append(good(id="pick-price", order=20, title="Pick the price", marketplace=None, kind="decision", steps=["Choose a price.", "Reply with it."],
+                              refs=["EARS-4"], covers=[], reply="price: free"))
+    model, board, page = _render_inproc(mod, dash, data, tmp_path)
+    assert board.unreadable == ["EARS-4"]
+    gap = [g for g in model["gaps"] if g["kind"] == "unreadable"]
+    assert len(gap) == 1 and "1 ticket could not be read: EARS-4" in gap[0]["text"] and "cannot prove completeness" in gap[0]["text"]
+    assert model["complete"] is False and "Complete: every barrier" not in page
+    assert "ticket groups" in page or "could not be read: EARS-4" in page
+    # the same data with every read working is complete again
+    mod = _inproc(dash, monkeypatch)
+    monkeypatch.delenv("PX_SHIM_DEAD")
+    model, board, page = _render_inproc(mod, dash, data, tmp_path)
+    assert not board.unreadable and model["complete"] is True
+
+
+def test_several_unreadable_cards_are_listed_in_one_gap(dash, tmp_path, monkeypatch):
+    mod = _inproc(dash, monkeypatch, dead=("EARS-4", "EARS-2"))
+    model, board, _ = _render_inproc(mod, dash, full_data(), tmp_path)
+    gap = [g for g in model["gaps"] if g["kind"] == "unreadable"]
+    assert len(gap) == 1 and "2 tickets could not be read: EARS-2, EARS-4" in gap[0]["text"]
+
+
+def test_waiting_on_him_means_needs_input_or_human_on_an_open_ticket(dash, tmp_path, monkeypatch):
+    _add_tickets(dash,
+                 ticket(8, "Todo", labels=["lifecycle:blocked"], name="Blocked on HOLY-2"),
+                 ticket(9, "Done", labels=["lifecycle:needs-input"], name="Finished with a stale label"),
+                 ticket(10, "Todo", labels=["lifecycle:human"], name="Needs his hands"),
+                 ticket(11, "Cancelled", labels=["lifecycle:human"], name="Dropped"))
+    mod = _inproc(dash, monkeypatch)
+    data = full_data()
+    data["items"][0]["why"] = "Mentions EARS-8, EARS-9 and EARS-11."
+    model, board, page = _render_inproc(mod, dash, data, tmp_path)
+    assert sorted(g["id"] for g in model["gaps"] if g["kind"] == "waiting") == ["EARS-10", "EARS-4"], "blocked alone and closed tickets never wait on him"
+    assert [board.tickets[r]["waiting"] for r in ("EARS-8", "EARS-9", "EARS-10", "EARS-11")] == [False, False, True, False]
+    cards = json.loads(re.search(r'id="tk-data">(.*?)</script>', page, re.S).group(1))
+    assert cards["EARS-8"]["waiting"] is False and cards["EARS-9"]["waiting"] is False and cards["EARS-11"]["waiting"] is False
+    assert 'class="tk wait" href="https://plane.delo.sh/33god/browse/EARS-8/"' not in page
+    work = {t["ref"]: t for t in model["agent_work"]}
+    assert work["EARS-8"]["waiting"] is False and work["EARS-10"]["waiting"] is True
+
+
+def test_an_old_cached_card_is_re_judged_by_the_owner_rule(dash, tmp_path, monkeypatch):
+    _add_tickets(dash, ticket(8, "Todo", labels=["lifecycle:blocked"], name="Blocked on HOLY-2"))
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    body["EARS-8"]["info"]["waiting"] = True  # written by the old driver, which counted blocked as waiting
+    cache.write_text(json.dumps(body))
+    gets.clear()
+    b = gather()
+    assert not gets and b.tickets["EARS-8"]["waiting"] is False
+
+
+def test_the_agent_list_is_rendered_once_before_the_first_publish_item_and_each_publish_card_points_to_it(dash, tmp_path, monkeypatch):
+    mod = _inproc(dash, monkeypatch)
+    data = full_data()
+    data["marketplaces"] = ["google_play", "app_store"]
+    data["requirements"].update({r["id"]: {"status": "na", "why": "not relevant in this fixture"} for r in CATALOG["requirements"] if r["marketplace"] == "app_store"})
+    data["items"] = [good(id="early", order=10, title="Do the early thing", kind="decision", marketplace=None, steps=["a", "b"], covers=[], reply="ok"),
+                     publish_item("google_play", id="pub-a", order=800), publish_item("google_play", id="pub-b", order=850), publish_item("app_store", id="pub-c", order=900)]
+    model, _, page = _render_inproc(mod, dash, data, tmp_path)
+    n = len(model["agent_work"])
+    assert n >= 3 and page.count("Agent work still open") == 1 and page.count('class="agentwork"') == 1
+    first_pub = page.index('id="step-2"')
+    assert page.index('class="agentwork"') < first_pub and page.index('id="step-1"') < page.index('class="agentwork"')
+    assert page.count('data-ref="EARS-2"') >= 1
+    assert page.count(f'<a href="#agent-work">{n} agent tickets still open</a>') == 3, "one pointer with the count on each publish card"
+    section = page[page.index('class="agentwork"'):page.index("</section>")]
+    assert section.count("<li>") == n, "the list is complete and appears exactly once"
+
+
+def test_a_ref_on_the_board_outside_the_listing_gets_a_card_and_is_not_missing(dash, tmp_path, monkeypatch):
+    unlisted = ticket(20, "Todo", name="Off the epic", description="## Goal\n\nLives outside the listing.")
+    unlisted["unlisted"] = True
+    _add_tickets(dash, unlisted)
+    mod = _inproc(dash, monkeypatch)
+    data = full_data()
+    data["items"][0]["why"] = "Waits on EARS-20 and on EARS-99."
+    data["requirements"]["gp.create-app"] = {"status": "agent", "ref": "EARS-20"}
+    data["requirements"]["gp.app-access"] = {"status": "agent", "ref": "EARS-99"}
+    model, board, page = _render_inproc(mod, dash, data, tmp_path)
+    cards = json.loads(re.search(r'id="tk-data">(.*?)</script>', page, re.S).group(1))
+    assert cards["EARS-20"]["title"] == "Off the epic" and cards["EARS-20"]["lane"] == "Todo" and "outside the listing" in cards["EARS-20"]["gist"]
+    assert "EARS-99" not in cards, "a ref that truly does not resolve has no card"
+    texts = {g["id"]: g["text"] for g in model["gaps"] if g["kind"] == "catalog"}
+    assert "gp.create-app" not in texts, "an agent ticket that exists off the listing is not missing"
+    assert "EARS-99 is not on the board" in texts["gp.app-access"]
+    assert "EARS-20" not in {t["ref"] for t in model["agent_work"]}, "an off-listing ticket is not drawn into the launch-critical list"
+
+
+def test_backticks_render_as_escaped_code_in_every_field(dash, tmp_path, monkeypatch):
+    mod = _inproc(dash, monkeypatch)
+    data = full_data()
+    data["items"][0].update(title="Run `px task list` first", why="Use `<b>raw</b>` and `EARS-2` literally.", done_when="The API shows `\"ok\"` for the package.",
+                            steps=["Open https://play.google.com/console/u/1/developers and run `ls -la`.", "Press `Save`."], recommend="Do `it` now, not `a stray tick.")
+    _, _, page = _render_inproc(mod, dash, data, tmp_path)
+    assert "Run <code>px task list</code> first" in page
+    assert "<code>&lt;b&gt;raw&lt;/b&gt;</code>" in page and "<b>raw</b>" not in page
+    assert "<code>EARS-2</code>" in page, "a ref inside a code span is code, not a chip"
+    assert "<code>&quot;ok&quot;</code>" in page and "run <code>ls -la</code>." in page and "Press <code>Save</code>." in page
+    assert "Do <code>it</code> now, not `a stray tick." in page, "an unpaired tick stays literal"
+    assert "`px" not in page and "list`" not in page
+
+
+def test_the_receipt_counts_failed_reads_and_stale_cards(dash, tmp_path, monkeypatch):
+    mod, gets, gather, cache = _counting_gather(dash, tmp_path, monkeypatch)
+    gather()
+    body = json.loads(cache.read_text())
+    for e in body.values():
+        e["at"] = "2020-01-01T00:00:00Z"
+    cache.write_text(json.dumps(body))
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+    monkeypatch.setenv("PX_SHIM_DEAD", "EARS-2")
+    b = gather()
+    line = mod.read_trouble(b)
+    assert b.failed_reads == ["EARS-2"] and "1 ticket read(s) failed" in line and "1 card(s) from stale cache (EARS-2)" in line and "unreadable" not in line
+    cache.unlink()
+    b = gather()
+    line = mod.read_trouble(b)
+    assert "1 ticket read(s) failed" in line and "1 card(s) unreadable (EARS-2)" in line and "not Complete" in line
+    b = gather(budget=-1)
+    assert "not read (the 90s budget ran out)" in mod.read_trouble(b)
+    monkeypatch.delenv("PX_SHIM_DEAD")
+    assert mod.read_trouble(gather()) == ""
+
+
+def test_apply_prints_the_read_trouble_in_the_ops_receipt(dash):
+    out = send(dash, {"dashboard": [{"op": "marketplaces", "value": ["google_play"]}]}, PX_SHIM_DEAD="EARS-4")
+    line = [l for l in out.stdout.splitlines() if l.startswith("dashboard render:")][0]
+    assert "1 ticket read(s) failed" in line and "1 card(s) unreadable (EARS-4)" in line
