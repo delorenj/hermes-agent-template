@@ -4,6 +4,7 @@ px is mocked with a PATH shim: a tiny python script that serves `task list` / `t
 board file and appends every write verb to a log, so the tests prove what the driver sends to px
 without a Plane board.
 """
+import importlib.util
 import json
 import os
 import subprocess
@@ -214,6 +215,66 @@ def test_monitor_board_unavailable_is_one_fixed_line(tmp_path, monkeypatch):
     (r.state / "board.json").unlink()
     lines = r.run("--monitor").stdout.splitlines()
     assert lines[0] == "launch-mode: launch" and lines[-1] == "board UNAVAILABLE"
+
+
+LIVE_DECL = """\
+# a live app: launch history stays, the live block is the Holocene Live hub's data
+mode: live
+declared: 2026-11-17
+live_since: 2026-11-20
+finish_line: "A signed APK is downloadable."
+epic: EARS-1
+live:
+  name: Earshot
+  tagline: "Let your agents speak, without pressing play."
+  store_url: https://store.automaticai.io/earshot/
+  checkout:
+    provider: stripe
+    payment_link: plink_1UcrsBFb6MyEY1wppwmX0Gzz
+    key_ref: "op://DeLoSecrets/a66hlehbsvi4xmf7nm2izkmhuy/API Secret"
+  fulfilment:
+    kind: manual-license-key
+    promise_hours: 24
+    outstanding_argv: ["uv", "run", "issuer.py", "--stripe-key-ref", "op://DeLoSecrets/x/API Secret", "outstanding"]
+    reminder_candybar: earshot-paid-key-reminder
+"""
+
+
+def test_monitor_live_is_exactly_live_and_never_calls_px(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration=LIVE_DECL)
+    (r.state / "board.json").unlink()  # a px call would crash the shim
+    out = r.run("--monitor")
+    assert out.returncode == 0 and out.stdout == "launch-mode: live\n" and out.stderr == ""
+    assert r.run("--monitor").stdout == out.stdout  # unchanged snapshot: 0 tokens
+
+
+def test_brief_live_has_no_finish_line_to_drive(tmp_path, monkeypatch):
+    out = Repo(tmp_path, monkeypatch, declaration=LIVE_DECL).run("--brief")
+    assert out.returncode == 0 and out.stdout.startswith("launch-mode: live\n") and "quiet: live" in out.stdout
+    assert "# Snapshot" not in out.stdout
+
+
+def test_apply_live_refuses_and_writes_nothing(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration=LIVE_DECL)
+    r.plan({"writes": [{"op": "comment", "ref": "EARS-2", "text": "x"}]})
+    out = r.run("--apply")
+    assert out.returncode == 0 and "launch-mode: live: apply refused" in out.stdout
+    assert r.writes() == []
+
+
+def test_check_parses_the_live_block_three_levels_deep(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration=LIVE_DECL)
+    spec = importlib.util.spec_from_file_location("launch_pass", DRIVER)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    data = mod.parse_yaml((r.root / ".launch.yaml").read_text())
+    live = data["live"]
+    assert live["name"] == "Earshot" and live["checkout"]["provider"] == "stripe"
+    assert live["checkout"]["key_ref"] == "op://DeLoSecrets/a66hlehbsvi4xmf7nm2izkmhuy/API Secret"
+    assert live["fulfilment"]["outstanding_argv"][-1] == "outstanding" and live["fulfilment"]["promise_hours"] == "24"
+    decl = mod.load_declaration(r.root)
+    assert decl["mode"] == "live" and decl["active"] is False and decl["live_since"] == "2026-11-20"
+    assert mod.load_declaration(tmp_path / "nowhere")["mode"] == "steady"
 
 
 # ---------------------------------------------------------------------------------- brief
