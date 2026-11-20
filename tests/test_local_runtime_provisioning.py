@@ -258,7 +258,7 @@ def test_runtime_provisioner_never_mutates_generated_profile_config_with_hermes(
     assert not Path(env["HERMES_LOG"]).exists()
 
 
-def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> None:
+def test_pm_voice_inherits_fleet_base_voice_and_claims_what_it_speaks(tmp_path: Path) -> None:
     _project, role, env = _fixture(tmp_path)
     plugin = tmp_path / "vox-plugin"
     plugin.mkdir()
@@ -274,18 +274,21 @@ def test_pm_voice_claim_matches_effective_vox_carlin_config(tmp_path: Path) -> N
     result = _run(role, env)
 
     assert result.returncode == 0, result.stderr
-    assert "PM voice verified: provider=vox voice=carlin" in result.stderr
+    # No VOX_VOICE: the desk pins nothing and speaks the fleet base voice (rick).
+    assert "PM voice verified: provider=vox voice=rick" in result.stderr
     assert (profile / "plugins" / "tts" / "vox").resolve() == plugin.resolve()
     generated = (profile / "config.yaml").read_text(encoding="utf-8")
     assert "tts/voxxy" not in generated
     assert "fleet/core-one" in generated
     assert "provider: vox\n" in generated
-    assert "voice: carlin\n" in generated
+    assert "voice: rick\n" in generated
+    assert "carlin" not in generated
     assert not Path(env["HERMES_LOG"]).exists()
 
     delta_path = profile / "config.delta.yaml"
     delta = yaml.safe_load(delta_path.read_text(encoding="utf-8"))
     assert "plugins" not in delta
+    assert "voice" not in delta["tts"] and "voice" not in (delta["tts"].get("vox") or {}), "no stamped default"
     assert delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"] == {
         "add": ["tts/vox"],
         "remove": ["tts/voxxy"],

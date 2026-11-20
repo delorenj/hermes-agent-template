@@ -139,7 +139,12 @@ VOX_URL_VALUE="${VOX_URL:-$(cfg fleet.vox_url 'https://vox.delo.sh')}"
 # optional dependency reported ONCE — not per-agent drift, which previously
 # buried every real finding under 20+ lines of noise.
 VOX_PLUGIN_NAME="${VOX_PLUGIN_NAME:-$(cfg fleet.vox_plugin_name vox)}"
-VOX_VOICE="${VOX_VOICE:-$(cfg fleet.vox_voice carlin)}"
+# The fleet's default voice is the fleet base (~/.hermes/config.yaml tts.vox.voice),
+# never a value stamped into each desk. VOX_VOICE is an explicit one-off override
+# only; unset, every desk keeps its own pin or inherits the base.
+VOX_VOICE="${VOX_VOICE:-}"
+VOX_VOICE_ARGS=()
+[[ -n "$VOX_VOICE" ]] && VOX_VOICE_ARGS=(--voice "$VOX_VOICE")
 VOX_PLUGIN_DIR="${VOX_PLUGIN_DIR:-$(cfg fleet.vox_plugin_dir "")}"
 if [[ -z "$VOX_PLUGIN_DIR" || ! -d "$VOX_PLUGIN_DIR" ]]; then
   for candidate in \
@@ -796,7 +801,7 @@ PYEOF
         --delta "$profile_dir/config.delta.yaml" \
         --generated "$profile_dir/config.yaml" \
         --plugin "$VOX_PLUGIN_NAME" \
-        --voice "$VOX_VOICE")"
+        "${VOX_VOICE_ARGS[@]}")"
       case "$config_status" in
         ok) ;;
         manual\|*)
@@ -810,16 +815,16 @@ PYEOF
               --delta "$profile_dir/config.delta.yaml" \
               --generated "$profile_dir/config.yaml" \
               --plugin "$VOX_PLUGIN_NAME" \
-              --voice "$VOX_VOICE"
+              "${VOX_VOICE_ARGS[@]}"
             then
-              note "$agent_id" FIXED "TTS delta enforced -> $VOX_PLUGIN_NAME/$VOX_VOICE"
+              note "$agent_id" FIXED "TTS delta enforced -> $VOX_PLUGIN_NAME/${VOX_VOICE:-desk-or-fleet-voice}"
               changed=1; FIXED=$((FIXED + 1))
             else
               note "$agent_id" DRIFT "TTS delta update failed; Vox not verified"
               DRIFT=$((DRIFT + 1))
             fi
           else
-            note "$agent_id" DRIFT "TTS config/delta requires reconciliation -> $VOX_PLUGIN_NAME/$VOX_VOICE"
+            note "$agent_id" DRIFT "TTS config/delta requires reconciliation -> $VOX_PLUGIN_NAME/${VOX_VOICE:-desk-or-fleet-voice}"
             DRIFT=$((DRIFT + 1))
           fi
           ;;

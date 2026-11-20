@@ -315,7 +315,7 @@ profile_config_delta_update() {
   [[ -f "$profile_lock_tool" && ! -L "$profile_lock_tool" ]] \
     || die "trusted PM profile config lock helper is unavailable"
   if [[ "${2:-}" == "voice" ]]; then
-    [[ $# -eq 4 ]] || die "voice requires a profile, plugin, and voice"
+    [[ $# -eq 3 || $# -eq 4 ]] || die "voice requires a profile, a plugin, and an optional voice"
     local voice_tool="$ROLE_DIR/.scripts/lib/voice-config.py"
     [[ -f "$voice_tool" && ! -L "$voice_tool" ]] \
       || die "trusted PM voice config helper is unavailable"
@@ -324,7 +324,7 @@ profile_config_delta_update() {
       --delta "$1/config.delta.yaml" \
       --generated "$1/config.yaml" \
       --plugin "$3" \
-      --voice "$4"
+      ${4:+--voice "$4"}
     return
   fi
   PJANGLER_REGISTRY_FILE="${REGISTRY_FILE:-}" python3 - "$profile_lock_tool" "$@" <<'PYEOF'

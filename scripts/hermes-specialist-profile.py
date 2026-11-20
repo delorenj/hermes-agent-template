@@ -401,19 +401,19 @@ def project(request, check):
             if current_voice is not None and current_voice not in (previous, voice):
                 raise ValueError("ownership conflict: definition voice conflicts with profile override")
         else:
-            base_tts = base.get("tts") or {}
-            voice = (current_voice if current_voice is not None else
-                     os.environ.get("VOX_VOICE") or fleet_cfg.get("vox_voice") or
-                     (base_tts.get(plugin_name) or {}).get("voice") or base_tts.get("voice") or "carlin")
+            # No definition voice: keep the desk's own pin, else an explicit
+            # VOX_VOICE, else None -- the desk inherits the fleet base voice
+            # (~/.hermes/config.yaml), so a default change reaches it on render.
+            voice = current_voice if current_voice is not None else (os.environ.get("VOX_VOICE") or None)
         try:
-            if not isinstance(voice, str):
+            if voice is not None and not isinstance(voice, str):
                 raise voice_config.ContractError("invalid TTS voice name")
             voice_config.reconcile_delta(delta, plugin_name, voice)
         except voice_config.ContractError as exc:
             raise ValueError(f"voice contract refused: {exc}")
         # Preserve a desk-specific endpoint; otherwise use the same service key
         # as fleet-sync. The plugin reads tts.<plugin>.base_url, not vox_url.
-        endpoint = (delta["tts"][plugin_name].get("base_url") or os.environ.get("VOX_URL") or
+        endpoint = ((delta["tts"].get(plugin_name) or {}).get("base_url") or os.environ.get("VOX_URL") or
                     fleet_cfg.get("vox_url") or ((base.get("tts") or {}).get(plugin_name) or {}).get("base_url") or
                     "https://vox.delo.sh")
         if not isinstance(endpoint, str):
@@ -422,10 +422,11 @@ def project(request, check):
         if (url.scheme not in ("http", "https") or not url.netloc or url.username is not None
                 or url.password is not None or url.query or url.fragment):
             raise ValueError("voice contract refused: Vox URL must be an HTTP(S) endpoint without credentials")
-        delta["tts"][plugin_name]["base_url"] = endpoint
+        delta["tts"].setdefault(plugin_name, {})["base_url"] = endpoint
         managed["tts.provider"] = plugin_name
-        managed["tts.voice"] = voice
-        managed[f"tts.{plugin_name}.voice"] = voice
+        if voice is not None:
+            managed["tts.voice"] = voice
+            managed[f"tts.{plugin_name}.voice"] = voice
         managed[f"tts.{plugin_name}.base_url"] = endpoint
         # THE expected config (base + delta + renderer pins), the same value `check` compares against.
         merged = r.expected_config(base, delta, employee)

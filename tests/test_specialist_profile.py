@@ -416,7 +416,7 @@ def voice_env(env, tmp_path, plugin_dir=True):
     if plugin_dir:
         plugin.mkdir(parents=True)
     (toml_dir / "config.toml").write_text(
-        f'[fleet]\nvox_plugin_name = "vox"\nvox_plugin_dir = "{plugin}"\nvox_voice = "carlin"\n')
+        f'[fleet]\nvox_plugin_name = "vox"\nvox_plugin_dir = "{plugin}"\n')
     return {**env, "HERMES_TEMPLATE_CONFIG": str(toml_dir / "config.toml"), "VOX_PLUGIN_DIR": ""}, plugin
 
 
@@ -426,18 +426,18 @@ def test_voice_contract_and_plugin_link_land(tmp_path):
     result = run(request, env)
     assert result.returncode == 0, result.stderr
     delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
-    assert delta["tts"] == {"provider": "vox", "voice": "carlin", "vox": {"voice": "carlin", "base_url": "https://vox.delo.sh"}}
+    # No definition voice: the desk pins nothing and inherits the fleet base voice.
+    assert delta["tts"] == {"provider": "vox", "vox": {"base_url": "https://vox.delo.sh"}}
     patches = delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]
     assert patches["add"] == ["tts/vox"]
     assert patches["remove"] == ["tts/voxxy"]
     config = yaml.safe_load((profile / "config.yaml").read_text())
     assert config["tts"]["provider"] == "vox"
-    assert config["tts"]["voice"] == "carlin"
-    assert config["tts"]["vox"]["voice"] == "carlin"
+    assert "voice" not in config["tts"] and "voice" not in config["tts"]["vox"]
     link = profile / "plugins/tts/vox"
     assert link.is_symlink() and link.resolve() == plugin
     receipt = json.loads((profile / "specialist-projection.json").read_text())
-    assert receipt["voice"] == {"plugin": "vox", "voice": "carlin", "plugin_dir": str(plugin), "installed": True}
+    assert receipt["voice"] == {"plugin": "vox", "voice": None, "plugin_dir": str(plugin), "installed": True}
     # idempotent re-run: no managed bytes or receipts change
     before = snapshot(profile)
     again = run(request, env)
@@ -446,7 +446,7 @@ def test_voice_contract_and_plugin_link_land(tmp_path):
     assert snapshot(profile) == before
 
 
-def test_definition_voice_overrides_fleet_default(tmp_path):
+def test_definition_voice_pins_the_desk(tmp_path):
     fleet, profile, request, env = fixture(tmp_path)
     env, plugin = voice_env(env, tmp_path)
     request["voice"] = "walken"
@@ -767,3 +767,22 @@ def test_definition_voice_beats_environment_default(tmp_path):
     result = run(request, {**env, "VOX_VOICE": "carlin"})
     assert result.returncode == 0, result.stderr
     assert yaml.safe_load((profile / "config.yaml").read_text())["tts"]["voice"] == "walken"
+
+
+def test_fleet_base_voice_change_reaches_an_unpinned_desk(tmp_path):
+    """The fleet base is THE default voice: change it, re-run, and the desk speaks the new one."""
+    fleet, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    base_path = fleet / "config.yaml"
+    base = yaml.safe_load(base_path.read_text())
+    base["tts"] = {"provider": "vox", "voice": "carlin", "vox": {"voice": "carlin"}}
+    base_path.write_text(yaml.safe_dump(base))
+    assert run(request, env).returncode == 0
+    assert yaml.safe_load((profile / "config.yaml").read_text())["tts"]["voice"] == "carlin"
+    base["tts"] = {"provider": "vox", "voice": "kurzgesagt", "vox": {"voice": "kurzgesagt"}}
+    base_path.write_text(yaml.safe_dump(base))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    tts = yaml.safe_load((profile / "config.yaml").read_text())["tts"]
+    assert tts["voice"] == tts["vox"]["voice"] == "kurzgesagt"
+    assert "voice" not in yaml.safe_load((profile / "config.delta.yaml").read_text())["tts"]

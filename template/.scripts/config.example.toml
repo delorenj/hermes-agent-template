@@ -42,7 +42,8 @@ codex_home = "~/.codex"
 # Optional Vox plugin + service defaults for Hermes PM agents.
 vox_plugin_name = "vox"
 vox_plugin_dir = "~/code/voxxy/plugins/tts/vox"
-vox_voice = "carlin"
+# No vox_voice: the fleet default voice is ~/.hermes/config.yaml tts.vox.voice;
+# a desk pins its own only in its config.delta.yaml (or a definition `voice:`).
 vox_url = "https://vox.delo.sh"
 # Channel credentials are written directly to Password items in this vault;
 # only op:// references are recorded in named-profile config.delta.yaml.
