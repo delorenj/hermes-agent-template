@@ -66,3 +66,10 @@ def test_inherit_leaves_other_provider_keys(vc):
 def test_invalid_pin_refused(vc):
     with pytest.raises(vc.ContractError):
         vc.reconcile_delta({"tts": {"voice": "../etc"}}, "vox")
+
+
+def test_clear_drops_the_pin(vc):
+    delta = {"tts": {"provider": "vox", "voice": "brule", "vox": {"voice": "brule", "base_url": "https://vox.test"}}}
+    vc.clear_pin(delta, "vox")
+    vc.reconcile_delta(delta, "vox")
+    assert delta["tts"] == {"provider": "vox", "vox": {"base_url": "https://vox.test"}}

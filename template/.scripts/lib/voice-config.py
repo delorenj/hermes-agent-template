@@ -331,6 +331,17 @@ def desk_voice(tts: dict, plugin: str) -> str | None:
     return None
 
 
+def clear_pin(delta: dict, plugin: str) -> None:
+    """Drop a desk's voice pin so it inherits the fleet base voice again."""
+    tts = delta.get("tts")
+    if not isinstance(tts, dict):
+        return
+    tts.pop("voice", None)
+    provider = tts.get(plugin)
+    if isinstance(provider, dict):
+        provider.pop("voice", None)
+
+
 def reconcile_delta(delta: dict, plugin: str, voice: str | None = None) -> None:
     """Wire the TTS plugin into a desk delta; never stamp the fleet default voice.
 
@@ -500,6 +511,8 @@ def reconcile(args: argparse.Namespace) -> int:
         generated_original = snapshot(generated_path, 0o600)
         PROFILE_LOCK.test_snapshot_barrier("voice")
         delta = load_mapping(delta_path, required=False)
+        if getattr(args, "clear", False):
+            clear_pin(delta, args.plugin)
         reconcile_delta(delta, args.plugin, args.voice or None)
         delta_content = render_delta(delta, delta_original.content)
         generated_content = render_generated(base, delta, base_path, profile)
@@ -521,6 +534,8 @@ def check(args: argparse.Namespace) -> int:
             base = load_mapping(base_path)
             original_delta = load_mapping(delta_path, required=False)
             expected_delta = copy.deepcopy(original_delta)
+            if getattr(args, "clear", False):
+                clear_pin(expected_delta, args.plugin)
             reconcile_delta(expected_delta, args.plugin, args.voice or None)
             generated = load_mapping(generated_path, required=False)
             if expected_delta == original_delta and generated == merge(
@@ -549,6 +564,8 @@ def build_parser() -> argparse.ArgumentParser:
         child.add_argument("--plugin", required=True)
         # Optional: omit it and the desk keeps its own pin or inherits the fleet base voice.
         child.add_argument("--voice", default=None)
+        # Drop the desk's pin first: it inherits the fleet base voice again.
+        child.add_argument("--clear", action="store_true")
     return parser
 
 
