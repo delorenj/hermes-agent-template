@@ -1,15 +1,34 @@
-# PM reconciliation pass
+# PM reconciliation: read-only checkpoint
 
-The snapshot is the work list, not approval. Work at most three ticket operations (six actual board writes), and use the compact brief for candidates; a quiet or UNAVAILABLE snapshot means no plan. Never infer owner approval from an untagged comment, a ticket age, or agent-authored prose. Fetch exact authority/restrictions and original hold/dependency/turn evidence before proposing a decision. A plan is a proposal, not a bypass: the applier rechecks it. After EVERY hold, replenish: held/waiting tickets consume zero Krebs slots. Inspect the independent Backlog queue in priority order; accept AND triage eligible ordinary-source work now rather than waiting for answers to other tickets. An occupied scope or existing accepted Todo does not prevent acceptance. Preserve the original holds, unanswered questions, busy turns and real restrictions. If none qualifies, name the exact exclusion reason for each candidate in the pass note; never just say "waiting" or "empty". Krebs alone dispatches up to scope WIP and owns `agent:working`.
+Automatic board writes are DISABLED unconditionally. `--apply` always refuses,
+before reading policy, a plan, a lease, or providers. Do not run Pilot writes
+manually to bypass this gate. No configuration or environment flag enables it.
+Pilot/Plane does not yet offer the provider-enforced expected-version and
+human-absence mutation predicates needed to preserve `lifecycle:human` against
+an outside writer. A local lease or another read cannot close that race.
+This is NOT delivery, installation readiness, or production acceptance.
 
-Only owned Backlog requests with documented ordinary-source authority may enter Todo. For each, state `authority:` (who/what authorized this exact work), `restriction:` (why no spend, credentials, publication, legal, or reserved product decision is implied), `criteria:` (testable acceptance), `dependencies:` (verify `blocked_by` and any outside dependency), `files:` (no collision with live work or sequencing rationale), and `launch-cut:` (declared cut inclusion, or no launch declaration). Order by priority, then sort order, then ref; if skipping a higher-priority item, state the exact reason. On acceptance, the applier moves Backlog to Todo, rechecks ownership/relations/liveness, then adds `lifecycle:triaged`; a refusal keeps it untriaged for a fresh plan. Do not promote speculative, planning-only or blocked requests. Krebs alone dispatches implementation.
+The snapshot is a proposal work list, not approval. Inspect independent Backlog
+in priority order even when other work is held; preserve real holds, unanswered
+questions, busy turns, review and human tickets. Krebs alone dispatches and owns
+`agent:working`. Never infer permission from age, agent prose, or a marker prefix.
 
-Clear `lifecycle:needs-input` only after citing the actual answer and the original question, or `lifecycle:blocked` only after checking the original dependency and its current resolution. Cite `recheck:` in the evidence. Failed turns require `diagnosis:` (last-turn proof and no active/queued/detached turn) and `recovery:` (the named next action); never clear `agent:failed` based on age. Do not touch a `lifecycle:human` ticket at all, even with a comment. Any ambiguous authority, source or ownership: stop and report, do not improvise.
+For an intake proposal, cite `authority:`, `restriction:`, `criteria:`,
+`dependencies:`, `files:`, and `launch-cut:` evidence. A resolved-hold proposal
+needs the original question/dependency and `recheck:` proof. Failed-turn proposals
+need `diagnosis:` and `recovery:`. Reserved spend/publication/legal/credential
+and product decisions remain reserved. Ambiguous sources stay unknown.
 
-Write ONE new JSON plan to the path in the brief, then invoke --apply once. Shape:
-{"writes":[{"op":"intake|resolve|failed","ref":"BOARD-1","scope":"repo:slug or (unlabeled)","expected":"64-character digest printed by brief","evidence":"intake: authority: ... restriction: ... criteria: ... dependencies: ... files: ... launch-cut: ...; hold: recheck: ...; failed: diagnosis: ... recovery: ...","hold":" for intake, else exact lifecycle:needs-input|lifecycle:blocked|agent:failed"}],"roadmap":"Only still-open work, under 4000 characters","note":"exact skipped Backlog reasons or short pass result"}
+Optional read-only evaluation: save a local runtime JSON plan then use
+`--evaluate <absolute-plan-path>`. A successful result says `proposal_only`, never
+applied. Shape:
+{"writes":[{"op":"intake|resolve|failed","ref":"BOARD-1","scope":"repo:slug or (unlabeled)","expected":"digest printed by brief","evidence":"authority: ... restriction: ... criteria: ... dependencies: ... files: ... launch-cut: ...","hold":""}],"note":"exact excluded-candidate reasons"}
 
-The driver caps actual board writes at six (at most three two-write ticket
-operations), checks exact current owner routing, fresh ticket state, liveness,
-lease and expected digest before each operation, records a receipt and stops on
-the first refusal. If a receipt exists, create a NEW plan filename with fresh expected digests; never replay a partially applied plan. No board comment on a quiet pass.
+A no-write plan is `{"writes":[],"note":"specific reasons"}`. Evaluation prints
+its note locally; it does not create a receipt, consume a plan, update a roadmap,
+or touch a lease. Estimated provider cost is THREE mutations per intake (move
+PATCH + evidence POST + triage PATCH) and TWO per hold recovery, maximum six.
+Those are proposal estimates, not a working write adapter or runtime cost bound.
+Reject/disposition, paging fairness, global read/deadline bounds, atomic confined
+receipts and exact lease handoff remain deferred. No comment echo is ignored
+without actor/receipt proof; this checkpoint conservatively retains all comments.

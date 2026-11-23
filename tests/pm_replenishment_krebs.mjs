@@ -1,6 +1,6 @@
-// End-to-end source fixture: the Python PM applier accepts and triages; the real
-// Krebs runTick consumes its resulting Todo tickets through its injected Plane.
-// Nothing here connects to a live board, NATS or Candystore.
+// Isolated collaborator model: input Todo is explicitly constructed by the test,
+// NOT PM-applier output (public --apply is disabled). Real injected Krebs runTick
+// exercises that model only; no live board, NATS or Candystore is contacted.
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -45,4 +45,4 @@ assert.deepEqual(publish.sent.map((c) => [c.data.context.ticket_key, c.data.cont
   ["SOLO-3", "ticket-delegation", "solo-pm", "bloodbank.agent.invocation.start"],
   ["SOLO-4", "ticket-delegation", "solo-pm", "bloodbank.agent.invocation.start"],
 ]);
-console.log("PM accepted/triaged priority queue; real Krebs runTick dispatched two via supported command; original holds untouched");
+console.log("isolated collaborator model: real injected Krebs runTick dispatched two modeled Todo tickets; NOT PM apply or production acceptance");

@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
-"""Owning-PM reconciliation. Candybar clocks the external Hermes job; this is not a dispatcher.
+"""Read-only owning-PM reconciliation prototype; automatic board writes are disabled.
 
-The authority and liveness commands are read-only, independently maintained sources. Missing,
-malformed or unobservable sources fail closed. Each operation checks a fresh ticket under the
-board-driver lease; no timestamp, age or untagged comment alone is an approval.
+Pilot/Plane must own conditional version + human-absence mutation predicates.
+Local leases and fresh reads cannot exclude an external writer's race.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import time
 
 HERE = Path(__file__).resolve().parent
 ROLE = HERE.parent
 RUNTIME = ROLE / "runtime"
-LEASE = HERE / "board-lease.py"
 PROMPT = HERE / "pm-reconcile.prompt.md"
 POLICY = RUNTIME / "pm-reconcile.json"
 PLAN = RUNTIME / "pm-reconcile-plan.json"
-RECEIPTS = RUNTIME / "pm-reconcile-receipts"
-REF = re.compile(r"^[A-Z][A-Z0-9]*-[1-9][0-9]*$")
+REF = re.compile(r"^[A-Z0-9]+-[1-9][0-9]*$")
 HOLDS = {"lifecycle:needs-input", "lifecycle:blocked", "agent:failed"}
 OPS = {"intake", "resolve", "failed"}
 
@@ -60,7 +55,7 @@ def authority(cfg: dict) -> dict:
         raise ValueError("owner authority unavailable or changed")
     board = data.get("board")
     scopes = data.get("scopes")
-    if not isinstance(board, str) or not re.fullmatch(r"[A-Z][A-Z0-9]*", board) or not isinstance(scopes, list) or not scopes or not all(isinstance(s, str) for s in scopes):
+    if not isinstance(board, str) or not re.fullmatch(r"[A-Z0-9]+", board) or not isinstance(scopes, list) or not scopes or not all(isinstance(s, str) for s in scopes):
         raise ValueError("scope authority unavailable")
     if len(scopes) != len(set(scopes)):
         raise ValueError("duplicate scope authority")
@@ -142,19 +137,20 @@ def launch_cut(repo: Path, ref: str) -> None:
             raise ValueError("ticket not in declared launch critical cut")
 
 
+def durable(t: dict) -> dict:
+    # Pilot's derived queue/ETA view is not a persisted ticket fact.
+    return {key: value for key, value in t.items() if key != "pipeline"}
+
+
 def digest(t: dict) -> str:
-    # Ignore the PM's own tagged comment on monitor, NOT for apply freshness.
-    return hashlib.sha256(json.dumps(t, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(durable(t), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def monitored(t: dict) -> str:
-    # Ignore only the tagged comment's echo; keep every other ticket field, including
-    # a real state/label change. An own comment can update the ticket timestamp.
-    copy = dict(t)
+    copy = durable(t)
     copy.pop("updated_at", None)
-    comments = copy.get("comments")
-    if isinstance(comments, list):
-        copy["comments"] = [c for c in comments if not isinstance(c, dict) or not (str(c.get("text") or c.get("comment_html") or "").startswith("[pm-reconcile]"))]
+    # No provider-actor/receipt proof exists in this checkpoint. Keep ALL comments;
+    # a marker prefix is not attribution, and must never hide another author's edit.
     return digest(copy)
 
 
@@ -245,143 +241,92 @@ def brief() -> int:
         print(f"{len(rows)-30} further candidates omitted; wait for a bounded later pass")
     road = RUNTIME / "pm-reconcile-roadmap.md"
     print("\n# Local context\n" + (road.read_text()[:4000] if road.exists() else "none"))
-    print(f"\nWrite a NEW JSON plan filename under {RUNTIME} (never reuse a receipted name). Apply with python3 {HERE / 'pm-reconcile.py'} --apply <absolute-plan-path>.")
+    print(f"\nAutomatic board writes DISABLED. Optional read-only proposal evaluation: save JSON under {RUNTIME} and run --evaluate <absolute-plan-path>. --apply always refuses; no install readiness.")
     return 0
 
 
-def lease(cmd: str, lock: Path, owner: str) -> bool:
-    return subprocess.run([sys.executable, str(LEASE), cmd, str(lock), owner], capture_output=True, timeout=10).returncode == 0
+def evaluate_plan(cfg: dict, plan: dict) -> list[dict]:
+    """Read-only proposal checks, not production mutation acceptance."""
+    if not isinstance(plan, dict) or set(plan) - {"writes", "roadmap", "note"} or not isinstance(plan.get("writes"), list):
+        raise ValueError("invalid plan")
+    writes = plan["writes"]
+    if not writes:
+        if not isinstance(plan.get("note"), str) or not plan["note"].strip() or len(plan["note"]) > 4000:
+            raise ValueError("no-write plan requires a bounded note")
+        return [{"status": "proposal_only", "note": plan["note"], "provider_mutations": 0}]
+    shape = {"op", "ref", "scope", "expected", "evidence", "hold"}
+    if len(writes) > 6 or any(not isinstance(w, dict) or set(w) != shape for w in writes):
+        raise ValueError("invalid or over-cap plan")
+    if any(not isinstance(w["op"], str) or w["op"] not in OPS for w in writes):
+        raise ValueError("unsupported operation")
+    # Real Pilot move -m = state PATCH + evidence POST; triage = another PATCH.
+    cost = sum(3 if w["op"] == "intake" else 2 for w in writes)
+    if cost > 6:
+        raise ValueError("plan exceeds six provider mutations")
+    if any(not isinstance(w["ref"], str) for w in writes) or len({w["ref"] for w in writes}) != len(writes):
+        raise ValueError("invalid or duplicate ticket in plan")
+    auth = authority(cfg)
+    entries = []
+    for w in writes:
+        op, ref, scope, expected, evidence, hold = (w[k] for k in ("op", "ref", "scope", "expected", "evidence", "hold"))
+        if not REF.fullmatch(ref) or not isinstance(scope, str) or scope not in auth["scopes"] or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 1200:
+            raise ValueError("invalid fields or scope")
+        if not isinstance(hold, str) or hold not in ("", "lifecycle:needs-input", "lifecycle:blocked", "agent:failed"):
+            raise ValueError("invalid hold")
+        t = ticket(cfg, ref, scope, auth["board"])
+        ticket_authority(cfg, ref, scope)
+        labels = set(t["label_names"])
+        if {"lifecycle:human", "agent:working", "lifecycle:review"}.intersection(labels):
+            raise ValueError("human, working or review ticket")
+        if digest(t) != expected:
+            raise ValueError("stale expected snapshot")
+        liveness(cfg, ref)
+        if op == "intake":
+            if t["state_name"] != "Backlog" or hold or HOLDS.intersection(labels):
+                raise ValueError("intake requires unheld Backlog")
+            intake_relations(t)
+            launch_cut(Path(cfg["repo"]), ref)
+            if not all(x in evidence.lower() for x in ("authority:", "restriction:", "criteria:", "dependencies:", "files:", "launch-cut:")):
+                raise ValueError("intake requires authority, restriction, criteria, dependencies, files and launch-cut disposition")
+        else:
+            if (op == "failed" and hold != "agent:failed") or hold not in labels or (op == "resolve" and hold not in HOLDS - {"agent:failed"}):
+                raise ValueError("specified hold not present or wrong recovery")
+            if len(HOLDS.intersection(labels)) != 1 or t["state_name"] not in ("Todo", "In Progress"):
+                raise ValueError("multiple holds or wrong lane")
+            if (op == "resolve" and "recheck:" not in evidence.lower()) or (op == "failed" and ("diagnosis:" not in evidence.lower() or "recovery:" not in evidence.lower())):
+                raise ValueError("hold needs recheck or failed-turn diagnosis and recovery")
+        entries.append({"status": "proposal_only", "ref": ref, "op": op, "provider_mutations": 0,
+                        "estimated_mutations_if_supported": 3 if op == "intake" else 2})
+    return entries
 
 
-def receipt(path: Path, entries: list[dict]) -> None:
-    RECEIPTS.mkdir(parents=True, exist_ok=True)
-    target = RECEIPTS / (path.name + ".receipt.json")
-    target.write_text(json.dumps(entries, indent=2) + "\n")
+def evaluate(path: Path) -> int:
+    try:
+        if not path.is_absolute() or path.is_symlink() or path.resolve().parent != RUNTIME.resolve() or path.suffix != ".json":
+            raise ValueError("plan must be a runtime JSON file")
+        entries = evaluate_plan(configuration(), json.loads(path.read_text()))
+        print(json.dumps({"status": "proposal_only", "automatic_writes": "disabled", "entries": entries}))
+        return 0
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        print(f"REFUSED: {error}; no writes")
+        return 2
 
 
 def apply(path: Path) -> int:
-    try:
-        cfg = configuration()
-        if not LEASE.is_file():
-            raise ValueError("lease helper missing")
-        plan = json.loads(path.read_text())
-        if not isinstance(plan, dict) or set(plan) - {"writes", "roadmap", "note"} or not isinstance(plan.get("writes"), list) or len(plan["writes"]) > 6:
-            raise ValueError("invalid or over-cap plan")
-        if not path.is_absolute() or path.resolve().parent != RUNTIME.resolve() or path.suffix != ".json":
-            raise ValueError("plan must be a runtime JSON file")
-        if not plan["writes"] or any(not isinstance(w, dict) or set(w) != {"op", "ref", "scope", "expected", "evidence", "hold"} for w in plan["writes"]):
-            raise ValueError("plan has no valid writes")
-        if len(plan["writes"]) * 2 > 6:
-            raise ValueError("plan exceeds six board writes")
-        if any(not isinstance(w["ref"], str) for w in plan["writes"]) or len({w["ref"] for w in plan["writes"]}) != len(plan["writes"]):
-            raise ValueError("invalid or duplicate ticket in plan")
-        owner = os.environ.get("HERMES_BOARD_LEASE_OWNER")
-        lock = Path(os.environ.get("HERMES_BOARD_LEASE_PATH") or RUNTIME / "wip-driver.lock")
-        if not os.environ.get("HERMES_BOARD_LEASE_PATH") or not owner or not re.fullmatch(r"hermes:" + re.escape(cfg["employee"]) + r":[a-zA-Z0-9_-]+", owner) or lock.resolve() != (RUNTIME / "wip-driver.lock").resolve():
-            raise ValueError("exact launcher lease owner/path required")
-        # Ensure no existing receipt: a consumed plan is never replayed.
-        if (RECEIPTS / (path.name + ".receipt.json")).exists():
-            raise ValueError("plan already consumed")
-        auth = authority(cfg)
-        if not lease("acquire", lock, owner):
-            raise ValueError("lease held by another driver")
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError, json.JSONDecodeError) as error:
-        print(f"REFUSED: {error}; plan retained")
-        return 2
-    entries: list[dict] = []
-    try:
-        for i, w in enumerate(plan["writes"]):
-            result = {"i": i, "status": "refused"}
-            try:
-                if not lease("held", lock, owner) or not lease("refresh", lock, owner):
-                    raise ValueError("lease lost")
-                current_auth = authority(cfg)
-                if current_auth != auth:
-                    raise ValueError("authority changed")
-                if not isinstance(w, dict) or set(w) != {"op", "ref", "scope", "expected", "evidence", "hold"}:
-                    raise ValueError("invalid write shape")
-                op, ref, scope, expected, evidence, hold = (w[k] for k in ("op", "ref", "scope", "expected", "evidence", "hold"))
-                if not isinstance(op, str) or op not in OPS or not isinstance(ref, str) or not REF.fullmatch(ref) or not isinstance(scope, str) or scope not in auth["scopes"] or not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or not isinstance(evidence, str) or not evidence.strip() or len(evidence) > 1200:
-                    raise ValueError("invalid fields or scope")
-                if not isinstance(hold, str) or hold not in ("", "lifecycle:needs-input", "lifecycle:blocked", "agent:failed"):
-                    raise ValueError("invalid hold")
-                t = ticket(cfg, ref, scope, auth["board"])
-                ticket_authority(cfg, ref, scope)
-                labels = set(t["label_names"])
-                if "lifecycle:human" in labels or "agent:working" in labels or "lifecycle:review" in labels:
-                    raise ValueError("human, working or review ticket")
-                if digest(t) != expected:
-                    raise ValueError("stale expected snapshot")
-                liveness(cfg, ref)
-                if op == "intake":
-                    if t["state_name"] != "Backlog" or hold or HOLDS.intersection(labels):
-                        raise ValueError("intake requires unheld Backlog")
-                    intake_relations(t)
-                    launch_cut(Path(cfg["repo"]), ref)
-                    if not all(x in evidence.lower() for x in ("authority:", "restriction:", "criteria:", "dependencies:", "files:", "launch-cut:")):
-                        raise ValueError("intake requires authority, restriction, criteria, dependencies, files and launch-cut disposition")
-                    argv = ["move", ref, "Todo", "-m", "[pm-reconcile] " + evidence]
-                else:
-                    if (op == "failed" and hold != "agent:failed") or hold not in labels or (op == "resolve" and hold not in HOLDS - {"agent:failed"}):
-                        raise ValueError("specified hold not present or wrong recovery")
-                    if len(HOLDS.intersection(labels)) != 1 or t["state_name"] not in ("Todo", "In Progress"):
-                        raise ValueError("multiple holds or wrong lane")
-                    if (op == "resolve" and "recheck:" not in evidence.lower()) or (op == "failed" and ("diagnosis:" not in evidence.lower() or "recovery:" not in evidence.lower())):
-                        raise ValueError("hold needs recheck or failed-turn diagnosis and recovery")
-                    argv = ["comment", ref, "-m", "[pm-reconcile] " + evidence]
-                # All steps are serial under the lease; a failed comment never clears its hold.
-                if op != "intake":
-                    command_result = subprocess.run(["px", *argv], cwd=cfg["repo"], capture_output=True, text=True, timeout=60)
-                    if command_result.returncode:
-                        raise ValueError("evidence comment failed")
-                    if not lease("held", lock, owner):
-                        raise ValueError("lease lost after evidence; hold retained")
-                    authority(cfg)
-                    fresh = ticket(cfg, ref, scope, auth["board"])
-                    ticket_authority(cfg, ref, scope)
-                    if monitored(fresh) != monitored(t) or fresh["state_name"] != t["state_name"] or set(fresh["label_names"]) != labels:
-                        raise ValueError("ticket changed after evidence; hold retained")
-                    liveness(cfg, ref)
-                    argv = ["label", "remove", ref, hold]
-                run = subprocess.run(["px", *argv], cwd=cfg["repo"], capture_output=True, text=True, timeout=60)
-                if run.returncode:
-                    raise ValueError(f"px write failed ({run.returncode}); outcome uncertain")
-                if op == "intake":
-                    if not lease("held", lock, owner) or not lease("refresh", lock, owner):
-                        raise ValueError("lease lost after intake; Todo left untriaged")
-                    authority(cfg)
-                    accepted = ticket(cfg, ref, scope, auth["board"])
-                    ticket_authority(cfg, ref, scope)
-                    if accepted["state_name"] != "Todo" or not {"agent:working", "lifecycle:human", "lifecycle:review", "lifecycle:triaged"}.isdisjoint(accepted["label_names"]) or HOLDS.intersection(accepted["label_names"]):
-                        raise ValueError("ticket changed after intake; Todo left untriaged")
-                    intake_relations(accepted)
-                    launch_cut(Path(cfg["repo"]), ref)
-                    liveness(cfg, ref)
-                    triage = subprocess.run(["px", "label", "add", ref, "lifecycle:triaged"], cwd=cfg["repo"], capture_output=True, text=True, timeout=60)
-                    if triage.returncode:
-                        raise ValueError(f"triage label failed ({triage.returncode}); Todo left untriaged")
-                result.update(status="ok", ref=ref, op=op)
-            except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-                result["reason"] = str(error)[:240]
-            entries.append(result)
-            receipt(path, entries)
-            if result["status"] != "ok":
-                break  # preserve remaining operations for an independently fresh plan
-        road = plan.get("roadmap")
-        if len(entries) == len(plan["writes"]) and all(e["status"] == "ok" for e in entries) and isinstance(road, str) and len(road) <= 4000:
-            (RUNTIME / "pm-reconcile-roadmap.md").write_text(road)
-    finally:
-        lease("release", lock, owner)
-    print(json.dumps(entries))
-    return 0 if len(entries) == len(plan["writes"]) and all(e["status"] == "ok" for e in entries) else 1
+    # A local lease/re-read cannot protect against an external Plane writer.
+    # No env/config flag may enable this until Pilot owns the conditional boundary.
+    print("REFUSED: automatic board writes disabled: Pilot/Plane lacks provider-conditional version and human-absence predicates; no writes")
+    return 2
 
 
 if __name__ == "__main__":
+    if "--apply" in sys.argv:
+        raise SystemExit(apply(PLAN))
     if "--monitor" in sys.argv:
         raise SystemExit(monitor())
     if "--brief" in sys.argv:
         raise SystemExit(brief())
-    if "--apply" in sys.argv:
-        pos = sys.argv.index("--apply")
-        raise SystemExit(apply(Path(sys.argv[pos + 1]) if len(sys.argv) > pos + 1 else PLAN))
+    if "--evaluate" in sys.argv:
+        pos = sys.argv.index("--evaluate")
+        raise SystemExit(evaluate(Path(sys.argv[pos + 1]) if len(sys.argv) > pos + 1 else PLAN))
     print(__doc__)
