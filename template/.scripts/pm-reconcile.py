@@ -108,6 +108,40 @@ def ticket(cfg: dict, ref: str, scope: str, board: str) -> dict:
     return t
 
 
+def intake_relations(t: dict) -> None:
+    relations = t.get("relations")
+    if not isinstance(relations, list):
+        raise ValueError("dependency relations unavailable")
+    for relation in relations:
+        if not isinstance(relation, dict) or relation.get("resolvable") is not True or not isinstance(relation.get("type"), str) or not isinstance(relation.get("state_name"), str):
+            raise ValueError("dependency relation unreadable")
+        if relation["type"] == "blocked_by" and relation["state_name"] not in ("Done", "Cancelled"):
+            raise ValueError(f'open blocking dependency {relation.get("ref", "unknown")}')
+
+
+def launch_cut(repo: Path, ref: str) -> None:
+    path = repo / ".launch.yaml"
+    if not path.exists():
+        return
+    source = HERE / "launch-pass.py"
+    if not source.is_file():
+        raise ValueError("launch declaration reader unavailable")
+    # Reuse the canonical stdlib-only declaration parser without executing the
+    # launch driver's CLI or importing optional runtime dependencies.
+    namespace = {"__file__": str(source), "__name__": "pm_launch_declaration"}
+    exec(compile(source.read_text(), str(source), "exec"), namespace)
+    declaration = namespace["load_declaration"](repo)
+    if declaration.get("error") or not declaration.get("raw") or declaration.get("mode") not in ("launch", "live", "steady"):
+        raise ValueError("launch declaration unavailable")
+    if declaration["mode"] == "launch":
+        if not declaration.get("launch_critical") and not declaration.get("after_launch"):
+            raise ValueError("launch cut undeclared; ask PM to verify exact cut")
+        if ref in declaration.get("after_launch", []):
+            raise ValueError("ticket is after declared launch cut")
+        if declaration.get("launch_critical") and ref not in declaration["launch_critical"]:
+            raise ValueError("ticket not in declared launch critical cut")
+
+
 def digest(t: dict) -> str:
     # Ignore the PM's own tagged comment on monitor, NOT for apply freshness.
     return hashlib.sha256(json.dumps(t, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -124,11 +158,12 @@ def monitored(t: dict) -> str:
     return digest(copy)
 
 
-def read_board(cfg: dict, auth: dict) -> list[tuple[str, str, dict]]:
+def read_board(cfg: dict, auth: dict) -> tuple[list[tuple[str, str, dict]], list[str]]:
     listing = command(["px", "task", "list", "--scope", "all", "--json"], Path(cfg["repo"]))
     if listing.get("ok") is not True or listing.get("board") != auth["board"] or not isinstance(listing.get("issues"), list):
         raise ValueError("board unavailable")
     found = []
+    excluded: list[str] = []
     for item in listing["issues"]:
         if not isinstance(item, dict) or type(item.get("sequence_id")) is not int or item["sequence_id"] < 1:
             raise ValueError("board entry unreadable")
@@ -143,16 +178,38 @@ def read_board(cfg: dict, auth: dict) -> list[tuple[str, str, dict]]:
         labels = t["label_names"]
         scopes = [s for s in labels if isinstance(s, str) and s.startswith("repo:")]
         scope = scopes[0] if len(scopes) == 1 else "(unlabeled)" if not scopes else "(ambiguous)"
+        if t.get("state_name") == "Backlog":
+            if "lifecycle:human" in labels:
+                excluded.append(f"{ref}:human hold")
+            elif "agent:working" in labels:
+                excluded.append(f"{ref}:live worker label")
+            elif HOLDS.intersection(labels):
+                excluded.append(f"{ref}:held ({','.join(sorted(HOLDS.intersection(labels)))})")
+            elif scope not in auth["scopes"]:
+                excluded.append(f"{ref}:foreign or ambiguous owner scope ({scope})")
         if scope in auth["scopes"] and not {"lifecycle:human", "agent:working", "lifecycle:review"}.intersection(labels) and (t.get("state_name") == "Backlog" or HOLDS.intersection(labels)):
             ticket_authority(cfg, ref, scope)
+            if t.get("state_name") == "Backlog":
+                if t.get("priority") not in ("urgent", "high", "medium", "low", "none") or type(t.get("sort_order")) not in (int, float):
+                    raise ValueError("Backlog priority unavailable")
+                try:
+                    intake_relations(t)
+                    launch_cut(Path(cfg["repo"]), ref)
+                except ValueError as error:
+                    excluded.append(f"{ref}:{error}")
+                    continue
             found.append((ref, scope, t))
-    return sorted(found, key=lambda x: x[0])
+    order = {"urgent": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
+    return sorted(found, key=lambda x: (0 if x[2]["state_name"] == "Backlog" else 1, order.get(str(x[2].get("priority")), 5), x[2].get("sort_order", float("inf")), x[0])), sorted(excluded)
 
 
 def snapshot(cfg: dict) -> tuple[list[str], list[tuple[str, str, dict]]]:
     auth = authority(cfg)
-    rows = read_board(cfg, auth)
+    rows, excluded = read_board(cfg, auth)
     lines = ["pm-reconcile: enabled", f'owner:{cfg["employee"]}', f'board:{auth["board"]}', "scopes:" + ",".join(sorted(auth["scopes"]))]
+    if not any(t["state_name"] == "Backlog" and not HOLDS.intersection(t["label_names"]) for _, _, t in rows):
+        lines.append("eligible-backlog:none|reason:no unheld, non-human, non-working Backlog in owned scopes; inspect exclusions and existing Todo")
+    lines.extend("excluded|" + why for why in excluded)
     for ref, scope, t in rows:
         try:
             liveness(cfg, ref)
@@ -214,6 +271,8 @@ def apply(path: Path) -> int:
             raise ValueError("plan must be a runtime JSON file")
         if not plan["writes"] or any(not isinstance(w, dict) or set(w) != {"op", "ref", "scope", "expected", "evidence", "hold"} for w in plan["writes"]):
             raise ValueError("plan has no valid writes")
+        if len(plan["writes"]) * 2 > 6:
+            raise ValueError("plan exceeds six board writes")
         if any(not isinstance(w["ref"], str) for w in plan["writes"]) or len({w["ref"] for w in plan["writes"]}) != len(plan["writes"]):
             raise ValueError("invalid or duplicate ticket in plan")
         owner = os.environ.get("HERMES_BOARD_LEASE_OWNER")
@@ -257,8 +316,10 @@ def apply(path: Path) -> int:
                 if op == "intake":
                     if t["state_name"] != "Backlog" or hold or HOLDS.intersection(labels):
                         raise ValueError("intake requires unheld Backlog")
-                    if "authority:" not in evidence.lower() or "restriction:" not in evidence.lower():
-                        raise ValueError("intake needs explicit authority and restriction disposition")
+                    intake_relations(t)
+                    launch_cut(Path(cfg["repo"]), ref)
+                    if not all(x in evidence.lower() for x in ("authority:", "restriction:", "criteria:", "dependencies:", "files:", "launch-cut:")):
+                        raise ValueError("intake requires authority, restriction, criteria, dependencies, files and launch-cut disposition")
                     argv = ["move", ref, "Todo", "-m", "[pm-reconcile] " + evidence]
                 else:
                     if (op == "failed" and hold != "agent:failed") or hold not in labels or (op == "resolve" and hold not in HOLDS - {"agent:failed"}):
@@ -285,6 +346,20 @@ def apply(path: Path) -> int:
                 run = subprocess.run(["px", *argv], cwd=cfg["repo"], capture_output=True, text=True, timeout=60)
                 if run.returncode:
                     raise ValueError(f"px write failed ({run.returncode}); outcome uncertain")
+                if op == "intake":
+                    if not lease("held", lock, owner) or not lease("refresh", lock, owner):
+                        raise ValueError("lease lost after intake; Todo left untriaged")
+                    authority(cfg)
+                    accepted = ticket(cfg, ref, scope, auth["board"])
+                    ticket_authority(cfg, ref, scope)
+                    if accepted["state_name"] != "Todo" or not {"agent:working", "lifecycle:human", "lifecycle:review", "lifecycle:triaged"}.isdisjoint(accepted["label_names"]) or HOLDS.intersection(accepted["label_names"]):
+                        raise ValueError("ticket changed after intake; Todo left untriaged")
+                    intake_relations(accepted)
+                    launch_cut(Path(cfg["repo"]), ref)
+                    liveness(cfg, ref)
+                    triage = subprocess.run(["px", "label", "add", ref, "lifecycle:triaged"], cwd=cfg["repo"], capture_output=True, text=True, timeout=60)
+                    if triage.returncode:
+                        raise ValueError(f"triage label failed ({triage.returncode}); Todo left untriaged")
                 result.update(status="ok", ref=ref, op=op)
             except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                 result["reason"] = str(error)[:240]

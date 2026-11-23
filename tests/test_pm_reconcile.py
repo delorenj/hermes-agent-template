@@ -18,12 +18,12 @@ def rig(tmp_path):
     scripts.mkdir(parents=True)
     runtime = scripts.parent / "runtime"
     runtime.mkdir()
-    for file in ("pm-reconcile.py", "pm-reconcile.prompt.md", "board-lease.py"):
+    for file in ("pm-reconcile.py", "pm-reconcile.prompt.md", "board-lease.py", "launch-pass.py"):
         shutil.copy2(SOURCE / file, scripts / file)
     policy = {"version": 1, "enabled": True, "repo": str(repo), "employee": "demo-pm", "liveness_argv": [str(tmp_path / "probe.py")]}
     (runtime / "pm-reconcile.json").write_text(json.dumps(policy))
     (tmp_path / "ticket.json").write_text(json.dumps({"ok": True, "ticket": {
-        "ref": "DEMO-1", "name": "Authorized request", "state_name": "Backlog", "updated_at": "2026-11-22T10:00:00Z", "label_names": [], "comments": []}}))
+        "ref": "DEMO-1", "name": "Authorized request", "state_name": "Backlog", "state_group": "backlog", "updated_at": "2026-11-22T10:00:00Z", "priority": "medium", "sort_order": 100, "relations": [], "label_names": [], "comments": []}}))
     (tmp_path / "fixture.json").write_text(json.dumps({"ok": True, "employee": "demo-pm", "enabled": True, "board": "DEMO", "scopes": ["(unlabeled)"]}))
     (tmp_path / "probe.py").write_text("#!/usr/bin/env python3\nimport json,os,sys\nprint(json.dumps(dict(ref=sys.argv[-1], running=False, queued=False, detached=False) if os.getenv('BUSY') != '1' else dict(ref=sys.argv[-1],running=True,queued=False,detached=False)))\n")
     px = tmp_path / "px"
@@ -32,6 +32,21 @@ import json,os,sys
 from pathlib import Path
 root=Path(os.environ['FIXTURE'])
 args=sys.argv[1:]
+multifile=root/'tickets.json'
+if multifile.exists():
+ records=json.loads(multifile.read_text())
+ ref=args[2] if args[:2]==['task','get'] else args[1] if args[:1] in (['move'],['comment']) else args[2] if args[:2]==['label','add'] else None
+ if args[:2]==['task','list']:
+  print(json.dumps(dict(ok=True,board='DEMO',issues=[dict(sequence_id=int(k.split('-')[1]),state_group=v['state_group']) for k,v in records.items()])));sys.exit()
+ if args[:2]==['task','get']:
+  print(json.dumps(dict(ok=True,ticket=records[ref])));sys.exit()
+ with (root/'writes.log').open('a') as f: f.write(json.dumps(args)+'\\n')
+ t=records[ref]
+ if args[:1]==['move']: t['state_name']=args[2]; t['state_group']='unstarted'
+ if args[:2]==['label','add']: t['label_names'].append(args[3])
+ records[ref]=t
+ multifile.write_text(json.dumps(records))
+ print('ok');sys.exit()
 if args[:2]==['task','list']:
  t=json.loads((root/'ticket.json').read_text())['ticket']
  print(json.dumps(dict(ok=True,board='DEMO',issues=[dict(sequence_id=1,state_group={'Backlog':'backlog','Todo':'unstarted','In Progress':'started'}[t['state_name']])])));sys.exit()
@@ -45,6 +60,7 @@ with (root/'writes.log').open('a') as f: f.write(json.dumps(args)+'\\n')
 t=json.loads((root/'ticket.json').read_text())
 if args[:1]==['move']:t['ticket']['state_name']=args[2]
 if args[:2]==['label','remove']:t['ticket']['label_names'].remove(args[3])
+if args[:2]==['label','add']:t['ticket']['label_names'].append(args[3])
 if args[:1]==['comment']:t['ticket']['comments'].append(dict(text=args[-1]))
 t['ticket']['updated_at']='2026-11-22T11:00:00Z'
 (root/'ticket.json').write_text(json.dumps(t))
@@ -63,7 +79,7 @@ def run(rig, *args, env=None):
     return subprocess.run([sys.executable, str(scripts / "pm-reconcile.py"), *args], text=True, capture_output=True, env=env or base)
 
 
-def plan(rig, op="intake", hold="", evidence="authority: owner approved ordinary source; restriction: no publication or spend"):
+def plan(rig, op="intake", hold="", evidence="authority: owner approved ordinary source; restriction: no publication or spend; criteria: acceptance verified; dependencies: none; files: independent; launch-cut: no launch declaration"):
     _, runtime, tmp, _ = rig
     t = json.loads((tmp / "ticket.json").read_text())["ticket"]
     expected = hashlib.sha256(json.dumps(t, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -87,10 +103,11 @@ def test_intake_quiet_retry(rig):
     path = plan(rig)
     applied = run(rig, "--apply", str(path))
     assert applied.returncode == 0, applied.stdout
-    assert ticket(rig)["state_name"] == "Todo"
+    assert ticket(rig)["state_name"] == "Todo" and "lifecycle:triaged" in ticket(rig)["label_names"]
     assert writes(rig)[0][:3] == ["move", "DEMO-1", "Todo"]
+    assert writes(rig)[1] == ["label", "add", "DEMO-1", "lifecycle:triaged"]
     assert run(rig, "--apply", str(path)).returncode == 2  # durable receipt prevents replay
-    assert len(writes(rig)) == 1
+    assert len(writes(rig)) == 2
 
 
 @pytest.mark.parametrize("cause", ["human", "working", "wrong-owner", "stale", "busy", "unavailable", "missing-authority"])
@@ -177,6 +194,77 @@ def test_plan_outside_runtime_refused_without_writes(rig):
     outside = rig[2] / "outside.json"
     outside.write_text(path.read_text())
     assert run(rig, "--apply", str(outside)).returncode == 2
+    assert not writes(rig)
+
+
+def test_two_held_replenish_then_real_krebs_dispatch(rig):
+    source = ticket(rig)
+    source.update(priority="urgent", sort_order=10)
+    def make(ref, state, labels, priority="medium", sort=100):
+        return {**source, "ref": ref, "state_name": state,
+                "state_group": {"In Progress": "started", "Backlog": "backlog", "Todo": "unstarted"}[state],
+                "label_names": labels, "priority": priority, "sort_order": sort, "comments": []}
+    rows = {
+        "DEMO-1": make("DEMO-1", "In Progress", ["lifecycle:needs-input"], "urgent"),
+        "DEMO-2": make("DEMO-2", "In Progress", ["lifecycle:blocked"], "high"),
+        "DEMO-3": make("DEMO-3", "Backlog", [], "high", 20),
+        "DEMO-4": make("DEMO-4", "Backlog", [], "medium", 30),
+        "DEMO-5": make("DEMO-5", "Backlog", ["lifecycle:human"], "urgent", 1),
+    }
+    path = rig[2] / "tickets.json"
+    path.write_text(json.dumps(rows))
+    brief = run(rig, "--brief")
+    assert brief.returncode == 0
+    assert brief.stdout.index("DEMO-3 (unlabeled):") < brief.stdout.index("DEMO-4 (unlabeled):")
+    assert "DEMO-5|" not in brief.stdout
+    evidence = "authority: ordinary source accepted by owner; restriction: no spend or release; criteria: independent checks pass; dependencies: none; files: independent trees; launch-cut: no launch declaration"
+    def candidate(ref):
+        t = rows[ref]
+        expected = hashlib.sha256(json.dumps(t, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return {"op": "intake", "ref": ref, "scope": "(unlabeled)", "expected": expected, "evidence": evidence, "hold": ""}
+    proposal = rig[1] / "replenish.json"
+    proposal.write_text(json.dumps({"writes": [candidate("DEMO-3"), candidate("DEMO-4")]}))
+    result = run(rig, "--apply", str(proposal))
+    assert result.returncode == 0, result.stdout
+    after = json.loads(path.read_text())
+    assert after["DEMO-1"]["label_names"] == ["lifecycle:needs-input"]
+    assert after["DEMO-2"]["label_names"] == ["lifecycle:blocked"]
+    assert after["DEMO-5"]["label_names"] == ["lifecycle:human"]
+    assert [(after[k]["state_name"], after[k]["label_names"]) for k in ("DEMO-3", "DEMO-4")] == [("Todo", ["lifecycle:triaged"])] * 2
+    assert [(w[0], w[1 if w[0] == "move" else 2]) for w in writes(rig)] == [
+        ("move", "DEMO-3"), ("label", "DEMO-3"), ("move", "DEMO-4"), ("label", "DEMO-4")]
+    runner = SOURCE.parents[1] / "tests" / "pm_replenishment_krebs.mjs"
+    krebs = subprocess.run(["node", str(runner), str(path)], capture_output=True, text=True, timeout=30)
+    assert krebs.returncode == 0, krebs.stdout + krebs.stderr
+    assert "real Krebs runTick dispatched two" in krebs.stdout
+
+
+def test_launch_cut_and_open_dependency_refuse_without_board_writes(rig):
+    t = ticket(rig)
+    t["relations"] = [{"type": "blocked_by", "ref": "DEMO-9", "state_name": "Todo", "resolvable": True}]
+    (rig[2] / "ticket.json").write_text(json.dumps({"ok": True, "ticket": t}))
+    assert "open blocking dependency DEMO-9" in run(rig, "--monitor").stdout
+    proposal = plan(rig)
+    assert run(rig, "--apply", str(proposal)).returncode == 1
+    assert not writes(rig)
+    t["relations"][0]["state_name"] = "Done"
+    (rig[2] / "ticket.json").write_text(json.dumps({"ok": True, "ticket": t}))
+    declaration = rig[2] / "repo" / ".launch.yaml"
+    declaration.write_text("mode: launch\ncut_line:\n  launch_critical: [DEMO-9]\n  after_launch: [DEMO-1]\n")
+    assert "after declared launch cut" in run(rig, "--monitor").stdout
+    new_plan = plan(rig)
+    second = rig[1] / "launch-cut.json"
+    second.write_text(new_plan.read_text())
+    assert run(rig, "--apply", str(second)).returncode == 1
+    assert not writes(rig)
+
+
+def test_actual_write_cap_refuses_four_intakes(rig):
+    proposal = plan(rig)
+    data = json.loads(proposal.read_text())
+    data["writes"] = [{**data["writes"][0], "ref": f"DEMO-{i}"} for i in range(1, 5)]
+    proposal.write_text(json.dumps(data))
+    assert run(rig, "--apply", str(proposal)).returncode == 2
     assert not writes(rig)
 
 
