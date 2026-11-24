@@ -194,6 +194,62 @@ def atomic(path: Path, text: str):
     return True
 
 
+_MISSING = object()
+
+
+def _lookup(data, path):
+    for part in path:
+        if not isinstance(data, dict) or part not in data:
+            return _MISSING
+        data = data[part]
+    return data
+
+
+def _leaves(data, prefix=()):
+    if isinstance(data, dict) and data:
+        for key, child in data.items():
+            yield from _leaves(child, prefix + (key,))
+    else:
+        yield prefix, data
+
+
+def config_drift(current, base, found_delta, employee):
+    """Classify how a generated config.yaml departs from the render of base + the delta it was rendered from.
+
+    Returns ``(conflicts, replaced)`` as dotted paths. A *conflict* is content a re-render would silently
+    destroy and nobody else holds: a value the delta owns that config.yaml now contradicts, or a key that
+    neither the base nor the delta defines (a handwritten addition). *Replaced* is every other difference:
+    a base-owned leaf that holds an older or rewritten value. That is what a moved fleet base leaves
+    behind, and what Hermes' own config migrations write in place on update (`hermes update`
+    re-stamps every profile's config.yaml; 2026-11-24 it rewrote all 53 desks and every specialist
+    launch was refused as "handwritten"). The base is THE owner of those leaves, so the projection
+    re-renders them, the same contract the PM renderer applies, and keeps a backup of the bytes it replaced.
+    """
+    expected = r.without_render_pins(r.expected_config(base, found_delta, employee))
+    current = r.without_render_pins(current)
+    patched = set(((found_delta.get(r.LIST_PATCH_KEY) or {}).get("list_patches") or {}))
+    conflicts, replaced = [], []
+    for path, value in _leaves(current):
+        dotted = ".".join(map(str, path))
+        want = _lookup(expected, path)
+        if want is _MISSING:
+            # A parent that is a scalar in the render is a changed value, not an addition.
+            if any(not isinstance(_lookup(expected, path[:i]), (dict, type(_MISSING))) for i in range(1, len(path))):
+                replaced.append(dotted)
+            elif value in ({}, None, [], ""):
+                continue  # an empty section loses nothing on re-render
+            else:
+                conflicts.append(dotted)
+            continue
+        if want == value:
+            continue
+        owned = any(_lookup(found_delta, path[:i]) is not _MISSING
+                    and not isinstance(_lookup(found_delta, path[:i]), dict) for i in range(1, len(path) + 1))
+        owned = owned or _lookup(found_delta, path) is not _MISSING or dotted in patched
+        (conflicts if owned else replaced).append(dotted)
+    return conflicts, replaced
+
+
 def member_consumer(profile: str) -> str:
     """Same deterministic gateway consumer contract as Flume's member helper."""
     name = f"hermes-{profile}"
@@ -434,8 +490,12 @@ def project(request, check):
             refuse_credentials(value, name)
         current_config = profile / "config.yaml"
         safe(current_config)
+        replaced_drift = []
         if pending is None and current_config.exists() and old.get("files", {}).get("config.yaml") not in (digest(current_config.read_text()), receipt_digest("config.yaml", current_config.read_text())) and not any(r.is_render_of(mapping(current_config), base, d, employee) for d in (found_delta, delta)):
-            raise ValueError("ownership conflict: handwritten config.yaml; retain changes in config.delta.yaml")
+            conflicts, replaced_drift = config_drift(mapping(current_config), base, found_delta, employee)
+            if conflicts:
+                shown = ", ".join(conflicts[:6]) + (f" (+{len(conflicts) - 6} more)" if len(conflicts) > 6 else "")
+                raise ValueError(f"ownership conflict: handwritten config.yaml ({shown}); retain changes in config.delta.yaml")
         # Inherited list patches cannot re-enable external discovery.
         if merged.get("skills", {}).get("external_dirs") != []:
             raise ValueError("strict specialist refuses external skill discovery patches")
@@ -482,6 +542,10 @@ def project(request, check):
             changes.append(link_name)
         if pending is not None:
             changes.append(PENDING)
+        drift_backup = None
+        if not check and replaced_drift and "config.yaml" in changes:
+            # The replaced bytes stay recoverable: same backup root and layout as the PM renderer.
+            drift_backup = r.backup([current_config], f"specialist-drift-{employee}")
         if not check and changes:
             journal = {"id": employee, "definition": request["definition"], "files": files,
                        "before": {name: digest((profile / name).read_text()) if (profile / name).exists() else None for name in files},
@@ -509,6 +573,10 @@ def project(request, check):
         result = {"profile": str(profile), "changed": changes, "write_bank": f"agent-{employee}", "recall_banks": recall}
         if voice_note:
             result["voice_deferred"] = voice_note
+        if replaced_drift:
+            # Base-owned leaves a moved base or a Hermes migration left in config.yaml; re-rendered, never adopted.
+            result["replaced_drift"] = {"paths": replaced_drift,
+                                        "backup": str(drift_backup / profile.name / "config.yaml") if drift_backup else None}
         return result
 
 

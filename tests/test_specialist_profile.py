@@ -786,3 +786,50 @@ def test_fleet_base_voice_change_reaches_an_unpinned_desk(tmp_path):
     tts = yaml.safe_load((profile / "config.yaml").read_text())["tts"]
     assert tts["voice"] == tts["vox"]["voice"] == "kurzgesagt"
     assert "voice" not in yaml.safe_load((profile / "config.delta.yaml").read_text())["tts"]
+
+
+def test_hermes_migration_rewrite_of_base_owned_leaves_reconverges_with_backup(tmp_path):
+    """`hermes update` re-stamps every desk's config.yaml in place: base-owned leaves are re-rendered, not 'handwritten'."""
+    fleet, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / "config.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["operator"]["base"] = "migrated"          # a base-owned leaf Hermes rewrote
+    data["_config_version"] = 54                  # ...and stamped
+    data["skills"].pop("project_discovery")       # a dropped leaf loses nothing
+    rewritten = yaml.safe_dump(data, indent=4)
+    path.write_text(rewritten)
+    base = yaml.safe_load((fleet / "config.yaml").read_text())
+    base["_config_version"] = 54
+    (fleet / "config.yaml").write_text(yaml.safe_dump(base))
+    preview = run(request, env, "--check")
+    assert preview.returncode == 0, preview.stderr
+    assert json.loads(preview.stdout)["replaced_drift"] == {"paths": ["operator.base"], "backup": None}
+    assert path.read_text() == rewritten
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    out = json.loads(result.stdout)
+    assert "config.yaml" in out["changed"]
+    assert out["replaced_drift"]["paths"] == ["operator.base"]
+    assert Path(out["replaced_drift"]["backup"]).read_text() == rewritten
+    config = yaml.safe_load(path.read_text())
+    assert config["operator"]["base"] == "keep" and config["skills"]["project_discovery"] is False
+    again = run(request, env)
+    assert again.returncode == 0 and json.loads(again.stdout)["changed"] == []
+    assert "replaced_drift" not in json.loads(again.stdout)
+
+
+def test_edit_of_a_delta_owned_value_in_config_yaml_is_refused_by_path(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    path = profile / "config.yaml"
+    data = yaml.safe_load(path.read_text())
+    data["model"]["provider"] = "handpicked"
+    data["operator"]["base"] = "migrated"
+    path.write_text(yaml.safe_dump(data))
+    before = snapshot(profile)
+    for args in [("--check",), ()]:
+        refused = run(request, env, *args)
+        assert refused.returncode != 0
+        assert "handwritten config.yaml (model.provider)" in refused.stderr
+        assert snapshot(profile) == before
