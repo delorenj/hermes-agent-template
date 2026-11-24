@@ -833,3 +833,60 @@ def test_edit_of_a_delta_owned_value_in_config_yaml_is_refused_by_path(tmp_path)
         assert refused.returncode != 0
         assert "handwritten config.yaml (model.provider)" in refused.stderr
         assert snapshot(profile) == before
+
+
+def _hermes_touch(profile, mutate):
+    path = profile / "config.yaml"
+    data = yaml.safe_load(path.read_text())
+    mutate(data)
+    path.write_text(yaml.safe_dump(data, indent=4))
+
+
+def test_shape_change_of_a_base_owned_value_is_replaced_not_refused(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    _hermes_touch(profile, lambda d: d["operator"].__setitem__("base", {"enabled": True}))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["replaced_drift"]["paths"] == ["operator.base.enabled"]
+    assert yaml.safe_load((profile / "config.yaml").read_text())["operator"]["base"] == "keep"
+
+
+def test_shape_change_of_a_delta_owned_value_is_refused(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    _hermes_touch(profile, lambda d: d["curator"].__setitem__("enabled", {"x": 1}))
+    refused = run(request, env)
+    assert refused.returncode != 0 and "handwritten config.yaml (curator.enabled)" in refused.stderr
+
+
+def test_moved_base_list_under_a_delta_list_patch_is_replaced(tmp_path):
+    fleet, profile, request, env = fixture(tmp_path)
+    env, _ = voice_env(env, tmp_path)
+    base = yaml.safe_load((fleet / "config.yaml").read_text())
+    base["plugins"] = {"enabled": ["a", "tts/voxxy"]}
+    (fleet / "config.yaml").write_text(yaml.safe_dump(base))
+    assert run(request, env).returncode == 0
+    base["plugins"]["enabled"] = ["a", "b", "tts/voxxy"]
+    (fleet / "config.yaml").write_text(yaml.safe_dump(base))
+    _hermes_touch(profile, lambda d: d["operator"].__setitem__("base", "migrated"))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert set(json.loads(result.stdout)["replaced_drift"]["paths"]) == {"operator.base", "plugins.enabled"}
+    assert yaml.safe_load((profile / "config.yaml").read_text())["plugins"]["enabled"] == ["a", "b", "tts/vox"]
+    # Undoing the delta's own patch in config.yaml is still a contradiction.
+    _hermes_touch(profile, lambda d: d["plugins"].__setitem__("enabled", ["a", "b", "tts/voxxy"]))
+    refused = run(request, env)
+    assert refused.returncode != 0 and "handwritten config.yaml (plugins.enabled)" in refused.stderr
+
+
+def test_unrendered_delta_edit_plus_hermes_rewrite_is_not_handwritten(tmp_path):
+    _, profile, request, env = fixture(tmp_path)
+    assert run(request, env).returncode == 0
+    delta = yaml.safe_load((profile / "config.delta.yaml").read_text())
+    delta["operator"] = {"base": "mine"}
+    (profile / "config.delta.yaml").write_text(yaml.safe_dump(delta))
+    _hermes_touch(profile, lambda d: d["skills"].pop("project_discovery"))
+    result = run(request, env)
+    assert result.returncode == 0, result.stderr
+    assert yaml.safe_load((profile / "config.yaml").read_text())["operator"]["base"] == "mine"

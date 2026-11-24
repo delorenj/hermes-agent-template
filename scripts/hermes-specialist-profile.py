@@ -213,7 +213,7 @@ def _leaves(data, prefix=()):
         yield prefix, data
 
 
-def config_drift(current, base, found_delta, employee):
+def config_drift(current, base, found_delta, employee, delta_changed=False):
     """Classify how a generated config.yaml departs from the render of base + the delta it was rendered from.
 
     Returns ``(conflicts, replaced)`` as dotted paths. A *conflict* is content a re-render would silently
@@ -224,30 +224,52 @@ def config_drift(current, base, found_delta, employee):
     re-stamps every profile's config.yaml; 2026-11-24 it rewrote all 53 desks and every specialist
     launch was refused as "handwritten"). The base is THE owner of those leaves, so the projection
     re-renders them, the same contract the PM renderer applies, and keeps a backup of the bytes it replaced.
+
+    ``delta_changed``: the delta on disk is not the one the receipt recorded, so config.yaml was rendered
+    from an older delta and a delta-owned difference is that edit not yet rendered, not a contradiction.
+    A list-patched path (``x-pjangler-merge``) is delta-owned only in its additions and removals; the
+    rest of that list belongs to the base.
     """
     expected = r.without_render_pins(r.expected_config(base, found_delta, employee))
     current = r.without_render_pins(current)
-    patched = set(((found_delta.get(r.LIST_PATCH_KEY) or {}).get("list_patches") or {}))
+    patches = (found_delta.get(r.LIST_PATCH_KEY) or {}).get("list_patches") or {}
+
+    def owned(path):
+        return any(_lookup(found_delta, path[:i]) is not _MISSING
+                   and not isinstance(_lookup(found_delta, path[:i]), dict) for i in range(1, len(path) + 1)) \
+            or _lookup(found_delta, path) is not _MISSING
+
+    def differs(path, value):
+        """A conflict, or None when the difference is replaceable."""
+        dotted = ".".join(map(str, path))
+        rule = patches.get(dotted)
+        if isinstance(rule, dict) and isinstance(value, list):
+            honoured = (all(item in value for item in rule.get("add") or [])
+                        and not any(item in value for item in rule.get("remove") or []))
+            return None if honoured or delta_changed else dotted
+        return dotted if owned(path) and not delta_changed else None
+
     conflicts, replaced = [], []
     for path, value in _leaves(current):
         dotted = ".".join(map(str, path))
         want = _lookup(expected, path)
         if want is _MISSING:
-            # A parent that is a scalar in the render is a changed value, not an addition.
-            if any(not isinstance(_lookup(expected, path[:i]), (dict, type(_MISSING))) for i in range(1, len(path))):
-                replaced.append(dotted)
+            scalar_parent = next((path[:i] for i in range(1, len(path))
+                                  if _lookup(expected, path[:i]) is not _MISSING
+                                  and not isinstance(_lookup(expected, path[:i]), dict)), None)
+            if scalar_parent is not None:
+                # A shape change of a rendered value (scalar or list became a mapping), not an addition.
+                conflict = differs(scalar_parent, value)
             elif value in ({}, None, [], ""):
                 continue  # an empty section loses nothing on re-render
             else:
-                conflicts.append(dotted)
+                conflict = dotted
+        elif want == value:
             continue
-        if want == value:
-            continue
-        owned = any(_lookup(found_delta, path[:i]) is not _MISSING
-                    and not isinstance(_lookup(found_delta, path[:i]), dict) for i in range(1, len(path) + 1))
-        owned = owned or _lookup(found_delta, path) is not _MISSING or dotted in patched
-        (conflicts if owned else replaced).append(dotted)
-    return conflicts, replaced
+        else:
+            conflict = differs(path, value)
+        (conflicts if conflict else replaced).append(conflict or dotted)
+    return list(dict.fromkeys(conflicts)), replaced
 
 
 def member_consumer(profile: str) -> str:
@@ -492,7 +514,10 @@ def project(request, check):
         safe(current_config)
         replaced_drift = []
         if pending is None and current_config.exists() and old.get("files", {}).get("config.yaml") not in (digest(current_config.read_text()), receipt_digest("config.yaml", current_config.read_text())) and not any(r.is_render_of(mapping(current_config), base, d, employee) for d in (found_delta, delta)):
-            conflicts, replaced_drift = config_drift(mapping(current_config), base, found_delta, employee)
+            found_delta_text = owned_text("config.delta.yaml") or ""
+            delta_changed = old.get("files", {}).get("config.delta.yaml") not in (
+                digest(found_delta_text), receipt_digest("config.delta.yaml", found_delta_text))
+            conflicts, replaced_drift = config_drift(mapping(current_config), base, found_delta, employee, delta_changed)
             if conflicts:
                 shown = ", ".join(conflicts[:6]) + (f" (+{len(conflicts) - 6} more)" if len(conflicts) > 6 else "")
                 raise ValueError(f"ownership conflict: handwritten config.yaml ({shown}); retain changes in config.delta.yaml")
