@@ -104,6 +104,20 @@ def fleet_report() -> tuple[list[str], list[str]]:
     other = [w for w in warns if w not in booted and w not in sha]
     if other:
         drift.append(f"{len(other)} other single-install warnings, first: {other[0][6:]}")
+    # fleet-sync's own dry run: every deployed desk vs the template and fleet contract (never --apply here).
+    r = sh(["bash", str(SCRIPTS / "fleet-sync.sh")], timeout=900)
+    rows = [l for l in r.stdout.splitlines() if re.match(r"^\S+\s+DRIFT\s", l)]
+    if rows:
+        agents = sorted({l.split()[0] for l in rows})
+        manual = sum(1 for l in rows if "MANUAL" in l)
+        kinds: dict[str, int] = {}
+        for l in rows:
+            kind = re.sub(r"\s*\(.*$|:.*$|-> .*$", "", l.split("DRIFT", 1)[1].strip())
+            kinds[kind] = kinds.get(kind, 0) + 1
+        top = ", ".join(f"{k} x{n}" for k, n in sorted(kinds.items(), key=lambda kv: -kv[1])[:4])
+        drift.append(f"fleet-sync: {len(rows)} drift items on {len(agents)} desks ({manual} MANUAL); top: {top}. Review: bash {SCRIPTS}/fleet-sync.sh; fix the fixable ones with --apply, then one hermes-gateway-restart")
+    elif r.returncode == 0:
+        info.append("fleet-sync: every desk matches the template and fleet contract")
     return drift, info
 
 
