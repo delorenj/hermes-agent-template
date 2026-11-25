@@ -1,0 +1,12 @@
+[candybar]
+name = "hermes-fork-drift"
+description = "Weekly check-only: install still on the fork (main tracking delorenj/main, not detached, update custody present) and how far the fork trails upstream; ntfy when a /hermes-sync is due"
+tags = ["hermes", "drift"]
+schedule = "0 9 * * 1"
+timezone = "America/New_York"
+enabled = false
+
+[candybar.runner]
+kind = "exec"
+argv = ["/usr/bin/python3", "-B", "scripts/hermes-drift-report.py", "fork"]
+timeout_s = 900

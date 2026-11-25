@@ -1,0 +1,12 @@
+[candybar]
+name = "hermes-fleet-drift"
+description = "Weekly check-only: profile configs vs base+delta, the single-install guard (with its WARNs), stale registry hermes SHAs; ntfy on drift"
+tags = ["hermes", "drift"]
+schedule = "15 9 * * 1"
+timezone = "America/New_York"
+enabled = false
+
+[candybar.runner]
+kind = "exec"
+argv = ["/usr/bin/python3", "-B", "scripts/hermes-drift-report.py", "fleet"]
+timeout_s = 900
