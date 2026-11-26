@@ -13,3 +13,18 @@ from pathlib import Path
 os.environ.setdefault(
     "PROFILE_RENDERER", str(Path(__file__).resolve().parents[1] / "scripts" / "hermes-profile-config.py")
 )
+
+
+def _inside_git_worktree(path: str) -> bool:
+    p = Path(path).resolve()
+    return any((d / ".git").exists() for d in (p, *p.parents))
+
+
+# Skillex refuses to write receipts inside a source repository (E_RECEIPT_UNSAFE_PATH). A Claude Code
+# shell exports TMPDIR=~/.claude/tmp, which is a git repo, so ~70 skillex/desk-root tests errored at
+# setup for every agent that ran the suite from one (2026-11-26). Scratch space must sit outside git.
+if _inside_git_worktree(os.environ.get("TMPDIR") or "/tmp"):
+    import tempfile
+
+    os.environ["TMPDIR"] = "/tmp"
+    tempfile.tempdir = None
