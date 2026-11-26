@@ -85,6 +85,11 @@ path_relative_to() {
     "$1" "$2"
 }
 
+# path_resolve PATH — `readlink -f PATH` (GNU-only): symlinks resolved to the canonical path.
+path_resolve() {
+  python3 -I -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$1"
+}
+
 # Read a single scalar from role.yaml. Requires python3 (no yaml dep).
 #
 # yaml_get KEY[.SUBKEY[...]]   e.g.  yaml_get role,  yaml_get telegram.bot_username

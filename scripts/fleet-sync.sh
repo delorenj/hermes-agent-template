@@ -181,7 +181,7 @@ done
 [[ -f "$REGISTRY_FILE" ]] || { echo "fleet-sync: registry not found: $REGISTRY_FILE" >&2; exit 2; }
 [[ -f "$WRAPPER_TEMPLATE" ]] || { echo "fleet-sync: wrapper template not found: $WRAPPER_TEMPLATE" >&2; exit 2; }
 
-# Registry -> TSV: agent_id, role_dir, profile_name, legacy_consumer_unit
+# Registry -> TSV: agent_id, role_dir, profile_name, legacy_consumer_unit, employment, desk_path
 # (systemd.gateway_unit is a retired 2026-10-11 projection and is ignored)
 read_registry() {
   python3 - "$REGISTRY_FILE" <<'PYEOF'
@@ -204,6 +204,8 @@ for agent_id, a in sorted((data.get("agents") or {}).items()):
         str(a.get("role_dir") or ""),
         str(a.get("profile_name") or agent_id),
         str(systemd.get("consumer_unit") or ""),
+        str(a.get("employment") or ""),
+        str(a.get("desk_path") or ""),
     ]))
 PYEOF
 }
@@ -358,8 +360,19 @@ wanted_agent() {
   return 1
 }
 
-while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit; do
+while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit employment desk_path; do
   wanted_agent "$agent_id" || continue
+  # Portable specialists (Flume `employment: portable-specialist`) have no role_dir by design: their desk is
+  # rendered from desk_path by hermes-specialist-profile.py, not this template. Not drift; only a missing desk is.
+  if [[ "$employment" == "portable-specialist" ]]; then
+    if [[ -n "$desk_path" && -d "$desk_path" ]]; then
+      note "$agent_id" SKIP "portable specialist: desk $desk_path is rendered by hermes-specialist-profile.py"
+    else
+      note "$agent_id" DRIFT "portable specialist desk_path missing: ${desk_path:-<unset>} (MANUAL: re-hire or offboard)"
+      DRIFT=$((DRIFT + 1))
+    fi
+    continue
+  fi
   if [[ -z "$role_dir" || ! -d "$role_dir" ]]; then
     note "$agent_id" DRIFT "role_dir missing: ${role_dir:-<unset>} (MANUAL: deprovision or fix registry)"
     DRIFT=$((DRIFT + 1))
