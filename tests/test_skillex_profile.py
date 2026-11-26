@@ -102,6 +102,10 @@ def installed():
             "HOME": str(root / "install-home"),
             "npm_config_cache": str(root / "npm-cache"),
             "PATH": f"{node.parent}{os.pathsep}/usr/bin{os.pathsep}/bin",
+            # mise's node build wraps npm to run `mise reshim` after a global install. This installs into a
+            # throwaway prefix, so a reshim is pointless, and with HOME a temp dir mise's trust database is
+            # empty: it refuses the operator's real global config ("not trusted") and fails the install rc 1.
+            "MISE_SKIP_RESHIM": "1",
         }
         Path(env["HOME"]).mkdir()
         package = os.environ.get("SKILLEX_TEST_TARBALL", "@delorenj/skillex@latest")

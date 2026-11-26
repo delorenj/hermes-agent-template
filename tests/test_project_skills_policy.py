@@ -710,7 +710,10 @@ sys.path.insert(0,sys.argv[1])
 from agent.skill_utils import get_project_skills_dirs
 from tools.skills_tool import skill_view
 result=json.loads(skill_view("proof", file_path="SKILL.md", preprocess=False))
-print(json.dumps({"dirs":[str(p) for p in get_project_skills_dirs()], "success":result.get("success"), "path":result.get("_source_path")}))
+path=result.get("_source_path")
+if result.get("success") and not path:  # newer runtimes name the lexical directory only in the whole-skill view
+    path=json.loads(skill_view("proof", preprocess=False))["skill_dir"] + "/SKILL.md"
+print(json.dumps({"dirs":[str(p) for p in get_project_skills_dirs()], "success":result.get("success"), "path":path}))
 '''
     observed = subprocess.run([str(repo / ".venv/bin/python"), "-I", "-B", "-c", code, str(repo)],
                               cwd=case["project"], env={**case["env"], "HERMES_HOME":str(case["profile"])},

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 import yaml
+from support.profile_pins import unpinned_env
 
 
 ROOT = Path(__file__).parents[1]
@@ -260,7 +261,7 @@ def _assert_converged(paths: dict[str, Path]) -> None:
     assert delta["tts"]["voice"] == "carlin"
     patch = delta["x-pjangler-merge"]["list_patches"]["plugins.enabled"]
     assert patch == {"add": ["tts/vox"], "remove": ["tts/voxxy"]}
-    assert generated["secrets"]["onepassword"]["env"] == references
+    assert unpinned_env(generated["secrets"]["onepassword"]["env"]) == references
     assert generated["platforms"]["slack"]["enabled"] is True
     assert generated["tts"]["provider"] == "vox"
     assert generated["plugins"]["enabled"] == ["core-one", "tts/vox"]

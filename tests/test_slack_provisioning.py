@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import yaml
+from support.profile_pins import unpinned_env
 
 
 ROOT = Path(__file__).parents[1]
@@ -252,7 +253,7 @@ def _assert_rotated_wiring(role: Path, registry: Path, home: Path) -> None:
     assert "fakeitem0002" in refs["SLACK_BOT_TOKEN"]
     assert delta["platforms"]["slack"]["enabled"] is True
     generated = yaml.safe_load((profile / "config.yaml").read_text(encoding="utf-8"))
-    assert generated["secrets"]["onepassword"]["env"] == refs
+    assert unpinned_env(generated["secrets"]["onepassword"]["env"]) == refs
     assert generated["platforms"]["slack"]["enabled"] is True
     role_slack = yaml.safe_load((role / "role.yaml").read_text(encoding="utf-8"))["slack"]
     registry_slack = yaml.safe_load(registry.read_text(encoding="utf-8"))["agents"]["demo-pm"]["slack"]

@@ -51,6 +51,8 @@ esac
                     "type": provider_name,
                     "board_id": "fixture-board",
                     "identifier": "JIMB",
+                    # Plane refuses a board-bound op without its canonical workspace (PJAN-17).
+                    **({"workspace": "fixture-workspace"} if provider_name == "plane" else {}),
                 }
             }
         ),
