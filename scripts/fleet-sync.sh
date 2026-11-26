@@ -10,6 +10,7 @@ set -euo pipefail
 #   contract  runtime/profile.yaml opts into config.inherit_from: default
 #   profile   ~/.hermes/profiles/<profile_name> is a REAL dir whose shared
 #             entries link to the fleet root and owned entries link to runtime
+#             (a real skills/ dir is the desk's own and is left alone)
 #   role      <role_dir>/role.yaml profile: <profile_name>
 #   services  stale per-profile Bloodbank consumers retired
 #
@@ -663,6 +664,12 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit employmen
 
   if [[ -d "$profile_dir" && ! -L "$profile_dir" ]]; then
     for entry in "${SHARED_PROFILE_ENTRIES[@]}"; do
+      # Desk skills stay per desk (Jarad, 2026-11-26): a real skills/ dir holds that desk's Skillex
+      # projection plus the skills the agent wrote itself, so it is the desk's own, never drift. Only a
+      # desk with no skills/ at all gets the fleet link.
+      if [[ "$entry" == "skills" && -d "$profile_dir/skills" && ! -L "$profile_dir/skills" ]]; then
+        continue
+      fi
       ensure_profile_link "$entry" "$profile_dir/$entry" "$FLEET_HOME/$entry" \
         "$([[ "$entry" == "skills" ]] && echo dir || echo file)"
     done
