@@ -281,6 +281,16 @@ def wrapper_defaults(home: Path, registry: Path) -> list[tuple[str, str]]:
     seen: set[str] = set()
     paths: list[Path] = []
     code = Path(os.environ["HERMES_CODE_ROOT"]).expanduser() if os.environ.get("HERMES_CODE_ROOT") else home / "code"
+    # Only a wrapper the registry hires is a consumer. A role dir nobody hired (a scaffold left in a repo,
+    # e.g. OptionJangler's never-registered PM since 2026-05) runs under no gateway, so its fallback is noise.
+    registered: set[str] | None = None
+    if yaml is not None and registry.is_file():
+        try:
+            agents = (yaml.safe_load(registry.read_text(encoding="utf-8")) or {}).get("agents") or {}
+            registered = {str(Path(str(a["role_dir"])).expanduser().resolve())
+                          for a in agents.values() if isinstance(a, dict) and a.get("role_dir")}
+        except Exception:
+            registered = None
     if code.is_dir():
         for pattern in ("*/agents/hermes/*/hermes", "*/*/agents/hermes/*/hermes"):
             paths.extend(code.glob(pattern))
@@ -289,6 +299,8 @@ def wrapper_defaults(home: Path, registry: Path) -> list[tuple[str, str]]:
             continue
         rp = str(p.resolve())
         if rp in seen:
+            continue
+        if registered and str(p.parent.resolve()) not in registered:
             continue
         seen.add(rp)
         try:

@@ -177,10 +177,10 @@ def fleet_report() -> tuple[list[str], list[str]]:
     booted = [w for w in warns if "running gateway booted from" in w]
     if booted:
         drift.append(f"{booted[0][6:]} (hermes-gateway-restart --reason 'pick up install HEAD')")
-    sha = [w for w in warns if re.search(r"registry \S+: git_sha", w)]
+    sha = [w for w in warns if re.search(r"registry \S+: (git_sha|records no hermes\.git_sha)", w)]
     if sha:
         r2 = sh([sys.executable, "-B", str(SCRIPTS / "repair-rebased-hermes-shas.py")], timeout=300)
-        info.append(f"{len(sha)} registry rows record an older hermes.git_sha (fleet-sync refreshes them; rebase repair dry run: {(r2.stdout.strip().splitlines() or ['?'])[-1]})")
+        info.append(f"{len(sha)} registry rows record an older or no hermes.git_sha (fleet-sync refreshes them; rebase repair dry run: {(r2.stdout.strip().splitlines() or ['?'])[-1]})")
     other = [w for w in warns if w not in booted and w not in sha]
     if other:
         drift.append(f"{len(other)} other single-install warnings, first: {other[0][6:]}")
