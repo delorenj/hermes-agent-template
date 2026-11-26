@@ -335,7 +335,10 @@ regenerate `SOUL.md` and pin operator-only values (DeLoSecrets member-token ref,
 
 - Each desk: `hindsight/config.json` with `mode: local_external` and the host's
   `api_url`, then `hermes-profile-config memory-pin --profile <desk> --bank-id agent-<desk>`
-  (memory-pin writes only `bank_id`, so seed mode/url first).
+  (memory-pin writes only `bank_id`, so seed mode/url first, or run
+  `hermes-profile-config memory-endpoint --all` to write `config.toml [hindsight] api_url` into every
+  pinned desk; `hermes-drift-report.py fleet` flags any desk the Hindsight API rejects or that has no
+  url and silently falls back to the vendor cloud).
 - `HINDSIGHT_API_KEY` in each desk `.env`.
 - Create each bank and prove one retain + recall roundtrip with a nonce through
   the desk's own config and key.
