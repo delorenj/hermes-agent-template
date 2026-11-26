@@ -727,7 +727,9 @@ while IFS=$'\x1f' read -r agent_id role_dir profile_name consumer_unit employmen
 
   # 4. role.yaml binds the registry profile name.
   role_yaml="$role_dir/role.yaml"
-  if [[ -f "$role_yaml" ]] && ! grep -q "^profile: $profile_name$" "$role_yaml"; then
+  # Quoted ("x" / 'x') and a trailing comment are the same binding: Flume writes the quoted form, and
+  # treating it as drift rewrote 17 role.yaml files on 2026-11-26 for nothing.
+  if [[ -f "$role_yaml" ]] && ! grep -Eq "^profile: *[\"']?${profile_name//./\\.}[\"']? *(#.*)?$" "$role_yaml"; then
     if [[ $APPLY -eq 1 ]] && grep -q '^profile: ' "$role_yaml"; then
       sed_inplace "s/^profile: .*/profile: $profile_name/" "$role_yaml"
       note "$agent_id" FIXED "role.yaml profile -> $profile_name"
