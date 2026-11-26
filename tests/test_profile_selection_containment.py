@@ -13,11 +13,11 @@ import yaml
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/hermes-profile-config.py"
 COMMANDS = (
     "init", "render", "check", "repin", "expected", "absorb", "status",
-    "skills-policy", "memory-pin", "memory-template", "project-skills",
+    "skills-policy", "memory-pin", "memory-template", "memory-endpoint", "project-skills",
 )
 WRITERS = (
     "init", "render", "repin", "absorb", "skills-policy", "memory-pin",
-    "memory-template", "project-skills",
+    "memory-template", "memory-endpoint", "project-skills",
 )
 BAD_NAMES = (
     "", " ", " desk", "desk ", ".", "..", "../outside", "desk/../outside",
@@ -161,7 +161,7 @@ def test_positive_single_and_batch_read_only_and_writers(fleet):
             result = run(fleet, command, *args)
             assert result.returncode in (0, 1), (command, result.stderr)
             assert contents(fleet) == before
-    for command in ("render", "init", "absorb", "repin", "memory-pin", "memory-template"):
+    for command in ("render", "init", "absorb", "repin", "memory-pin", "memory-template", "memory-endpoint"):
         for args in (("--profile", "Bravo_2"), ("--all",)):
             before = contents(fleet)
             result = run(fleet, command, *args, "--dry-run")

@@ -7,7 +7,9 @@
          prevents that, and this report proves it stays prevented. It also says when a /hermes-sync is due.
   fleet  Does every consumer still agree with the install? Generated profile configs vs base+delta
          (hermes-profile-config.py check), the single-install guard (its WARN lines too), and registry
-         hermes.git_sha rows a rebase left behind (repair-rebased-hermes-shas.py, dry run).
+         hermes.git_sha rows a rebase left behind (repair-rebased-hermes-shas.py, dry run), and every
+         Hindsight desk's resolved endpoint + key (one authenticated GET per distinct url/key pair):
+         a desk with no api_url silently falls back to the vendor cloud and 401s every fleet key.
 
 Exit 0 clean, 1 drift (an ntfy alert went out), 2 the check itself could not run (also alerted).
 --no-alert prints only. Every finding names the command that fixes it.
@@ -16,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
@@ -79,9 +84,84 @@ def fork_report(max_days: int, max_commits: int) -> tuple[list[str], list[str]]:
     return drift, info
 
 
+HERMES_HOME = Path(os.environ.get("HERMES_FLEET_HOME", HOME / ".hermes"))
+HINDSIGHT_VENDOR_HOST = "hindsight.vectorize.io"
+
+
+def hindsight_report() -> tuple[list[str], list[str]]:
+    """Does every Hindsight desk resolve an endpoint and key the API accepts? Check-only.
+
+    Mirrors the plugin: api_url = hindsight/config.json api_url, else HINDSIGHT_API_URL in the desk's
+    .env, else the vendor cloud (which 401s every key minted here). Then one authenticated GET
+    /v1/default/banks per distinct (url, key ref). The key is read through `op` and never printed."""
+    import yaml
+    drift: list[str] = []
+    info: list[str] = []
+    probes: dict[tuple[str, str], list[str]] = {}
+    desks = 0
+    for pdir in sorted((HERMES_HOME / "profiles").iterdir()):
+        cfg_path = pdir / "config.yaml"
+        if pdir.name.startswith(".") or not cfg_path.is_file():
+            continue
+        try:
+            cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        if (cfg.get("memory") or {}).get("provider") != "hindsight":
+            continue
+        desks += 1
+        url = ""
+        try:
+            url = str(json.loads((pdir / "hindsight/config.json").read_text(encoding="utf-8")).get("api_url") or "")
+        except Exception:
+            pass
+        if not url:
+            try:
+                m = re.search(r"^HINDSIGHT_API_URL=(\S+)", (pdir / ".env").read_text(encoding="utf-8"), re.M)
+                url = m.group(1).strip("'\"") if m else ""
+            except OSError:
+                pass
+        ref = ((((cfg.get("secrets") or {}).get("onepassword") or {}).get("env") or {}).get("HINDSIGHT_API_KEY")) or ""
+        if not url or HINDSIGHT_VENDOR_HOST in url:
+            drift.append(f"{pdir.name}: no Hindsight api_url, so the plugin uses the vendor cloud and 401s: python3 {SCRIPTS}/hermes-profile-config.py memory-endpoint --profile {pdir.name}")
+            continue
+        if not ref:
+            drift.append(f"{pdir.name}: memory.provider is hindsight but secrets.onepassword.env has no HINDSIGHT_API_KEY")
+            continue
+        probes.setdefault((url.rstrip("/"), ref), []).append(pdir.name)
+    for (url, ref), names in sorted(probes.items()):
+        who = f"{len(names)} desk(s) ({', '.join(names[:4])}{', ...' if len(names) > 4 else ''}) at {url}"
+        r = sh(["op", "read", ref], timeout=60)
+        key = r.stdout.strip()
+        if r.returncode != 0 or not key:
+            drift.append(f"hindsight key ref for {who} could not be read through op (item {ref.rsplit('/', 2)[-2]}): {r.stderr.strip()[:120]}")
+            continue
+        req = urllib.request.Request(f"{url}/v1/default/banks", headers={"Authorization": f"Bearer {key}"})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                code = resp.status
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        except Exception as exc:
+            drift.append(f"hindsight API unreachable for {who}: {type(exc).__name__}: {str(exc)[:100]}")
+            continue
+        if code in (401, 403):
+            drift.append(f"hindsight API REJECTS the key for {who} (HTTP {code}); the key (item {ref.rsplit('/', 2)[-2]}) was revoked or minted for another consumer, or the url is the wrong tenant")
+        elif code >= 400:
+            drift.append(f"hindsight API answered HTTP {code} for {who}")
+        else:
+            info.append(f"hindsight: {who} accepted the key (HTTP {code})")
+    if not drift:
+        info.append(f"hindsight: all {desks} desks resolve an endpoint the API accepts")
+    return drift, info
+
+
 def fleet_report() -> tuple[list[str], list[str]]:
     drift: list[str] = []
     info: list[str] = []
+    h_drift, h_info = hindsight_report()
+    drift += h_drift
+    info += h_info
     r = sh([sys.executable, "-B", str(SCRIPTS / "hermes-profile-config.py"), "check"], timeout=600)
     if r.returncode != 0:
         lines = [l for l in (r.stdout + r.stderr).splitlines() if l.strip()]

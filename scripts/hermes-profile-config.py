@@ -1127,6 +1127,74 @@ def cmd_memory_template(args) -> int:
     return 0
 
 
+# The fleet's one Hindsight API. The Hermes Hindsight plugin falls back to the vendor cloud
+# (api.hindsight.vectorize.io) when a desk names no api_url, and that endpoint answers every
+# key minted here with 401 "Invalid API key format". Until 2026-11-24 the URL rode in the shared
+# ~/.hermes/.env (HINDSIGHT_API_URL); that file was rewritten without it and ~38 desks went
+# memoryless. The desk's own hindsight/config.json is the durable home, so it is written there.
+DEFAULT_HINDSIGHT_API_URL = "https://api.hs.delo.sh"
+
+
+def _configured_hindsight_api_url() -> str:
+    """``[hindsight] api_url`` from config.toml, else the fleet default (a hostname, never a LAN IP)."""
+    path = _template_config_path()
+    if path.is_file():
+        try:
+            import tomllib
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except ImportError:
+            data = {}
+        except Exception as exc:
+            sys.exit(f"FATAL: cannot parse {path}: {exc}")
+        value = (data.get("hindsight") or {}).get("api_url") or ""
+        if not isinstance(value, str):
+            sys.exit(f"FATAL: {path}: [hindsight] api_url must be a string")
+        if value.strip():
+            return value.strip()
+    return DEFAULT_HINDSIGHT_API_URL
+
+
+def cmd_memory_endpoint(args) -> int:
+    """Record the Hindsight API every desk talks to in its ``hindsight/config.json``.
+
+    Touches only ``api_url`` (``bank_id``, ``bank_template`` and the rest stay as memory-pin and
+    memory-template left them). A desk with no pinned config.json is skipped: writing a file with
+    only ``api_url`` would make the plugin ignore its env and template and fall back to the bank
+    ``hermes``. The URL comes from ``--api-url``, else config.toml ``[hindsight] api_url``, else
+    https://api.hs.delo.sh.
+    """
+    import json
+
+    url = (args.api_url or "").strip() or _configured_hindsight_api_url()
+    if not re.fullmatch(r"https?://[A-Za-z0-9.-]+(:\d+)?(/[^\s]*)?", url) or re.match(r"https?://\d+\.\d+\.\d+\.\d+", url):
+        sys.exit(f"FATAL: api_url must be an http(s) hostname URL, never a bare IP: {url}")
+    changed = 0
+    for pdir in _select(args):
+        target = pdir / "hindsight" / "config.json"
+        if not target.is_file() or target.is_symlink():
+            print(f"skip {pdir.name:34s} (no pinned hindsight/config.json; run memory-pin first)")
+            continue
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except Exception as exc:
+            sys.exit(f"FATAL: {target} is not valid JSON: {exc}")
+        if not isinstance(payload, dict):
+            sys.exit(f"FATAL: {target} is not a JSON object")
+        before = payload.get("api_url")
+        if before == url:
+            print(f"ok   {pdir.name:34s} api_url={before}")
+            continue
+        payload["api_url"] = url
+        print(f"set  {pdir.name:34s} api_url={url} (was {before or 'unset: vendor cloud default'})")
+        if args.dry_run:
+            continue
+        target.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.chmod(target, 0o600)
+        changed += 1
+    print(f"\nchanged {changed}")
+    return 0
+
+
 def _ensure_runtime_ignored(path: Path) -> None:
     """Keep a pinned config out of any repo that happens to contain it.
 
@@ -1215,6 +1283,8 @@ def main() -> int:
         ("memory-pin", cmd_memory_pin, "pin each agent's identity-memory bank explicitly"),
         ("memory-template", cmd_memory_template,
          "record the bank template the Hindsight provider imports into an unsteered identity bank"),
+        ("memory-endpoint", cmd_memory_endpoint,
+         "record the fleet Hindsight api_url in each desk's hindsight/config.json (no url = vendor cloud 401s)"),
     ]:
         p = sub.add_parser(name, help=helptext)
         p.add_argument("--profile", help="operate on one profile (default: all)")
@@ -1242,6 +1312,11 @@ def main() -> int:
             "--bank-template",
             help="memory-template: manifest path (default: config.toml [hindsight] "
             "agent_bank_template); '' removes it",
+        )
+        p.add_argument(
+            "--api-url",
+            help="memory-endpoint: Hindsight API URL (default: config.toml [hindsight] api_url, "
+            "else https://api.hs.delo.sh)",
         )
         p.add_argument(
             "--delta-file",

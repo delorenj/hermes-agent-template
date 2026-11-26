@@ -84,6 +84,11 @@ workspace = "33god"
 operator_user_ids = ["7564050286"]
 
 [hindsight]
+# The Hindsight API every desk talks to, recorded in each desk's hindsight/config.json as `api_url`
+# (`hermes-profile-config.py memory-endpoint`; hire step 10 runs it). A hostname, never a LAN IP.
+# Unset desks fall back to the plugin's vendor-cloud default, which answers every fleet key with
+# 401 "Invalid API key format". Empty = https://api.hs.delo.sh.
+api_url = "https://api.hs.delo.sh"
 # Bank-template manifest a new agent's identity bank starts from (retain /
 # reflect / observations missions, entity labels, mental models, directives).
 # Hire step 10 records it in the desk's hindsight/config.json as

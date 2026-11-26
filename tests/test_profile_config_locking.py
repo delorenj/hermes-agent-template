@@ -671,3 +671,48 @@ def test_hire_step_records_the_identity_bank_template() -> None:
     assert 'memory-template --profile "$PROFILE_NAME"' in profile_step
     example = (ROOT / "template" / ".scripts" / "config.example.toml").read_text(encoding="utf-8")
     assert "[hindsight]" in example and "agent_bank_template" in example
+
+
+def _memory_endpoint(env: dict, *extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-I", str(PROFILE_RENDERER), "memory-endpoint", *extra],
+        env=env, text=True, capture_output=True, check=False,
+    )
+
+
+def test_memory_endpoint_writes_the_fleet_api_url_and_keeps_the_pin(tmp_path: Path) -> None:
+    # A desk with no api_url falls back to the vendor cloud, which 401s every fleet key.
+    fleet, env = _memory_template_env(tmp_path, None)
+    pin = _pinned_profile(fleet, "33god-pm", "agent-grolf")
+    first = _memory_endpoint(env, "--all")
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert json.loads(pin.read_text(encoding="utf-8")) == {
+        "bank_id": "agent-grolf", "api_url": "https://api.hs.delo.sh"}
+    assert pin.stat().st_mode & 0o777 == 0o600
+    before = pin.read_bytes()
+    again = _memory_endpoint(env, "--all")
+    assert "changed 0" in again.stdout
+    assert pin.read_bytes() == before
+
+
+def test_memory_endpoint_reads_config_toml_and_skips_unpinned_desks(tmp_path: Path) -> None:
+    fleet, env = _memory_template_env(tmp_path, None)
+    Path(env["HERMES_TEMPLATE_CONFIG"]).write_text(
+        '[hindsight]\napi_url = "https://memory.example.test"\n', encoding="utf-8")
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    (fleet / "profiles" / "bare").mkdir()
+    result = _memory_endpoint(env, "--all")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(pin.read_text(encoding="utf-8"))["api_url"] == "https://memory.example.test"
+    assert "skip bare" in result.stdout
+    assert not (fleet / "profiles" / "bare" / "hindsight").exists()
+
+
+def test_memory_endpoint_refuses_a_bare_ip(tmp_path: Path) -> None:
+    fleet, env = _memory_template_env(tmp_path, None)
+    pin = _pinned_profile(fleet, "demo-pm", "agent-demo-pm")
+    before = pin.read_bytes()
+    result = _memory_endpoint(env, "--api-url", "http://192.168.1.50:8888", "--all")
+    assert result.returncode != 0
+    assert "never a bare IP" in result.stderr
+    assert pin.read_bytes() == before
