@@ -176,6 +176,31 @@ replacements also sync the containing directory where the platform supports it.
 Unexpected directory-sync errors are reported as failures without marking the
 step complete, so rerunning the idempotent provisioning step is safe.
 
+## Fleet A2A ingress
+
+One gateway process serves every desk, and the A2A platform mounts each profile on ONE listener
+(`:9900`, each desk at `/p/<profile>/`; Hermes fork commits `f421dc027a` and `07e5bbfc85`, upstream
+PR NousResearch/hermes-agent#160330). Hermes only widens the bind past loopback when a bearer token is
+configured, and remote callers also need an allow-list or allow-all, so the fleet sets three variables
+for every desk:
+
+| variable | value | why |
+| --- | --- | --- |
+| `A2A_BEARER_TOKEN` | the item's `bearer_token` field | any token turns remote exposure on; callers send `Authorization: Bearer` |
+| `A2A_HOST` | `0.0.0.0` | all interfaces (hostname routing, tailnet), not loopback |
+| `A2A_ALLOW_ALL_USERS` | `true` | single operator: any caller holding the token is trusted |
+
+They live in the 1Password item `Hermes A2A Gateway` (DeLoSecrets, `bo3wkjm35jhewyzmxpv6pd6ygu`) and reach
+each desk as `secrets.onepassword.env` references, the path every other fleet credential takes. A
+multiplexed profile never reads the process environment, and a third of the desks keep a private `.env`,
+so neither a systemd `Environment=` line nor a shared `~/.hermes/.env` edit would reach them.
+`hermes-profile-config.py` pins the three references into every generated config (`pin_a2a_ingress`,
+`RENDER_PIN_PATHS`), so a new hire, a delta or `fleet-sync` cannot drop them; a desk that sets
+`platforms.a2a.enabled: false` is left alone. The launch profile's config is the base itself and is
+never rendered, so the same three references are also in `~/.hermes/config.yaml`. No `A2A_PUBLIC_URL`:
+agent cards are built from the request's `Host`, so every hostname that reaches the box advertises itself.
+Rotate by editing the item's `bearer_token` field, then one `hermes-gateway-restart`.
+
 ## Start the daemon for an agent
 
 An agent has no systemd unit of its own: the one host gateway,

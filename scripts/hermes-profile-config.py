@@ -583,7 +583,48 @@ def pin_terminal_cwd(config: dict, profile: str, registry: Path | None = None) -
 # Dotted paths whose generated value the RENDERER owns (derived from the host or the org chart, never
 # from the delta). A consumer that compared config.yaml against a bare deep_merge(base, delta) called
 # every pinned desk "out-of-band drift" and, when it wrote, stripped the pin again (2026-10-18).
-RENDER_PIN_PATHS = ("terminal.cwd", "mcp_servers.codegraph", "gateway.platforms.bloodbank.enabled")
+A2A_INGRESS_ENV = ("A2A_BEARER_TOKEN", "A2A_HOST", "A2A_ALLOW_ALL_USERS")
+RENDER_PIN_PATHS = (
+    "terminal.cwd",
+    "mcp_servers.codegraph",
+    "gateway.platforms.bloodbank.enabled",
+    *(f"secrets.onepassword.env.{name}" for name in A2A_INGRESS_ENV),
+)
+
+# The fleet's A2A ingress. One gateway process serves every profile on ONE listener (profiles mount at
+# /p/<profile>/), exposed beyond loopback with a shared bearer token. The settings reach each profile's
+# own secret scope through the 1Password env map (the same path every other fleet credential takes): a
+# multiplexed profile never reads the process environment, and a third of the desks keep a private .env
+# that a shared ~/.hermes/.env edit would miss. Host and allow-all are not secrets, but riding the same
+# item makes one mechanism reach every desk, current and future. Item "Hermes A2A Gateway" in DeLoSecrets.
+A2A_VAULT_ITEM = "bo3wkjm35jhewyzmxpv6pd6ygu"
+A2A_INGRESS_REFS = {
+    "A2A_BEARER_TOKEN": f"op://DeLoSecrets/{A2A_VAULT_ITEM}/on3llvge2z556uevg6vd4t6qlm",
+    "A2A_HOST": f"op://DeLoSecrets/{A2A_VAULT_ITEM}/qhei6ibjzuktm4oh2rgsmpt3ry",
+    "A2A_ALLOW_ALL_USERS": f"op://DeLoSecrets/{A2A_VAULT_ITEM}/falmqidqth2sa7kpm7bhq47juu",
+}
+
+
+def pin_a2a_ingress(config: dict) -> dict:
+    """Every desk reads the fleet's A2A ingress settings from its own secret scope.
+
+    Skipped for a desk that disables the A2A platform or has no 1Password source (nothing to wire).
+    The fleet base carries the same refs for the launch profile, which is never rendered.
+    """
+    gateway = config.get("gateway")
+    for platforms in (config.get("platforms"), gateway.get("platforms") if isinstance(gateway, dict) else None):
+        a2a = platforms.get("a2a") if isinstance(platforms, dict) else None
+        if isinstance(a2a, dict) and a2a.get("enabled") is False:
+            return config
+    secrets = config.get("secrets")
+    onepassword = secrets.get("onepassword") if isinstance(secrets, dict) else None
+    if not isinstance(onepassword, dict) or onepassword.get("enabled") is False:
+        return config
+    env = onepassword.get("env")
+    if not isinstance(env, dict):
+        env = onepassword["env"] = {}
+    env.update(A2A_INGRESS_REFS)
+    return config
 
 
 def pin_bloodbank_transport(config: dict) -> dict:
@@ -598,7 +639,7 @@ def pin_bloodbank_transport(config: dict) -> dict:
 
 def apply_render_pins(config: dict, profile: str, *, registry: Path | None = None) -> dict:
     """Every renderer pin, in render order. Add a new pin HERE and in ``RENDER_PIN_PATHS`` only."""
-    return pin_bloodbank_transport(pin_terminal_cwd(pin_codegraph_root(config), profile, registry))
+    return pin_a2a_ingress(pin_bloodbank_transport(pin_terminal_cwd(pin_codegraph_root(config), profile, registry)))
 
 
 def expected_config(base: dict, delta: dict, profile, *, registry: Path | None = None) -> dict:

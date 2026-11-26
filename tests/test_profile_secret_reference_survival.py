@@ -143,6 +143,6 @@ def test_init_recovery_keeps_references(tmp_path):
     delta = _delta(pdir)
     assert delta["secrets"] == SECRETS
     assert "api_key" not in delta
-    # and the regenerated config still carries the references
+    # and the regenerated config still carries the references (plus the renderer's own A2A ingress pin)
     rendered = yaml.safe_load((pdir / "config.yaml").read_text(encoding="utf-8"))
-    assert rendered["secrets"] == SECRETS
+    assert _load().without_render_pins(rendered)["secrets"] == SECRETS
