@@ -30,6 +30,18 @@ cut_line:
     - EARS-4
 """
 
+POLISH_DECL = """\
+mode: polish
+declared: 2026-11-27
+source: "owner decision 2026-11-27"
+epic: EARS-1
+polish:
+  focus: [ux, physics]
+  qa: ["mise run qa:explore"]
+  wip: 4
+  cadence: "*/15 * * * *"
+"""
+
 SHIM = r'''#!__PY__
 import json, os, sys
 state = os.environ["PX_SHIM_STATE"]
@@ -67,7 +79,10 @@ else:
         print("px: boom", file=sys.stderr)
         sys.exit(1)
     if args[:2] == ["task", "create"]:
-        print("created EARS-99 [" + args[args.index("--state") + 1] + "] " + args[2])
+        cfile = state + "/create-count"
+        n = (int(open(cfile).read()) if os.path.exists(cfile) else 98) + 1  # first create is EARS-99, then 100, ...
+        open(cfile, "w").write(str(n))
+        print(f"created EARS-{n} [" + args[args.index("--state") + 1] + "] " + args[2])
     else:
         print("ok " + " ".join(args[:3]))
 '''
@@ -112,7 +127,7 @@ class Repo:
         self.role = self.root / "agents" / "hermes" / "pm"
         scripts = self.role / ".scripts"
         scripts.mkdir(parents=True)
-        for name in ("launch-pass.py", "board-lease.py", "launch-pass.prompt.md", "launch-dashboard.py"):
+        for name in ("launch-pass.py", "board-lease.py", "launch-pass.prompt.md", "polish-pass.prompt.md", "launch-dashboard.py"):
             (scripts / name).write_text((SCRIPTS / name).read_text())
         (scripts / "lib").mkdir()
         (scripts / "lib" / "launch-marketplaces.json").write_text((SCRIPTS / "lib" / "launch-marketplaces.json").read_text())
@@ -145,6 +160,8 @@ class Repo:
         self.env.pop("HERMES_BOARD_LEASE_OWNER", None)
         self.env.pop("LAUNCH_REPO", None)
         self.env.pop("LAUNCH_PASS_MAX", None)
+        self.env.pop("LAUNCH_PASS_NOW", None)
+        self.env.pop("POLISH_SLOT_MINUTES", None)
 
     def set_board(self, tickets):
         (self.state / "board.json").write_text(json.dumps({"board": "EARS", "tickets": tickets}))
@@ -179,25 +196,41 @@ def repo(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------------- monitor
 
-def test_monitor_without_a_declaration_is_exactly_steady(tmp_path, monkeypatch):
+def test_monitor_without_a_declaration_is_exactly_develop(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, declaration=None)
     out = r.run("--monitor")
     assert out.returncode == 0
-    assert out.stdout == "launch-mode: steady\n"
+    assert out.stdout == "launch-mode: develop\n"
     assert r.writes() == []
 
 
-@pytest.mark.parametrize("declaration", ["mode: steady\ndeclared: 2026-11-17\n", "mode: launch\n  broken: [\n", "::: not yaml", "finish_line: x\n"])
-def test_monitor_steady_or_unreadable_declaration_is_exactly_steady(tmp_path, monkeypatch, declaration):
+@pytest.mark.parametrize("declaration", ["mode: develop\ndeclared: 2026-11-17\n", "mode: steady\ndeclared: 2026-11-17\n",
+                                         "mode: launch\n  broken: [\n", "::: not yaml", "finish_line: x\n"])
+def test_monitor_develop_steady_or_unreadable_declaration_is_exactly_develop(tmp_path, monkeypatch, declaration):
     r = Repo(tmp_path, monkeypatch, declaration=declaration)
-    assert r.run("--monitor").stdout == "launch-mode: steady\n"
+    assert r.run("--monitor").stdout == "launch-mode: develop\n"
 
 
-def test_monitor_steady_never_calls_px(tmp_path, monkeypatch):
+def test_monitor_develop_never_calls_px(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, declaration=None)
     (r.state / "board.json").unlink()  # a px call would crash the shim
     out = r.run("--monitor")
-    assert out.stdout == "launch-mode: steady\n" and out.stderr == ""
+    assert out.stdout == "launch-mode: develop\n" and out.stderr == ""
+
+
+def test_steady_is_a_legacy_alias_of_develop(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration="mode: steady\ndeclared: 2026-11-01\n")
+    assert r.run("--monitor").stdout == "launch-mode: develop\n"
+    d = json.loads(r.run("--check").stdout)
+    assert d["mode"] == "develop" and d["active"] is False
+
+
+def test_unknown_mode_reads_as_develop_and_is_reported(tmp_path, monkeypatch):
+    r = Repo(tmp_path, monkeypatch, declaration="mode: cruise\ndeclared: 2026-11-01\n")
+    assert r.run("--monitor").stdout == "launch-mode: develop\n"
+    assert r.run("--check").returncode == 1
+    out = r.run("--brief").stdout
+    assert "unknown mode 'cruise'" in out and "quiet: develop" in out
 
 
 def test_monitor_is_deterministic_and_sorted(repo):
@@ -330,15 +363,15 @@ def test_check_parses_the_live_block_three_levels_deep(tmp_path, monkeypatch):
     assert live["fulfilment"]["outstanding_argv"][-1] == "outstanding" and live["fulfilment"]["promise_hours"] == "24"
     decl = mod.load_declaration(r.root)
     assert decl["mode"] == "live" and decl["active"] is False and decl["live_since"] == "2026-11-20"
-    assert mod.load_declaration(tmp_path / "nowhere")["mode"] == "steady"
+    assert mod.load_declaration(tmp_path / "nowhere")["mode"] == "develop"
 
 
 # ---------------------------------------------------------------------------------- brief
 
-def test_brief_steady_has_nothing_to_do(tmp_path, monkeypatch):
+def test_brief_develop_has_nothing_to_do(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, declaration=None)
     out = r.run("--brief")
-    assert out.returncode == 0 and out.stdout.startswith("launch-mode: steady\n") and "quiet: steady" in out.stdout
+    assert out.returncode == 0 and out.stdout.startswith("launch-mode: develop\n") and "quiet: develop" in out.stdout
 
 
 def test_brief_carries_declaration_snapshot_roadmap_and_schema(repo):
@@ -353,7 +386,7 @@ def test_brief_carries_declaration_snapshot_roadmap_and_schema(repo):
 
 # ---------------------------------------------------------------------------------- apply
 
-def test_apply_steady_refuses_and_writes_nothing(tmp_path, monkeypatch):
+def test_apply_develop_refuses_and_writes_nothing(tmp_path, monkeypatch):
     r = Repo(tmp_path, monkeypatch, declaration=None)
     r.plan({"writes": [{"op": "comment", "ref": "EARS-2", "text": "x"}]})
     out = r.run("--apply")
@@ -400,6 +433,7 @@ def test_apply_runs_every_allowed_op_through_px_with_tag(repo):
     assert w[6][:3] == ["task", "create", "Write store listing"]
     assert "-l" in w[6] and w[6][w[6].index("-l") + 1] == "docs"  # lifecycle: labels are dropped
     assert w[6][w[6].index("--idempotency-key") + 1] == "launch:listing"
+    assert w[6][w[6].index("--idempotency-source") + 1] == "launch-pass"
     assert w[6][w[6].index("--state") + 1] == "Todo"
     assert "degraded: px has no rank verb" in out.stdout
     assert (repo.role / "runtime" / "launch-roadmap.md").read_text() == "# r\n- one\n"
@@ -708,3 +742,168 @@ def test_a_throttled_ticket_read_is_retried_not_reported_as_board_unavailable(tm
     r = Repo(tmp_path, monkeypatch, tickets=[ticket(2, "Todo")])
     out = r.run("--monitor", PX_SHIM_FLAKY="1").stdout
     assert "UNAVAILABLE" not in out and "EARS-2|" in out
+
+
+# ------------------------------------------------------------------------------------- polish
+
+def polish_repo(tmp_path, monkeypatch, tickets=None, declaration=POLISH_DECL):
+    return Repo(tmp_path, monkeypatch, declaration=declaration,
+                tickets=tickets if tickets is not None else [ticket(2, "Todo", labels=["polish"]), ticket(3, "Backlog")])
+
+
+def write_ledger(r, **over):
+    ledger = {"declared": "2026-11-27", "cycles": 0, "proposed": [], "implemented": [], "updated_at": "2026-11-27T00:00:00+00:00"}
+    ledger.update(over)
+    path = r.role / "runtime" / "polish-metrics.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(ledger))
+    return path
+
+
+def test_polish_declaration_parses_the_polish_block(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    d = json.loads(r.run("--check").stdout)
+    assert d["mode"] == "polish" and d["active"] is True
+    assert d["focus"] == ["ux", "physics"] and d["qa"] == ["mise run qa:explore"]
+    assert d["wip"] == 4 and d["cadence"] == "*/15 * * * *" and d["todo_depth"] == 8  # 2 x wip by default
+
+
+def test_polish_monitor_snapshot_head_slot_and_metrics(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    out = r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:07:30+00:00")
+    assert out.returncode == 0, out.stderr
+    lines = out.stdout.splitlines()
+    assert lines[0] == "launch-mode: polish"
+    assert lines[1] == "date 2026-11-17"  # LAUNCH_PASS_DATE still pins the date line
+    assert lines[2].startswith("declaration ")
+    assert lines[3] == "epic EARS-1"
+    assert lines[4] == "qa-slot 2026-11-27T10:00Z"  # floored to the 15 minute slot
+    assert lines[5] == "polish-metrics proposed=0 implemented=0 cycles=0"
+    assert any(l.startswith("EARS-2|") and "polish" in l.split("|")[4] for l in lines), "polish-labelled rows are flagged"
+    assert any(l.startswith("EARS-3|") for l in lines)
+
+
+def test_polish_qa_slot_changes_across_slots_so_every_fire_wakes(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    base = r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:07:30+00:00").stdout
+    assert r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:14:59+00:00").stdout == base, "one slot, one snapshot"
+    nxt = r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:15:00+00:00").stdout
+    assert nxt != base and "qa-slot 2026-11-27T10:15Z" in nxt
+    five = r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:07:30+00:00", POLISH_SLOT_MINUTES="5").stdout
+    assert "qa-slot 2026-11-27T10:05Z" in five, "POLISH_SLOT_MINUTES overrides the slot width"
+
+
+def test_polish_monitor_refreshes_implemented_from_the_board(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch, tickets=[ticket(2, "Done", labels=["polish"]), ticket(3, "Backlog")])
+    write_ledger(r, cycles=3, proposed=[{"ref": "EARS-2", "title": "[ux:improvement] x", "at": "2026-11-27T00:00:00+00:00"}])
+    lines = r.run("--monitor").stdout.splitlines()
+    assert "polish-metrics proposed=1 implemented=1 cycles=3" in lines
+    m = json.loads((r.role / "runtime" / "polish-metrics.json").read_text())
+    assert m["implemented"] == ["EARS-2"], "the ledger itself is refreshed, not only the line"
+
+
+def test_polish_apply_labels_source_key_caps_and_ledger(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    r.plan({"writes": [
+        {"op": "create", "title": "[ux:improvement] The location of the X element sometimes blocks Y", "labels": ["ux"]},
+        {"op": "create", "title": "[physics:tweak] Unrealistically high force on the cue ball", "labels": ["polish", "physics"], "key": "polish:cue-ball"},
+    ]})
+    out = r.run("--apply", LAUNCH_PASS_NOW="2026-11-27T10:07:30+00:00")
+    assert out.returncode == 0, out.stdout + out.stderr
+    w = r.writes()
+    assert w[0][:3] == ["task", "create", "[ux:improvement] The location of the X element sometimes blocks Y"]
+    assert w[0][w[0].index("-l") + 1] == "ux,polish", "the driver adds the bare-word polish label"
+    assert w[0][w[0].index("--idempotency-source") + 1] == "polish-pass"
+    assert w[0][w[0].index("--idempotency-key") + 1].startswith("polish:")
+    assert w[1][w[1].index("-l") + 1] == "polish,physics", "an explicit polish label is not doubled"
+    assert w[1][w[1].index("--idempotency-key") + 1] == "polish:cue-ball", "an explicit key still wins"
+    m = json.loads((r.role / "runtime" / "polish-metrics.json").read_text())
+    assert m["cycles"] == 1
+    assert [p["ref"] for p in m["proposed"]] == ["EARS-99", "EARS-100"]
+    assert m["proposed"][0]["title"].startswith("[ux:improvement]") and m["proposed"][0]["at"]
+    assert m["implemented"] == []
+    assert "metrics polish: ok: QA cycle 1" in out.stdout
+
+
+def test_polish_apply_with_zero_writes_is_still_one_cycle(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    r.plan({"writes": []})
+    out = r.run("--apply")
+    assert out.returncode == 0 and r.writes() == []
+    assert json.loads((r.role / "runtime" / "polish-metrics.json").read_text())["cycles"] == 1
+
+
+def test_polish_caps_are_eight_creates_and_twenty_writes(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    r.plan({"writes": [{"op": "create", "title": f"[ux:improvement] idea {i}"} for i in range(10)]})
+    out = r.run("--apply")
+    assert len([w for w in r.writes() if w[:2] == ["task", "create"]]) == 8
+    assert "at most 8 creates" in out.stdout
+    before = len(r.writes())
+    r.plan({"writes": [{"op": "comment", "ref": "EARS-3", "text": f"note {i}"} for i in range(25)]})
+    r.run("--apply")
+    assert len(r.writes()) - before == 20, "the polish write cap is 20"
+    before = len(r.writes())
+    r.plan({"writes": [{"op": "comment", "ref": "EARS-3", "text": f"env {i}"} for i in range(9)]})
+    r.run("--apply", LAUNCH_PASS_MAX="3")
+    assert len(r.writes()) - before == 3, "LAUNCH_PASS_MAX still overrides the polish cap"
+
+
+def test_polish_ledger_is_archived_when_declared_changes(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    write_ledger(r, declared="2026-11-20", cycles=9,
+                 proposed=[{"ref": "EARS-2", "title": "x", "at": "2026-11-20T00:00:00+00:00"}], implemented=["EARS-2"])
+    body = json.loads(r.run("--metrics").stdout)
+    assert body["declared"] == "2026-11-27"
+    assert body["counts"] == {"proposed": 0, "implemented": 0, "cycles": 0}
+    archived = json.loads((r.role / "runtime" / "polish-metrics.2026-11-20.json").read_text())
+    assert archived["cycles"] == 9 and archived["implemented"] == ["EARS-2"]
+
+
+def test_metrics_command_prints_the_ledger_with_counts(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    write_ledger(r, cycles=4, proposed=[{"ref": "EARS-2", "title": "x", "at": "t"}, {"ref": "EARS-3", "title": "y", "at": "t"}],
+                 implemented=["EARS-2"])
+    body = json.loads(r.run("--metrics").stdout)
+    assert body["counts"] == {"proposed": 2, "implemented": 1, "cycles": 4}
+    assert body["implemented"] == ["EARS-2"]
+
+
+def test_metrics_command_with_no_ledger_is_zeroes_not_an_error(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    out = r.run("--metrics")
+    assert out.returncode == 0
+    assert json.loads(out.stdout)["counts"] == {"proposed": 0, "implemented": 0, "cycles": 0}
+
+
+def test_polish_brief_picks_the_polish_prompt_and_lists_open_polish_titles(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch, tickets=[
+        ticket(2, "Backlog", labels=["polish"], name="[ux:improvement] X blocks Y"),
+        ticket(3, "Todo"),
+    ])
+    out = r.run("--brief").stdout
+    assert "# Polish pass: the QA-cycle contract" in out
+    assert "# Launch pass: the pass contract" not in out
+    assert "## Polish mode" in out, "the rules pointer names the polish SOUL section"
+    assert "# Polish metrics" in out and "QA cycles=0 improvements proposed=0 implemented=0" in out
+    assert "Open polish tickets (1)" in out and "[ux:improvement] X blocks Y" in out
+    assert "todo_depth 8" in out
+    assert "mise run qa:explore" in out, "the declaration's qa commands reach the cycle"
+    assert "# Launch dashboard" in out and "launch-only" in out
+    assert "polish-pass" in out and "polish:<hash>" in out
+
+
+def test_polish_apply_refuses_dashboard_ops_with_a_receipt_note(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    r.plan({"writes": [], "dashboard": [{"op": "check", "id": "play-create-app", "evidence": "x"}]})
+    out = r.run("--apply")
+    assert out.returncode == 0
+    assert "launch-only" in out.stdout and "dashboard ops are refused" in out.stdout
+    assert not (r.state / "publish.log").exists(), "nothing was rendered or published"
+
+
+def test_polish_repo_monitor_lines_still_ride_the_snapshot(tmp_path, monkeypatch):
+    r = polish_repo(tmp_path, monkeypatch)
+    _repo_monitor(r, "echo 'qa harness green'")
+    lines = r.run("--monitor", LAUNCH_PASS_NOW="2026-11-27T10:07:30+00:00").stdout.splitlines()
+    assert lines[0] == "launch-mode: polish" and lines[-1] == "repo|qa harness green"

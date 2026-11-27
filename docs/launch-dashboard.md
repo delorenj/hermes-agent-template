@@ -10,7 +10,9 @@ whose repo's `.launch.yaml` says `mode: launch`. It ships once, in the hermes-ag
 `launch-dashboard.py`, the shared marketplace catalog, the plan ops in `launch-pass.py`, and the
 rules in the SOUL's `## Launch mode` section. A repo gets it through
 `flume remediate hermes.pm-scaffold`. It was dogfooded first on green-in-between, gruvato and tolt.
-For a `steady` or `live` repo, the dashboard is inert.
+For a `develop` (legacy `steady`), `polish` or `live` repo, the dashboard is inert: it is
+launch-only. In polish mode the pass machinery is shared but the dashboard never renders or
+publishes, and a polish plan's `dashboard` ops are refused with a receipt note.
 
 ## The rules
 

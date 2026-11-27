@@ -1244,7 +1244,7 @@ def read_trouble(board: Board) -> str:
 def run_apply(repo: Path, decl: dict, ops, do_publish: bool = True) -> list[dict]:
     """Apply `ops` (may be empty), re-render and publish. Returns receipt entries; a publish failure never raises."""
     entries: list[dict] = []
-    if not decl.get("active"):
+    if decl.get("mode") != "launch":  # the dashboard is launch-only: inert in develop, polish and live
         return entries
     with Locked():
         data = load_data(DATA_FILE)
@@ -1368,7 +1368,7 @@ def main(argv: list[str]) -> int:
     mode = modes[0]
     repo = LP.find_repo()
     decl = LP.load_declaration(repo)
-    if not decl["active"]:
+    if decl["mode"] != "launch":  # launch-only: `active` also covers polish, and the dashboard stays inert there
         print(f"launch-mode: {decl['mode']}: the dashboard is inert, nothing done.")
         return 0
     data_path = Path(flag("--data")) if flag("--data") else DATA_FILE

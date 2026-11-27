@@ -133,21 +133,50 @@ Candybar `exec` runner, see the README) rather than on a timer. Its own cooldown
 reconciliation pass is worth running; see [the sentinel
 docs](sentinel/README.md).
 
-### Launch pass (PM launch mode)
+### Mode pass (PM modes: develop / launch / polish)
 
-A launch runs on the repo's one PM, not on a director desk (launch-director,
-paired-launch-director and em roles are retired, 2026-11-18). Launch mode is repo
-data: the committed `<repo>/.launch.yaml` (`mode: launch|steady`; absent means
-steady). The role ships `.scripts/launch-pass.py` and `launch-pass.prompt.md`, an
+The mode runs on the repo's one PM, not on a director desk (launch-director,
+paired-launch-director and em roles are retired, 2026-11-18). The mode is repo
+data: the committed `<repo>/.launch.yaml` (`mode: develop|launch|polish|live`;
+absent, unreadable or unknown means `develop`, and `steady` is a legacy alias
+that reads as `develop`). Agents never edit the file. `develop` is the quiet
+default (no pass); `launch` races a finish line; `polish` is around-the-clock
+exploratory QA of the user experience — anything, however small, that can be
+improved or fixed gets a ticket; `live` is the product in production (no pass).
+`active` is `launch` or `polish`.
+
+The role ships `.scripts/launch-pass.py` with one contract per active mode
+(`launch-pass.prompt.md`, `polish-pass.prompt.md`), an
 interval-driver pass (`--monitor` gate, `--brief`, `--apply plan.json`: the only
 board writer, under the board-driver lease, with an op allowlist, a write cap and
-receipts in `runtime/launch-receipts/`). Candybar `<repo>-pm-launch-pass` is its
+receipts in `runtime/launch-receipts/`, plus `--check` and `--metrics`). Candybar
+`<repo>-pm-launch-pass` is its
 only clock, firing a Hermes job pinned `--scheduler external` whose wrappers
 (`launch-monitor.sh`, `launch-brief.sh`) are real files in the profile's
-`scripts/`. `flume launch status|enable|disable` wires it; in steady mode the
-monitor prints one fixed line and a fire costs 0 tokens. A monorepo parent may list child directories in `scopes:` of `.launch.yaml`; the pass then lists those scopes too and runs each write from the directory that owns the ref (a `create` may name a declared `scope`). Behavior is
-`flume/roles/pm.md`, "## Launch mode"; operations are `agent-fleet-operations`,
-"Launch mode".
+`scripts/`. The wrappers, the Hermes job and the Candybar entry are shared by
+both active modes — they drive "the active mode" and are never renamed.
+`flume launch status|enable|disable` wires it; in develop or live mode the
+monitor prints one fixed line and a fire costs 0 tokens.
+
+Polish reuses the launch machinery with these deltas: the monitor adds a
+`qa-slot` line (the UTC minute floored to `POLISH_SLOT_MINUTES`, default 15) so
+every fire wakes the agent, and a `polish-metrics proposed=N implemented=M
+cycles=K` line fed by the ledger `runtime/polish-metrics.json` — the single
+source for the status line: proposed = improvements proposed, implemented =
+proposed refs now in the completed state group (refreshed whenever a pass reads
+the board), cycles = QA cycles (each apply is one, even with zero writes); a new
+`declared:` archives the old ledger to `polish-metrics.<declared>.json`. Polish
+creates carry `[area:kind] ...` words inside the title (never a colon label),
+the bare-word `polish` label, idempotency source `polish-pass` and key
+`polish:<hash>`; they land in Backlog and each cycle tops Todo up to
+`todo_depth` (default 2 x `wip`, and `wip` defaults to 4 lanes while
+polishing). Caps are 8 creates / 20 writes (`LAUNCH_PASS_MAX` still overrides
+the write cap). The launch dashboard stays launch-only: a polish plan's
+`dashboard` ops are refused with a receipt note.
+
+A monorepo parent may list child directories in `scopes:` of `.launch.yaml`; the pass then lists those scopes too and runs each write from the directory that owns the ref (a `create` may name a declared `scope`). Behavior is
+`flume/roles/pm.md`, "## Launch mode" / "## Polish mode"; operations are
+`agent-fleet-operations`, "Launch mode".
 
 Sensitive state — `.env`, `auth.json`, OAuth tokens — never enters project Git.
 It lives only in ignored local storage unless the operator separately places a
